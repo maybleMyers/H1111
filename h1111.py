@@ -217,7 +217,7 @@ with gr.Blocks(css="""
 .green-btn:hover {
     background: linear-gradient(to bottom right, #27ae60, #219651) !important;
 }
-""") as demo:
+""", title="H1111") as demo:
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
     v2v_selected_index = gr.State(value=None)  # For Video to Video
