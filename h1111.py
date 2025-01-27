@@ -185,7 +185,10 @@ def generate_video(
     return generated_videos
 
 # UI setup
-with gr.Blocks() as demo:
+with gr.Blocks(css="""
+.gallery-item:first-child { border: 2px solid #4CAF50 !important; }
+.gallery-item:first-child:hover { border-color: #45a049 !important; }
+""") as demo:
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
     v2v_selected_index = gr.State(value=None)  # For Video to Video
@@ -326,6 +329,10 @@ with gr.Blocks() as demo:
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, output_type, attn_mode, block_swap
         ] + lora_weights + lora_multipliers,
         outputs=video_output
+    ).then(
+    fn=lambda batch_size: 0 if batch_size == 1 else None,
+    inputs=[batch_size],
+    outputs=selected_index
     )
 
     # Update gallery selection handling
@@ -352,6 +359,10 @@ with gr.Blocks() as demo:
         if not gallery or idx is None or idx >= len(gallery):
             return None, ""
         
+        # Auto-select first item if only one exists and no selection made
+        if idx is None and len(gallery) == 1:
+            idx = 0
+
         selected_item = gallery[idx]
         
         # Handle different gallery item formats

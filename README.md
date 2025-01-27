@@ -15,6 +15,8 @@ This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 
 Tested on ubuntu 24
 
+to update navigate to H1111 and git pull
+
 ```powershell
 git clone https://github.com/maybleMyers/H1111
 cd H1111
