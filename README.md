@@ -1,10 +1,11 @@
 This is a very early release and there are many bugs I am still working on
 
-```markdown
-# H1111
+
 ![GUI Screenshot](images/screenshot.png)
 
-This is a GUI for tech wizard kohya-ss's musubi tuner's inference script. It is styled after AUTOMATIC1111 for SDXL.
+# H1111
+
+This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 
 ## Requirements
 - Python 3.10
@@ -15,7 +16,7 @@ This is a GUI for tech wizard kohya-ss's musubi tuner's inference script. It is 
 First, open PowerShell and navigate to your desired installation directory. Then run these commands:
 
 ```powershell
-git clone https://github.com/mayblemyers/H1111
+git clone https://github.com/maybleMyers/H1111
 cd musubi-tuner
 python -m venv env
 ./env/scripts/activate
