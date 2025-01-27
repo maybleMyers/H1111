@@ -130,7 +130,8 @@ def generate_video(
             "--output_type", output_type,
             "--attn_mode", attn_mode,
             "--blocks_to_swap", block_swap,
-            "--split_attn"
+            "--split_attn",
+            "--fp8_llm"
 
         ]
 
