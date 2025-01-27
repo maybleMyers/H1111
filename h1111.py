@@ -9,6 +9,9 @@ import tiktoken
 import sys
 from typing import List, Tuple, Optional, Generator
 
+# Add global stop event
+stop_event = threading.Event()
+
 def count_prompt_tokens(prompt: str) -> int:
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(prompt)
@@ -87,7 +90,10 @@ def generate_video(
     lora4_multiplier: float = 1.0,
     video_path: Optional[str] = None,
     strength: Optional[float] = None
-) -> List[Tuple[str, str]]:  # Return type changed to List[Tuple[str, str]]
+) -> List[Tuple[str, str]]:  
+    global stop_event
+    stop_event.clear()  # Reset stop event at start
+
     # Validate video dimensions
     match = re.match(r'(\d+)\s+(\d+)', video_size)
     if not match:
@@ -101,6 +107,10 @@ def generate_video(
 
     generated_videos: List[Tuple[str, str]] = []
     seeds: List[int] = []
+
+    for batch_idx in range(batch_size):
+        if stop_event.is_set():
+            break  # Exit early if stopped
 
     # Process one video at a time
     for batch_idx in range(batch_size):
@@ -161,14 +171,23 @@ def generate_video(
         # Run single process with direct console output
         p = subprocess.Popen(
             command,
-            stdout=None,  # This will print directly to console
-            stderr=None,  # This will print directly to console
+            stdout=None,
+            stderr=None,
             env=env,
             executable=sys.executable
         )
 
-        # Wait for process to complete
-        p.wait()
+        # Modified wait with stop check
+        while True:
+            retcode = p.poll()
+            if retcode is not None:
+                break
+            if stop_event.is_set():
+                p.terminate()
+                p.wait()
+                print("Generation stopped by user.")
+                return generated_videos  # Return videos generated so far
+            time.sleep(0.5)
             
         # Find the most recently generated video after each batch
         save_path_abs = os.path.abspath(save_path)
@@ -190,6 +209,14 @@ def generate_video(
 with gr.Blocks(css="""
 .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
 .gallery-item:first-child:hover { border-color: #45a049 !important; }
+.green-btn {
+    background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
+    color: white !important;
+    border: none !important;
+}
+.green-btn:hover {
+    background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+}
 """) as demo:
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
@@ -229,9 +256,11 @@ with gr.Blocks(css="""
                 seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
                 cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0)
-            
-            generate_btn = gr.Button("Generate Video")
-            
+
+            with gr.Row():
+                generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                stop_btn = gr.Button("Stop Generation", variant="stop")
+
             with gr.Row():
                 video_output = gr.Gallery(
                     label="Generated Videos (Click to select)",
@@ -263,8 +292,9 @@ with gr.Blocks(css="""
                 v2v_prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
 
-            v2v_generate_btn = gr.Button("Generate Video")
-            v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
+            with gr.Row():
+                v2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                v2v_stop_btn = gr.Button("Stop Generation", variant="stop")
 
             with gr.Row():
                 with gr.Column():
@@ -278,6 +308,7 @@ with gr.Blocks(css="""
                         object_fit="contain",
                         height="auto"
                     )
+                    v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
             
             with gr.Row():
                 v2v_video_size = gr.Textbox(label="Video Size (Width Height)", value="544 544", info="Space-separated values, must be divisible by 8")
@@ -322,6 +353,8 @@ with gr.Blocks(css="""
     # Event handlers
     prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
     v2v_prompt.change(fn=count_prompt_tokens, inputs=v2v_prompt, outputs=v2v_token_counter)
+    stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
     # Text to Video generation
     generate_btn.click(
