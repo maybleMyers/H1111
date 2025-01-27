@@ -131,7 +131,9 @@ def generate_video(
             "--attn_mode", attn_mode,
             "--blocks_to_swap", block_swap,
             "--split_attn",
-            "--fp8_llm"
+            "--fp8_llm",
+            "--vae_chunk_size", "32",
+            "--vae_spatial_tile_sample_min_size", "128"            
 
         ]
 
