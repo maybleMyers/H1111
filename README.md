@@ -6,6 +6,7 @@ This is a very early release and there are many bugs I am still working on
 # H1111
 
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
+https://github.com/kohya-ss/musubi-tuner
 
 ## Requirements
 - Python 3.10
