@@ -17,7 +17,17 @@ First, open PowerShell and navigate to your desired installation directory. Then
 
 ```powershell
 git clone https://github.com/maybleMyers/H1111
-cd musubi-tuner
+cd H1111
+
+#to download models
+wget https://huggingface.co/tencent/HunyuanVideo/resolve/main/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt -P hunyuan
+wget https://huggingface.co/tencent/HunyuanVideo/resolve/main/hunyuan-video-t2v-720p/vae/pytorch_model.pt -P hunyuan
+wget https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/resolve/main/split_files/text_encoders/llava_llama3_fp16.safetensors -P hunyuan
+wget https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/resolve/main/split_files/text_encoders/clip_l.safetensors -P hunyuan
+#fp8 model
+wget https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial/resolve/main/mp_rank_00_model_states_fp8.safetensors -P hunyuan
+
+
 python -m venv env
 ./env/scripts/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
