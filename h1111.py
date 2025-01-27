@@ -417,4 +417,4 @@ with gr.Blocks() as demo:
         outputs=v2v_output
     )
 
-demo.launch()
+demo.launch(server_name="0.0.0.0", share=False, port=7860) 
