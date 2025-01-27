@@ -69,7 +69,7 @@ pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken
 ## To run
 
 ```
-python h1111.py --listen
+python h1111.py
 ```
 
 open 127.0.0.1:7860 in a browser
