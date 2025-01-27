@@ -419,7 +419,10 @@ with gr.Blocks(css="""
         fn=handle_send_button,
         inputs=[video_output, prompt, selected_index],
         outputs=[v2v_input, v2v_prompt]
-    ).then(lambda: gr.Tabs(selected="Video to Video"), outputs=tabs)
+    ).then(
+        lambda: gr.Tabs(selected="Video to Video"),  # Tab switch logic
+        outputs=tabs  # This targets the main Tabs component
+    )
 
     # Handler for sending selected video from Video2Video gallery to input
     def handle_v2v_send_button(gallery: list, prompt: str, idx: int) -> Tuple[Optional[str], str]:
