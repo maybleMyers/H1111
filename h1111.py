@@ -248,7 +248,7 @@ with gr.Blocks(css="""
                         ))
             
             with gr.Row():
-                video_size = gr.Textbox(label="Video Size (Width Height)", value="544 544", info="Space-separated values, must be divisible by 8")
+                video_size = gr.Textbox(label="Video Size (Height Width)", value="544 544", info="Space-separated values, must be divisible by 8")
                 batch_size = gr.Number(label="Batch Size", value=1, minimum=1, step=1)
                 video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                 fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
