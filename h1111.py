@@ -284,7 +284,7 @@ with gr.Blocks(css="""
                 save_path = gr.Textbox(label="Save Path", value="outputs")
                 output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                block_swap = gr.Textbox(label="Blocks to Swap to save vram", value="0")
+                block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
 
         # Video to Video Tab
         with gr.Tab("Video to Video") as v2v_tab:
@@ -348,7 +348,7 @@ with gr.Blocks(css="""
                 v2v_save_path = gr.Textbox(label="Save Path", value="outputs")
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                v2v_block_swap = gr.Textbox(label="Blocks to Swap to save vram", value="0")
+                v2v_block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
 
     # Event handlers
     prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
