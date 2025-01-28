@@ -451,10 +451,21 @@ with gr.Blocks(css="""
         infer_steps: int, 
         seed: int, 
         flow_shift: float, 
-        cfg_scale: float
-    ) -> Tuple[Optional[str], str, str, int, int, int, int, int, float, float]:
+        cfg_scale: float,
+        lora1: str,
+        lora2: str,
+        lora3: str,
+        lora4: str,
+        lora1_multiplier: float,
+        lora2_multiplier: float,
+        lora3_multiplier: float,
+        lora4_multiplier: float
+    ) -> tuple:
         if not gallery or idx is None or idx >= len(gallery):
-            return (None, "", video_size, batch_size, video_length, fps, infer_steps, seed, flow_shift, cfg_scale)
+            return (None, "", video_size, batch_size, video_length, fps, infer_steps, 
+                    seed, flow_shift, cfg_scale, 
+                    lora1, lora2, lora3, lora4,
+                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
 
         # Auto-select first item if only one exists and no selection made
         if idx is None and len(gallery) == 1:
@@ -484,7 +495,15 @@ with gr.Blocks(css="""
             infer_steps, 
             seed, 
             flow_shift, 
-            cfg_scale
+            cfg_scale,
+            lora1,
+            lora2,
+            lora3,
+            lora4,
+            lora1_multiplier,
+            lora2_multiplier,
+            lora3_multiplier,
+            lora4_multiplier
         )
     
             # Send button click handler
@@ -494,7 +513,7 @@ with gr.Blocks(css="""
             video_output, prompt, selected_index,
             video_size, batch_size, video_length, 
             fps, infer_steps, seed, flow_shift, cfg_scale
-        ],
+        ] + lora_weights + lora_multipliers,  # Add LoRA inputs
         outputs=[
             v2v_input, 
             v2v_prompt,
@@ -506,9 +525,9 @@ with gr.Blocks(css="""
             v2v_seed,
             v2v_flow_shift,
             v2v_cfg_scale
-        ]
+        ] + v2v_lora_weights + v2v_lora_multipliers  # Add LoRA outputs
     ).then(
-        lambda: gr_update(selected="Video to Video"),  # Correct tab switching
+        lambda: gr_update(selected="Video to Video"),
         outputs=tabs
     )
 
@@ -577,5 +596,6 @@ with gr.Blocks(css="""
         inputs=[v2v_lora_folder] + v2v_lora_weights,
         outputs=v2v_refresh_outputs
     )
+
 
 demo.launch(server_name="0.0.0.0", share=False) 
