@@ -1,4 +1,5 @@
 import gradio as gr
+from gradio import update as gr_update
 import subprocess
 import threading
 import time
@@ -16,6 +17,39 @@ def count_prompt_tokens(prompt: str) -> int:
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(prompt)
     return len(tokens)
+
+def get_lora_options():
+    lora_folder = "lora"
+    if not os.path.exists(lora_folder):
+        return []
+    lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
+    return sorted(lora_files)
+
+def refresh_lora_choices():
+    """Get updated list of LoRA files from the lora directory"""
+    lora_folder = "lora"
+    if not os.path.exists(lora_folder):
+        return []
+    lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
+    return sorted(lora_files)
+
+def update_lora_dropdowns(*current_values):
+    """Update all LoRA dropdowns while preserving current selections if they still exist"""
+    new_choices = refresh_lora_choices()
+    
+    # For each current value, check if it exists in new choices
+    updated_values = []
+    for value in current_values:
+        if value in new_choices:
+            updated_values.append(value)
+        else:
+            updated_values.append("")  # Reset to empty if current value no longer exists
+            
+    # Return new choices for all dropdowns and their updated values
+    results = []
+    for _ in range(len(current_values)):
+        results.extend([gr.update(choices=new_choices), gr.update()])  # Use gr.update() instead
+    return results
 
 def send_to_v2v(evt: gr.SelectData, gallery: list, prompt: str, selected_index: gr.State) -> Tuple[Optional[str], str, int]:
     """Transfer selected video and prompt to Video2Video tab"""
@@ -148,11 +182,13 @@ def generate_video(
         ]
 
         # Add LoRA weights and multipliers if provided
+        lora_dir = 'lora/'
         lora_weights = [lora1, lora2, lora3, lora4]
         lora_multipliers = [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]
         
         # Filter out empty LoRA paths
-        valid_loras = [(weight, mult) for weight, mult in zip(lora_weights, lora_multipliers) if weight.strip()]
+        valid_loras = [(lora_dir + weight, mult) for weight, mult in zip(lora_weights, lora_multipliers) if weight.strip()]
+
         
         if valid_loras:
             command.extend(["--lora_weight"] + [weight for weight, _ in valid_loras])
@@ -217,6 +253,16 @@ with gr.Blocks(css="""
 .green-btn:hover {
     background: linear-gradient(to bottom right, #27ae60, #219651) !important;
 }
+               .refresh-btn {
+    max-width: 40px !important;
+    min-width: 40px !important;
+    height: 40px !important;
+    border-radius: 50% !important;
+    padding: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
 """, title="H1111-beta") as demo:
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
@@ -228,24 +274,27 @@ with gr.Blocks(css="""
             with gr.Row():
                 prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
 
             with gr.Row():
-                lora_weights = []
-                lora_multipliers = []
-                for i in range(4):
-                    with gr.Column():
-                        lora_weights.append(gr.Textbox(
-                            label=f"LoRA {i+1}", 
-                            value="", 
-                            placeholder="Path to LoRA weight file"
-                        ))
-                        lora_multipliers.append(gr.Slider(
-                            label=f"Multiplier", 
-                            minimum=0.0, 
-                            maximum=2.0, 
-                            step=0.05, 
-                            value=1.0
-                        ))
+                    lora_weights = []
+                    lora_multipliers = []
+                    for i in range(4):
+                        with gr.Column():
+                            lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", 
+                                choices=get_lora_options(), 
+                                value="", 
+                                allow_custom_value=True,
+                                interactive=True
+                            ))
+                            lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier", 
+                                minimum=0.0, 
+                                maximum=2.0, 
+                                step=0.05, 
+                                value=1.0
+                            ))
             
             with gr.Row():
                 video_size = gr.Textbox(label="Video Size (Height Width)", value="544 544", info="Space-separated values, must be divisible by 8")
@@ -291,6 +340,7 @@ with gr.Blocks(css="""
             with gr.Row():
                 v2v_prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
 
             with gr.Row():
                 v2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
@@ -321,16 +371,17 @@ with gr.Blocks(css="""
                 v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
                 v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
             
-            # Add LoRA inputs for Video2Video tab
             with gr.Row():
                 v2v_lora_weights = []
                 v2v_lora_multipliers = []
                 for i in range(4):
                     with gr.Column():
-                        v2v_lora_weights.append(gr.Textbox(
+                        v2v_lora_weights.append(gr.Dropdown(
                             label=f"LoRA {i+1}", 
+                            choices=get_lora_options(), 
                             value="", 
-                            placeholder="Path to LoRA weight file"
+                            allow_custom_value=True,
+                            interactive=True
                         ))
                         v2v_lora_multipliers.append(gr.Slider(
                             label=f"Multiplier", 
@@ -446,14 +497,11 @@ with gr.Blocks(css="""
 
         return str(video_path), prompt
 
-
-    # Connect the new button's click event
     v2v_send_to_input_btn.click(
         fn=handle_v2v_send_button,
         inputs=[v2v_output, v2v_prompt, v2v_selected_index],
         outputs=[v2v_input, v2v_prompt]
     )
-
 
     # Video to Video generation
     v2v_generate_btn.click(
@@ -465,5 +513,32 @@ with gr.Blocks(css="""
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
         outputs=v2v_output
     )
+
+    refresh_outputs = []
+    for _ in range(4):
+        refresh_outputs.extend([
+            lora_weights[_],
+            lora_multipliers[_]
+        ])
+    
+    refresh_btn.click(
+        fn=update_lora_dropdowns,
+        inputs=lora_weights,
+        outputs=refresh_outputs
+    )
+    
+    v2v_refresh_outputs = []
+    for _ in range(4):
+        v2v_refresh_outputs.extend([
+            v2v_lora_weights[_],
+            v2v_lora_multipliers[_]
+        ])
+    
+    v2v_refresh_btn.click(
+        fn=update_lora_dropdowns,
+        inputs=v2v_lora_weights,
+        outputs=v2v_refresh_outputs
+    )
+
 
 demo.launch(server_name="0.0.0.0", share=False) 
