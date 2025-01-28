@@ -124,9 +124,12 @@ def generate_video(
     lora4_multiplier: float = 1.0,
     video_path: Optional[str] = None,
     strength: Optional[float] = None
-) -> List[Tuple[str, str]]:  
+) -> Generator[List[Tuple[str, str]], None, None]:  
     global stop_event
     stop_event.clear()  # Reset stop event at start
+
+    progress_text = "0% complete"
+    yield [], progress_text
 
     # Validate video dimensions
     match = re.match(r'(\d+)\s+(\d+)', video_size)
@@ -139,8 +142,8 @@ def generate_video(
         print(f"Video dimensions must be divisible by 8. Current dimensions are {height}x{width}.")
         return []
 
-    generated_videos: List[Tuple[str, str]] = []
-    seeds: List[int] = []
+    generated_videos = []
+    seeds = []
 
     for batch_idx in range(batch_size):
         if stop_event.is_set():
@@ -198,28 +201,43 @@ def generate_video(
         env = os.environ.copy()
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         
-        # Run single process with direct console output
+        # Modified subprocess setup with stdout capture
         p = subprocess.Popen(
             command,
-            stdout=None,
-            stderr=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             env=env,
-            executable=sys.executable
+            universal_newlines=True,
+            bufsize=1
         )
 
-        # Modified wait with stop check
+        # Read output line by line and print to console
         while True:
-            retcode = p.poll()
-            if retcode is not None:
-                break
+            line = p.stdout.readline()
+            if not line:
+                if p.poll() is not None:
+                    break
+                continue
+                
+            # Print to console immediately
+            print(line.strip())
+            
+            # Check for progress percentage
+            match = re.search(r'(\d+)%', line)
+            if match:
+                progress_text = f"{match.group(1)}% complete"
+                yield generated_videos.copy(), progress_text
+
             if stop_event.is_set():
                 p.terminate()
                 p.wait()
                 print("Generation stopped by user.")
-                return generated_videos
-            time.sleep(0.5)
-            
-        # Find the most recently generated video after each batch
+                return
+
+        p.stdout.close()
+        p.wait()
+
+        # Collect generated videos after each batch
         save_path_abs = os.path.abspath(save_path)
         if os.path.exists(save_path_abs):
             all_videos = sorted(
@@ -230,10 +248,10 @@ def generate_video(
             matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
             if matching_videos:
                 video_path = os.path.join(save_path_abs, matching_videos[0])
-                caption = f"Seed: {current_seed}"
-                generated_videos.append((str(video_path), caption))
+                generated_videos.append((str(video_path), f"Seed: {current_seed}"))
+                yield generated_videos.copy(), ""
 
-    return generated_videos
+    yield generated_videos, ""
 
 # UI setup
 with gr.Blocks(css="""
@@ -265,6 +283,17 @@ with gr.Blocks(css="""
     with gr.Tabs() as tabs:
         # Text to Video Tab
         with gr.Tab("Text to Video"):
+            with gr.Row():
+                progress_text = gr.Textbox(visible=True, elem_id="progress_text")
+                gr.HTML("""
+                <script>
+                    const progressText = document.getElementById('progress_text');
+                    function updateTitle() {
+                        document.title = progressText.value || 'H1111-beta';
+                    }
+                    progressText.addEventListener('input', updateTitle);
+                </script>
+                """)
             with gr.Row():
                 prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
@@ -413,7 +442,7 @@ with gr.Blocks(css="""
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
             output_type, attn_mode, block_swap, lora_folder  # Added lora_folder here
         ] + lora_weights + lora_multipliers,
-        outputs=video_output
+        outputs=[video_output, progress_text]
     ).then(
     fn=lambda batch_size: 0 if batch_size == 1 else None,
     inputs=[batch_size],
@@ -568,7 +597,7 @@ with gr.Blocks(css="""
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
             v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
-        outputs=v2v_output
+        outputs=[v2v_output, progress_text]
     )
 
     refresh_outputs = []
