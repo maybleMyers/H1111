@@ -18,24 +18,23 @@ def count_prompt_tokens(prompt: str) -> int:
     tokens = enc.encode(prompt)
     return len(tokens)
 
-def get_lora_options():
-    lora_folder = "lora"
+def get_lora_options(lora_folder: str = "lora"):
+    """Get list of LoRA files from the specified folder"""
     if not os.path.exists(lora_folder):
         return []
     lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
     return sorted(lora_files)
 
-def refresh_lora_choices():
-    """Get updated list of LoRA files from the lora directory"""
-    lora_folder = "lora"
+def refresh_lora_choices(lora_folder: str = "lora"):
+    """Get updated list of LoRA files from the specified folder"""
     if not os.path.exists(lora_folder):
         return []
     lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
     return sorted(lora_files)
 
-def update_lora_dropdowns(*current_values):
+def update_lora_dropdowns(lora_folder: str, *current_values):
     """Update all LoRA dropdowns while preserving current selections if they still exist"""
-    new_choices = refresh_lora_choices()
+    new_choices = refresh_lora_choices(lora_folder)
     
     # For each current value, check if it exists in new choices
     updated_values = []
@@ -43,12 +42,12 @@ def update_lora_dropdowns(*current_values):
         if value in new_choices:
             updated_values.append(value)
         else:
-            updated_values.append("")  # Reset to empty if current value no longer exists
+            updated_values.append("")
             
     # Return new choices for all dropdowns and their updated values
     results = []
     for _ in range(len(current_values)):
-        results.extend([gr.update(choices=new_choices), gr.update()])  # Use gr.update() instead
+        results.extend([gr.update(choices=new_choices), gr.update()]) 
     return results
 
 def send_to_v2v(evt: gr.SelectData, gallery: list, prompt: str, selected_index: gr.State) -> Tuple[Optional[str], str, int]:
@@ -124,7 +123,7 @@ def generate_video(
     lora4_multiplier: float = 1.0,
     video_path: Optional[str] = None,
     strength: Optional[float] = None
-) -> List[Tuple[str, str]]:  
+) -> List[Tuple[str, str]]: 
     global stop_event
     stop_event.clear()  # Reset stop event at start
 
@@ -142,43 +141,44 @@ def generate_video(
     generated_videos: List[Tuple[str, str]] = []
     seeds: List[int] = []
 
+    # Generate seeds first for all batches
+    for batch_idx in range(batch_size):
+        current_seed = random.randint(0, 2**32 - 1) if (seed == -1) else seed + batch_idx
+        seeds.append(current_seed)
+
+    # Process each video in the batch
     for batch_idx in range(batch_size):
         if stop_event.is_set():
             break  # Exit early if stopped
 
-    # Process one video at a time
-    for batch_idx in range(batch_size):
-        current_seed = random.randint(0, 2**32 - 1) if (batch_size > 1 or seed == -1) else seed
-        seeds.append(current_seed)
-        
+        current_seed = seeds[batch_idx]
         batch_message = f"\n--- Generating video {batch_idx + 1} of {batch_size} (seed: {current_seed}) ---\n"
         print(batch_message)
         
         command = [
             sys.executable,
             "hv_generate_video.py",
-            "--dit", model,
-            "--vae", vae,
-            "--text_encoder1", te1,
-            "--text_encoder2", te2,
-            "--prompt", prompt,
+            "--dit", str(model),
+            "--vae", str(vae),
+            "--text_encoder1", str(te1),
+            "--text_encoder2", str(te2),
+            "--prompt", str(prompt),
             "--video_size", str(width), str(height),
             "--video_length", str(video_length),
             "--fps", str(fps),
             "--infer_steps", str(infer_steps),
-            "--save_path", save_path,
+            "--save_path", str(save_path),
             "--seed", str(current_seed),
             "--fp8",
             "--flow_shift", str(flow_shift),
             "--embedded_cfg_scale", str(cfg_scale),
-            "--output_type", output_type,
-            "--attn_mode", attn_mode,
-            "--blocks_to_swap", block_swap,
+            "--output_type", str(output_type),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
             "--split_attn",
             "--fp8_llm",
             "--vae_chunk_size", "32",
             "--vae_spatial_tile_sample_min_size", "128"            
-
         ]
 
         # Add LoRA weights and multipliers if provided
@@ -188,7 +188,6 @@ def generate_video(
         
         # Filter out empty LoRA paths
         valid_loras = [(lora_dir + weight, mult) for weight, mult in zip(lora_weights, lora_multipliers) if weight.strip()]
-
         
         if valid_loras:
             command.extend(["--lora_weight"] + [weight for weight, _ in valid_loras])
@@ -213,7 +212,7 @@ def generate_video(
             executable=sys.executable
         )
 
-        # Modified wait with stop check
+        # Wait for process to complete or stop event
         while True:
             retcode = p.poll()
             if retcode is not None:
@@ -222,10 +221,10 @@ def generate_video(
                 p.terminate()
                 p.wait()
                 print("Generation stopped by user.")
-                return generated_videos  # Return videos generated so far
+                return generated_videos
             time.sleep(0.5)
             
-        # Find the most recently generated video after each batch
+        # Find and add the generated video
         save_path_abs = os.path.abspath(save_path)
         if os.path.exists(save_path_abs):
             all_videos = sorted(
@@ -326,6 +325,7 @@ with gr.Blocks(css="""
             send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
+                lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
                 vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
@@ -412,13 +412,14 @@ with gr.Blocks(css="""
         fn=generate_video,
         inputs=[
             prompt, video_size, batch_size, video_length, fps, infer_steps, 
-            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, output_type, attn_mode, block_swap
-        ] + lora_weights + lora_multipliers,
+            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
+            output_type, attn_mode, block_swap,
+            # LoRA weights individually
+            lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+            # LoRA multipliers individually
+            lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3]
+        ],
         outputs=video_output
-    ).then(
-    fn=lambda batch_size: 0 if batch_size == 1 else None,
-    inputs=[batch_size],
-    outputs=selected_index
     )
 
     # Update gallery selection handling
@@ -440,18 +441,46 @@ with gr.Blocks(css="""
         outputs=v2v_selected_index
     )
     
-    # Send button handler with gallery selection
-    def handle_send_button(gallery: list, prompt: str, idx: int) -> Tuple[Optional[str], str]:
+        # Send button handler with gallery selection
+    def handle_send_button(
+        gallery: list, 
+        prompt: str, 
+        idx: int,
+        # Add all settings that match generate_video's parameters
+        video_size: str,
+        batch_size: int,
+        video_length: int,
+        fps: int,
+        infer_steps: int,
+        seed: int,
+        model: str,  # Added
+        vae: str,   # Added
+        te1: str,   # Added
+        te2: str,   # Added
+        save_path: str,  # Added
+        flow_shift: float,
+        cfg_scale: float,
+        output_type: str,  # Added
+        attn_mode: str,   # Added
+        block_swap: str,  # Added
+        lora1: str,
+        lora2: str,
+        lora3: str,
+        lora4: str,
+        lora1_mult: float,
+        lora2_mult: float,
+        lora3_mult: float,
+        lora4_mult: float
+    ) -> Tuple:
         if not gallery or idx is None or idx >= len(gallery):
-            return None, ""
+            return (None, prompt, video_size, batch_size, video_length, fps, 
+                    infer_steps, seed, model, vae, te1, te2, save_path,
+                    flow_shift, cfg_scale, output_type, attn_mode, block_swap,
+                    lora1, lora2, lora3, lora4,
+                    lora1_mult, lora2_mult, lora3_mult, lora4_mult)
         
-        # Auto-select first item if only one exists and no selection made
-        if idx is None and len(gallery) == 1:
-            idx = 0
-
         selected_item = gallery[idx]
         
-        # Handle different gallery item formats
         if isinstance(selected_item, dict):
             video_path = selected_item.get("name", selected_item.get("data", None))
         elif isinstance(selected_item, (tuple, list)):
@@ -459,20 +488,37 @@ with gr.Blocks(css="""
         else:
             video_path = selected_item
         
-        # Final cleanup for Gradio Video component
         if isinstance(video_path, tuple):
             video_path = video_path[0]
         
-        return str(video_path), prompt
+        return (str(video_path), prompt, video_size, batch_size, video_length, fps, 
+                infer_steps, seed, model, vae, te1, te2, save_path,
+                flow_shift, cfg_scale, output_type, attn_mode, block_swap,
+                lora1, lora2, lora3, lora4,
+                lora1_mult, lora2_mult, lora3_mult, lora4_mult)
     
             # Send button click handler
     send_to_v2v_btn.click(
         fn=handle_send_button,
-        inputs=[video_output, prompt, selected_index],
-        outputs=[v2v_input, v2v_prompt]
+        inputs=[
+            video_output, prompt, selected_index,
+            video_size, batch_size, video_length, fps, infer_steps, 
+            seed, model, vae, te1, te2, save_path,
+            flow_shift, cfg_scale, output_type, attn_mode, block_swap,
+            lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+            lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3]
+        ],
+        outputs=[
+            v2v_input, v2v_prompt,
+            v2v_video_size, v2v_batch_size, v2v_video_length, v2v_fps, 
+            v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, v2v_te1, v2v_te2, v2v_save_path,
+            v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, v2v_block_swap,
+            v2v_lora_weights[0], v2v_lora_weights[1], v2v_lora_weights[2], v2v_lora_weights[3],
+            v2v_lora_multipliers[0], v2v_lora_multipliers[1], v2v_lora_multipliers[2], v2v_lora_multipliers[3]
+        ]
     ).then(
-        lambda: gr.Tabs(selected="Video to Video"),  # Tab switch logic
-        outputs=tabs  # This targets the main Tabs component
+        lambda: gr.Tabs(selected="Video to Video"),
+        outputs=tabs
     )
 
     # Handler for sending selected video from Video2Video gallery to input
@@ -509,8 +555,15 @@ with gr.Blocks(css="""
         inputs=[
             v2v_prompt, v2v_video_size, v2v_batch_size, v2v_video_length, 
             v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
-            v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, v2v_block_swap
-        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
+            v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
+            v2v_output_type, v2v_attn_mode, v2v_block_swap,
+            # LoRA weights individually
+            v2v_lora_weights[0], v2v_lora_weights[1], v2v_lora_weights[2], v2v_lora_weights[3],
+            # LoRA multipliers individually
+            v2v_lora_multipliers[0], v2v_lora_multipliers[1], v2v_lora_multipliers[2], v2v_lora_multipliers[3],
+            # V2V specific inputs
+            v2v_input, v2v_strength
+        ],
         outputs=v2v_output
     )
 
@@ -523,7 +576,7 @@ with gr.Blocks(css="""
     
     refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=lora_weights,
+        inputs=[lora_folder] + lora_weights,  # Add lora_folder as first input
         outputs=refresh_outputs
     )
     
@@ -536,7 +589,7 @@ with gr.Blocks(css="""
     
     v2v_refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=v2v_lora_weights,
+        inputs=[lora_folder] + v2v_lora_weights,  # Add lora_folder as first input
         outputs=v2v_refresh_outputs
     )
 
