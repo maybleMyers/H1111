@@ -8,9 +8,14 @@ This is a very early release and there are many bugs I am still working on
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
+
 ## Requirements
 - Python 3.10
 - CUDA 12.4
+
+## Basic Installation
+
+If you already have musubi tuner installed and running you should just be able to download h1111.py and pip install gradio tiktoken then run with python h1111.py
 
 ## Basic Installation (Linux)
 
