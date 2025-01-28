@@ -18,24 +18,23 @@ def count_prompt_tokens(prompt: str) -> int:
     tokens = enc.encode(prompt)
     return len(tokens)
 
-def get_lora_options():
-    lora_folder = "lora"
+def get_lora_options(lora_folder: str = "lora"):
+    """Get list of LoRA files from the specified folder"""
     if not os.path.exists(lora_folder):
         return []
     lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
     return sorted(lora_files)
 
-def refresh_lora_choices():
-    """Get updated list of LoRA files from the lora directory"""
-    lora_folder = "lora"
+def refresh_lora_choices(lora_folder: str = "lora"):
+    """Get updated list of LoRA files from the specified folder"""
     if not os.path.exists(lora_folder):
         return []
     lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
     return sorted(lora_files)
 
-def update_lora_dropdowns(*current_values):
+def update_lora_dropdowns(lora_folder: str, *current_values):
     """Update all LoRA dropdowns while preserving current selections if they still exist"""
-    new_choices = refresh_lora_choices()
+    new_choices = refresh_lora_choices(lora_folder)
     
     # For each current value, check if it exists in new choices
     updated_values = []
@@ -48,7 +47,7 @@ def update_lora_dropdowns(*current_values):
     # Return new choices for all dropdowns and their updated values
     results = []
     for _ in range(len(current_values)):
-        results.extend([gr.update(choices=new_choices), gr.update()])  # Use gr.update() instead
+        results.extend([gr.update(choices=new_choices), gr.update()])
     return results
 
 def send_to_v2v(evt: gr.SelectData, gallery: list, prompt: str, selected_index: gr.State) -> Tuple[Optional[str], str, int]:
@@ -114,6 +113,7 @@ def generate_video(
     output_type: str,
     attn_mode: str,
     block_swap: str,
+    lora_folder: str,  # Moved lora_folder here
     lora1: str = "",
     lora2: str = "",
     lora3: str = "",
@@ -146,8 +146,6 @@ def generate_video(
         if stop_event.is_set():
             break  # Exit early if stopped
 
-    # Process one video at a time
-    for batch_idx in range(batch_size):
         current_seed = random.randint(0, 2**32 - 1) if (batch_size > 1 or seed == -1) else seed
         seeds.append(current_seed)
         
@@ -167,7 +165,7 @@ def generate_video(
             "--fps", str(fps),
             "--infer_steps", str(infer_steps),
             "--save_path", save_path,
-            "--seed", str(current_seed),
+            "--seed", str(current_seed),  # Ensure seed is converted to string
             "--fp8",
             "--flow_shift", str(flow_shift),
             "--embedded_cfg_scale", str(cfg_scale),
@@ -178,17 +176,13 @@ def generate_video(
             "--fp8_llm",
             "--vae_chunk_size", "32",
             "--vae_spatial_tile_sample_min_size", "128"            
-
         ]
 
         # Add LoRA weights and multipliers if provided
-        lora_dir = 'lora/'
-        lora_weights = [lora1, lora2, lora3, lora4]
-        lora_multipliers = [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]
-        
-        # Filter out empty LoRA paths
-        valid_loras = [(lora_dir + weight, mult) for weight, mult in zip(lora_weights, lora_multipliers) if weight.strip()]
-
+        valid_loras = [(os.path.join(lora_folder, weight), mult) 
+                      for weight, mult in zip([lora1, lora2, lora3, lora4], 
+                                           [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]) 
+                      if weight.strip()]
         
         if valid_loras:
             command.extend(["--lora_weight"] + [weight for weight, _ in valid_loras])
@@ -222,7 +216,7 @@ def generate_video(
                 p.terminate()
                 p.wait()
                 print("Generation stopped by user.")
-                return generated_videos  # Return videos generated so far
+                return generated_videos
             time.sleep(0.5)
             
         # Find the most recently generated video after each batch
@@ -331,6 +325,8 @@ with gr.Blocks(css="""
                 te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
                 te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
                 save_path = gr.Textbox(label="Save Path", value="outputs")
+            with gr.Row():
+                lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
@@ -397,6 +393,8 @@ with gr.Blocks(css="""
                 v2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
                 v2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
                 v2v_save_path = gr.Textbox(label="Save Path", value="outputs")
+            with gr.Row():
+                v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
@@ -412,7 +410,8 @@ with gr.Blocks(css="""
         fn=generate_video,
         inputs=[
             prompt, video_size, batch_size, video_length, fps, infer_steps, 
-            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, output_type, attn_mode, block_swap
+            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
+            output_type, attn_mode, block_swap, lora_folder  # Added lora_folder here
         ] + lora_weights + lora_multipliers,
         outputs=video_output
     ).then(
@@ -547,7 +546,8 @@ with gr.Blocks(css="""
         inputs=[
             v2v_prompt, v2v_video_size, v2v_batch_size, v2v_video_length, 
             v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
-            v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, v2v_block_swap
+            v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
+            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
         outputs=v2v_output
     )
@@ -561,7 +561,7 @@ with gr.Blocks(css="""
     
     refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=lora_weights,
+        inputs=[lora_folder] + lora_weights,
         outputs=refresh_outputs
     )
     
@@ -574,9 +574,8 @@ with gr.Blocks(css="""
     
     v2v_refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=v2v_lora_weights,
+        inputs=[v2v_lora_folder] + v2v_lora_weights,
         outputs=v2v_refresh_outputs
     )
-
 
 demo.launch(server_name="0.0.0.0", share=False) 
