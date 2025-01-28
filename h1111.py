@@ -441,16 +441,28 @@ with gr.Blocks(css="""
     )
     
     # Send button handler with gallery selection
-    def handle_send_button(gallery: list, prompt: str, idx: int) -> Tuple[Optional[str], str]:
+    def handle_send_button(
+        gallery: list, 
+        prompt: str, 
+        idx: int, 
+        video_size: str, 
+        batch_size: int, 
+        video_length: int, 
+        fps: int, 
+        infer_steps: int, 
+        seed: int, 
+        flow_shift: float, 
+        cfg_scale: float
+    ) -> Tuple[Optional[str], str, str, int, int, int, int, int, float, float]:
         if not gallery or idx is None or idx >= len(gallery):
-            return None, ""
-        
+            return (None, "", video_size, batch_size, video_length, fps, infer_steps, seed, flow_shift, cfg_scale)
+
         # Auto-select first item if only one exists and no selection made
         if idx is None and len(gallery) == 1:
             idx = 0
 
         selected_item = gallery[idx]
-        
+
         # Handle different gallery item formats
         if isinstance(selected_item, dict):
             video_path = selected_item.get("name", selected_item.get("data", None))
@@ -458,21 +470,47 @@ with gr.Blocks(css="""
             video_path = selected_item[0]
         else:
             video_path = selected_item
-        
+
         # Final cleanup for Gradio Video component
         if isinstance(video_path, tuple):
             video_path = video_path[0]
-        
-        return str(video_path), prompt
+
+        return (
+            str(video_path), 
+            prompt,
+            video_size, 
+            batch_size, 
+            video_length, 
+            fps, 
+            infer_steps, 
+            seed, 
+            flow_shift, 
+            cfg_scale
+        )
     
             # Send button click handler
     send_to_v2v_btn.click(
         fn=handle_send_button,
-        inputs=[video_output, prompt, selected_index],
-        outputs=[v2v_input, v2v_prompt]
+        inputs=[
+            video_output, prompt, selected_index,
+            video_size, batch_size, video_length, 
+            fps, infer_steps, seed, flow_shift, cfg_scale
+        ],
+        outputs=[
+            v2v_input, 
+            v2v_prompt,
+            v2v_video_size,
+            v2v_batch_size,
+            v2v_video_length,
+            v2v_fps,
+            v2v_infer_steps,
+            v2v_seed,
+            v2v_flow_shift,
+            v2v_cfg_scale
+        ]
     ).then(
-        lambda: gr.Tabs(selected="Video to Video"),  # Tab switch logic
-        outputs=tabs  # This targets the main Tabs component
+        lambda: gr_update(selected="Video to Video"),  # Correct tab switching
+        outputs=tabs
     )
 
     # Handler for sending selected video from Video2Video gallery to input
