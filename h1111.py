@@ -128,8 +128,9 @@ def generate_video(
     global stop_event
     stop_event.clear()  # Reset stop event at start
 
-    progress_text = "0% complete"
-    yield [], progress_text
+    progress_text = "Starting generation..."
+    batch_text = "Preparing..."
+    yield [], batch_text, progress_text
 
     # Validate video dimensions
     match = re.match(r'(\d+)\s+(\d+)', video_size)
@@ -152,8 +153,9 @@ def generate_video(
         current_seed = random.randint(0, 2**32 - 1) if (batch_size > 1 or seed == -1) else seed
         seeds.append(current_seed)
         
-        batch_message = f"\n--- Generating video {batch_idx + 1} of {batch_size} (seed: {current_seed}) ---\n"
-        print(batch_message)
+        batch_text = f"Generating video {batch_idx + 1} of {batch_size} (seed: {current_seed})"
+        print(f"\n--- {batch_text} ---\n")
+        yield generated_videos.copy(), batch_text, progress_text
         
         command = [
             sys.executable,
@@ -200,6 +202,8 @@ def generate_video(
         # Get current environment variables
         env = os.environ.copy()
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+        # Explicitly set PYTHONIOENCODING to ensure proper UTF-8 handling
+        env["PYTHONIOENCODING"] = "utf-8"
         
         # Modified subprocess setup with stdout capture
         p = subprocess.Popen(
@@ -207,7 +211,9 @@ def generate_video(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
-            universal_newlines=True,
+            text=True,  # Use text mode instead of universal_newlines
+            encoding='utf-8',  # Explicitly specify UTF-8 encoding
+            errors='replace',  # Replace invalid characters
             bufsize=1
         )
 
@@ -220,13 +226,13 @@ def generate_video(
                 continue
                 
             # Print to console immediately
-            print(line.strip())
+            print(line)
             
             # Check for progress percentage
-            match = re.search(r'(\d+)%', line)
-            if match:
-                progress_text = f"{match.group(1)}% complete"
-                yield generated_videos.copy(), progress_text
+            if '|' in line and '%' in line and '[' in line and ']' in line:
+                # This captures lines that look like: 76%|██████████████████████████▉    | 38/50 [00:19<00:06,  1.92it/s]
+                progress_text = line
+                yield generated_videos.copy(), batch_text, progress_text
 
             if stop_event.is_set():
                 p.terminate()
@@ -249,9 +255,9 @@ def generate_video(
             if matching_videos:
                 video_path = os.path.join(save_path_abs, matching_videos[0])
                 generated_videos.append((str(video_path), f"Seed: {current_seed}"))
-                yield generated_videos.copy(), ""
+                yield generated_videos.copy(), batch_text, ""
 
-    yield generated_videos, ""
+    yield generated_videos, "", ""
 
 # UI setup
 with gr.Blocks(css="""
@@ -287,6 +293,7 @@ with gr.Blocks(css="""
                 prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                 refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
                 progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
 
             with gr.Row():
@@ -356,6 +363,7 @@ with gr.Blocks(css="""
                 v2v_prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                 v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                v2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="v2v_batch_progress")
                 v2v_progress_text = gr.Textbox(label="", visible=True, elem_id="v2v_progress_text")
 
             with gr.Row():
@@ -432,7 +440,7 @@ with gr.Blocks(css="""
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
             output_type, attn_mode, block_swap, lora_folder  # Added lora_folder here
         ] + lora_weights + lora_multipliers,
-        outputs=[video_output, progress_text]
+        outputs=[video_output, batch_progress, progress_text]
     ).then(
     fn=lambda batch_size: 0 if batch_size == 1 else None,
     inputs=[batch_size],
@@ -587,7 +595,7 @@ with gr.Blocks(css="""
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
             v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
-        outputs=[v2v_output, v2v_progress_text]
+        outputs=[v2v_output, v2v_batch_progress, v2v_progress_text]
     )
 
     refresh_outputs = []
