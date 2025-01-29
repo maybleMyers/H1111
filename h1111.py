@@ -284,20 +284,10 @@ with gr.Blocks(css="""
         # Text to Video Tab
         with gr.Tab("Text to Video"):
             with gr.Row():
-                progress_text = gr.Textbox(visible=True, elem_id="progress_text")
-                gr.HTML("""
-                <script>
-                    const progressText = document.getElementById('progress_text');
-                    function updateTitle() {
-                        document.title = progressText.value || 'H1111-beta';
-                    }
-                    progressText.addEventListener('input', updateTitle);
-                </script>
-                """)
-            with gr.Row():
                 prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                 refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
 
             with gr.Row():
                     lora_weights = []
@@ -324,8 +314,7 @@ with gr.Blocks(css="""
                 batch_size = gr.Number(label="Batch Size", value=1, minimum=1, step=1)
                 video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                 fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                infer_steps = gr.Slider(minimum=10, maximum=100, step=10, label="Inference Steps", value=30)
-                seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
                 flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
                 cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0)
 
@@ -349,6 +338,7 @@ with gr.Blocks(css="""
             send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
+                seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
                 vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
@@ -366,6 +356,7 @@ with gr.Blocks(css="""
                 v2v_prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
                 v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                 v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                v2v_progress_text = gr.Textbox(label="", visible=True, elem_id="v2v_progress_text")
 
             with gr.Row():
                 v2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
@@ -386,13 +377,11 @@ with gr.Blocks(css="""
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
             
             with gr.Row():
-                v2v_video_size = gr.Textbox(label="Video Size (Width Height)", value="544 544", info="Space-separated values, must be divisible by 8")
-                # Add these as actual components instead of invisible values
+                v2v_video_size = gr.Textbox(label="Video Size (Height Width)", value="544 544", info="Space-separated values, must be divisible by 8")
                 v2v_batch_size = gr.Number(label="Batch Size", value=1, minimum=1, step=1)
                 v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                 v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=10, label="Inference Steps", value=30)
-                v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
                 v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
                 v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
             
@@ -417,6 +406,7 @@ with gr.Blocks(css="""
                         ))
 
             with gr.Row():
+                v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 v2v_model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
                 v2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 v2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
@@ -597,7 +587,7 @@ with gr.Blocks(css="""
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
             v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
-        outputs=[v2v_output, progress_text]
+        outputs=[v2v_output, v2v_progress_text]
     )
 
     refresh_outputs = []
