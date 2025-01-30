@@ -11,6 +11,9 @@ import sys
 import ffmpeg
 from typing import List, Tuple, Optional, Generator, Dict
 import json
+from gradio import themes
+from gradio.themes.utils import colors
+
 
 # Add global stop event
 stop_event = threading.Event()
@@ -123,35 +126,28 @@ def count_prompt_tokens(prompt: str) -> int:
     return len(tokens)
 
 def get_lora_options(lora_folder: str = "lora"):
-    """Get list of LoRA files from the specified folder"""
+    """Get list of LoRA files from the specified folder with 'None' as first option"""
     if not os.path.exists(lora_folder):
-        return []
-    lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
-    return sorted(lora_files)
-
-def refresh_lora_choices(lora_folder: str = "lora"):
-    """Get updated list of LoRA files from the specified folder"""
-    if not os.path.exists(lora_folder):
-        return []
-    lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
-    return sorted(lora_files)
+        return ["None"]
+    lora_files = ["None"] + [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
+    return lora_files
 
 def update_lora_dropdowns(lora_folder: str, *current_values):
-    """Update all LoRA dropdowns while preserving current selections if they still exist"""
-    new_choices = refresh_lora_choices(lora_folder)
+    """Update all LoRA dropdowns while preserving current selections if they still exist, including 'None'"""
+    # Always include "None" as the first option
+    new_choices = ["None"] + [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
     
-    # For each current value, check if it exists in new choices
     updated_values = []
     for value in current_values:
         if value in new_choices:
             updated_values.append(value)
         else:
-            updated_values.append("")  # Reset to empty if current value no longer exists
+            updated_values.append("None")  # If the current selection no longer exists, set to 'None'
             
     # Return new choices for all dropdowns and their updated values
     results = []
     for _ in range(len(current_values)):
-        results.extend([gr.update(choices=new_choices), gr.update()])
+        results.extend([gr.update(choices=new_choices), gr.update(value=updated_values[_])])
     return results
 
 def send_to_v2v(evt: gr.SelectData, gallery: list, prompt: str, selected_index: gr.State) -> Tuple[Optional[str], str, int]:
@@ -278,10 +274,10 @@ def generate_video(
         ]
 
         # Add LoRA weights and multipliers if provided
-        valid_loras = [(os.path.join(lora_folder, weight), mult) 
-                      for weight, mult in zip([lora1, lora2, lora3, lora4], 
-                                           [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]) 
-                      if weight.strip()]
+        valid_loras = []
+        for weight, mult in zip([lora1, lora2, lora3, lora4], [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+            if weight and weight != "None":  # Check if weight is not "None"
+                valid_loras.append((os.path.join(lora_folder, weight), mult))
         
         if valid_loras:
             command.extend(["--lora_weight"] + [weight for weight, _ in valid_loras])
@@ -386,28 +382,47 @@ def generate_video(
     yield generated_videos, "", ""
 
 # UI setup
-with gr.Blocks(css="""
-.gallery-item:first-child { border: 2px solid #4CAF50 !important; }
-.gallery-item:first-child:hover { border-color: #45a049 !important; }
-.green-btn {
-    background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
-    color: white !important;
-    border: none !important;
-}
-.green-btn:hover {
-    background: linear-gradient(to bottom right, #27ae60, #219651) !important;
-}
-               .refresh-btn {
-    max-width: 40px !important;
-    min-width: 40px !important;
-    height: 40px !important;
-    border-radius: 50% !important;
-    padding: 0 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-}
-""", title="H1111-beta") as demo:
+with gr.Blocks(
+    theme=themes.Default(
+        primary_hue=colors.Color(
+            name="custom",
+            c50="#E6F0FF",
+            c100="#CCE0FF",
+            c200="#99C1FF",
+            c300="#66A3FF",
+            c400="#3384FF",
+            c500="#0060df",  # This is your main color
+            c600="#0052C2",
+            c700="#003D91",
+            c800="#002961",
+            c900="#001430",
+            c950="#000A18"
+        )
+    ),
+    css="""
+    .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
+    .gallery-item:first-child:hover { border-color: #45a049 !important; }
+    .green-btn {
+        background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
+        color: white !important;
+        border: none !important;
+    }
+    .green-btn:hover {
+        background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+    }
+    .refresh-btn {
+        max-width: 40px !important;
+        min-width: 40px !important;
+        height: 40px !important;
+        border-radius: 50% !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    """, 
+    title="H1111-beta"
+) as demo:
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
     v2v_selected_index = gr.State(value=None)  # For Video to Video
@@ -417,13 +432,50 @@ with gr.Blocks(css="""
         # Text to Video Tab
         with gr.Tab("Text to Video"):
             with gr.Row():
-                prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
-                token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                with gr.Column(scale=4):
+                    prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+
+                with gr.Column(scale=1):
+                    token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
 
             with gr.Row():
+                generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    
+                    width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width", elem_id="my_special_slider")
+                    height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height", elem_id="my_special_slider")
+                    video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25, elem_id="my_special_slider")
+                    fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24, elem_id="my_special_slider")
+                    infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30, elem_id="my_special_slider")
+                    flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0, elem_id="my_special_slider")
+                    cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0, elem_id="my_special_slider")
+            
+                with gr.Column():
+
+                    with gr.Row():
+                        video_output = gr.Gallery(
+                            label="Generated Videos (Click to select)",
+                            columns=[2],
+                            rows=[2],
+                            object_fit="contain",
+                            height="auto",
+                            show_label=True,
+                            elem_id="gallery",
+                            allow_preview=True,
+                            preview=True
+                        )
+                    with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+            
+            with gr.Row():
+                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -431,8 +483,8 @@ with gr.Blocks(css="""
                             lora_weights.append(gr.Dropdown(
                                 label=f"LoRA {i+1}", 
                                 choices=get_lora_options(), 
-                                value="", 
-                                allow_custom_value=True,
+                                value="None", 
+                                allow_custom_value=False,
                                 interactive=True
                             ))
                             lora_multipliers.append(gr.Slider(
@@ -441,37 +493,7 @@ with gr.Blocks(css="""
                                 maximum=2.0, 
                                 step=0.05, 
                                 value=1.0
-                            ))
-            
-            with gr.Row():
-                width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
-                height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
-                batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
-                fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
-                flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
-                cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0)
-
-            with gr.Row():
-                generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                video_output = gr.Gallery(
-                    label="Generated Videos (Click to select)",
-                    columns=[2],
-                    rows=[2],
-                    object_fit="contain",
-                    height="auto",
-                    show_label=True,
-                    elem_id="gallery",
-                    allow_preview=True,
-                    preview=True
-                )
-            
-            send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
-            
+                            ))            
             with gr.Row():
                 seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
@@ -488,11 +510,16 @@ with gr.Blocks(css="""
         # Video to Video Tab
         with gr.Tab("Video to Video") as v2v_tab:
             with gr.Row():
-                v2v_prompt = gr.Textbox(label="Enter your prompt", value="POV video of a cat chasing a frob.", scale=2)
-                v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                v2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="v2v_batch_progress")
-                v2v_progress_text = gr.Textbox(label="", visible=True, elem_id="v2v_progress_text")
+                with gr.Column(scale=4):
+                    v2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+
+                with gr.Column(scale=1):
+                    v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    v2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    v2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    v2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
 
             with gr.Row():
                 v2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
@@ -511,36 +538,37 @@ with gr.Blocks(css="""
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
+                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
             
             with gr.Row():
-                v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
-                v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
-                v2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
-                v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
-                v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
-                v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
-            
-            with gr.Row():
-                v2v_lora_weights = []
-                v2v_lora_multipliers = []
-                for i in range(4):
-                    with gr.Column():
-                        v2v_lora_weights.append(gr.Dropdown(
-                            label=f"LoRA {i+1}", 
-                            choices=get_lora_options(), 
-                            value="", 
-                            allow_custom_value=True,
-                            interactive=True
-                        ))
-                        v2v_lora_multipliers.append(gr.Slider(
-                            label=f"Multiplier", 
-                            minimum=0.0, 
-                            maximum=2.0, 
-                            step=0.05, 
-                            value=1.0
-                        ))
+                with gr.Column():
+                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
+                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                    v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
+                    v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
+                    v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
+                    v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
+                    v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
+
+                with gr.Column():
+                    v2v_lora_weights = []
+                    v2v_lora_multipliers = []
+                    for i in range(4):
+                        with gr.Column():
+                            v2v_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", 
+                                choices=get_lora_options(), 
+                                value="None", 
+                                allow_custom_value=False,
+                                interactive=True
+                            ))
+                            v2v_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier", 
+                                minimum=0.0, 
+                                maximum=2.0, 
+                                step=0.05, 
+                                value=1.0
+                            ))
 
             with gr.Row():
                 v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
