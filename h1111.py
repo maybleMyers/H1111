@@ -133,31 +133,27 @@ def get_lora_options(lora_folder: str = "lora"):
     return lora_files
 
 def update_lora_dropdowns(lora_folder: str, *current_values):
-    """Update all LoRA dropdowns and multipliers, preserving current selections and values if they still exist"""
+    """Update all LoRA dropdowns while preserving current selections if they still exist"""
     new_choices = get_lora_options(lora_folder)
     
-    # Ensure we have enough current values (4 weights + 4 multipliers)
-    if len(current_values) < 8:
-        current_values = list(current_values) + ["None"] * (4 - len(current_values[:4])) + [1.0] * (4 - len(current_values[4:]))
-    
-    # Separate dropdowns (weights) and sliders (multipliers)
-    current_weights = current_values[:4]  # First 4 are weights
-    current_multipliers = current_values[4:8]  # Next 4 are multipliers
+    # Handle weights (first 4 values) and multipliers (last 4 values) separately
+    current_weights = current_values[:4]
+    current_multipliers = current_values[4:8]
     
     results = []
-    # Process each weight-multiplier pair
     for i in range(4):
         weight = current_weights[i] if i < len(current_weights) else "None"
         multiplier = current_multipliers[i] if i < len(current_multipliers) else 1.0
         
-        # If the current weight exists in new choices and isn't "None", keep it
-        if weight and weight != "None" and weight in new_choices:
+        # Keep current weight if it exists in new choices
+        if weight in new_choices:
             new_weight = weight
             new_multiplier = multiplier
         else:
             new_weight = "None"
             new_multiplier = 1.0
-            
+        
+        # Update both dropdown and slider
         results.extend([
             gr.update(choices=new_choices, value=new_weight),
             gr.update(value=new_multiplier)
@@ -494,7 +490,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -557,7 +553,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
             
             with gr.Row():
                 with gr.Column():
