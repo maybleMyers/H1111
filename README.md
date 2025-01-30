@@ -40,7 +40,7 @@ python -m venv env
 source env/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken
+pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg
 pip install flash-attn --no-build-isolation
 pip install sageattention==1.0.6
 
@@ -73,7 +73,7 @@ python -m venv env
 ./env/scripts/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken
+pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg
 
 ```
 
