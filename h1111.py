@@ -8,10 +8,114 @@ import os
 import random
 import tiktoken
 import sys
-from typing import List, Tuple, Optional, Generator
+import ffmpeg
+from typing import List, Tuple, Optional, Generator, Dict
+import json
 
 # Add global stop event
 stop_event = threading.Event()
+
+def extract_video_metadata(video_path: str) -> Dict:
+    """Extract metadata from video file using ffprobe."""
+    cmd = [
+        'ffprobe',
+        '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_format',
+        video_path
+    ]
+    
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        metadata = json.loads(result.stdout.decode('utf-8'))
+        if 'format' in metadata and 'tags' in metadata['format']:
+            comment = metadata['format']['tags'].get('comment', '{}')
+            return json.loads(comment)
+        return {}
+    except Exception as e:
+        print(f"Metadata extraction failed: {str(e)}")
+        return {}
+
+def create_parameter_transfer_map(metadata: Dict, target_tab: str) -> Dict:
+    """Map metadata parameters to Gradio components for different tabs"""
+    mapping = {
+        'common': {
+            'prompt': ('prompt', 'v2v_prompt'),
+            'width': ('width', 'v2v_width'),
+            'height': ('height', 'v2v_height'),
+            'batch_size': ('batch_size', 'v2v_batch_size'),
+            'video_length': ('video_length', 'v2v_video_length'),
+            'fps': ('fps', 'v2v_fps'),
+            'infer_steps': ('infer_steps', 'v2v_infer_steps'),
+            'seed': ('seed', 'v2v_seed'),
+            'model': ('model', 'v2v_model'),
+            'vae': ('vae', 'v2v_vae'),
+            'te1': ('te1', 'v2v_te1'),
+            'te2': ('te2', 'v2v_te2'),
+            'save_path': ('save_path', 'v2v_save_path'),
+            'flow_shift': ('flow_shift', 'v2v_flow_shift'),
+            'cfg_scale': ('cfg_scale', 'v2v_cfg_scale'),
+            'output_type': ('output_type', 'v2v_output_type'),
+            'attn_mode': ('attn_mode', 'v2v_attn_mode'),
+            'block_swap': ('block_swap', 'v2v_block_swap')
+        },
+        'lora': {
+            'lora_weights': [(f'lora{i+1}', f'v2v_lora_weights[{i}]') for i in range(4)],
+            'lora_multipliers': [(f'lora{i+1}_multiplier', f'v2v_lora_multipliers[{i}]') for i in range(4)]
+        }
+    }
+    
+    results = {}
+    for param, value in metadata.items():
+        # Handle common parameters
+        if param in mapping['common']:
+            target = mapping['common'][param][0 if target_tab == 't2v' else 1]
+            results[target] = value
+        
+        # Handle LoRA parameters
+        if param == 'lora_weights':
+            for i, weight in enumerate(value[:4]):
+                target = mapping['lora']['lora_weights'][i][1 if target_tab == 'v2v' else 0]
+                results[target] = weight
+                
+        if param == 'lora_multipliers':
+            for i, mult in enumerate(value[:4]):
+                target = mapping['lora']['lora_multipliers'][i][1 if target_tab == 'v2v' else 0]
+                results[target] = float(mult)
+                
+    return results
+
+def add_metadata_to_video(video_path: str, parameters: dict) -> None:
+    """Add generation parameters to video metadata using ffmpeg."""
+    import json
+    import subprocess
+
+    # Convert parameters to JSON string
+    params_json = json.dumps(parameters, indent=2)
+    
+    # Temporary output path
+    temp_path = video_path.replace(".mp4", "_temp.mp4")
+    
+    # FFmpeg command to add metadata without re-encoding
+    cmd = [
+        'ffmpeg',
+        '-i', video_path,
+        '-metadata', f'comment={params_json}',
+        '-codec', 'copy',
+        temp_path
+    ]
+    
+    try:
+        # Execute FFmpeg command
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Replace original file with the metadata-enhanced version
+        os.replace(temp_path, video_path)
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to add metadata: {e.stderr.decode()}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    except Exception as e:
+        print(f"Error: {str(e)}")
 
 def count_prompt_tokens(prompt: str) -> int:
     enc = tiktoken.get_encoding("cl100k_base")
@@ -97,7 +201,8 @@ def send_selected_to_v2v(gallery: list, prompt: str, selected_index: gr.State) -
 
 def generate_video(
     prompt: str,
-    video_size: str,
+    width: int,  # Changed from video_size
+    height: int,
     batch_size: int,
     video_length: int,
     fps: int,
@@ -132,17 +237,6 @@ def generate_video(
     batch_text = "Preparing..."
     yield [], batch_text, progress_text
 
-    # Validate video dimensions
-    match = re.match(r'(\d+)\s+(\d+)', video_size)
-    if not match:
-        print("Invalid video size format. Use 'Width Height'.")
-        return []
-    
-    width, height = int(match.group(1)), int(match.group(2))
-    if height % 8 != 0 or width % 8 != 0:
-        print(f"Video dimensions must be divisible by 8. Current dimensions are {height}x{width}.")
-        return []
-
     generated_videos = []
     seeds = []
 
@@ -165,7 +259,7 @@ def generate_video(
             "--text_encoder1", te1,
             "--text_encoder2", te2,
             "--prompt", prompt,
-            "--video_size", str(width), str(height),
+            "--video_size", str(height), str(width), 
             "--video_length", str(video_length),
             "--fps", str(fps),
             "--infer_steps", str(infer_steps),
@@ -254,7 +348,39 @@ def generate_video(
             matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
             if matching_videos:
                 video_path = os.path.join(save_path_abs, matching_videos[0])
+
+                # Collect parameters for metadata
+                parameters = {
+                    "prompt": prompt,
+                    "width": width,
+                    "height": height,
+                    "batch_size": batch_size,
+                    "video_length": video_length,
+                    "fps": fps,
+                    "infer_steps": infer_steps,
+                    "seed": current_seed,
+                    "model": model,
+                    "vae": vae,
+                    "te1": te1,
+                    "te2": te2,
+                    "save_path": save_path,
+                    "flow_shift": flow_shift,
+                    "cfg_scale": cfg_scale,
+                    "output_type": output_type,
+                    "attn_mode": attn_mode,
+                    "block_swap": block_swap,
+                    "lora_weights": [lora1, lora2, lora3, lora4],
+                    "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                    "input_video": video_path,
+                    "strength": strength
+                }
+                
+                # Add metadata to the video file
+                add_metadata_to_video(video_path, parameters)
+                
+                # Append to generated_videos
                 generated_videos.append((str(video_path), f"Seed: {current_seed}"))
+
                 yield generated_videos.copy(), batch_text, ""
 
     yield generated_videos, "", ""
@@ -285,6 +411,7 @@ with gr.Blocks(css="""
     # Add state for tracking selected video indices in both tabs
     selected_index = gr.State(value=None)  # For Text to Video
     v2v_selected_index = gr.State(value=None)  # For Video to Video
+    params_state = gr.State() #New addition
     
     with gr.Tabs() as tabs:
         # Text to Video Tab
@@ -317,8 +444,9 @@ with gr.Blocks(css="""
                             ))
             
             with gr.Row():
-                video_size = gr.Textbox(label="Video Size (Height Width)", value="544 544", info="Space-separated values, must be divisible by 8")
-                batch_size = gr.Number(label="Batch Size", value=1, minimum=1, step=1)
+                width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
+                height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                 fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                 infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -342,7 +470,7 @@ with gr.Blocks(css="""
                     preview=True
                 )
             
-            send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+            send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
                 seed = gr.Number(label="Seed (use -1 for random)", value=-1)
@@ -385,8 +513,9 @@ with gr.Blocks(css="""
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
             
             with gr.Row():
-                v2v_video_size = gr.Textbox(label="Video Size (Height Width)", value="544 544", info="Space-separated values, must be divisible by 8")
-                v2v_batch_size = gr.Number(label="Batch Size", value=1, minimum=1, step=1)
+                v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
+                v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                v2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                 v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                 v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -425,6 +554,17 @@ with gr.Blocks(css="""
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
+        with gr.Tab("Video Info") as video_info_tab:
+            with gr.Row():
+                video_input = gr.Video(label="Upload Video", interactive=True)
+                metadata_output = gr.JSON(label="Generation Parameters")
+
+            with gr.Row():
+                send_to_t2v_btn = gr.Button("Send to Text2Video", variant="primary")
+                send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
+
+            with gr.Row():
+                status = gr.Textbox(label="Status", interactive=False)
 
     # Event handlers
     prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
@@ -432,19 +572,97 @@ with gr.Blocks(css="""
     stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
+    #Video Info
+    def clean_video_path(video_path) -> str:
+        """Extract clean video path from Gradio's various return formats"""
+        print(f"Input video_path: {video_path}, type: {type(video_path)}")
+        if isinstance(video_path, dict):
+            path = video_path.get("name", "")
+        elif isinstance(video_path, (tuple, list)):
+            path = video_path[0]
+        elif isinstance(video_path, str):
+            path = video_path
+        else:
+            path = ""
+        print(f"Cleaned path: {path}")
+        return path
+    def handle_video_upload(video_path: str) -> Dict:
+        """Handle video upload and metadata extraction"""
+        if not video_path:
+            return {}, "No video uploaded"
+
+        metadata = extract_video_metadata(video_path)
+        if not metadata:
+            return {}, "No metadata found in video"
+
+        return metadata, "Metadata extracted successfully"
+
+    def send_parameters_to_tab(metadata: Dict, target_tab: str) -> Tuple[str, Dict]:
+        """Create parameter mapping for target tab"""
+        if not metadata:
+            return "No parameters to send", {}
+
+        tab_name = "Text2Video" if target_tab == "t2v" else "Video2Video"
+        try:
+            mapping = create_parameter_transfer_map(metadata, target_tab)
+            return f"Parameters ready for {tab_name}", mapping
+        except Exception as e:
+            return f"Error: {str(e)}", {}
+        
+    video_input.upload(
+        fn=handle_video_upload,
+        inputs=video_input,
+        outputs=[metadata_output, status]
+    )
+
+    send_to_t2v_btn.click(
+        fn=lambda m: send_parameters_to_tab(m, "t2v"),
+        inputs=metadata_output,
+        outputs=[status, params_state]
+    ).then(
+        lambda: gr.Tabs(selected="Text to Video"),
+        outputs=tabs
+    ).then(
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("width", 544),
+            params.get("height", 544),
+            params.get("batch_size", 1),
+            params.get("video_length", 25),
+            params.get("fps", 24),
+            params.get("infer_steps", 30),
+            params.get("seed", -1),
+            params.get("model", "hunyuan/mp_rank_00_model_states.pt"),
+            params.get("vae", "hunyuan/pytorch_model.pt"),
+            params.get("te1", "hunyuan/llava_llama3_fp16.safetensors"),
+            params.get("te2", "hunyuan/clip_l.safetensors"),
+            params.get("save_path", "outputs"),
+            params.get("flow_shift", 11.0),
+            params.get("cfg_scale", 7.0),
+            params.get("output_type", "video"),
+            params.get("attn_mode", "sdpa"),
+            params.get("block_swap", "0"),
+            *[params.get(f"lora{i+1}", "") for i in range(4)],
+            *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
+        ] if params else [gr.update()]*26,
+        inputs=params_state,
+        outputs=[prompt, width, height, batch_size, video_length, fps, infer_steps, seed, 
+                 model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
+                 output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
+    )
     # Text to Video generation
     generate_btn.click(
         fn=generate_video,
         inputs=[
-            prompt, video_size, batch_size, video_length, fps, infer_steps, 
+            prompt, width, height, batch_size, video_length, fps, infer_steps,  # Updated inputs
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
-            output_type, attn_mode, block_swap, lora_folder  # Added lora_folder here
+            output_type, attn_mode, block_swap, lora_folder
         ] + lora_weights + lora_multipliers,
         outputs=[video_output, batch_progress, progress_text]
     ).then(
-    fn=lambda batch_size: 0 if batch_size == 1 else None,
-    inputs=[batch_size],
-    outputs=selected_index
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[batch_size],
+        outputs=selected_index
     )
 
     # Update gallery selection handling
@@ -471,7 +689,8 @@ with gr.Blocks(css="""
         gallery: list, 
         prompt: str, 
         idx: int, 
-        video_size: str, 
+        width: int,  # Changed from video_size
+        height: int,  # Added height
         batch_size: int, 
         video_length: int, 
         fps: int, 
@@ -489,7 +708,7 @@ with gr.Blocks(css="""
         lora4_multiplier: float
     ) -> tuple:
         if not gallery or idx is None or idx >= len(gallery):
-            return (None, "", video_size, batch_size, video_length, fps, infer_steps, 
+            return (None, "", width, height, batch_size, video_length, fps, infer_steps, 
                     seed, flow_shift, cfg_scale, 
                     lora1, lora2, lora3, lora4,
                     lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
@@ -515,7 +734,8 @@ with gr.Blocks(css="""
         return (
             str(video_path), 
             prompt,
-            video_size, 
+            width,  # Changed
+            height, 
             batch_size, 
             video_length, 
             fps, 
@@ -533,18 +753,18 @@ with gr.Blocks(css="""
             lora4_multiplier
         )
     
-            # Send button click handler
-    send_to_v2v_btn.click(
+    send_t2v_to_v2v_btn.click(
         fn=handle_send_button,
         inputs=[
             video_output, prompt, selected_index,
-            video_size, batch_size, video_length, 
+            width, height, batch_size, video_length,
             fps, infer_steps, seed, flow_shift, cfg_scale
-        ] + lora_weights + lora_multipliers,  # Add LoRA inputs
+        ] + lora_weights + lora_multipliers,
         outputs=[
             v2v_input, 
             v2v_prompt,
-            v2v_video_size,
+            v2v_width,
+            v2v_height,
             v2v_batch_size,
             v2v_video_length,
             v2v_fps,
@@ -552,10 +772,64 @@ with gr.Blocks(css="""
             v2v_seed,
             v2v_flow_shift,
             v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers  # Add LoRA outputs
+        ] + v2v_lora_weights + v2v_lora_multipliers
     ).then(
         lambda: gr_update(selected="Video to Video"),
         outputs=tabs
+    )
+
+    def handle_send_to_v2v(metadata: dict, video_path: str) -> Tuple[str, dict, str]:
+        """Handle both parameters and video transfer"""
+        status_msg, params = send_parameters_to_tab(metadata, "v2v")
+        return status_msg, params, video_path
+    
+    def handle_info_to_v2v(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+        """Handle both parameters and video transfer from Video Info to V2V tab"""
+        if not video_path:
+            return "No video selected", {}, None
+
+        status_msg, params = send_parameters_to_tab(metadata, "v2v")
+        # Just return the path directly
+        return status_msg, params, video_path
+
+            # Send button click handler
+    send_to_v2v_btn.click(
+        fn=handle_info_to_v2v,
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, v2v_input]
+    ).then(
+        lambda: gr.Tabs(selected="Video to Video"),
+        outputs=tabs
+    ).then(
+        lambda params: [
+            params.get("v2v_prompt", ""),
+            params.get("v2v_width", 544),
+            params.get("v2v_height", 544),
+            params.get("v2v_batch_size", 1),
+            params.get("v2v_video_length", 25),
+            params.get("v2v_fps", 24),
+            params.get("v2v_infer_steps", 30),
+            params.get("v2v_seed", -1),
+            params.get("v2v_model", "hunyuan/mp_rank_00_model_states.pt"),
+            params.get("v2v_vae", "hunyuan/pytorch_model.pt"),
+            params.get("v2v_te1", "hunyuan/llava_llama3_fp16.safetensors"),
+            params.get("v2v_te2", "hunyuan/clip_l.safetensors"),
+            params.get("v2v_save_path", "outputs"),
+            params.get("v2v_flow_shift", 11.0),
+            params.get("v2v_cfg_scale", 7.0),
+            params.get("v2v_output_type", "video"),
+            params.get("v2v_attn_mode", "sdpa"),
+            params.get("v2v_block_swap", "0"),
+            *[params.get(f"v2v_lora_weights[{i}]", "") for i in range(4)],
+            *[params.get(f"v2v_lora_multipliers[{i}]", 1.0) for i in range(4)]
+        ] if params else [gr.update()] * 26,
+        inputs=params_state,
+        outputs=[
+            v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length,
+            v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, v2v_te1,
+            v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type,
+            v2v_attn_mode, v2v_block_swap
+        ] + v2v_lora_weights + v2v_lora_multipliers
     )
 
     # Handler for sending selected video from Video2Video gallery to input
@@ -590,7 +864,7 @@ with gr.Blocks(css="""
     v2v_generate_btn.click(
         fn=generate_video,
         inputs=[
-            v2v_prompt, v2v_video_size, v2v_batch_size, v2v_video_length, 
+            v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length,  # Updated inputs
             v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
             v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
