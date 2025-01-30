@@ -133,21 +133,36 @@ def get_lora_options(lora_folder: str = "lora"):
     return lora_files
 
 def update_lora_dropdowns(lora_folder: str, *current_values):
-    """Update all LoRA dropdowns while preserving current selections if they still exist, including 'None'"""
-    # Always include "None" as the first option
-    new_choices = ["None"] + [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
+    """Update all LoRA dropdowns and multipliers, preserving current selections and values if they still exist"""
+    new_choices = get_lora_options(lora_folder)
     
-    updated_values = []
-    for value in current_values:
-        if value in new_choices:
-            updated_values.append(value)
-        else:
-            updated_values.append("None")  # If the current selection no longer exists, set to 'None'
-            
-    # Return new choices for all dropdowns and their updated values
+    # Ensure we have enough current values (4 weights + 4 multipliers)
+    if len(current_values) < 8:
+        current_values = list(current_values) + ["None"] * (4 - len(current_values[:4])) + [1.0] * (4 - len(current_values[4:]))
+    
+    # Separate dropdowns (weights) and sliders (multipliers)
+    current_weights = current_values[:4]  # First 4 are weights
+    current_multipliers = current_values[4:8]  # Next 4 are multipliers
+    
     results = []
-    for _ in range(len(current_values)):
-        results.extend([gr.update(choices=new_choices), gr.update(value=updated_values[_])])
+    # Process each weight-multiplier pair
+    for i in range(4):
+        weight = current_weights[i] if i < len(current_weights) else "None"
+        multiplier = current_multipliers[i] if i < len(current_multipliers) else 1.0
+        
+        # If the current weight exists in new choices and isn't "None", keep it
+        if weight and weight != "None" and weight in new_choices:
+            new_weight = weight
+            new_multiplier = multiplier
+        else:
+            new_weight = "None"
+            new_multiplier = 1.0
+            
+        results.extend([
+            gr.update(choices=new_choices, value=new_weight),
+            gr.update(value=new_multiplier)
+        ])
+    
     return results
 
 def send_to_v2v(evt: gr.SelectData, gallery: list, prompt: str, selected_index: gr.State) -> Tuple[Optional[str], str, int]:
@@ -276,12 +291,16 @@ def generate_video(
         # Add LoRA weights and multipliers if provided
         valid_loras = []
         for weight, mult in zip([lora1, lora2, lora3, lora4], [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
-            if weight and weight != "None":  # Check if weight is not "None"
+            if weight and weight != "None":
                 valid_loras.append((os.path.join(lora_folder, weight), mult))
-        
+
         if valid_loras:
-            command.extend(["--lora_weight"] + [weight for weight, _ in valid_loras])
-            command.extend(["--lora_multiplier"] + [str(mult) for _, mult in valid_loras])
+            # Separate weights and multipliers
+            weights = [weight for weight, _ in valid_loras]
+            multipliers = [str(mult) for _, mult in valid_loras]
+
+            command.extend(["--lora_weight"] + weights)
+            command.extend(["--lora_multiplier"] + multipliers)
 
         # Add video2video parameters if provided
         if video_path:
@@ -475,7 +494,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -484,7 +503,7 @@ with gr.Blocks(
                                 label=f"LoRA {i+1}", 
                                 choices=get_lora_options(), 
                                 value="None", 
-                                allow_custom_value=False,
+                                allow_custom_value=True,
                                 interactive=True
                             ))
                             lora_multipliers.append(gr.Slider(
@@ -538,7 +557,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
             
             with gr.Row():
                 with gr.Column():
@@ -559,7 +578,7 @@ with gr.Blocks(
                                 label=f"LoRA {i+1}", 
                                 choices=get_lora_options(), 
                                 value="None", 
-                                allow_custom_value=False,
+                                allow_custom_value=True,
                                 interactive=True
                             ))
                             v2v_lora_multipliers.append(gr.Slider(
