@@ -565,6 +565,83 @@ with gr.Blocks(css="""
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
+        with gr.Tab("Convert LoRA") as convert_lora_tab:
+            def suggest_output_name(file_obj) -> str:
+                """Generate suggested output name from input file"""
+                if not file_obj:
+                    return ""
+                # Get input filename without extension and add MUSUBI
+                base_name = os.path.splitext(os.path.basename(file_obj.name))[0]
+                return f"{base_name}_MUSUBI"
+
+            def convert_lora(input_file, output_name: str, target_format: str) -> str:
+                """Convert LoRA file to specified format"""
+                try:
+                    if not input_file:
+                        return "Error: No input file selected"
+
+                    # Ensure output directory exists
+                    os.makedirs("lora", exist_ok=True)
+
+                    # Construct output path
+                    output_path = os.path.join("lora", f"{output_name}.safetensors")
+
+                    # Build command
+                    cmd = [
+                        sys.executable,
+                        "convert_lora.py",
+                        "--input", input_file.name,
+                        "--output", output_path,
+                        "--target", target_format
+                    ]
+
+                    print(f"Converting {input_file.name} to {output_path}")
+
+                    # Execute conversion
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+
+                    if os.path.exists(output_path):
+                        return f"Successfully converted LoRA to {output_path}"
+                    else:
+                        return "Error: Output file not created"
+
+                except subprocess.CalledProcessError as e:
+                    return f"Error during conversion: {e.stderr}"
+                except Exception as e:
+                    return f"Error: {str(e)}"
+
+            with gr.Row():
+                input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
+                output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
+                format_radio = gr.Radio(
+                    choices=["default", "other"],
+                    value="default",
+                    label="Target Format",
+                    info="Choose 'default' for H1111/MUSUBI format or 'other' for diffusion pipe format"
+                )
+
+            with gr.Row():
+                convert_btn = gr.Button("Convert LoRA", variant="primary")
+                status_output = gr.Textbox(label="Status", interactive=False)
+
+            # Automatically update output name when file is selected
+            input_file.change(
+                fn=suggest_output_name,
+                inputs=[input_file],
+                outputs=[output_name]
+            )
+
+            # Handle conversion
+            convert_btn.click(
+                fn=convert_lora,
+                inputs=[input_file, output_name, format_radio],
+                outputs=status_output
+            )
 
     # Event handlers
     prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)

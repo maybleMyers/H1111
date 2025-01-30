@@ -1,6 +1,3 @@
-This is a very early release and there are many bugs I am still working on
-
-
 ![GUI Screenshot](images/screenshot.png)
 
 # H1111
@@ -10,12 +7,17 @@ https://github.com/kohya-ss/musubi-tuner
 
 
 ## Requirements
+
 - Python 3.10
 - CUDA 12.4
 
 ## Basic Installation
 
-If you already have musubi tuner installed and running you should just be able to download h1111.py and pip install gradio tiktoken then run with python h1111.py
+If you already have musubi tuner installed and running you should just be able to download h1111.py and 
+
+pip install gradio tiktoken ffmpeg ffmpeg-python
+
+then run with python h1111.py
 
 ## Basic Installation (Linux)
 
@@ -40,7 +42,7 @@ python -m venv env
 source env/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg
+pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation
 pip install sageattention==1.0.6
 
@@ -73,7 +75,7 @@ python -m venv env
 ./env/scripts/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg
+pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg ffmpeg-python
 
 ```
 
@@ -91,7 +93,7 @@ pip install --no-deps xformers --index-url https://download.pytorch.org/whl/cu12
 ```
 
 ### Optional: Install Flash Attention
-Note: This can take 1+ hour to install even on a good CPU, but provides faster generation.
+Note: This can take 1-5 hour to install even on a good CPU, but provides faster generation.
 ```powershell
 pip install flash-attn --no-build-isolation
 ```
