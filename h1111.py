@@ -224,7 +224,7 @@ def generate_video(
     cfg_scale: float,
     output_type: str,
     attn_mode: str,
-    block_swap: str,
+    block_swap: int,
     lora_folder: str,  # Moved lora_folder here
     lora1: str = "",
     lora2: str = "",
@@ -277,7 +277,7 @@ def generate_video(
             "--embedded_cfg_scale", str(cfg_scale),
             "--output_type", output_type,
             "--attn_mode", attn_mode,
-            "--blocks_to_swap", block_swap,
+            "--blocks_to_swap", str(block_swap),
             "--split_attn",
             "--fp8_llm",
             "--vae_chunk_size", "32",
