@@ -520,7 +520,7 @@ with gr.Blocks(
                 lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
+                block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         # Video to Video Tab
         with gr.Tab("Video to Video") as v2v_tab:
@@ -596,7 +596,7 @@ with gr.Blocks(
                 v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                v2v_block_swap = gr.Textbox(label="Blocks to Swap to save vram (max 36)", value="0")
+                v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
         with gr.Tab("Video Info") as video_info_tab:
             with gr.Row():
                 video_input = gr.Video(label="Upload Video", interactive=True)
