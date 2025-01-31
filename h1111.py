@@ -536,6 +536,13 @@ with gr.Blocks(
                 with gr.Column():
                     v2v_input = gr.Video(label="Input Video", format="mp4")
                     v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.75, label="Denoise Strength")
+                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
+                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                    v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
+                    v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
+                    v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
+                    v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
+                    v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
                 with gr.Column():
                     v2v_output = gr.Gallery(
                         label="Generated Videos",
@@ -546,18 +553,6 @@ with gr.Blocks(
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
                     v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-            
-            with gr.Row():
-                with gr.Column():
-                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
-                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
-                    v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
-                    v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                    v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
-                    v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
-                    v2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
-
-                with gr.Column():
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
