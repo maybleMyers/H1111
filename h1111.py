@@ -215,7 +215,8 @@ def generate_video(
     output_type: str,
     attn_mode: str,
     block_swap: int,
-    lora_folder: str,  # Moved lora_folder here
+    exclude_single_blocks: bool,    
+    lora_folder: str,
     lora1: str = "",
     lora2: str = "",
     lora3: str = "",
@@ -279,14 +280,14 @@ def generate_video(
         for weight, mult in zip([lora1, lora2, lora3, lora4], [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
             if weight and weight != "None":
                 valid_loras.append((os.path.join(lora_folder, weight), mult))
-
         if valid_loras:
-            # Separate weights and multipliers
             weights = [weight for weight, _ in valid_loras]
             multipliers = [str(mult) for _, mult in valid_loras]
-
             command.extend(["--lora_weight"] + weights)
             command.extend(["--lora_multiplier"] + multipliers)
+
+        if exclude_single_blocks:
+            command.append("--exclude_single_blocks")
 
         # Add video2video parameters if provided
         if video_path:
@@ -500,6 +501,7 @@ with gr.Blocks(
                                 value=1.0
                             ))            
             with gr.Row():
+                exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
                 seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
                 vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
@@ -576,6 +578,7 @@ with gr.Blocks(
                             ))
 
             with gr.Row():
+                v2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
                 v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 v2v_model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
                 v2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
@@ -766,7 +769,7 @@ with gr.Blocks(
         inputs=[
             prompt, width, height, batch_size, video_length, fps, infer_steps,  # Updated inputs
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
-            output_type, attn_mode, block_swap, lora_folder
+            output_type, attn_mode, block_swap, exclude_single_blocks, lora_folder
         ] + lora_weights + lora_multipliers,
         outputs=[video_output, batch_progress, progress_text]
     ).then(
@@ -977,7 +980,7 @@ with gr.Blocks(
             v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length,  # Updated inputs
             v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
-            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_lora_folder
+            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_exclude_single_blocks, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
         outputs=[v2v_output, v2v_batch_progress, v2v_progress_text]
     )

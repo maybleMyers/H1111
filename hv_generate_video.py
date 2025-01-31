@@ -417,6 +417,7 @@ def parse_args():
         default=None,
         help="Save merged model to path. If specified, no inference will be performed.",
     )
+    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
 
     # inference
     parser.add_argument("--prompt", type=str, required=True, help="prompt for generation")
@@ -575,6 +576,12 @@ def main():
 
                 logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
                 weights_sd = load_file(lora_weight)
+                
+                # Filter to exclude keys that are part of single_blocks
+                if args.exclude_single_blocks:
+                    filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
+                    weights_sd = filtered_weights
+
                 if args.lycoris:
                     lycoris_net, _ = create_network_from_weights(
                         multiplier=lora_multiplier, file=None, weights_sd=weights_sd, unet=transformer, text_encoder=None, vae=None, for_inference=True
