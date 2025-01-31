@@ -13,7 +13,7 @@ https://github.com/kohya-ss/musubi-tuner
 
 ## Basic Installation
 
-If you already have musubi tuner installed and running you should just be able to download h1111.py and 
+If you already have musubi tuner installed and running you should just be able to just download h1111.py and hv_generate_video.py and put them in your misubi directory
 
 pip install gradio tiktoken ffmpeg ffmpeg-python
 
