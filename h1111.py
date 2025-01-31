@@ -125,38 +125,28 @@ def count_prompt_tokens(prompt: str) -> int:
     tokens = enc.encode(prompt)
     return len(tokens)
 
-def get_lora_options(lora_folder: str = "lora"):
-    """Get list of LoRA files from the specified folder with 'None' as first option"""
+
+def get_lora_options(lora_folder: str = "lora") -> List[str]:
     if not os.path.exists(lora_folder):
         return ["None"]
-    lora_files = ["None"] + [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
-    return lora_files
+    lora_files = [f for f in os.listdir(lora_folder) if f.endswith('.safetensors') or f.endswith('.pt')]
+    lora_files.sort(key=str.lower)
+    return ["None"] + lora_files
 
-def update_lora_dropdowns(lora_folder: str, *current_values):
-    """Update all LoRA dropdowns while preserving current selections if they still exist"""
+def update_lora_dropdowns(lora_folder: str, *current_values) -> List[gr.update]:
     new_choices = get_lora_options(lora_folder)
-    
-    # Handle weights (first 4 values) and multipliers (last 4 values) separately
-    current_weights = current_values[:4]
-    current_multipliers = current_values[4:8]
+    weights = current_values[:4]
+    multipliers = current_values[4:8]
     
     results = []
     for i in range(4):
-        weight = current_weights[i] if i < len(current_weights) else "None"
-        multiplier = current_multipliers[i] if i < len(current_multipliers) else 1.0
-        
-        # Keep current weight if it exists in new choices
-        if weight in new_choices:
-            new_weight = weight
-            new_multiplier = multiplier
-        else:
-            new_weight = "None"
-            new_multiplier = 1.0
-        
-        # Update both dropdown and slider
+        weight = weights[i] if i < len(weights) else "None"
+        multiplier = multipliers[i] if i < len(multipliers) else 1.0
+        if weight not in new_choices:
+            weight = "None"
         results.extend([
-            gr.update(choices=new_choices, value=new_weight),
-            gr.update(value=new_multiplier)
+            gr.update(choices=new_choices, value=weight),
+            gr.update(value=multiplier) 
         ])
     
     return results
@@ -991,30 +981,24 @@ with gr.Blocks(
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
         outputs=[v2v_output, v2v_batch_progress, v2v_progress_text]
     )
-
     refresh_outputs = []
-    for _ in range(4):
-        refresh_outputs.extend([
-            lora_weights[_],
-            lora_multipliers[_]
-        ])
+    for i in range(4):
+        refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
     
+
     refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=[lora_folder] + lora_weights,
+        inputs=[lora_folder] + lora_weights + lora_multipliers,  # Include both weights and multipliers
         outputs=refresh_outputs
     )
     
     v2v_refresh_outputs = []
-    for _ in range(4):
-        v2v_refresh_outputs.extend([
-            v2v_lora_weights[_],
-            v2v_lora_multipliers[_]
-        ])
-    
+    for i in range(4):
+        v2v_refresh_outputs.extend([v2v_lora_weights[i], v2v_lora_multipliers[i]])
+        
     v2v_refresh_btn.click(
         fn=update_lora_dropdowns,
-        inputs=[v2v_lora_folder] + v2v_lora_weights,
+        inputs=[v2v_lora_folder] + v2v_lora_weights + v2v_lora_multipliers,  # Include both weights and multipliers
         outputs=v2v_refresh_outputs
     )
 
