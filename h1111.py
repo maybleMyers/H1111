@@ -13,7 +13,9 @@ from typing import List, Tuple, Optional, Generator, Dict
 import json
 from gradio import themes
 from gradio.themes.utils import colors
-
+import subprocess
+from PIL import Image
+import math
 
 # Add global stop event
 stop_event = threading.Event()
@@ -435,6 +437,7 @@ with gr.Blocks(
     selected_index = gr.State(value=None)  # For Text to Video
     v2v_selected_index = gr.State(value=None)  # For Video to Video
     params_state = gr.State() #New addition
+    i2v_selected_index = gr.State(value=None) 
     
     with gr.Tabs() as tabs:
         # Text to Video Tab
@@ -516,6 +519,84 @@ with gr.Blocks(
                 use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+
+        #Image to Video Tab
+        with gr.Tab("Image to Video") as i2v_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+
+                with gr.Column(scale=1):
+                    i2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    i2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    i2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    i2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+
+            with gr.Row():
+                i2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                i2v_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    i2v_input = gr.Image(label="Input Image", type="filepath")
+                    i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.75, label="Denoise Strength")
+                    i2v_max_res = gr.Number(label="Max Resolution (Width or Height)", value=544, step=8, minimum=64, maximum=1536)
+                    i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
+                    i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
+                    i2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
+                    i2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
+                    i2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
+                with gr.Column():
+                    i2v_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2],
+                        rows=[2],
+                        object_fit="contain",
+                        height="auto",
+                        show_label=True,
+                        elem_id="gallery",
+                        allow_preview=True,
+                        preview=True
+                    )
+                    i2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+
+                    # Add LoRA section for Image2Video
+                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    i2v_lora_weights = []
+                    i2v_lora_multipliers = []
+                    for i in range(4):
+                        with gr.Column():
+                            i2v_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", 
+                                choices=get_lora_options(), 
+                                value="None", 
+                                allow_custom_value=True,
+                                interactive=True
+                            ))
+                            i2v_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier", 
+                                minimum=0.0, 
+                                maximum=2.0, 
+                                step=0.05, 
+                                value=1.0
+                            ))
+
+            with gr.Row():
+                i2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
+                i2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                i2v_model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
+                i2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
+                i2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
+                i2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
+                i2v_save_path = gr.Textbox(label="Save Path", value="outputs")
+            with gr.Row():
+                i2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                i2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                i2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                i2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         # Video to Video Tab
         with gr.Tab("Video to Video") as v2v_tab:
@@ -684,6 +765,185 @@ with gr.Blocks(
     stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
+    #Image_to_Video
+    def image_to_video(image_path, output_path, frames=240, max_res=None):
+        img = Image.open(image_path)
+        width, height = img.size
+
+        # Determine new dimensions
+        if max_res:
+            if width > height:
+                aspect_ratio = width / height
+                new_width = min(width, max_res)
+                new_height = int(new_width / aspect_ratio)
+            else:
+                aspect_ratio = height / width
+                new_height = min(height, max_res)
+                new_width = int(new_height / aspect_ratio)
+        else:
+            new_width, new_height = width, height
+
+        # Ensure dimensions are divisible by 8
+        new_width = (new_width // 8) * 8
+        new_height = (new_height // 8) * 8
+
+        img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+        temp_image_path = os.path.join(os.path.dirname(output_path), "temp_resized_image.png")
+        img_resized.save(temp_image_path)
+    
+        # Use FFmpeg to create the video
+        frame_rate = 24
+        duration = frames / frame_rate  # Convert frames to duration in seconds
+        command = [
+            "ffmpeg", "-loop", "1", "-i", temp_image_path, "-c:v", "libx264", 
+            "-t", str(duration), "-pix_fmt", "yuv420p", 
+            "-vf", f"fps={frame_rate}", output_path
+        ]
+        
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Video saved to {output_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"An error occurred while creating the video: {e}")
+            return False
+        finally:
+            # Clean up the temporary image file
+            if os.path.exists(temp_image_path):
+                os.remove(temp_image_path)
+            img.close()  # Make sure to close the image file explicitly
+
+    def generate_from_image(
+        image_path, 
+        prompt, max_res, video_length, fps, infer_steps,
+        seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
+        output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+        lora_folder, strength, *lora_params
+    ):
+        """Generate video from input image with proper error handling and response formatting"""
+        global stop_event
+        stop_event.clear()
+
+        # Create temporary video path
+        temp_video_path = os.path.join(save_path, f"temp_{os.path.basename(image_path)}.mp4")
+
+        try:
+            # Convert image to video
+            if not image_to_video(image_path, temp_video_path, frames=video_length, max_res=max_res):
+                return [], "Failed to create temporary video", "Error in video creation"
+
+            # Ensure video is fully written before proceeding
+            time.sleep(1)  # Small delay to ensure file writing is complete
+            if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
+                return [], "Failed to create temporary video", "Temporary video file is empty or missing"
+
+            # Get video dimensions
+            try:
+                probe = ffmpeg.probe(temp_video_path)
+                video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                if video_stream is None:
+                    raise ValueError("No video stream found")
+                width = int(video_stream['width'])
+                height = int(video_stream['height'])
+            except Exception as e:
+                return [], f"Error reading video dimensions: {str(e)}", "Video processing error"
+
+            # Generate the video using the temporary file
+            try:
+                generator = generate_video(
+                    prompt, width, height, 1, video_length, fps, infer_steps,
+                    seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+                    output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+                    lora_folder, *lora_params, video_path=temp_video_path, strength=strength
+                )
+
+                # Process generator results
+                final_videos = []
+                final_batch_text = ""
+                final_progress_text = ""
+
+                for videos, batch_text, progress_text in generator:
+                    final_videos = videos
+                    final_batch_text = batch_text
+                    final_progress_text = progress_text
+
+                if not final_videos:
+                    return [], "No videos generated", "Generation failed"
+
+                return final_videos, final_batch_text, final_progress_text
+
+            except Exception as e:
+                return [], f"Error in video generation: {str(e)}", "Generation error"
+
+        except Exception as e:
+            return [], f"Unexpected error: {str(e)}", "Error occurred"
+
+        finally:
+            # Clean up temporary file
+            try:
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+            except Exception:
+                pass  # Ignore cleanup errors
+
+    # Add event handlers
+    i2v_prompt.change(fn=count_prompt_tokens, inputs=i2v_prompt, outputs=i2v_token_counter)
+    i2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    def handle_i2v_gallery_select(evt: gr.SelectData) -> int:
+        """Track selected index when I2V gallery item is clicked"""
+        return evt.index
+
+    def send_i2v_to_v2v(gallery: list, prompt: str, selected_index: int) -> Tuple[Optional[str], str]:
+        """Send the selected video from Image2Video tab to Video2Video tab"""
+        if not gallery or selected_index is None or selected_index >= len(gallery):
+            return None, ""
+
+        selected_item = gallery[selected_index]
+
+        # Handle different gallery item formats
+        if isinstance(selected_item, dict):
+            video_path = selected_item.get("name", selected_item.get("data", None))
+        elif isinstance(selected_item, (tuple, list)):
+            video_path = selected_item[0]
+        else:
+            video_path = selected_item
+
+        # Final cleanup for Gradio Video component
+        if isinstance(video_path, tuple):
+            video_path = video_path[0]
+
+        return str(video_path), prompt
+
+    # Generate button handler
+    i2v_generate_btn.click(
+        fn=generate_from_image,
+        inputs=[
+            i2v_input, i2v_prompt, i2v_max_res, i2v_video_length, i2v_fps, i2v_infer_steps,
+            i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, i2v_save_path, i2v_flow_shift, i2v_cfg_scale, 
+            i2v_output_type, i2v_attn_mode, i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn,
+            i2v_lora_folder, i2v_strength
+        ] + i2v_lora_weights + i2v_lora_multipliers,  # Add the LoRA components here
+        outputs=[i2v_output, i2v_batch_progress, i2v_progress_text]
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[i2v_batch_size],
+        outputs=i2v_selected_index
+    )
+    # Send to Video2Video
+    i2v_output.select(
+        fn=handle_i2v_gallery_select,
+        outputs=i2v_selected_index
+    )
+
+    i2v_send_to_v2v_btn.click(
+        fn=send_i2v_to_v2v,
+        inputs=[i2v_output, i2v_prompt, i2v_selected_index],
+        outputs=[v2v_input, v2v_prompt]
+    ).then(
+        lambda: gr.update(selected="Video to Video"),
+        outputs=tabs
+    )
     #Video Info
     def clean_video_path(video_path) -> str:
         """Extract clean video path from Gradio's various return formats"""
@@ -1039,6 +1299,16 @@ with gr.Blocks(
         fn=update_lora_dropdowns,
         inputs=[lora_folder] + lora_weights + lora_multipliers,  # Include both weights and multipliers
         outputs=refresh_outputs
+    )
+
+    i2v_refresh_outputs = []
+    for i in range(4):
+        i2v_refresh_outputs.extend([i2v_lora_weights[i], i2v_lora_multipliers[i]])
+
+    i2v_refresh_btn.click(
+        fn=update_lora_dropdowns,
+        inputs=[i2v_lora_folder] + i2v_lora_weights + i2v_lora_multipliers,
+        outputs=i2v_refresh_outputs
     )
     
     v2v_refresh_outputs = []
