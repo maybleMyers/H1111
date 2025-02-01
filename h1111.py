@@ -708,6 +708,53 @@ with gr.Blocks(
             return {}, "No metadata found in video"
 
         return metadata, "Metadata extracted successfully"
+    
+    def get_video_info(video_path: str) -> dict:
+        try:
+            probe = ffmpeg.probe(video_path)
+            video_info = next(stream for stream in probe['streams'] if stream['codec_type'] == 'video')
+            
+            width = int(video_info['width'])
+            height = int(video_info['height'])
+            fps = eval(video_info['r_frame_rate'])  # This converts '30/1' to 30.0
+            
+            # Calculate total frames
+            duration = float(probe['format']['duration'])
+            total_frames = int(duration * fps)
+            
+            # Ensure video length does not exceed 201 frames
+            if total_frames > 201:
+                total_frames = 201
+                duration = total_frames / fps  # Adjust duration accordingly
+    
+            return {
+                'width': width,
+                'height': height,
+                'fps': fps,
+                'total_frames': total_frames,
+                'duration': duration  # Might be useful in some contexts
+            }
+        except Exception as e:
+            print(f"Error extracting video info: {e}")
+            return {}
+        
+    def extract_video_details(video_path: str) -> Tuple[dict, str]:
+        metadata = extract_video_metadata(video_path)
+        video_details = get_video_info(video_path)
+
+        # Combine metadata with video details
+        for key, value in video_details.items():
+            if key not in metadata:
+                metadata[key] = value
+
+        # Ensure video length does not exceed 201 frames
+        if 'video_length' in metadata:
+            metadata['video_length'] = min(metadata['video_length'], 201)
+        else:
+            metadata['video_length'] = min(video_details.get('total_frames', 0), 201)
+
+        # Return both the updated metadata and a status message
+        return metadata, "Video details extracted successfully"
 
     def send_parameters_to_tab(metadata: Dict, target_tab: str) -> Tuple[str, Dict]:
         """Create parameter mapping for target tab"""
@@ -722,7 +769,7 @@ with gr.Blocks(
             return f"Error: {str(e)}", {}
         
     video_input.upload(
-        fn=handle_video_upload,
+        fn=extract_video_details,
         inputs=video_input,
         outputs=[metadata_output, status]
     )
