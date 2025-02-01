@@ -818,7 +818,7 @@ with gr.Blocks(
         prompt, max_res, video_length, fps, infer_steps,
         seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
         output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-        lora_folder, strength, *lora_params
+        lora_folder, strength, batch_size, *lora_params  # Added batch_size parameter
     ):
         """Generate video from input image with proper error handling and response formatting"""
         global stop_event
@@ -851,7 +851,7 @@ with gr.Blocks(
             # Generate the video using the temporary file
             try:
                 generator = generate_video(
-                    prompt, width, height, 1, video_length, fps, infer_steps,
+                    prompt, width, height, batch_size, video_length, fps, infer_steps,  # Added batch_size here
                     seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
                     output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
                     lora_folder, *lora_params, video_path=temp_video_path, strength=strength
@@ -922,8 +922,8 @@ with gr.Blocks(
             i2v_input, i2v_prompt, i2v_max_res, i2v_video_length, i2v_fps, i2v_infer_steps,
             i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, i2v_save_path, i2v_flow_shift, i2v_cfg_scale, 
             i2v_output_type, i2v_attn_mode, i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn,
-            i2v_lora_folder, i2v_strength
-        ] + i2v_lora_weights + i2v_lora_multipliers,  # Add the LoRA components here
+            i2v_lora_folder, i2v_strength, i2v_batch_size  # Added i2v_batch_size here
+        ] + i2v_lora_weights + i2v_lora_multipliers,
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text]
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
