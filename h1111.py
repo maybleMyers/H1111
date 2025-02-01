@@ -818,25 +818,27 @@ with gr.Blocks(
         prompt, max_res, video_length, fps, infer_steps,
         seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
         output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-        lora_folder, strength, batch_size, *lora_params  # Added batch_size parameter
+        lora_folder, strength, batch_size, *lora_params
     ):
-        """Generate video from input image with proper error handling and response formatting"""
+        """Generate video from input image with progressive updates"""
         global stop_event
         stop_event.clear()
-
+    
         # Create temporary video path
         temp_video_path = os.path.join(save_path, f"temp_{os.path.basename(image_path)}.mp4")
-
+    
         try:
             # Convert image to video
             if not image_to_video(image_path, temp_video_path, frames=video_length, max_res=max_res):
-                return [], "Failed to create temporary video", "Error in video creation"
-
+                yield [], "Failed to create temporary video", "Error in video creation"
+                return
+    
             # Ensure video is fully written before proceeding
-            time.sleep(1)  # Small delay to ensure file writing is complete
+            time.sleep(1)
             if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
-                return [], "Failed to create temporary video", "Temporary video file is empty or missing"
-
+                yield [], "Failed to create temporary video", "Temporary video file is empty or missing"
+                return
+    
             # Get video dimensions
             try:
                 probe = ffmpeg.probe(temp_video_path)
@@ -846,38 +848,30 @@ with gr.Blocks(
                 width = int(video_stream['width'])
                 height = int(video_stream['height'])
             except Exception as e:
-                return [], f"Error reading video dimensions: {str(e)}", "Video processing error"
-
+                yield [], f"Error reading video dimensions: {str(e)}", "Video processing error"
+                return
+    
             # Generate the video using the temporary file
             try:
                 generator = generate_video(
-                    prompt, width, height, batch_size, video_length, fps, infer_steps,  # Added batch_size here
+                    prompt, width, height, batch_size, video_length, fps, infer_steps,
                     seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
                     output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
                     lora_folder, *lora_params, video_path=temp_video_path, strength=strength
                 )
-
-                # Process generator results
-                final_videos = []
-                final_batch_text = ""
-                final_progress_text = ""
-
+    
+                # Forward all generator updates
                 for videos, batch_text, progress_text in generator:
-                    final_videos = videos
-                    final_batch_text = batch_text
-                    final_progress_text = progress_text
-
-                if not final_videos:
-                    return [], "No videos generated", "Generation failed"
-
-                return final_videos, final_batch_text, final_progress_text
-
+                    yield videos, batch_text, progress_text
+    
             except Exception as e:
-                return [], f"Error in video generation: {str(e)}", "Generation error"
-
+                yield [], f"Error in video generation: {str(e)}", "Generation error"
+                return
+    
         except Exception as e:
-            return [], f"Unexpected error: {str(e)}", "Error occurred"
-
+            yield [], f"Unexpected error: {str(e)}", "Error occurred"
+            return
+    
         finally:
             # Clean up temporary file
             try:
@@ -885,6 +879,7 @@ with gr.Blocks(
                     os.remove(temp_video_path)
             except Exception:
                 pass  # Ignore cleanup errors
+
 
     # Add event handlers
     i2v_prompt.change(fn=count_prompt_tokens, inputs=i2v_prompt, outputs=i2v_token_counter)
@@ -922,7 +917,7 @@ with gr.Blocks(
             i2v_input, i2v_prompt, i2v_max_res, i2v_video_length, i2v_fps, i2v_infer_steps,
             i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, i2v_save_path, i2v_flow_shift, i2v_cfg_scale, 
             i2v_output_type, i2v_attn_mode, i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn,
-            i2v_lora_folder, i2v_strength, i2v_batch_size  # Added i2v_batch_size here
+            i2v_lora_folder, i2v_strength, i2v_batch_size
         ] + i2v_lora_weights + i2v_lora_multipliers,
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text]
     ).then(
