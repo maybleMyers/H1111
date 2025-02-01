@@ -215,7 +215,8 @@ def generate_video(
     output_type: str,
     attn_mode: str,
     block_swap: int,
-    exclude_single_blocks: bool,    
+    exclude_single_blocks: bool,
+    use_split_attn: bool,    
     lora_folder: str,
     lora1: str = "",
     lora2: str = "",
@@ -269,7 +270,6 @@ def generate_video(
             "--output_type", output_type,
             "--attn_mode", attn_mode,
             "--blocks_to_swap", str(block_swap),
-            "--split_attn",
             "--fp8_llm",
             "--vae_chunk_size", "32",
             "--vae_spatial_tile_sample_min_size", "128"            
@@ -288,6 +288,8 @@ def generate_video(
 
         if exclude_single_blocks:
             command.append("--exclude_single_blocks")
+        if use_split_attn:
+            command.append("--split_attn")
 
         # Add video2video parameters if provided
         if video_path:
@@ -511,6 +513,7 @@ with gr.Blocks(
             with gr.Row():
                 lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
@@ -583,6 +586,7 @@ with gr.Blocks(
             with gr.Row():
                 v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                v2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
         with gr.Tab("Video Info") as video_info_tab:
@@ -764,7 +768,7 @@ with gr.Blocks(
         inputs=[
             prompt, width, height, batch_size, video_length, fps, infer_steps,  # Updated inputs
             seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
-            output_type, attn_mode, block_swap, exclude_single_blocks, lora_folder
+            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn, lora_folder
         ] + lora_weights + lora_multipliers,
         outputs=[video_output, batch_progress, progress_text]
     ).then(
@@ -975,7 +979,7 @@ with gr.Blocks(
             v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length,  # Updated inputs
             v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
             v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
-            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_exclude_single_blocks, v2v_lora_folder
+            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder
         ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
         outputs=[v2v_output, v2v_batch_progress, v2v_progress_text]
     )
