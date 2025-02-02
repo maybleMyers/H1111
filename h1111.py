@@ -441,7 +441,7 @@ with gr.Blocks(
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
-        
+
         function updateTitle(text) {
             if (text && text.trim()) {
                 const percentMatch = text.match(/(\d+)%/);
@@ -450,7 +450,7 @@ with gr.Blocks(
                 }
             }
         }
-        
+
         setTimeout(() => {
             const progressElements = document.querySelectorAll('textarea.scroll-hide');
             progressElements.forEach(element => {
@@ -918,10 +918,31 @@ with gr.Blocks(
         """Track selected index when I2V gallery item is clicked"""
         return evt.index
 
-    def send_i2v_to_v2v(gallery: list, prompt: str, selected_index: int) -> Tuple[Optional[str], str]:
-        """Send the selected video from Image2Video tab to Video2Video tab"""
+    def send_i2v_to_v2v(
+        gallery: list, 
+        prompt: str, 
+        selected_index: int,
+        width: int,
+        height: int,
+        video_length: int,
+        fps: int,
+        infer_steps: int,
+        seed: int,
+        flow_shift: float,
+        cfg_scale: float,
+        lora1: str,
+        lora2: str,
+        lora3: str,
+        lora4: str,
+        lora1_multiplier: float,
+        lora2_multiplier: float,
+        lora3_multiplier: float,
+        lora4_multiplier: float
+    ) -> Tuple[Optional[str], str, int, int, int, int, int, int, float, float, str, str, str, str, float, float, float, float]:
+        """Send the selected video and parameters from Image2Video tab to Video2Video tab"""
         if not gallery or selected_index is None or selected_index >= len(gallery):
-            return None, ""
+            return None, "", width, height, video_length, fps, infer_steps, seed, flow_shift, cfg_scale, \
+                   lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier
 
         selected_item = gallery[selected_index]
 
@@ -937,7 +958,9 @@ with gr.Blocks(
         if isinstance(video_path, tuple):
             video_path = video_path[0]
 
-        return str(video_path), prompt
+        return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, cfg_scale, lora1, lora2, lora3, lora4, 
+                lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
 
     # Generate button handler
     i2v_generate_btn.click(
@@ -962,10 +985,20 @@ with gr.Blocks(
 
     i2v_send_to_v2v_btn.click(
         fn=send_i2v_to_v2v,
-        inputs=[i2v_output, i2v_prompt, i2v_selected_index],
-        outputs=[v2v_input, v2v_prompt]
+        inputs=[
+            i2v_output, i2v_prompt, i2v_selected_index,
+            i2v_max_res, i2v_max_res,  # Using max_res for both width and height
+            i2v_video_length, i2v_fps, i2v_infer_steps,
+            i2v_seed, i2v_flow_shift, i2v_cfg_scale
+        ] + i2v_lora_weights + i2v_lora_multipliers,
+        outputs=[
+            v2v_input, v2v_prompt,
+            v2v_width, v2v_height,
+            v2v_video_length, v2v_fps, v2v_infer_steps,
+            v2v_seed, v2v_flow_shift, v2v_cfg_scale
+        ] + v2v_lora_weights + v2v_lora_multipliers
     ).then(
-        lambda: gr.update(selected="Video to Video"),
+        lambda: gr.Tabs(selected="Video to Video"),
         outputs=tabs
     )
     #Video Info
