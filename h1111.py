@@ -440,59 +440,31 @@ with gr.Blocks(
     i2v_selected_index = gr.State(value=None) 
     demo.load(None, None, None, js="""
     () => {
-        // Set initial title
-        document.title = 'H1111-start';
-        console.log('Title updater script starting');
+        document.title = 'H1111';
         
-        // Function to update title based on progress
         function updateTitle(text) {
-            console.log('Updating title with text:', text);
-            
             if (text && text.trim()) {
-                // Extract percentage if present
                 const percentMatch = text.match(/(\d+)%/);
                 if (percentMatch) {
                     document.title = `${percentMatch[1]}% - H1111`;
-                    console.log('Found percentage:', percentMatch[1]);
-                } else {
-                    document.title = 'H1111-no-percent';
-                    console.log('No percentage found in text');
                 }
-            } else {
-                document.title = 'H1111-empty';
-                console.log('Empty text received');
             }
         }
         
-        // Find all textbox elements with progress text
-        const textboxes = document.querySelectorAll('textarea[data-testid], textarea.scroll-hide');
-        console.log('Found textboxes:', textboxes.length);
-        
-        const observers = [];
-        textboxes.forEach(element => {
-            if (element) {
-                console.log('Setting up observer for element:', element.id);
-                
-                const observer = new MutationObserver((mutations) => {
-                    mutations.forEach((mutation) => {
-                        console.log('Mutation detected:', mutation.type);
+        setTimeout(() => {
+            const progressElements = document.querySelectorAll('textarea.scroll-hide');
+            progressElements.forEach(element => {
+                if (element) {
+                    new MutationObserver(() => {
                         updateTitle(element.value);
+                    }).observe(element, {
+                        attributes: true,
+                        childList: true,
+                        characterData: true
                     });
-                });
-                
-                observer.observe(element, {
-                    childList: true,
-                    subtree: true,
-                    characterData: true,
-                    attributes: true
-                });
-                
-                observers.push(observer);
-            }
-        });
-        
-        // Cleanup function
-        return () => observers.forEach(obs => obs.disconnect());
+                }
+            });
+        }, 1000);
     }
     """)
         
