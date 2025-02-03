@@ -570,7 +570,7 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     i2v_input = gr.Image(label="Input Image", type="filepath")
-                    i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.75, label="Denoise Strength")
+                    i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
                     i2v_max_res = gr.Number(label="Max Resolution (Width or Height)", value=544, step=8, minimum=64, maximum=1536)
                     i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                     i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
@@ -648,7 +648,7 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     v2v_input = gr.Video(label="Input Video", format="mp4")
-                    v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.75, label="Denoise Strength")
+                    v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
                     v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
                     v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
                     v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
