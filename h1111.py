@@ -1378,5 +1378,4 @@ with gr.Blocks(
         outputs=v2v_refresh_outputs
     )
 
-
-demo.launch(server_name="0.0.0.0", share=False) 
+demo.queue().launch(server_name="0.0.0.0", share=False)
