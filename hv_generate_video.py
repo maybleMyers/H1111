@@ -35,7 +35,7 @@ except:
 from utils.model_utils import str_to_dtype
 from utils.safetensors_utils import mem_eff_save_file
 from dataset.image_video_dataset import load_video, glob_images, resize_image_to_bucket
-
+import math
 import logging
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,63 @@ def synchronize_device(device: torch.device):
     elif device.type == "mps":
         torch.mps.synchronize()
 
+def extend_video_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """
+    Extends a video tensor to reach the target number of frames by duplicating frames.
+    
+    Args:
+        video: Input video tensor of shape [B, C, F, H, W]
+        target_frames: Desired number of frames
+        
+    Returns:
+        Extended video tensor
+    """
+    current_frames = video.shape[2]
+    if current_frames >= target_frames:
+        return video
+    
+    # Calculate how many times to repeat each frame
+    repeat_factor = math.ceil(target_frames / current_frames)
+    
+    # Create index tensor for frame selection
+    # This will repeat frames in a pattern to reach desired length
+    indices = torch.arange(current_frames, device=video.device)
+    indices = indices.repeat(repeat_factor)[:target_frames]
+    
+    # Use index_select to create the extended video
+    extended_video = torch.index_select(video, 2, indices)
+    
+    return extended_video
+
+def load_and_extend_video(args, video_length: int):
+    """
+    Load video and extend it if needed to match target length.
+    """
+    if os.path.isfile(args.video_path):
+        video = load_video(args.video_path, 0, video_length, bucket_reso=(args.video_size[1], args.video_size[0]))
+    else:
+        video = load_images(args.video_path, video_length, bucket_reso=(args.video_size[1], args.video_size[0]))
+
+    if len(video) < video_length:
+        logger.info(f"Video length ({len(video)}) is less than target length ({video_length}). Extending video...")
+        # Convert list of frames to tensor
+        video_tensor = torch.from_numpy(np.stack(video, axis=0))  # [F, H, W, C]
+        video_tensor = video_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+        
+        # Extend the video
+        extended_tensor = extend_video_frames(video_tensor, video_length)
+        
+        # Convert back to list of frames
+        extended_tensor = extended_tensor.squeeze(0).permute(1, 2, 3, 0)  # [F, H, W, C]
+        video = [frame.numpy() for frame in extended_tensor]
+        
+        logger.info(f"Video extended to {len(video)} frames")
+    
+    video = np.stack(video, axis=0)  # F, H, W, C
+    video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
+    video = video / 255.0
+    
+    return video
 
 def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, fps=24):
     """save videos by video tensor
@@ -534,22 +591,14 @@ def main():
         if args.video_path is not None:
             # v2v inference
             logger.info(f"Video2Video inference: {args.video_path}")
-
-            if os.path.isfile(args.video_path):
-                video = load_video(args.video_path, 0, video_length, bucket_reso=(width, height))  # list of frames
-            else:
-                video = load_images(args.video_path, video_length, bucket_reso=(width, height))  # list of frames
-
-            if len(video) < video_length:
-                raise ValueError(f"Video length is less than {video_length}")
-            video = np.stack(video, axis=0)  # F, H, W, C
-            video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
-            video = video / 255.0
-
+            
+            # Load and extend video if necessary
+            video = load_and_extend_video(args, video_length)
+            
             logger.info(f"Encoding video to latents")
             video_latents = encode_to_latents(args, video, device)
             video_latents = video_latents.to(device=device, dtype=dit_dtype)
-
+            
             clean_memory_on_device(device)
 
         # load DiT model
