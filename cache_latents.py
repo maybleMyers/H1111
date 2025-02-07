@@ -10,7 +10,6 @@ from tqdm import tqdm
 from dataset import config_utils
 from dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from PIL import Image
-import numpy as np
 
 import logging
 
@@ -22,6 +21,10 @@ from utils.model_utils import str_to_dtype
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
+def ensure_array(image: Union[Image.Image, np.ndarray]) -> np.ndarray:
+    return np.array(image) if isinstance(image, Image.Image) else image
+    
 
 def show_image(image: Union[list[Union[Image.Image, np.ndarray], Union[Image.Image, np.ndarray]]]) -> int:
     import cv2
@@ -121,60 +124,34 @@ def show_datasets(
             batch_index += 1
 
 
-from PIL import Image
-import numpy as np
-
-
-def resize_image(frame: np.ndarray, min_width=720, min_height=720):
-    print(f"Original frame shape: {frame.shape}, dtype: {frame.dtype}")
-
-    # If we have more than 3 dimensions, handle each frame or image in the batch separately
-    if frame.ndim > 3:
-        # Assuming first dimension is for batch or frames
-        resized_frames = []
-        for single_frame in frame:
-            h, w = single_frame.shape[:2]
-            if h < min_height or w < min_width:
-                scale_h = min_height / h
-                scale_w = min_width / w
-                scale = max(scale_h, scale_w)
-                new_h, new_w = int(h * scale), int(w * scale)
-                
-                pil_image = Image.fromarray(single_frame)
-                resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
-                resized_frames.append(np.array(resized))
-            else:
-                resized_frames.append(single_frame)
-        
-        # Stack the frames back into a batch
-        return np.stack(resized_frames)
-    else:
-        # If we only have a single image, handle it directly
-        h, w = frame.shape[:2]
-        if h < min_height or w < min_width:
-            scale_h = min_height / h
-            scale_w = min_width / w
-            scale = max(scale_h, scale_w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            
-            pil_image = Image.fromarray(frame)
-            resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
-            return np.array(resized)
-        return frame
-
-# In encode_and_save_batch, keep the usage as before:
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
-    contents = []
+    processed = []
     for item in batch:
-        frame = item.content if isinstance(item.content, np.ndarray) else np.array(item.content)
+        # Convert and resize if needed
+        frame = ensure_array(item.content)
+        frame = np.array(item.content) if not isinstance(item.content, np.ndarray) else item.content
         
-        # Resize if below target resolution
-        frame = resize_image(frame)
+        # Handle resizing for small images AND ensure 8x divisibility
+        h, w = frame.shape[:2]
+        min_size = max(64, 8 * 2)  # Minimum 64 pixels (8 latent units * 8 downscale)
         
-        contents.append(torch.from_numpy(frame))
+        if h < min_size or w < min_size:
+            scale = max(min_size/h, min_size/w)
+            new_h, new_w = int(np.ceil(h * scale)), int(np.ceil(w * scale))
+        else:
+            new_h, new_w = h, w
+        
+        # Round to nearest multiple of 8
+        new_h = ((new_h + 7) // 8) * 8  # [peps.python.org](https://peps.python.org/pep-0008/)
+        new_w = ((new_w + 7) // 8) * 8
+        
+        if (new_h, new_w) != (h, w):
+            pil_img = Image.fromarray(frame)
+            frame = np.array(pil_img.resize((new_w, new_h), Image.LANCZOS))  # [docs.python.org](https://docs.python.org/3/library/stdtypes.html)
 
-    # The rest of the function remains as before, but we've handled the resizing differently
-    contents = torch.stack(contents)
+        processed.append(torch.from_numpy(frame))
+    
+    contents = torch.stack(processed)
     if len(contents.shape) == 4:
         contents = contents.unsqueeze(1)  # B, H, W, C -> B, F, H, W, C
 
@@ -183,15 +160,30 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
     h, w = contents.shape[3], contents.shape[4]
-    if h < 8 or w < 8:
-        item = batch[0]  # other items should have the same size
-        raise ValueError(f"Image or video size too small after resizing: {item.item_key} and {len(batch) - 1} more, size: {item.original_size}")
-
+    if not (h >= 8 and w >= 8 and h % 8 == 0 and w % 8 == 0):
+        item = batch[0]
+        raise ValueError(f"Invalid latent size {h}x{w} for {item.item_key}")
+    # print(f"encode batch: {contents.shape}")
     with torch.no_grad():
         latent = vae.encode(contents).latent_dist.sample()
         # latent = latent * vae.config.scaling_factor
 
+    # # debug: decode and save
+    # with torch.no_grad():
+    #     latent_to_decode = latent / vae.config.scaling_factor
+    #     images = vae.decode(latent_to_decode, return_dict=False)[0]
+    #     images = (images / 2 + 0.5).clamp(0, 1)
+    #     images = images.cpu().float().numpy()
+    #     images = (images * 255).astype(np.uint8)
+    #     images = images.transpose(0, 2, 3, 4, 1)  # B, C, F, H, W -> B, F, H, W, C
+    #     for b in range(images.shape[0]):
+    #         for f in range(images.shape[1]):
+    #             fln = os.path.splitext(os.path.basename(batch[b].item_key))[0]
+    #             img = Image.fromarray(images[b, f])
+    #             img.save(f"./logs/decode_{fln}_{b}_{f:03d}.jpg")
+
     for item, l in zip(batch, latent):
+        # print(f"save latent cache: {item.latent_cache_path}, latent shape: {l.shape}")
         save_latent_cache(item, l)
 
 
