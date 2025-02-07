@@ -128,41 +128,39 @@ import numpy as np
 def resize_image(frame: np.ndarray, min_width=720, min_height=720):
     print(f"Original frame shape: {frame.shape}, dtype: {frame.dtype}")
 
-    # Ensure we have a 3D array where the last dimension is for color channels
+    # If we have more than 3 dimensions, handle each frame or image in the batch separately
     if frame.ndim > 3:
-        # If we have more than 3 dimensions, try to reduce to 3D
-        while frame.ndim > 3:
-            frame = np.squeeze(frame)
-            if frame.ndim <= 3:
-                break
-    elif frame.ndim == 2:
-        frame = frame[..., np.newaxis]  # Convert 2D to 3D by adding a channel dimension
-    elif frame.ndim == 1:
-        # Single row or column, reshape to 2D then add channel
-        frame = frame.reshape(-1, 1, 3) if len(frame) == 3 else frame.reshape(-1, 3)
+        # Assuming first dimension is for batch or frames
+        resized_frames = []
+        for single_frame in frame:
+            h, w = single_frame.shape[:2]
+            if h < min_height or w < min_width:
+                scale_h = min_height / h
+                scale_w = min_width / w
+                scale = max(scale_h, scale_w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                
+                pil_image = Image.fromarray(single_frame)
+                resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+                resized_frames.append(np.array(resized))
+            else:
+                resized_frames.append(single_frame)
+        
+        # Stack the frames back into a batch
+        return np.stack(resized_frames)
     else:
-        # If we still have an unexpected shape, log and raise an error
-        print(f"Unexpected frame shape: {frame.shape}")
-        raise ValueError("Frame does not match expected image shape.")
-
-    # Now adjust dimensions to ensure we have height, width, channels
-    h, w, c = frame.shape if frame.ndim == 3 else (frame.shape[0], frame.shape[1], 1)  # Assume grayscale if only 2 dimensions
-
-    if h < min_height or w < min_width:
-        scale_h = min_height / h
-        scale_w = min_width / w
-        scale = max(scale_h, scale_w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        
-        # Convert to uint8 if not already
-        if frame.dtype != np.uint8:
-            frame = (frame * 255).astype(np.uint8) if frame.dtype in [np.float32, np.float64] else frame.astype(np.uint8)
-        
-        pil_image = Image.fromarray(frame)
-        resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
-        return np.array(resized)
-    
-    return frame
+        # If we only have a single image, handle it directly
+        h, w = frame.shape[:2]
+        if h < min_height or w < min_width:
+            scale_h = min_height / h
+            scale_w = min_width / w
+            scale = max(scale_h, scale_w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            
+            pil_image = Image.fromarray(frame)
+            resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+            return np.array(resized)
+        return frame
 
 # In encode_and_save_batch, keep the usage as before:
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
