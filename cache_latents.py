@@ -125,19 +125,25 @@ from PIL import Image
 import numpy as np
 
 def resize_image(frame: np.ndarray, min_width=720, min_height=720):
+    # Check if the frame is in an unexpected format
+    if frame.ndim == 4 and frame.shape[1] == 1:  # Assume first dimension is batch or frame, second is 1
+        frame = frame.squeeze(1)  # Remove the dimension of size 1
+
     h, w = frame.shape[:2]
     if h < min_height or w < min_width:
         scale_h = min_height / h
         scale_w = min_width / w
         scale = max(scale_h, scale_w)
         new_h, new_w = int(h * scale), int(w * scale)
-        return np.array(Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS))
+        # Convert to PIL Image then resize. Here we assume the data is already in uint8 format.
+        pil_image = Image.fromarray(frame.astype(np.uint8))
+        resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+        return np.array(resized)
     return frame
 
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
     contents = []
     for item in batch:
-        # Convert to numpy array if necessary
         frame = item.content if isinstance(item.content, np.ndarray) else np.array(item.content)
         
         # Resize if below target resolution
@@ -145,6 +151,7 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
         
         contents.append(torch.from_numpy(frame))
 
+    # The rest of the function remains as before, but we've handled the resizing differently
     contents = torch.stack(contents)
     if len(contents.shape) == 4:
         contents = contents.unsqueeze(1)  # B, H, W, C -> B, F, H, W, C
