@@ -126,26 +126,28 @@ import numpy as np
 
 
 def resize_image(frame: np.ndarray, min_width=720, min_height=720):
-    # Print for debugging
     print(f"Original frame shape: {frame.shape}, dtype: {frame.dtype}")
 
-    # Ensure we have 3 dimensions (H, W, C) - remove extra dimensions where possible
-    while frame.ndim > 3:
-        # Check if any dimension is of size 1 and remove it
-        squeeze_axis = next((i for i, x in enumerate(frame.shape) if x == 1), None)
-        if squeeze_axis is not None:
-            frame = np.squeeze(frame, axis=squeeze_axis)
-        else:
-            break  # If no dimension of size 1 is found, we can't squeeze further
-    
-    # Ensure we have at least 3 dimensions (H, W, C)
-    if frame.ndim < 3:
-        if frame.ndim == 2:  # Grayscale image
-            frame = frame[..., np.newaxis]  # Add channel dimension
-        elif frame.ndim == 1:  # Single row or column of pixels
-            frame = frame[np.newaxis, :, np.newaxis]  # Add height and channel dimensions
+    # Ensure we have a 3D array where the last dimension is for color channels
+    if frame.ndim > 3:
+        # If we have more than 3 dimensions, try to reduce to 3D
+        while frame.ndim > 3:
+            frame = np.squeeze(frame)
+            if frame.ndim <= 3:
+                break
+    elif frame.ndim == 2:
+        frame = frame[..., np.newaxis]  # Convert 2D to 3D by adding a channel dimension
+    elif frame.ndim == 1:
+        # Single row or column, reshape to 2D then add channel
+        frame = frame.reshape(-1, 1, 3) if len(frame) == 3 else frame.reshape(-1, 3)
+    else:
+        # If we still have an unexpected shape, log and raise an error
+        print(f"Unexpected frame shape: {frame.shape}")
+        raise ValueError("Frame does not match expected image shape.")
 
-    h, w = frame.shape[:2]
+    # Now adjust dimensions to ensure we have height, width, channels
+    h, w, c = frame.shape if frame.ndim == 3 else (frame.shape[0], frame.shape[1], 1)  # Assume grayscale if only 2 dimensions
+
     if h < min_height or w < min_width:
         scale_h = min_height / h
         scale_w = min_width / w
@@ -159,6 +161,7 @@ def resize_image(frame: np.ndarray, min_width=720, min_height=720):
         pil_image = Image.fromarray(frame)
         resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
         return np.array(resized)
+    
     return frame
 
 # In encode_and_save_batch, keep the usage as before:
