@@ -125,22 +125,34 @@ from PIL import Image
 import numpy as np
 
 def resize_image(frame: np.ndarray, min_width=720, min_height=720):
-    # Check if the frame is in an unexpected format
-    if frame.ndim == 4 and frame.shape[1] == 1:  # Assume first dimension is batch or frame, second is 1
-        frame = frame.squeeze(1)  # Remove the dimension of size 1
+    # Print for debugging
+    print(f"Original frame shape: {frame.shape}, dtype: {frame.dtype}")
 
+    # Remove any extra dimensions if present
+    while frame.ndim > 3:
+        frame = frame.squeeze(0)  # Remove first dimension if it's of size 1
+    
+    # Ensure we have 3 dimensions (H, W, C)
+    if frame.ndim < 3:
+        frame = frame[..., np.newaxis]  # Add a dimension for single-channel images
+    
     h, w = frame.shape[:2]
     if h < min_height or w < min_width:
         scale_h = min_height / h
         scale_w = min_width / w
         scale = max(scale_h, scale_w)
         new_h, new_w = int(h * scale), int(w * scale)
-        # Convert to PIL Image then resize. Here we assume the data is already in uint8 format.
-        pil_image = Image.fromarray(frame.astype(np.uint8))
+        
+        # Convert to uint8 if not already
+        if frame.dtype != np.uint8:
+            frame = (frame * 255).astype(np.uint8) if frame.dtype in [np.float32, np.float64] else frame.astype(np.uint8)
+        
+        pil_image = Image.fromarray(frame)
         resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
         return np.array(resized)
     return frame
 
+# In encode_and_save_batch, keep the usage as before:
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
     contents = []
     for item in batch:
