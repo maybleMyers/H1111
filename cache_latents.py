@@ -124,18 +124,27 @@ def show_datasets(
 from PIL import Image
 import numpy as np
 
+
 def resize_image(frame: np.ndarray, min_width=720, min_height=720):
     # Print for debugging
     print(f"Original frame shape: {frame.shape}, dtype: {frame.dtype}")
 
-    # Remove any extra dimensions if present
+    # Ensure we have 3 dimensions (H, W, C) - remove extra dimensions where possible
     while frame.ndim > 3:
-        frame = frame.squeeze(0)  # Remove first dimension if it's of size 1
+        # Check if any dimension is of size 1 and remove it
+        squeeze_axis = next((i for i, x in enumerate(frame.shape) if x == 1), None)
+        if squeeze_axis is not None:
+            frame = np.squeeze(frame, axis=squeeze_axis)
+        else:
+            break  # If no dimension of size 1 is found, we can't squeeze further
     
-    # Ensure we have 3 dimensions (H, W, C)
+    # Ensure we have at least 3 dimensions (H, W, C)
     if frame.ndim < 3:
-        frame = frame[..., np.newaxis]  # Add a dimension for single-channel images
-    
+        if frame.ndim == 2:  # Grayscale image
+            frame = frame[..., np.newaxis]  # Add channel dimension
+        elif frame.ndim == 1:  # Single row or column of pixels
+            frame = frame[np.newaxis, :, np.newaxis]  # Add height and channel dimensions
+
     h, w = frame.shape[:2]
     if h < min_height or w < min_width:
         scale_h = min_height / h
