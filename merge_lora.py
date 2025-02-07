@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=[1.0], help="LoRA multiplier (can specify multiple values)")
     parser.add_argument("--save_merged_model", type=str, required=True, help="Path to save the merged model")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for merging")
+    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
+
 
     return parser.parse_args()
 
@@ -44,6 +46,11 @@ def main():
 
             logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
             weights_sd = load_file(lora_weight)
+
+            if args.exclude_single_blocks:
+                filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
+                weights_sd = filtered_weights
+
             network = lora.create_network_from_weights_hunyuan_video(
                 lora_multiplier, weights_sd, unet=transformer, for_inference=True
             )
