@@ -22,10 +22,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def ensure_array(image: Union[Image.Image, np.ndarray]) -> np.ndarray:
-    return np.array(image) if isinstance(image, Image.Image) else image
-    
-
 def show_image(image: Union[list[Union[Image.Image, np.ndarray], Union[Image.Image, np.ndarray]]]) -> int:
     import cv2
 
@@ -125,33 +121,7 @@ def show_datasets(
 
 
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
-    processed = []
-    for item in batch:
-        # Convert and resize if needed
-        frame = ensure_array(item.content)
-        frame = np.array(item.content) if not isinstance(item.content, np.ndarray) else item.content
-        
-        # Handle resizing for small images AND ensure 8x divisibility
-        h, w = frame.shape[:2]
-        min_size = max(64, 8 * 2)  # Minimum 64 pixels (8 latent units * 8 downscale)
-        
-        if h < min_size or w < min_size:
-            scale = max(min_size/h, min_size/w)
-            new_h, new_w = int(np.ceil(h * scale)), int(np.ceil(w * scale))
-        else:
-            new_h, new_w = h, w
-        
-        # Round to nearest multiple of 8
-        new_h = ((new_h + 7) // 8) * 8  # [peps.python.org](https://peps.python.org/pep-0008/)
-        new_w = ((new_w + 7) // 8) * 8
-        
-        if (new_h, new_w) != (h, w):
-            pil_img = Image.fromarray(frame)
-            frame = np.array(pil_img.resize((new_w, new_h), Image.LANCZOS))  # [docs.python.org](https://docs.python.org/3/library/stdtypes.html)
-
-        processed.append(torch.from_numpy(frame))
-    
-    contents = torch.stack(processed)
+    contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if len(contents.shape) == 4:
         contents = contents.unsqueeze(1)  # B, H, W, C -> B, F, H, W, C
 
@@ -160,9 +130,10 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
     h, w = contents.shape[3], contents.shape[4]
-    if not (h >= 8 and w >= 8 and h % 8 == 0 and w % 8 == 0):
-        item = batch[0]
-        raise ValueError(f"Invalid latent size {h}x{w} for {item.item_key}")
+    if h < 8 or w < 8:
+        item = batch[0]  # other items should have the same size
+        raise ValueError(f"Image or video size too small: {item.item_key} and {len(batch) - 1} more, size: {item.original_size}")
+
     # print(f"encode batch: {contents.shape}")
     with torch.no_grad():
         latent = vae.encode(contents).latent_dist.sample()
