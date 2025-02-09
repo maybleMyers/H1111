@@ -198,11 +198,18 @@ def send_selected_to_v2v(gallery: list, prompt: str, selected_index: gr.State) -
     
     return str(video_path), prompt
 
-def generate_video(
+def clear_cuda_cache():
+    """Clear CUDA cache if available"""
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Optional: synchronize to ensure cache is cleared
+        torch.cuda.synchronize()
+
+def process_single_video(
     prompt: str,
-    width: int,  # Changed from video_size
+    width: int,
     height: int,
-    batch_size: int,
     video_length: int,
     fps: int,
     infer_steps: int,
@@ -230,166 +237,175 @@ def generate_video(
     lora4_multiplier: float = 1.0,
     video_path: Optional[str] = None,
     strength: Optional[float] = None
-) -> Generator[List[Tuple[str, str]], None, None]:  
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     global stop_event
-    stop_event.clear()  # Reset stop event at start
+    
+    if stop_event.is_set():
+        yield [], "", ""
+        return
 
-    progress_text = "Starting generation..."
-    batch_text = "Preparing..."
-    yield [], batch_text, progress_text
+    current_seed = random.randint(0, 2**32 - 1) if seed == -1 else seed
+    
+    clear_cuda_cache()
 
-    generated_videos = []
-    seeds = []
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["BATCH_RUN_ID"] = f"{time.time()}"
 
-    for batch_idx in range(batch_size):
+    command = [
+        sys.executable,
+        "hv_generate_video.py",
+        "--dit", model,
+        "--vae", vae,
+        "--text_encoder1", te1,
+        "--text_encoder2", te2,
+        "--prompt", prompt,
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", save_path,
+        "--seed", str(current_seed),
+        "--fp8",
+        "--flow_shift", str(flow_shift),
+        "--embedded_cfg_scale", str(cfg_scale),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(block_swap),
+        "--fp8_llm",
+        "--vae_chunk_size", "32",
+        "--vae_spatial_tile_sample_min_size", "128"
+    ]
+
+    # Add LoRA weights and multipliers if provided
+    valid_loras = []
+    for weight, mult in zip([lora1, lora2, lora3, lora4], 
+                          [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+        if weight and weight != "None":
+            valid_loras.append((os.path.join(lora_folder, weight), mult))
+    if valid_loras:
+        weights = [weight for weight, _ in valid_loras]
+        multipliers = [str(mult) for _, mult in valid_loras]
+        command.extend(["--lora_weight"] + weights)
+        command.extend(["--lora_multiplier"] + multipliers)
+
+    if exclude_single_blocks:
+        command.append("--exclude_single_blocks")
+    if use_split_attn:
+        command.append("--split_attn")
+    if video_path:
+        command.extend(["--video_path", video_path])
+        if strength is not None:
+            command.extend(["--strength", str(strength)])
+
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    videos = []
+    
+    while True:
         if stop_event.is_set():
-            break  # Exit early if stopped
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
 
-        current_seed = random.randint(0, 2**32 - 1) if (batch_size > 1 or seed == -1) else seed
-        seeds.append(current_seed)
-        
-        batch_text = f"Generating video {batch_idx + 1} of {batch_size} (seed: {current_seed})"
-        print(f"\n--- {batch_text} ---\n")
-        yield generated_videos.copy(), batch_text, progress_text
-        
-        command = [
-            sys.executable,
-            "hv_generate_video.py",
-            "--dit", model,
-            "--vae", vae,
-            "--text_encoder1", te1,
-            "--text_encoder2", te2,
-            "--prompt", prompt,
-            "--video_size", str(height), str(width), 
-            "--video_length", str(video_length),
-            "--fps", str(fps),
-            "--infer_steps", str(infer_steps),
-            "--save_path", save_path,
-            "--seed", str(current_seed),  # Ensure seed is converted to string
-            "--fp8",
-            "--flow_shift", str(flow_shift),
-            "--embedded_cfg_scale", str(cfg_scale),
-            "--output_type", output_type,
-            "--attn_mode", attn_mode,
-            "--blocks_to_swap", str(block_swap),
-            "--fp8_llm",
-            "--vae_chunk_size", "32",
-            "--vae_spatial_tile_sample_min_size", "128"            
-        ]
-
-        # Add LoRA weights and multipliers if provided
-        valid_loras = []
-        for weight, mult in zip([lora1, lora2, lora3, lora4], [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
-            if weight and weight != "None":
-                valid_loras.append((os.path.join(lora_folder, weight), mult))
-        if valid_loras:
-            weights = [weight for weight, _ in valid_loras]
-            multipliers = [str(mult) for _, mult in valid_loras]
-            command.extend(["--lora_weight"] + weights)
-            command.extend(["--lora_multiplier"] + multipliers)
-
-        if exclude_single_blocks:
-            command.append("--exclude_single_blocks")
-        if use_split_attn:
-            command.append("--split_attn")
-
-        # Add video2video parameters if provided
-        if video_path:
-            command.extend(["--video_path", video_path])
-            if strength is not None:
-                command.extend(["--strength", str(strength)])
-        
-        # Get current environment variables
-        env = os.environ.copy()
-        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
-        # Explicitly set PYTHONIOENCODING to ensure proper UTF-8 handling
-        env["PYTHONIOENCODING"] = "utf-8"
-        
-        # Modified subprocess setup with stdout capture
-        p = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            text=True,  # Use text mode instead of universal_newlines
-            encoding='utf-8',  # Explicitly specify UTF-8 encoding
-            errors='replace',  # Replace invalid characters
-            bufsize=1
-        )
-
-        # Read output line by line and print to console
-        while True:
-            line = p.stdout.readline()
-            if not line:
-                if p.poll() is not None:
-                    break
-                continue
-                
-            # Print to console immediately
-            print(line)
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
             
-            # Check for progress percentage
-            if '|' in line and '%' in line and '[' in line and ']' in line:
-                # This captures lines that look like: 76%|██████████████████████████▉    | 38/50 [00:19<00:06,  1.92it/s]
-                progress_text = line
-                yield generated_videos.copy(), batch_text, progress_text
+        print(line, end='')
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
 
-            if stop_event.is_set():
-                p.terminate()
-                p.wait()
-                print("Generation stopped by user.")
-                return
+    p.stdout.close()
+    p.wait()
 
-        p.stdout.close()
-        p.wait()
+    clear_cuda_cache()
+    time.sleep(0.5)
 
-        # Collect generated videos after each batch
-        save_path_abs = os.path.abspath(save_path)
-        if os.path.exists(save_path_abs):
-            all_videos = sorted(
-                [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
-                key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
-                reverse=True
-            )
-            matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
-            if matching_videos:
-                video_path = os.path.join(save_path_abs, matching_videos[0])
+    # Collect generated video
+    save_path_abs = os.path.abspath(save_path)
+    if os.path.exists(save_path_abs):
+        all_videos = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
+        if matching_videos:
+            video_path = os.path.join(save_path_abs, matching_videos[0])
+            
+            # Collect parameters for metadata
+            parameters = {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "video_length": video_length,
+                "fps": fps,
+                "infer_steps": infer_steps,
+                "seed": current_seed,
+                "model": model,
+                "vae": vae,
+                "te1": te1,
+                "te2": te2,
+                "save_path": save_path,
+                "flow_shift": flow_shift,
+                "cfg_scale": cfg_scale,
+                "output_type": output_type,
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "lora_weights": [lora1, lora2, lora3, lora4],
+                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                "input_video": video_path if video_path else None,
+                "strength": strength
+            }
+            
+            add_metadata_to_video(video_path, parameters)
+            videos.append((str(video_path), f"Seed: {current_seed}"))
 
-                # Collect parameters for metadata
-                parameters = {
-                    "prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "batch_size": batch_size,
-                    "video_length": video_length,
-                    "fps": fps,
-                    "infer_steps": infer_steps,
-                    "seed": current_seed,
-                    "model": model,
-                    "vae": vae,
-                    "te1": te1,
-                    "te2": te2,
-                    "save_path": save_path,
-                    "flow_shift": flow_shift,
-                    "cfg_scale": cfg_scale,
-                    "output_type": output_type,
-                    "attn_mode": attn_mode,
-                    "block_swap": block_swap,
-                    "lora_weights": [lora1, lora2, lora3, lora4],
-                    "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
-                    "input_video": video_path,
-                    "strength": strength
-                }
-                
-                # Add metadata to the video file
-                add_metadata_to_video(video_path, parameters)
-                
-                # Append to generated_videos
-                generated_videos.append((str(video_path), f"Seed: {current_seed}"))
+    yield videos, f"Completed (seed: {current_seed})", ""
 
-                yield generated_videos.copy(), batch_text, ""
+def process_batch(
+    prompt: str,
+    width: int,
+    height: int,
+    batch_size: int,
+    *args
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Process a batch of videos using Gradio's queue"""
+    global stop_event
+    stop_event.clear()
 
-    yield generated_videos, "", ""
+    all_videos = []
+    progress_text = "Starting generation..."
+    yield [], "Preparing...", progress_text
+
+    for i in range(batch_size):
+        if stop_event.is_set():
+            break
+
+        batch_text = f"Generating video {i + 1} of {batch_size}"
+        yield all_videos.copy(), batch_text, progress_text
+
+        for videos, status, progress in process_single_video(prompt, width, height, *args):
+            if videos:
+                all_videos.extend(videos)
+            yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+
+    yield all_videos, "Batch complete", ""
+
 
 # UI setup
 with gr.Blocks(
@@ -964,14 +980,16 @@ with gr.Blocks(
 
     # Generate button handler
     i2v_generate_btn.click(
-        fn=generate_from_image,
+        fn=process_batch,
         inputs=[
-            i2v_input, i2v_prompt, i2v_max_res, i2v_video_length, i2v_fps, i2v_infer_steps,
-            i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, i2v_save_path, i2v_flow_shift, i2v_cfg_scale, 
-            i2v_output_type, i2v_attn_mode, i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn,
-            i2v_lora_folder, i2v_strength, i2v_batch_size
-        ] + i2v_lora_weights + i2v_lora_multipliers,
-        outputs=[i2v_output, i2v_batch_progress, i2v_progress_text]
+            i2v_prompt, i2v_max_res, i2v_max_res, i2v_batch_size, i2v_video_length, 
+            i2v_fps, i2v_infer_steps, i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, 
+            i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
+            i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
+            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength
+        ],
+        outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
+        queue=True
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
         inputs=[i2v_batch_size],
@@ -1128,18 +1146,20 @@ with gr.Blocks(
     )
     # Text to Video generation
     generate_btn.click(
-        fn=generate_video,
+        fn=process_batch,
         inputs=[
-            prompt, width, height, batch_size, video_length, fps, infer_steps,  # Updated inputs
-            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
-            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn, lora_folder
-        ] + lora_weights + lora_multipliers,
-        outputs=[video_output, batch_progress, progress_text]
+            prompt, width, height, batch_size, video_length, fps, infer_steps,
+            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+            lora_folder, *lora_weights, *lora_multipliers
+        ],
+        outputs=[video_output, batch_progress, progress_text],
+        queue=True
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
         inputs=[batch_size],
         outputs=selected_index
-    )
+    )    
 
     # Update gallery selection handling
     def handle_gallery_select(evt: gr.SelectData) -> int:
@@ -1338,14 +1358,20 @@ with gr.Blocks(
 
     # Video to Video generation
     v2v_generate_btn.click(
-        fn=generate_video,
+        fn=process_batch,
         inputs=[
-            v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length,  # Updated inputs
-            v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, 
-            v2v_te1, v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, 
-            v2v_output_type, v2v_attn_mode, v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder
-        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_input, v2v_strength],
-        outputs=[v2v_output, v2v_batch_progress, v2v_progress_text]
+            v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length, 
+            v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, v2v_te1, v2v_te2, 
+            v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, 
+            v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder, 
+            *v2v_lora_weights, *v2v_lora_multipliers, v2v_input, v2v_strength
+        ],
+        outputs=[v2v_output, v2v_batch_progress, v2v_progress_text],
+        queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[v2v_batch_size],
+        outputs=v2v_selected_index
     )
     refresh_outputs = []
     for i in range(4):
