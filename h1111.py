@@ -545,8 +545,8 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     
-                    width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width", elem_id="my_special_slider")
-                    height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height", elem_id="my_special_slider")
+                    t2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
+                    t2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
                     video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25, elem_id="my_special_slider")
                     fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24, elem_id="my_special_slider")
                     infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30, elem_id="my_special_slider")
@@ -1410,7 +1410,7 @@ with gr.Blocks(
     generate_btn.click(
         fn=process_batch,
         inputs=[
-            prompt, width, height, batch_size, video_length, fps, infer_steps,
+            prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
             seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,  # Added dit_folder
             output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
             lora_folder, *lora_weights, *lora_multipliers
@@ -1515,7 +1515,7 @@ with gr.Blocks(
         fn=handle_send_button,
         inputs=[
             video_output, prompt, selected_index,
-            width, height, batch_size, video_length,
+            t2v_width, t2v_height, batch_size, video_length,
             fps, infer_steps, seed, flow_shift, cfg_scale
         ] + lora_weights + lora_multipliers,
         outputs=[
