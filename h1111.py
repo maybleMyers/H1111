@@ -1026,20 +1026,22 @@ with gr.Blocks(
     def image_to_video(image_path, output_path, frames=240, max_res=None):
         img = Image.open(image_path)
         width, height = img.size
-
+    
         # Determine new dimensions
         if max_res:
             if width > height:
-                aspect_ratio = width / height
-                new_width = min(width, max_res)
-                new_height = int(new_width / aspect_ratio)
+                # Scale width to max_res and adjust height proportionally
+                scale = min(max_res / width, 1.0)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
             else:
-                aspect_ratio = height / width
-                new_height = min(height, max_res)
-                new_width = int(new_height / aspect_ratio)
+                # Scale height to max_res and adjust width proportionally
+                scale = min(max_res / height, 1.0)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
         else:
             new_width, new_height = width, height
-
+    
         # Ensure dimensions are divisible by 8
         new_width = (new_width // 8) * 8
         new_height = (new_height // 8) * 8
