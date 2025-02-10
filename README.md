@@ -9,6 +9,7 @@ It allows simple inference with hunyuan video model , with video2video, image2vi
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
+If you are using a lora that you didn't train with musubi you need to drag it to the convert lora tab and convert it to the default format. It should spit it out into the /lora folder.
 
 ## Requirements
 
