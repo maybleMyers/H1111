@@ -20,6 +20,43 @@ import math
 # Add global stop event
 stop_event = threading.Event()
 
+def get_dit_models(dit_folder: str) -> List[str]:
+    """Get list of available DiT models in the specified folder"""
+    if not os.path.exists(dit_folder):
+        return ["mp_rank_00_model_states.pt"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.pt') or f.endswith('.safetensors')]
+    models.sort(key=str.lower)
+    return models if models else ["mp_rank_00_model_states.pt"]
+
+def update_dit_and_lora_dropdowns(dit_folder: str, lora_folder: str, *current_values) -> List[gr.update]:
+    """Update both DiT and LoRA dropdowns"""
+    # Get model lists
+    dit_models = get_dit_models(dit_folder)
+    lora_choices = get_lora_options(lora_folder)
+    
+    # Current values processing
+    dit_value = current_values[0]
+    if dit_value not in dit_models:
+        dit_value = dit_models[0] if dit_models else None
+        
+    weights = current_values[1:5]
+    multipliers = current_values[5:9]
+    
+    results = [gr.update(choices=dit_models, value=dit_value)]
+    
+    # Add LoRA updates
+    for i in range(4):
+        weight = weights[i] if i < len(weights) else "None"
+        multiplier = multipliers[i] if i < len(multipliers) else 1.0
+        if weight not in lora_choices:
+            weight = "None"
+        results.extend([
+            gr.update(choices=lora_choices, value=weight),
+            gr.update(value=multiplier)
+        ])
+    
+    return results
+
 def extract_video_metadata(video_path: str) -> Dict:
     """Extract metadata from video file using ffprobe."""
     cmd = [
@@ -214,6 +251,7 @@ def process_single_video(
     fps: int,
     infer_steps: int,
     seed: int,
+    dit_folder: str,
     model: str,
     vae: str,
     te1: str,
@@ -244,6 +282,7 @@ def process_single_video(
         yield [], "", ""
         return
 
+    model_path = os.path.join(dit_folder, model)
     current_seed = random.randint(0, 2**32 - 1) if seed == -1 else seed
     
     clear_cuda_cache()
@@ -256,7 +295,7 @@ def process_single_video(
     command = [
         sys.executable,
         "hv_generate_video.py",
-        "--dit", model,
+        "--dit", model_path,
         "--vae", vae,
         "--text_encoder1", te1,
         "--text_encoder2", te2,
@@ -553,7 +592,14 @@ with gr.Blocks(
             with gr.Row():
                 exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
                 seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
+                dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                model = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("hunyuan"),
+                    value="mp_rank_00_model_states.pt",
+                    allow_custom_value=True,
+                    interactive=True
+                )
                 vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
                 te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
@@ -631,7 +677,15 @@ with gr.Blocks(
             with gr.Row():
                 i2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
                 i2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                i2v_model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
+                i2v_dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                i2v_model = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("hunyuan"),
+                    value="mp_rank_00_model_states.pt",
+                    allow_custom_value=True,
+                    interactive=True
+                )
+
                 i2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 i2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
                 i2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
@@ -704,7 +758,14 @@ with gr.Blocks(
             with gr.Row():
                 v2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
                 v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                v2v_model = gr.Textbox(label="Enter dit location", value="hunyuan/mp_rank_00_model_states.pt")
+                v2v_dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                v2v_model = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("hunyuan"),
+                    value="mp_rank_00_model_states.pt",
+                    allow_custom_value=True,
+                    interactive=True
+                )
                 v2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
                 v2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
                 v2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
@@ -803,7 +864,158 @@ with gr.Blocks(
                 inputs=[input_file, output_name, format_radio],
                 outputs=status_output
             )
+        with gr.Tab("Model Merging") as model_merge_tab:
+            with gr.Row():
+                with gr.Column():
+                    # Model selection
+                    dit_model = gr.Dropdown(
+                        label="Base DiT Model",
+                        choices=["mp_rank_00_model_states.pt"],
+                        value="mp_rank_00_model_states.pt",
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+            with gr.Row():
+                with gr.Column():
+                    # Output model name
+                    output_model = gr.Textbox(label="Output Model Name", value="merged_model.safetensors")
+                    exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
+                    merge_btn = gr.Button("Merge Models", variant="primary")
+                    merge_status = gr.Textbox(label="Status", interactive=False)
+            with gr.Row():
+                # LoRA selection section (similar to Text2Video)
+                merge_lora_weights = []
+                merge_lora_multipliers = []
+                for i in range(4):
+                    with gr.Column():
+                        merge_lora_weights.append(gr.Dropdown(
+                            label=f"LoRA {i+1}",
+                            choices=get_lora_options(),
+                            value="None",
+                            allow_custom_value=True,
+                            interactive=True
+                        ))
+                        merge_lora_multipliers.append(gr.Slider(
+                            label=f"Multiplier",
+                            minimum=0.0,
+                            maximum=2.0,
+                            step=0.05,
+                            value=1.0
+                        ))
+                with gr.Row():
+                    merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                    dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                        
 
+    # Function to get available DiT models
+    def get_dit_models(dit_folder: str) -> List[str]:
+        if not os.path.exists(dit_folder):
+            return ["mp_rank_00_model_states.pt"]
+        models = [f for f in os.listdir(dit_folder) if f.endswith('.pt') or f.endswith('.safetensors')]
+        models.sort(key=str.lower)
+        return models if models else ["mp_rank_00_model_states.pt"]
+
+    # Function to perform model merging
+    def merge_models(
+        dit_folder: str,
+        dit_model: str,
+        output_model: str,
+        exclude_single_blocks: bool,
+        merge_lora_folder: str,
+        *lora_params  # Will contain both weights and multipliers
+    ) -> str:
+        try:
+            # Separate weights and multipliers
+            num_loras = len(lora_params) // 2
+            weights = list(lora_params[:num_loras])
+            multipliers = list(lora_params[num_loras:])
+
+            # Filter out "None" selections
+            valid_loras = []
+            for weight, mult in zip(weights, multipliers):
+                if weight and weight != "None":
+                    valid_loras.append((os.path.join(merge_lora_folder, weight), mult))
+
+            if not valid_loras:
+                return "No LoRA models selected for merging"
+
+            # Create output path in the dit folder
+            os.makedirs(dit_folder, exist_ok=True)
+            output_path = os.path.join(dit_folder, output_model)
+            
+            # Prepare command
+            cmd = [
+                sys.executable,
+                "merge_lora.py",
+                "--dit", os.path.join(dit_folder, dit_model),
+                "--save_merged_model", output_path
+            ]
+
+            # Add LoRA weights and multipliers
+            weights = [weight for weight, _ in valid_loras]
+            multipliers = [str(mult) for _, mult in valid_loras]
+            cmd.extend(["--lora_weight"] + weights)
+            cmd.extend(["--lora_multiplier"] + multipliers)
+
+            if exclude_single_blocks:
+                cmd.append("--exclude_single_blocks")
+
+            # Execute merge operation
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            if os.path.exists(output_path):
+                return f"Successfully merged model and saved to {output_path}"
+            else:
+                return "Error: Output file not created"
+
+        except subprocess.CalledProcessError as e:
+            return f"Error during merging: {e.stderr}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    # Update DiT model dropdown
+    def update_dit_dropdown(dit_folder: str) -> Dict:
+        models = get_dit_models(dit_folder)
+        return gr.update(choices=models, value=models[0] if models else None)
+
+    # Connect events
+    merge_btn.click(
+        fn=merge_models,
+        inputs=[
+            dit_folder,
+            dit_model,
+            output_model,
+            exclude_single_blocks,
+            merge_lora_folder,
+            *merge_lora_weights,
+            *merge_lora_multipliers
+        ],
+        outputs=merge_status
+    )
+
+    # Refresh buttons for both DiT and LoRA dropdowns
+    merge_refresh_btn.click(
+        fn=lambda f: update_dit_dropdown(f),
+        inputs=[dit_folder],
+        outputs=[dit_model]
+    )
+
+    # LoRA refresh handling
+    merge_refresh_outputs = []
+    for i in range(4):
+        merge_refresh_outputs.extend([merge_lora_weights[i], merge_lora_multipliers[i]])
+
+    merge_refresh_btn.click(
+        fn=update_lora_dropdowns,
+        inputs=[merge_lora_folder] + merge_lora_weights + merge_lora_multipliers,
+        outputs=merge_refresh_outputs
+    )
     # Event handlers
     prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
     v2v_prompt.change(fn=count_prompt_tokens, inputs=v2v_prompt, outputs=v2v_token_counter)
@@ -983,7 +1195,7 @@ with gr.Blocks(
         fn=process_batch,
         inputs=[
             i2v_prompt, i2v_max_res, i2v_max_res, i2v_batch_size, i2v_video_length, 
-            i2v_fps, i2v_infer_steps, i2v_seed, i2v_model, i2v_vae, i2v_te1, i2v_te2, 
+            i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,  # Added i2v_dit_folder
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
             *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength
@@ -1149,7 +1361,7 @@ with gr.Blocks(
         fn=process_batch,
         inputs=[
             prompt, width, height, batch_size, video_length, fps, infer_steps,
-            seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,  # Added dit_folder
             output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
             lora_folder, *lora_weights, *lora_multipliers
         ],
@@ -1361,7 +1573,7 @@ with gr.Blocks(
         fn=process_batch,
         inputs=[
             v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length, 
-            v2v_fps, v2v_infer_steps, v2v_seed, v2v_model, v2v_vae, v2v_te1, v2v_te2, 
+            v2v_fps, v2v_infer_steps, v2v_seed, v2v_dit_folder, v2v_model, v2v_vae, v2v_te1, v2v_te2,  # Added v2v_dit_folder
             v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, 
             v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder, 
             *v2v_lora_weights, *v2v_lora_multipliers, v2v_input, v2v_strength
@@ -1373,34 +1585,34 @@ with gr.Blocks(
         inputs=[v2v_batch_size],
         outputs=v2v_selected_index
     )
-    refresh_outputs = []
+    refresh_outputs = [model]  # Add model dropdown to outputs
     for i in range(4):
         refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
     
-
     refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[lora_folder] + lora_weights + lora_multipliers,  # Include both weights and multipliers
+        fn=update_dit_and_lora_dropdowns,
+        inputs=[dit_folder, lora_folder, model] + lora_weights + lora_multipliers,
         outputs=refresh_outputs
     )
-
-    i2v_refresh_outputs = []
+    # Image2Video refresh
+    i2v_refresh_outputs = [i2v_model]  # Add model dropdown to outputs
     for i in range(4):
         i2v_refresh_outputs.extend([i2v_lora_weights[i], i2v_lora_multipliers[i]])
-
+    
     i2v_refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[i2v_lora_folder] + i2v_lora_weights + i2v_lora_multipliers,
+        fn=update_dit_and_lora_dropdowns,
+        inputs=[i2v_dit_folder, i2v_lora_folder, i2v_model] + i2v_lora_weights + i2v_lora_multipliers,
         outputs=i2v_refresh_outputs
     )
     
-    v2v_refresh_outputs = []
+    # Video2Video refresh
+    v2v_refresh_outputs = [v2v_model]  # Add model dropdown to outputs
     for i in range(4):
         v2v_refresh_outputs.extend([v2v_lora_weights[i], v2v_lora_multipliers[i]])
-        
+    
     v2v_refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[v2v_lora_folder] + v2v_lora_weights + v2v_lora_multipliers,  # Include both weights and multipliers
+        fn=update_dit_and_lora_dropdowns,
+        inputs=[v2v_dit_folder, v2v_lora_folder, v2v_model] + v2v_lora_weights + v2v_lora_multipliers,
         outputs=v2v_refresh_outputs
     )
 
