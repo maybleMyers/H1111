@@ -633,7 +633,16 @@ with gr.Blocks(
                 with gr.Column():
                     i2v_input = gr.Image(label="Input Image", type="filepath")
                     i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
-                    i2v_max_res = gr.Number(label="Max Resolution (Width or Height)", value=544, step=8, minimum=64, maximum=1536)
+
+                    original_dims = gr.Textbox(label="Original Dimensions", interactive=False)
+                    # Scale slider as percentage 
+                    scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    # Width and height inputs
+                    width = gr.Number(label="Width (divisible by 8)", value=544, step=8)
+                    height = gr.Number(label="Height (divisible by 8)", value=544, step=8)
+                    calc_width_btn = gr.Button("Calculate Width")
+                    calc_height_btn = gr.Button("Calculate Height")
+
                     i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                     i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                     i2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -906,7 +915,64 @@ with gr.Blocks(
                 with gr.Row():
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
-                        
+
+##Image 2 video dimension logic
+    def update_dimensions(image):
+        if image is None:
+            return "", gr.update(value=544), gr.update(value=544)
+        img = Image.open(image)
+        w, h = img.size
+        # Make dimensions divisible by 8
+        w = (w // 8) * 8
+        h = (h // 8) * 8
+        return f"{w}x{h}", w, h
+
+    def calculate_width(height, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_width = math.floor((height * aspect_ratio) / 8) * 8
+        return gr.update(value=new_width)
+
+    def calculate_height(width, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_height = math.floor((width / aspect_ratio) / 8) * 8
+        return gr.update(value=new_height)
+
+    def update_from_scale(scale, original_dims):
+        if not original_dims:
+            return gr.update(), gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        new_w = math.floor((orig_w * scale / 100) / 8) * 8
+        new_h = math.floor((orig_h * scale / 100) / 8) * 8
+        return gr.update(value=new_w), gr.update(value=new_h)            
+    i2v_input.change(
+        fn=update_dimensions,
+        inputs=[i2v_input],
+        outputs=[original_dims, width, height]
+    )
+
+    scale_slider.change(
+        fn=update_from_scale,
+        inputs=[scale_slider, original_dims],
+        outputs=[width, height]
+    )
+
+    calc_width_btn.click(
+        fn=calculate_width,
+        inputs=[height, original_dims],
+        outputs=[width]
+    )
+
+    calc_height_btn.click(
+        fn=calculate_height,
+        inputs=[width, original_dims],
+        outputs=[height]
+    )            
 
     # Function to get available DiT models
     def get_dit_models(dit_folder: str) -> List[str]:
@@ -1023,39 +1089,20 @@ with gr.Blocks(
     v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
     #Image_to_Video
-    def image_to_video(image_path, output_path, frames=240, max_res=None):
+    def image_to_video(image_path, output_path, width, height, frames=240):  # Add width, height parameters
         img = Image.open(image_path)
-        width, height = img.size
-    
-        # Determine new dimensions
-        if max_res:
-            if width > height:
-                # Scale width to max_res and adjust height proportionally
-                scale = min(max_res / width, 1.0)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-            else:
-                # Scale height to max_res and adjust width proportionally
-                scale = min(max_res / height, 1.0)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-        else:
-            new_width, new_height = width, height
-    
-        # Ensure dimensions are divisible by 8
-        new_width = (new_width // 8) * 8
-        new_height = (new_height // 8) * 8
 
-        img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+        # Resize to the specified dimensions
+        img_resized = img.resize((width, height), Image.LANCZOS)
         temp_image_path = os.path.join(os.path.dirname(output_path), "temp_resized_image.png")
         img_resized.save(temp_image_path)
-    
-        # Use FFmpeg to create the video
+
+        # Rest of function remains the same
         frame_rate = 24
-        duration = frames / frame_rate  # Convert frames to duration in seconds
+        duration = frames / frame_rate
         command = [
-            "ffmpeg", "-loop", "1", "-i", temp_image_path, "-c:v", "libx264", 
-            "-t", str(duration), "-pix_fmt", "yuv420p", 
+            "ffmpeg", "-loop", "1", "-i", temp_image_path, "-c:v", "libx264",
+            "-t", str(duration), "-pix_fmt", "yuv420p",
             "-vf", f"fps={frame_rate}", output_path
         ]
         
@@ -1074,7 +1121,7 @@ with gr.Blocks(
 
     def generate_from_image(
         image_path, 
-        prompt, max_res, video_length, fps, infer_steps,
+        prompt, width, height, video_length, fps, infer_steps,
         seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
         output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
         lora_folder, strength, batch_size, *lora_params
@@ -1088,7 +1135,7 @@ with gr.Blocks(
     
         try:
             # Convert image to video
-            if not image_to_video(image_path, temp_video_path, frames=video_length, max_res=max_res):
+            if not image_to_video(image_path, temp_video_path, width, height, frames=video_length):
                 yield [], "Failed to create temporary video", "Error in video creation"
                 return
     
@@ -1196,8 +1243,9 @@ with gr.Blocks(
     i2v_generate_btn.click(
         fn=process_batch,
         inputs=[
-            i2v_prompt, i2v_max_res, i2v_max_res, i2v_batch_size, i2v_video_length, 
-            i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,  # Added i2v_dit_folder
+            i2v_prompt, width, height,  # Add width, height here
+            i2v_batch_size, i2v_video_length, 
+            i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
             *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength
@@ -1219,7 +1267,7 @@ with gr.Blocks(
         fn=send_i2v_to_v2v,
         inputs=[
             i2v_output, i2v_prompt, i2v_selected_index,
-            i2v_max_res, i2v_max_res,  # Using max_res for both width and height
+            width, height,
             i2v_video_length, i2v_fps, i2v_infer_steps,
             i2v_seed, i2v_flow_shift, i2v_cfg_scale
         ] + i2v_lora_weights + i2v_lora_multipliers,
