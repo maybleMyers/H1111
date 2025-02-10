@@ -7,7 +7,7 @@ https://github.com/kohya-ss/musubi-tuner
 
 It allows simple inference with hunyuan video model , with video2video, image2video and text2video support.
 
-If you are running out of vram use block swapping and some form of attention besides sdpa or torch and split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
+If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
 
 ## Requirements
@@ -19,7 +19,7 @@ If you are running out of vram use block swapping and some form of attention bes
 
 If you already have musubi tuner installed and running you should just be able to just download h1111.py and hv_generate_video.py and put them in your musubi directory
 
-pip install gradio tiktoken ffmpeg ffmpeg-python
+pip install gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 
 then run with python h1111.py
 
@@ -47,7 +47,7 @@ python -m venv env
 source env/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg ffmpeg-python
+pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation
 pip install sageattention==1.0.6
 might need python3.10-dev as well for sage attention to work
