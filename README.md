@@ -5,6 +5,10 @@
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
+It allows simple inference with hunyuan video model , with video2video, image2video and text2video support.
+
+If you are running out of vram use block swapping and some form of attention besides sdpa or torch and split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
+
 
 ## Requirements
 
@@ -13,7 +17,7 @@ https://github.com/kohya-ss/musubi-tuner
 
 ## Basic Installation
 
-If you already have musubi tuner installed and running you should just be able to just download h1111.py and hv_generate_video.py and put them in your misubi directory
+If you already have musubi tuner installed and running you should just be able to just download h1111.py and hv_generate_video.py and put them in your musubi directory
 
 pip install gradio tiktoken ffmpeg ffmpeg-python
 
@@ -66,7 +70,7 @@ https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/resolve/main/split_file
 
 https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial/resolve/main/mp_rank_00_model_states_fp8.safetensors
 
-place models in hunyuan folder
+place models in H1111/hunyuan folder
 
 First, open PowerShell and navigate to your desired installation directory. Then run these commands:
 
