@@ -633,16 +633,15 @@ with gr.Blocks(
                 with gr.Column():
                     i2v_input = gr.Image(label="Input Image", type="filepath")
                     i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
-
-                    original_dims = gr.Textbox(label="Original Dimensions", interactive=False)
                     # Scale slider as percentage 
                     scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
                     # Width and height inputs
-                    width = gr.Number(label="Width (divisible by 8)", value=544, step=8)
-                    height = gr.Number(label="Height (divisible by 8)", value=544, step=8)
-                    calc_width_btn = gr.Button("Calculate Width")
-                    calc_height_btn = gr.Button("Calculate Height")
-
+                    with gr.Row():
+                        width = gr.Number(label="New Width", value=544, step=16)
+                        calc_height_btn = gr.Button("→")
+                        calc_width_btn = gr.Button("←")
+                        height = gr.Number(label="New Height", value=544, step=16)
                     i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                     i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                     i2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -916,23 +915,13 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
-##Image 2 video dimension logic
-    def update_dimensions(image):
-        if image is None:
-            return "", gr.update(value=544), gr.update(value=544)
-        img = Image.open(image)
-        w, h = img.size
-        # Make dimensions divisible by 8
-        w = (w // 8) * 8
-        h = (h // 8) * 8
-        return f"{w}x{h}", w, h
-
+    ##Image 2 video dimension logic
     def calculate_width(height, original_dims):
         if not original_dims:
             return gr.update()
         orig_w, orig_h = map(int, original_dims.split('x'))
         aspect_ratio = orig_w / orig_h
-        new_width = math.floor((height * aspect_ratio) / 8) * 8
+        new_width = math.floor((height * aspect_ratio) / 16) * 16  # Changed from 8 to 16
         return gr.update(value=new_width)
 
     def calculate_height(width, original_dims):
@@ -940,16 +929,26 @@ with gr.Blocks(
             return gr.update()
         orig_w, orig_h = map(int, original_dims.split('x'))
         aspect_ratio = orig_w / orig_h
-        new_height = math.floor((width / aspect_ratio) / 8) * 8
+        new_height = math.floor((width / aspect_ratio) / 16) * 16  # Changed from 8 to 16
         return gr.update(value=new_height)
 
     def update_from_scale(scale, original_dims):
         if not original_dims:
             return gr.update(), gr.update()
         orig_w, orig_h = map(int, original_dims.split('x'))
-        new_w = math.floor((orig_w * scale / 100) / 8) * 8
-        new_h = math.floor((orig_h * scale / 100) / 8) * 8
-        return gr.update(value=new_w), gr.update(value=new_h)            
+        new_w = math.floor((orig_w * scale / 100) / 16) * 16  # Changed from 8 to 16
+        new_h = math.floor((orig_h * scale / 100) / 16) * 16  # Changed from 8 to 16
+        return gr.update(value=new_w), gr.update(value=new_h)
+
+    def update_dimensions(image):
+        if image is None:
+            return "", gr.update(value=544), gr.update(value=544)
+        img = Image.open(image)
+        w, h = img.size
+        # Make dimensions divisible by 16
+        w = (w // 16) * 16  # Changed from 8 to 16
+        h = (h // 16) * 16  # Changed from 8 to 16
+        return f"{w}x{h}", w, h
     i2v_input.change(
         fn=update_dimensions,
         inputs=[i2v_input],
@@ -1235,6 +1234,7 @@ with gr.Blocks(
         if isinstance(video_path, tuple):
             video_path = video_path[0]
 
+        # Use the original width and height without doubling
         return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
                 flow_shift, cfg_scale, lora1, lora2, lora3, lora4, 
                 lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
