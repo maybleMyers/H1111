@@ -528,7 +528,7 @@ with gr.Blocks(
         
     with gr.Tabs() as tabs:
         # Text to Video Tab
-        with gr.Tab("Text to Video"):
+        with gr.Tab(id=1, label="Text to Video"):
             with gr.Row():
                 with gr.Column(scale=4):
                     prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -615,7 +615,7 @@ with gr.Blocks(
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         #Image to Video Tab
-        with gr.Tab(id=1, label="Image to Video") as i2v_tab:
+        with gr.Tab(label="Image to Video") as i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
