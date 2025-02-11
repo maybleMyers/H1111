@@ -282,7 +282,10 @@ def process_single_video(
         yield [], "", ""
         return
 
-    model_path = os.path.join(dit_folder, model)
+    if os.path.isabs(model):
+        model_path = model
+    else:
+        model_path = os.path.normpath(os.path.join(dit_folder, model))
     current_seed = random.randint(0, 2**32 - 1) if seed == -1 else seed
     
     clear_cuda_cache()
