@@ -548,8 +548,8 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     
-                    t2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
-                    t2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                    t2v_width = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Width")
+                    t2v_height = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Height")
                     video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25, elem_id="my_special_slider")
                     fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24, elem_id="my_special_slider")
                     infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30, elem_id="my_special_slider")
@@ -730,8 +730,8 @@ with gr.Blocks(
                 with gr.Column():
                     v2v_input = gr.Video(label="Input Video", format="mp4")
                     v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
-                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Width")
-                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=8, value=544, label="Video Height")
+                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Width")
+                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Height")
                     v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                     v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                     v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -1438,8 +1438,10 @@ with gr.Blocks(
 
     # Track selected index when Video2Video gallery item is clicked
     def handle_v2v_gallery_select(evt: gr.SelectData) -> int:
+        """Handle gallery selection without automatically updating the input"""
         return evt.index
-
+    
+    # Update the gallery selection event
     v2v_output.select(
         fn=handle_v2v_gallery_select,
         outputs=v2v_selected_index
@@ -1600,25 +1602,33 @@ with gr.Blocks(
             return None, ""
 
         selected_item = gallery[idx]
+        video_path = None
 
-        # Handle different gallery item formats (same as Text to Video)
-        if isinstance(selected_item, dict):
+        # Handle different gallery item formats
+        if isinstance(selected_item, tuple):
+            video_path = selected_item[0]  # Gallery returns (path, caption)
+        elif isinstance(selected_item, dict):
             video_path = selected_item.get("name", selected_item.get("data", None))
-        elif isinstance(selected_item, (tuple, list)):
-            video_path = selected_item[0]
-        else:
+        elif isinstance(selected_item, str):
             video_path = selected_item
 
-        # Final cleanup for Gradio Video component
-        if isinstance(video_path, tuple):
-            video_path = video_path[0]
+        if not video_path:
+            return None, ""
 
-        return str(video_path), prompt
+        # Check if the file exists and is accessible
+        if not os.path.exists(video_path):
+            print(f"Warning: Video file not found at {video_path}")
+            return None, ""
+
+        return video_path, prompt
 
     v2v_send_to_input_btn.click(
         fn=handle_v2v_send_button,
         inputs=[v2v_output, v2v_prompt, v2v_selected_index],
         outputs=[v2v_input, v2v_prompt]
+    ).then(
+        lambda: gr.update(visible=True),  # Ensure the video input is visible
+        outputs=v2v_input
     )
 
     # Video to Video generation
