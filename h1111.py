@@ -615,7 +615,7 @@ with gr.Blocks(
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         #Image to Video Tab
-        with gr.Tab("Image to Video") as i2v_tab:
+        with gr.Tab(id=1, label="Image to Video") as i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -709,7 +709,7 @@ with gr.Blocks(
                 i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         # Video to Video Tab
-        with gr.Tab("Video to Video") as v2v_tab:
+        with gr.Tab(id=2, label="Video to Video") as v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     v2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -787,6 +787,8 @@ with gr.Blocks(
                 v2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+
+        #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
             with gr.Row():
                 video_input = gr.Video(label="Upload Video", interactive=True)
@@ -798,6 +800,8 @@ with gr.Blocks(
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
+
+        #Merge Model's tab        
         with gr.Tab("Convert LoRA") as convert_lora_tab:
             def suggest_output_name(file_obj) -> str:
                 """Generate suggested output name from input file"""
@@ -917,6 +921,15 @@ with gr.Blocks(
                 with gr.Row():
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+
+    #text to video
+    def change_to_tab_one():
+
+        return gr.Tabs(selected=1) #This will navigate
+    #video to video
+    def change_to_tab_two():
+
+        return gr.Tabs(selected=2) #This will navigate
 
     ##Image 2 video dimension logic
     def calculate_width(height, original_dims):
@@ -1281,8 +1294,7 @@ with gr.Blocks(
             v2v_seed, v2v_flow_shift, v2v_cfg_scale
         ] + v2v_lora_weights + v2v_lora_multipliers
     ).then(
-        lambda: gr.Tabs(selected="Video to Video"),
-        outputs=tabs
+        fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
     #Video Info
     def clean_video_path(video_path) -> str:
@@ -1379,8 +1391,7 @@ with gr.Blocks(
         inputs=metadata_output,
         outputs=[status, params_state]
     ).then(
-        lambda: gr.Tabs(selected="Text to Video"),
-        outputs=tabs
+        fn=change_to_tab_one, inputs=None, outputs=[tabs]
     ).then(
         lambda params: [
             params.get("prompt", ""),
@@ -1440,7 +1451,7 @@ with gr.Blocks(
     def handle_v2v_gallery_select(evt: gr.SelectData) -> int:
         """Handle gallery selection without automatically updating the input"""
         return evt.index
-    
+
     # Update the gallery selection event
     v2v_output.select(
         fn=handle_v2v_gallery_select,
@@ -1537,8 +1548,7 @@ with gr.Blocks(
             v2v_cfg_scale
         ] + v2v_lora_weights + v2v_lora_multipliers
     ).then(
-        lambda: gr_update(selected="Video to Video"),
-        outputs=tabs
+        fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
 
     def handle_send_to_v2v(metadata: dict, video_path: str) -> Tuple[str, dict, str]:
@@ -1555,14 +1565,11 @@ with gr.Blocks(
         # Just return the path directly
         return status_msg, params, video_path
 
-            # Send button click handler
+    # Send button click handler
     send_to_v2v_btn.click(
         fn=handle_info_to_v2v,
         inputs=[metadata_output, video_input],
         outputs=[status, params_state, v2v_input]
-    ).then(
-        lambda: gr.Tabs(selected="Video to Video"),
-        outputs=tabs
     ).then(
         lambda params: [
             params.get("v2v_prompt", ""),
@@ -1593,6 +1600,11 @@ with gr.Blocks(
             v2v_te2, v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type,
             v2v_attn_mode, v2v_block_swap
         ] + v2v_lora_weights + v2v_lora_multipliers
+    ).then(
+        lambda: print(f"Tabs object: {tabs}"),  # Debug print
+        outputs=None
+    ).then(
+        fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
 
     # Handler for sending selected video from Video2Video gallery to input
