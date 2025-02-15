@@ -502,11 +502,11 @@ with gr.Blocks(
 
         function updateTitle(text) {
             if (text && text.trim()) {
-                const progressMatch = text.match(/(\d+)%.*\[.*<(.+?)\]/);
+                const progressMatch = text.match(/(\d+)%.*\[.*<(\d+:\d+),/);
                 if (progressMatch) {
                     const percentage = progressMatch[1];
                     const timeRemaining = progressMatch[2];
-                    document.title = `${percentage}% TA:(${timeRemaining} ) - H1111`;
+                    document.title = `${percentage}% ETA:(${timeRemaining} ) - H1111`;
                 }
             }
         }
