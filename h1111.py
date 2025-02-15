@@ -247,6 +247,7 @@ def process_single_video(
     prompt: str,
     width: int,
     height: int,
+    batch_size: int,
     video_length: int,
     fps: int,
     infer_steps: int,
@@ -286,14 +287,23 @@ def process_single_video(
         model_path = model
     else:
         model_path = os.path.normpath(os.path.join(dit_folder, model))
-    current_seed = random.randint(0, 2**32 - 1) if seed == -1 else seed
     
-    clear_cuda_cache()
-
     env = os.environ.copy()
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
     env["BATCH_RUN_ID"] = f"{time.time()}"
+
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    else:
+        batch_id = int(env.get("BATCH_RUN_ID", "0").split('.')[-1])
+        if batch_size > 1:  # Only modify seed for batch generation
+            # Generate a unique but deterministic seed for each batch iteration
+            current_seed = (seed + batch_id * 100003) % (2**32)
+        else:
+            current_seed = seed  # Use exact seed for single video generation
+    
+    clear_cuda_cache()
 
     command = [
         sys.executable,
@@ -441,7 +451,7 @@ def process_batch(
         batch_text = f"Generating video {i + 1} of {batch_size}"
         yield all_videos.copy(), batch_text, progress_text
 
-        for videos, status, progress in process_single_video(prompt, width, height, *args):
+        for videos, status, progress in process_single_video(prompt, width, height, batch_size, *args):
             if videos:
                 all_videos.extend(videos)
             yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
@@ -1176,7 +1186,7 @@ with gr.Blocks(
     
             # Generate the video using the temporary file
             try:
-                generator = generate_video(
+                generator = process_single_video(
                     prompt, width, height, batch_size, video_length, fps, infer_steps,
                     seed, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
                     output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
