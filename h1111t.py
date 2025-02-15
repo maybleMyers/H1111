@@ -506,7 +506,7 @@ with gr.Blocks(
                 if (progressMatch) {
                     const percentage = progressMatch[1];
                     const timeRemaining = progressMatch[2];
-                    document.title = `${percentage}% ETA:(${timeRemaining} ) - H1111`;
+                    document.title = `[${percentage}% ETA:${timeRemaining}] - H1111`;
                 }
             }
         }
