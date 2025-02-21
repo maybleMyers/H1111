@@ -16,6 +16,7 @@ from gradio.themes.utils import colors
 import subprocess
 from PIL import Image
 import math
+import cv2
 
 # Add global stop event
 stop_event = threading.Event()
@@ -650,7 +651,7 @@ with gr.Blocks(
                     i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
                     # Scale slider as percentage 
                     scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
-                    original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+                    original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
                     # Width and height inputs
                     with gr.Row():
                         width = gr.Number(label="New Width", value=544, step=16)
@@ -742,8 +743,15 @@ with gr.Blocks(
                 with gr.Column():
                     v2v_input = gr.Video(label="Input Video", format="mp4")
                     v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
-                    v2v_width = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Width")
-                    v2v_height = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Height")
+                    v2v_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    v2v_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
+
+                    # Width and Height Inputs
+                    with gr.Row():
+                        v2v_width = gr.Number(label="New Width", value=544, step=16)
+                        v2v_calc_height_btn = gr.Button("→")
+                        v2v_calc_width_btn = gr.Button("←")
+                        v2v_height = gr.Number(label="New Height", value=544, step=16)
                     v2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
                     v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                     v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
@@ -942,6 +950,67 @@ with gr.Blocks(
     def change_to_tab_two():
 
         return gr.Tabs(selected=2) #This will navigate
+    
+    def calculate_v2v_width(height, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_width = math.floor((height * aspect_ratio) / 16) * 16  # Ensure divisible by 16
+        return gr.update(value=new_width)
+
+    def calculate_v2v_height(width, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_height = math.floor((width / aspect_ratio) / 16) * 16  # Ensure divisible by 16
+        return gr.update(value=new_height)
+
+    def update_v2v_from_scale(scale, original_dims):
+        if not original_dims:
+            return gr.update(), gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        new_w = math.floor((orig_w * scale / 100) / 16) * 16  # Ensure divisible by 16
+        new_h = math.floor((orig_h * scale / 100) / 16) * 16  # Ensure divisible by 16
+        return gr.update(value=new_w), gr.update(value=new_h)
+
+    def update_v2v_dimensions(video):
+        if video is None:
+            return "", gr.update(value=544), gr.update(value=544)
+        cap = cv2.VideoCapture(video)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        # Make dimensions divisible by 16
+        w = (w // 16) * 16
+        h = (h // 16) * 16
+        return f"{w}x{h}", w, h
+    
+    # Event Handlers for Video to Video Tab
+    v2v_input.change(
+        fn=update_v2v_dimensions,
+        inputs=[v2v_input],
+        outputs=[v2v_original_dims, v2v_width, v2v_height]
+    )
+
+    v2v_scale_slider.change(
+        fn=update_v2v_from_scale,
+        inputs=[v2v_scale_slider, v2v_original_dims],
+        outputs=[v2v_width, v2v_height]
+    )
+
+    v2v_calc_width_btn.click(
+        fn=calculate_v2v_width,
+        inputs=[v2v_height, v2v_original_dims],
+        outputs=[v2v_width]
+    )
+
+    v2v_calc_height_btn.click(
+        fn=calculate_v2v_height,
+        inputs=[v2v_width, v2v_original_dims],
+        outputs=[v2v_height]
+    )
 
     ##Image 2 video dimension logic
     def calculate_width(height, original_dims):
