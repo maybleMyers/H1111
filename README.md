@@ -82,7 +82,7 @@ python -m venv env
 ./env/scripts/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio tiktoken ffmpeg ffmpeg-python
+pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 
 ```
 
