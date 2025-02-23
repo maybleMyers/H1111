@@ -2,14 +2,24 @@
 
 # H1111
 
+
+
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
-It allows simple inference with hunyuan video model , with video2video, image2video and text2video support.
+It allows simple inference with hunyuan video model , with video2video, image2video, Skyreels and text2video support.
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
 If you are using a lora that you didn't train with musubi you need to drag it to the convert lora tab and convert it to the default format. It should spit it out into the /lora folder.
+
+## changlog
+
+2/23/2025
+    Added initial support for skyreels using musubi's skyreel implementation. (thanks  sdbds :D)
+download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and add them to your hunyuan folder
+skyreels_hunyuan_i2v_bf16.safetensors
+skyreels_hunyuan_t2v_bf16.safetensors
 
 ## Requirements
 

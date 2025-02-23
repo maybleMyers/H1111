@@ -276,13 +276,33 @@ def process_single_video(
     lora3_multiplier: float = 1.0,
     lora4_multiplier: float = 1.0,
     video_path: Optional[str] = None,
-    strength: Optional[float] = None
+    image_path: Optional[str] = None,
+    strength: Optional[float] = None,
+    negative_prompt: Optional[str] = None,
+    embedded_cfg_scale: Optional[float] = None,
+    split_uncond: Optional[bool] = None,
+    guidance_scale: Optional[float] = None
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate a single video with the given parameters"""
     global stop_event
     
     if stop_event.is_set():
         yield [], "", ""
         return
+
+    # Determine if this is a SkyReels model
+    is_skyreels = "skyreels" in model.lower()
+    if is_skyreels:
+        # Force certain parameters for SkyReels
+        dit_in_channels = 32  # SkyReels uses 32 channels
+        if negative_prompt is None:
+            negative_prompt = ""
+        if embedded_cfg_scale is None:
+            embedded_cfg_scale = 1.0
+        if split_uncond is None:
+            split_uncond = True
+    else:
+        dit_in_channels = 16  # Regular models use 16 channels
 
     if os.path.isabs(model):
         model_path = model
@@ -299,11 +319,10 @@ def process_single_video(
     else:
         batch_id = int(env.get("BATCH_RUN_ID", "0").split('.')[-1])
         if batch_size > 1:  # Only modify seed for batch generation
-            # Generate a unique but deterministic seed for each batch iteration
             current_seed = (seed + batch_id * 100003) % (2**32)
         else:
-            current_seed = seed  # Use exact seed for single video generation
-    
+            current_seed = seed
+
     clear_cuda_cache()
 
     command = [
@@ -331,6 +350,16 @@ def process_single_video(
         "--vae_spatial_tile_sample_min_size", "128"
     ]
 
+    # Add negative prompt and embedded cfg scale for SkyReels
+    if is_skyreels:
+        command.extend(["--dit_in_channels", str(dit_in_channels)])
+        command.extend(["--guidance_scale", str(guidance_scale)])
+        
+        if negative_prompt:
+            command.extend(["--negative_prompt", negative_prompt])
+        if split_uncond:
+            command.append("--split_uncond")
+
     # Add LoRA weights and multipliers if provided
     valid_loras = []
     for weight, mult in zip([lora1, lora2, lora3, lora4], 
@@ -347,10 +376,18 @@ def process_single_video(
         command.append("--exclude_single_blocks")
     if use_split_attn:
         command.append("--split_attn")
+
+    # Handle input paths
     if video_path:
         command.extend(["--video_path", video_path])
         if strength is not None:
             command.extend(["--strength", str(strength)])
+    elif image_path and is_skyreels:
+        command.extend(["--image_path", image_path])
+        if strength is not None:
+            command.extend(["--strength", str(strength)])
+            
+    print(f"{command}")
 
     p = subprocess.Popen(
         command,
@@ -422,7 +459,10 @@ def process_single_video(
                 "lora_weights": [lora1, lora2, lora3, lora4],
                 "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
                 "input_video": video_path if video_path else None,
-                "strength": strength
+                "input_image": image_path if image_path else None,
+                "strength": strength,
+                "negative_prompt": negative_prompt if is_skyreels else None,
+                "embedded_cfg_scale": embedded_cfg_scale if is_skyreels else None
             }
             
             add_metadata_to_video(video_path, parameters)
@@ -435,6 +475,24 @@ def process_batch(
     width: int,
     height: int,
     batch_size: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    dit_folder: str,
+    model: str,
+    vae: str,
+    te1: str,
+    te2: str,
+    save_path: str,
+    flow_shift: float,
+    cfg_scale: float,
+    output_type: str,
+    attn_mode: str,
+    block_swap: int,
+    exclude_single_blocks: bool,
+    use_split_attn: bool,
+    lora_folder: str,
     *args
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Process a batch of videos using Gradio's queue"""
@@ -445,6 +503,31 @@ def process_batch(
     progress_text = "Starting generation..."
     yield [], "Preparing...", progress_text
 
+    # Extract additional arguments
+    num_lora_weights = 4
+    lora_weights = args[:num_lora_weights]
+    lora_multipliers = args[num_lora_weights:num_lora_weights*2]
+    extra_args = args[num_lora_weights*2:]
+
+    # Determine if this is a SkyReels model
+    is_skyreels = "skyreels" in model.lower()
+
+    # Handle input paths and additional parameters
+    input_path = extra_args[0] if extra_args else None
+    strength = float(extra_args[1]) if len(extra_args) > 1 else None
+
+    # Get SkyReels specific parameters if applicable
+    if is_skyreels:
+        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else ""
+        guidance_scale = float(extra_args[3]) if len(extra_args) > 3 and extra_args[3] is not None else 7.5
+        embedded_cfg_scale = 1.0  # Force to 1.0 for SKYREELS
+        split_uncond = True if len(extra_args) > 4 and extra_args[4] else False
+    else:
+        negative_prompt = None
+        embedded_cfg_scale = None
+        split_uncond = None
+        guidance_scale = None
+
     for i in range(batch_size):
         if stop_event.is_set():
             break
@@ -452,7 +535,31 @@ def process_batch(
         batch_text = f"Generating video {i + 1} of {batch_size}"
         yield all_videos.copy(), batch_text, progress_text
 
-        for videos, status, progress in process_single_video(prompt, width, height, batch_size, *args):
+        # Handle different input types
+        video_path = None
+        image_path = None
+        if input_path:
+            if is_skyreels:
+                image_path = input_path  # SkyReels uses image input
+            else:
+                video_path = input_path  # Regular mode uses video input
+
+        # Prepare arguments for process_single_video
+        single_video_args = [
+            prompt, width, height, batch_size, video_length, fps, infer_steps,
+            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+            lora_folder
+        ]
+        single_video_args.extend(lora_weights)
+        single_video_args.extend(lora_multipliers)
+        single_video_args.extend([video_path, image_path, strength])
+
+        # Add SkyReels specific arguments if applicable
+        if is_skyreels:
+            single_video_args.extend([negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale])
+
+        for videos, status, progress in process_single_video(*single_video_args):
             if videos:
                 all_videos.extend(videos)
             yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
@@ -507,6 +614,7 @@ with gr.Blocks(
     v2v_selected_index = gr.State(value=None)  # For Video to Video
     params_state = gr.State() #New addition
     i2v_selected_index = gr.State(value=None) 
+    skyreels_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -808,6 +916,115 @@ with gr.Blocks(
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
+        with gr.Tab(label="SKYREELS") as skyreels_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    skyreels_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A person walking on a beach at sunset", 
+                        lines=5
+                    )
+                    skyreels_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion",
+                        lines=3
+                    )
+
+                with gr.Column(scale=1):
+                    skyreels_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    skyreels_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    skyreels_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    skyreels_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+
+            with gr.Row():
+                skyreels_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                skyreels_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    skyreels_input = gr.Image(label="Input Image (optional)", type="filepath")
+                    skyreels_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
+
+                    # Scale slider as percentage 
+                    skyreels_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    skyreels_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
+
+                    # Width and height inputs
+                    with gr.Row():
+                        skyreels_width = gr.Number(label="New Width", value=544, step=16)
+                        skyreels_calc_height_btn = gr.Button("→")
+                        skyreels_calc_width_btn = gr.Button("←")
+                        skyreels_height = gr.Number(label="New Height", value=544, step=16)
+
+                    skyreels_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
+                    skyreels_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
+                    skyreels_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
+                    skyreels_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
+                    skyreels_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=6.0)
+                    skyreels_embedded_cfg_scale = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, label="Embedded CFG Scale", value=1.0)
+
+                with gr.Column():
+                    skyreels_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2],
+                        rows=[2],
+                        object_fit="contain",
+                        height="auto",
+                        show_label=True,
+                        elem_id="gallery",
+                        allow_preview=True,
+                        preview=True
+                    )
+                    skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+
+                    # Add LoRA section for SKYREELS
+                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    skyreels_lora_weights = []
+                    skyreels_lora_multipliers = []
+                    for i in range(4):
+                        with gr.Column():
+                            skyreels_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", 
+                                choices=get_lora_options(), 
+                                value="None", 
+                                allow_custom_value=True,
+                                interactive=True
+                            ))
+                            skyreels_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier", 
+                                minimum=0.0, 
+                                maximum=2.0, 
+                                step=0.05, 
+                                value=1.0
+                            ))
+            with gr.Row():
+                skyreels_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
+                skyreels_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                skyreels_dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                skyreels_model = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("skyreels"),
+                    value="skyreels_hunyuan_i2v_bf16.safetensors",
+                    allow_custom_value=True,
+                    interactive=True
+                )
+                skyreels_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
+                skyreels_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
+                skyreels_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
+                skyreels_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Row():
+                skyreels_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                skyreels_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                skyreels_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                skyreels_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                skyreels_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+                skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
+
         #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
             with gr.Row():
@@ -944,12 +1161,244 @@ with gr.Blocks(
 
     #text to video
     def change_to_tab_one():
-
         return gr.Tabs(selected=1) #This will navigate
     #video to video
     def change_to_tab_two():
-
         return gr.Tabs(selected=2) #This will navigate
+    def change_to_skyreels_tab():
+        return gr.Tabs(selected=3) 
+    
+    #SKYREELS TAB!!!
+    # Add state management for dimensions
+    def sync_skyreels_dimensions(width, height):
+        return gr.update(value=width), gr.update(value=height)
+
+    # Add this function to update the LoRA dropdowns in the SKYREELS tab
+    def update_skyreels_lora_dropdowns(lora_folder: str, *current_values) -> List[gr.update]:
+        new_choices = get_lora_options(lora_folder)
+        weights = current_values[:4]
+        multipliers = current_values[4:8]
+
+        results = []
+        for i in range(4):
+            weight = weights[i] if i < len(weights) else "None"
+            multiplier = multipliers[i] if i < len(multipliers) else 1.0
+            if weight not in new_choices:
+                weight = "None"
+            results.extend([
+                gr.update(choices=new_choices, value=weight),
+                gr.update(value=multiplier) 
+            ])
+
+        return results
+
+    # Add this function to update the models dropdown in the SKYREELS tab
+    def update_skyreels_model_dropdown(dit_folder: str) -> Dict:
+        models = get_dit_models(dit_folder)
+        return gr.update(choices=models, value=models[0] if models else None)
+
+    # Add event handler for model dropdown refresh
+    skyreels_dit_folder.change(
+        fn=update_skyreels_model_dropdown,
+        inputs=[skyreels_dit_folder],
+        outputs=[skyreels_model]
+    )
+
+    # Add handlers for the refresh button
+    skyreels_refresh_btn.click(
+        fn=update_skyreels_lora_dropdowns,
+        inputs=[skyreels_lora_folder] + skyreels_lora_weights + skyreels_lora_multipliers,
+        outputs=[drop for _ in range(4) for drop in [skyreels_lora_weights[_], skyreels_lora_multipliers[_]]]
+    )      
+    # Skyreels dimension handling
+    def calculate_skyreels_width(height, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_width = math.floor((height * aspect_ratio) / 16) * 16
+        return gr.update(value=new_width)
+
+    def calculate_skyreels_height(width, original_dims):
+        if not original_dims:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        aspect_ratio = orig_w / orig_h
+        new_height = math.floor((width / aspect_ratio) / 16) * 16
+        return gr.update(value=new_height)
+
+    def update_skyreels_from_scale(scale, original_dims):
+        if not original_dims:
+            return gr.update(), gr.update()
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        new_w = math.floor((orig_w * scale / 100) / 16) * 16
+        new_h = math.floor((orig_h * scale / 100) / 16) * 16
+        return gr.update(value=new_w), gr.update(value=new_h)
+
+    def update_skyreels_dimensions(image):
+        if image is None:
+            return "", gr.update(value=544), gr.update(value=544)
+        img = Image.open(image)
+        w, h = img.size
+        w = (w // 16) * 16
+        h = (h // 16) * 16
+        return f"{w}x{h}", w, h
+
+    def handle_skyreels_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    def send_skyreels_to_v2v(
+        gallery: list,
+        prompt: str,
+        selected_index: int,
+        width: int,
+        height: int,
+        video_length: int,
+        fps: int,
+        infer_steps: int,
+        seed: int,
+        flow_shift: float,
+        cfg_scale: float,
+        lora1: str,
+        lora2: str,
+        lora3: str,
+        lora4: str,
+        lora1_multiplier: float,
+        lora2_multiplier: float,
+        lora3_multiplier: float,
+        lora4_multiplier: float
+    ) -> Tuple:
+        if not gallery or selected_index is None or selected_index >= len(gallery):
+            return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                    flow_shift, cfg_scale, lora1, lora2, lora3, lora4,
+                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
+
+        selected_item = gallery[selected_index]
+
+        if isinstance(selected_item, dict):
+            video_path = selected_item.get("name", selected_item.get("data", None))
+        elif isinstance(selected_item, (tuple, list)):
+            video_path = selected_item[0]
+        else:
+            video_path = selected_item
+
+        if isinstance(video_path, tuple):
+            video_path = video_path[0]
+
+        return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, cfg_scale, lora1, lora2, lora3, lora4,
+                lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
+
+    # Add event handlers for the SKYREELS tab
+    skyreels_prompt.change(fn=count_prompt_tokens, inputs=skyreels_prompt, outputs=skyreels_token_counter)
+    skyreels_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Image input handling
+    skyreels_input.change(
+        fn=update_skyreels_dimensions,
+        inputs=[skyreels_input],
+        outputs=[skyreels_original_dims, skyreels_width, skyreels_height]
+    )
+
+    skyreels_scale_slider.change(
+        fn=update_skyreels_from_scale,
+        inputs=[skyreels_scale_slider, skyreels_original_dims],
+        outputs=[skyreels_width, skyreels_height]
+    )
+
+    skyreels_calc_width_btn.click(
+        fn=calculate_skyreels_width,
+        inputs=[skyreels_height, skyreels_original_dims],
+        outputs=[skyreels_width]
+    )
+
+    skyreels_calc_height_btn.click(
+        fn=calculate_skyreels_height,
+        inputs=[skyreels_width, skyreels_original_dims],
+        outputs=[skyreels_height]
+    )
+
+    # SKYREELS tab generator button handler
+    skyreels_generate_btn.click(
+        fn=process_batch,
+        inputs=[
+            skyreels_prompt,
+            skyreels_width,
+            skyreels_height,
+            skyreels_batch_size,
+            skyreels_video_length,
+            skyreels_fps,
+            skyreels_infer_steps,
+            skyreels_seed,
+            skyreels_dit_folder,
+            skyreels_model,
+            skyreels_vae,
+            skyreels_te1,
+            skyreels_te2,
+            skyreels_save_path,
+            skyreels_flow_shift,
+            skyreels_embedded_cfg_scale,  # cfg_scale
+            skyreels_output_type,
+            skyreels_attn_mode,
+            skyreels_block_swap,
+            skyreels_exclude_single_blocks,
+            skyreels_use_split_attn,
+            skyreels_lora_folder,
+            *skyreels_lora_weights,
+            *skyreels_lora_multipliers,
+            skyreels_input,
+            skyreels_strength,
+            skyreels_negative_prompt,
+            skyreels_guidance_scale,
+            skyreels_split_uncond,
+        ],
+        outputs=[skyreels_output, skyreels_batch_progress, skyreels_progress_text],
+        queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[skyreels_batch_size],
+        outputs=skyreels_selected_index
+    )
+
+    # Gallery selection handling
+    skyreels_output.select(
+        fn=handle_skyreels_gallery_select,
+        outputs=skyreels_selected_index
+    )
+
+    # Send to Video2Video handler
+    skyreels_send_to_v2v_btn.click(
+        fn=send_skyreels_to_v2v,
+        inputs=[
+            skyreels_output, skyreels_prompt, skyreels_selected_index,
+            skyreels_width, skyreels_height, skyreels_video_length,
+            skyreels_fps, skyreels_infer_steps, skyreels_seed,
+            skyreels_flow_shift, skyreels_guidance_scale
+        ] + skyreels_lora_weights + skyreels_lora_multipliers,
+        outputs=[
+            v2v_input, v2v_prompt, v2v_width, v2v_height,
+            v2v_video_length, v2v_fps, v2v_infer_steps,
+            v2v_seed, v2v_flow_shift, v2v_cfg_scale
+        ] + v2v_lora_weights + v2v_lora_multipliers
+    ).then(
+        fn=change_to_tab_two,
+        inputs=None,
+        outputs=[tabs]
+    )
+
+    # Refresh button handler
+    skyreels_refresh_outputs = [skyreels_model]
+    for i in range(4):
+        skyreels_refresh_outputs.extend([skyreels_lora_weights[i], skyreels_lora_multipliers[i]])
+
+    skyreels_refresh_btn.click(
+        fn=update_dit_and_lora_dropdowns,
+        inputs=[skyreels_dit_folder, skyreels_lora_folder, skyreels_model] + skyreels_lora_weights + skyreels_lora_multipliers,
+        outputs=skyreels_refresh_outputs
+    )
+
+    # Add skyreels_selected_index to the initial states at the beginning of the script
+    skyreels_selected_index = gr.State(value=None)  # Add this with other state declarations    
     
     def calculate_v2v_width(height, original_dims):
         if not original_dims:
