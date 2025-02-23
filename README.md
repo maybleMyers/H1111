@@ -16,14 +16,6 @@ If you are using a lora that you didn't train with musubi you need to drag it to
 - Python 3.10
 - CUDA 12.4
 
-## Basic Installation
-
-If you already have musubi tuner installed and running you should just be able to just download h1111.py and hv_generate_video.py and put them in your musubi directory
-
-pip install gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
-
-then run with python h1111.py
-
 ## Basic Installation (Linux)
 
 Tested on ubuntu 24
