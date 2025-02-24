@@ -616,24 +616,20 @@ def main():
             prompt, args, device, args.fp8_llm, accelerator
         )
 
-        # encode latents for video2video inference
         video_latents = None
         if args.video_path is not None:
             # v2v inference
             logger.info(f"Video2Video inference: {args.video_path}")
-            # Load and extend video if necessary
             video = load_and_extend_video(args, video_length)
 
-            if os.path.isfile(args.video_path):
-                video = load_video(args.video_path, 0, video_length, bucket_reso=(width, height))  # list of frames
-            else:
-                video = load_images(args.video_path, video_length, bucket_reso=(width, height))  # list of frames
+            if not isinstance(video, torch.Tensor):
+                video = np.stack(video, axis=0)  # F, H, W, C
+                video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
+                video = video / 255.0
 
-            if len(video) < video_length:
-                raise ValueError(f"Video length is less than {video_length}")
-            video = np.stack(video, axis=0)  # F, H, W, C
-            video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
-            video = video / 255.0
+            # Verify the video length after extension
+            if video.shape[2] < video_length:  # Check tensor dimension F
+                raise ValueError(f"Video length {video.shape[2]} is less than target length {video_length} after extension")
 
             logger.info(f"Encoding video to latents")
             video_latents = encode_to_latents(args, video, device)
