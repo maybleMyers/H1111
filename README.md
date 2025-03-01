@@ -11,12 +11,32 @@ It allows simple inference with hunyuan video model , with video2video, image2vi
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
+Best quality will be obtained without fp8, enabling block swapping and disabling fp8 is not too much of a speed hit.
+
 If you are using a lora that you didn't train with musubi you need to drag it to the convert lora tab and convert it to the default format. It should spit it out into the /lora folder.
+
+This about the speed I get generating a 960x544 97 frame 40 step video without fp8 using sage attention and skyreels on a 4090: 80%|████████  | 24/30 [11:01<02:45, 27.54s/it]
+
+## To Use Skyreels
+
+To use the Skyreels models, first download Kijai's awesome models:
+
+https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_i2v_bf16.safetensors?download=true
+https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_t2v_bf16.safetensors?download=true
+
+Place the models inside the hunyuan folder inside of H1111 and select them at the bottom of the page by clicking DIT model
+
+Use the i2v model for image to video.
+Use the t2v model for video to video and text to video.
+
+Most of the lora's for hunyuan will work with skyreels also.
 
 ## changlog
 
+3/1/2025
+    Added support for Skyreels Video to Video and Text to Video. 
 2/23/2025
-    Added initial support for skyreels using musubi's skyreel implementation. (thanks  sdbds :D)
+    Added initial support for skyreels using musubi's skyreel implementation. (thanks  sdbds && Kijai :D)
 download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and add them to your hunyuan folder
 skyreels_hunyuan_i2v_bf16.safetensors
 skyreels_hunyuan_t2v_bf16.safetensors
