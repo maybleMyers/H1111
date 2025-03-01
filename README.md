@@ -21,9 +21,9 @@ This about the speed I get generating a 960x544 97 frame 40 step video without f
 
 To use the Skyreels models, first download Kijai's awesome models:
 
-https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_i2v_bf16.safetensors?download=true
+https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_i2v_bf16.safetensors?download=true  
 and
-https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_t2v_bf16.safetensors?download=true
+https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_t2v_bf16.safetensors?download=true  
 
 Place the models inside the hunyuan folder inside of H1111 and select them at the bottom of the page by clicking DIT model
 
