@@ -290,19 +290,30 @@ def process_single_video(
         yield [], "", ""
         return
 
-    # Determine if this is a SkyReels model
+    # Determine if this is a SkyReels model and what type
     is_skyreels = "skyreels" in model.lower()
+    is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
+    is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
+    
     if is_skyreels:
         # Force certain parameters for SkyReels
-        dit_in_channels = 32  # SkyReels uses 32 channels
         if negative_prompt is None:
             negative_prompt = ""
         if embedded_cfg_scale is None:
-            embedded_cfg_scale = 1.0
+            embedded_cfg_scale = 1.0  # Force to 1.0 for SkyReels
         if split_uncond is None:
             split_uncond = True
+        if guidance_scale is None:
+            guidance_scale = cfg_scale  # Use cfg_scale as guidance_scale if not provided
+            
+        # Determine the input channels based on model type
+        if is_skyreels_i2v:
+            dit_in_channels = 32  # SkyReels I2V uses 32 channels
+        else:
+            dit_in_channels = 16  # SkyReels T2V uses 16 channels (same as regular models)
     else:
-        dit_in_channels = 16  # Regular models use 16 channels
+        dit_in_channels = 16  # Regular Hunyuan models use 16 channels
+        embedded_cfg_scale = cfg_scale 
 
     if os.path.isabs(model):
         model_path = model
@@ -470,6 +481,9 @@ def process_single_video(
 
     yield videos, f"Completed (seed: {current_seed})", ""
 
+# The issue is in the process_batch function, in the section that handles different input types
+# Here's the corrected version of that section:
+
 def process_batch(
     prompt: str,
     width: int,
@@ -509,24 +523,26 @@ def process_batch(
     lora_multipliers = args[num_lora_weights:num_lora_weights*2]
     extra_args = args[num_lora_weights*2:]
 
-    # Determine if this is a SkyReels model
+    # Determine if this is a SkyReels model and what type
     is_skyreels = "skyreels" in model.lower()
+    is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
+    is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
 
     # Handle input paths and additional parameters
     input_path = extra_args[0] if extra_args else None
     strength = float(extra_args[1]) if len(extra_args) > 1 else None
-
+    
     # Get SkyReels specific parameters if applicable
+    embedded_cfg_scale = 1.0 if is_skyreels else cfg_scale
+    
     if is_skyreels:
         negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else ""
-        guidance_scale = float(extra_args[3]) if len(extra_args) > 3 and extra_args[3] is not None else 7.5
-        embedded_cfg_scale = 1.0  # Force to 1.0 for SKYREELS
+        guidance_scale = float(extra_args[3]) if len(extra_args) > 3 and extra_args[3] is not None else cfg_scale
         split_uncond = True if len(extra_args) > 4 and extra_args[4] else False
     else:
-        negative_prompt = None
-        embedded_cfg_scale = None
-        split_uncond = None
-        guidance_scale = None
+        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else None
+        guidance_scale = cfg_scale
+        split_uncond = bool(extra_args[4]) if len(extra_args) > 4 else None
 
     for i in range(batch_size):
         if stop_event.is_set():
@@ -538,11 +554,19 @@ def process_batch(
         # Handle different input types
         video_path = None
         image_path = None
+        
         if input_path:
-            if is_skyreels:
-                image_path = input_path  # SkyReels uses image input
+            # Check if it's an image file (common image extensions)
+            is_image = False
+            lower_path = input_path.lower()
+            image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
+            is_image = any(lower_path.endswith(ext) for ext in image_extensions)
+            
+            # Only use image_path for SkyReels I2V models and actual image files
+            if is_skyreels_i2v and is_image:
+                image_path = input_path
             else:
-                video_path = input_path  # Regular mode uses video input
+                video_path = input_path
 
         # Prepare arguments for process_single_video
         single_video_args = [
@@ -553,11 +577,7 @@ def process_batch(
         ]
         single_video_args.extend(lora_weights)
         single_video_args.extend(lora_multipliers)
-        single_video_args.extend([video_path, image_path, strength])
-
-        # Add SkyReels specific arguments if applicable
-        if is_skyreels:
-            single_video_args.extend([negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale])
+        single_video_args.extend([video_path, image_path, strength, negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale])
 
         for videos, status, progress in process_single_video(*single_video_args):
             if videos:
@@ -834,6 +854,12 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column(scale=4):
                     v2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+                    v2v_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt (for SkyReels models)",
+                        value="Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion",
+                        lines=3
+                    )
 
                 with gr.Column(scale=1):
                     v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
@@ -915,6 +941,7 @@ with gr.Blocks(
                 v2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+                v2v_split_uncond = gr.Checkbox(label="Split Unconditional (for SkyReels)", value=True)
 
         with gr.Tab(label="SKYREELS") as skyreels_tab:
             with gr.Row():
@@ -1266,12 +1293,14 @@ with gr.Blocks(
         lora1_multiplier: float,
         lora2_multiplier: float,
         lora3_multiplier: float,
-        lora4_multiplier: float
+        lora4_multiplier: float,
+        negative_prompt: str = ""  # Add this parameter
     ) -> Tuple:
         if not gallery or selected_index is None or selected_index >= len(gallery):
             return (None, "", width, height, video_length, fps, infer_steps, seed, 
                     flow_shift, cfg_scale, lora1, lora2, lora3, lora4,
-                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
+                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier,
+                    negative_prompt)  # Add negative_prompt to return
 
         selected_item = gallery[selected_index]
 
@@ -1287,7 +1316,8 @@ with gr.Blocks(
 
         return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
                 flow_shift, cfg_scale, lora1, lora2, lora3, lora4,
-                lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
+                lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier,
+                negative_prompt)  # Add negative_prompt to return
 
     # Add event handlers for the SKYREELS tab
     skyreels_prompt.change(fn=count_prompt_tokens, inputs=skyreels_prompt, outputs=skyreels_token_counter)
@@ -1374,12 +1404,12 @@ with gr.Blocks(
             skyreels_width, skyreels_height, skyreels_video_length,
             skyreels_fps, skyreels_infer_steps, skyreels_seed,
             skyreels_flow_shift, skyreels_guidance_scale
-        ] + skyreels_lora_weights + skyreels_lora_multipliers,
+        ] + skyreels_lora_weights + skyreels_lora_multipliers + [skyreels_negative_prompt],  # This is ok because skyreels_negative_prompt is a Gradio component
         outputs=[
             v2v_input, v2v_prompt, v2v_width, v2v_height,
             v2v_video_length, v2v_fps, v2v_infer_steps,
             v2v_seed, v2v_flow_shift, v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers
+        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
     ).then(
         fn=change_to_tab_two,
         inputs=None,
@@ -1993,8 +2023,8 @@ with gr.Blocks(
         gallery: list, 
         prompt: str, 
         idx: int, 
-        width: int,  # Changed from video_size
-        height: int,  # Added height
+        width: int,
+        height: int,
         batch_size: int, 
         video_length: int, 
         fps: int, 
@@ -2015,7 +2045,8 @@ with gr.Blocks(
             return (None, "", width, height, batch_size, video_length, fps, infer_steps, 
                     seed, flow_shift, cfg_scale, 
                     lora1, lora2, lora3, lora4,
-                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
+                    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier,
+                    "")  # Add empty string for negative_prompt in the return values
 
         # Auto-select first item if only one exists and no selection made
         if idx is None and len(gallery) == 1:
@@ -2038,7 +2069,7 @@ with gr.Blocks(
         return (
             str(video_path), 
             prompt,
-            width,  # Changed
+            width,
             height, 
             batch_size, 
             video_length, 
@@ -2054,7 +2085,8 @@ with gr.Blocks(
             lora1_multiplier,
             lora2_multiplier,
             lora3_multiplier,
-            lora4_multiplier
+            lora4_multiplier,
+            ""  # Add empty string for negative_prompt
         )
     
     send_t2v_to_v2v_btn.click(
@@ -2063,7 +2095,7 @@ with gr.Blocks(
             video_output, prompt, selected_index,
             t2v_width, t2v_height, batch_size, video_length,
             fps, infer_steps, seed, flow_shift, cfg_scale
-        ] + lora_weights + lora_multipliers,
+        ] + lora_weights + lora_multipliers,  # Remove the string here
         outputs=[
             v2v_input, 
             v2v_prompt,
@@ -2076,7 +2108,7 @@ with gr.Blocks(
             v2v_seed,
             v2v_flow_shift,
             v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers
+        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
     ).then(
         fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
@@ -2178,10 +2210,11 @@ with gr.Blocks(
         fn=process_batch,
         inputs=[
             v2v_prompt, v2v_width, v2v_height, v2v_batch_size, v2v_video_length, 
-            v2v_fps, v2v_infer_steps, v2v_seed, v2v_dit_folder, v2v_model, v2v_vae, v2v_te1, v2v_te2,  # Added v2v_dit_folder
+            v2v_fps, v2v_infer_steps, v2v_seed, v2v_dit_folder, v2v_model, v2v_vae, v2v_te1, v2v_te2,
             v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, 
             v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder, 
-            *v2v_lora_weights, *v2v_lora_multipliers, v2v_input, v2v_strength
+            *v2v_lora_weights, *v2v_lora_multipliers, v2v_input, v2v_strength,
+            v2v_negative_prompt, v2v_cfg_scale, v2v_split_uncond  # Add these new parameters
         ],
         outputs=[v2v_output, v2v_batch_progress, v2v_progress_text],
         queue=True
