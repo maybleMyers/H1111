@@ -281,7 +281,8 @@ def process_single_video(
     negative_prompt: Optional[str] = None,
     embedded_cfg_scale: Optional[float] = None,
     split_uncond: Optional[bool] = None,
-    guidance_scale: Optional[float] = None
+    guidance_scale: Optional[float] = None,
+    use_fp8: bool = True
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate a single video with the given parameters"""
     global stop_event
@@ -350,7 +351,6 @@ def process_single_video(
         "--infer_steps", str(infer_steps),
         "--save_path", save_path,
         "--seed", str(current_seed),
-        "--fp8",
         "--flow_shift", str(flow_shift),
         "--embedded_cfg_scale", str(cfg_scale),
         "--output_type", output_type,
@@ -360,6 +360,9 @@ def process_single_video(
         "--vae_chunk_size", "32",
         "--vae_spatial_tile_sample_min_size", "128"
     ]
+    
+    if use_fp8:
+        command.append("--fp8")
 
     # Add negative prompt and embedded cfg scale for SkyReels
     if is_skyreels:
@@ -532,17 +535,20 @@ def process_batch(
     input_path = extra_args[0] if extra_args else None
     strength = float(extra_args[1]) if len(extra_args) > 1 else None
     
+    # Get use_fp8 flag (it should be the last parameter)
+    use_fp8 = bool(extra_args[-1]) if extra_args and len(extra_args) >= 3 else True
+    
     # Get SkyReels specific parameters if applicable
     if is_skyreels:
         # Always set embedded_cfg_scale to 1.0 for SkyReels models
         embedded_cfg_scale = 1.0
         
-        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else ""
+        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 and extra_args[2] is not None else ""
         # Use cfg_scale for guidance_scale parameter
         guidance_scale = float(extra_args[3]) if len(extra_args) > 3 and extra_args[3] is not None else cfg_scale
         split_uncond = True if len(extra_args) > 4 and extra_args[4] else False
     else:
-        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else None
+        negative_prompt = str(extra_args[2]) if len(extra_args) > 2 and extra_args[2] is not None else None
         guidance_scale = cfg_scale
         embedded_cfg_scale = cfg_scale
         split_uncond = bool(extra_args[4]) if len(extra_args) > 4 else None
@@ -580,7 +586,7 @@ def process_batch(
         ]
         single_video_args.extend(lora_weights)
         single_video_args.extend(lora_multipliers)
-        single_video_args.extend([video_path, image_path, strength, negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale])
+        single_video_args.extend([video_path, image_path, strength, negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale, use_fp8])
 
         for videos, status, progress in process_single_video(*single_video_args):
             if videos:
@@ -755,6 +761,7 @@ with gr.Blocks(
                 lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
                 attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
@@ -849,6 +856,7 @@ with gr.Blocks(
                 i2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 i2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 i2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                i2v_use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
                 i2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
@@ -942,6 +950,7 @@ with gr.Blocks(
                 v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 v2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                v2v_use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
                 v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 v2v_split_uncond = gr.Checkbox(label="Split Unconditional (for SkyReels)", value=True)
@@ -1051,6 +1060,7 @@ with gr.Blocks(
                 skyreels_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                 skyreels_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
                 skyreels_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
+                skyreels_use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
                 skyreels_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 skyreels_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
@@ -1370,7 +1380,7 @@ with gr.Blocks(
             skyreels_te2,
             skyreels_save_path,
             skyreels_flow_shift,
-            skyreels_embedded_cfg_scale,  # cfg_scale
+            skyreels_embedded_cfg_scale,
             skyreels_output_type,
             skyreels_attn_mode,
             skyreels_block_swap,
@@ -1384,6 +1394,7 @@ with gr.Blocks(
             skyreels_negative_prompt,
             skyreels_guidance_scale,
             skyreels_split_uncond,
+            skyreels_use_fp8
         ],
         outputs=[skyreels_output, skyreels_batch_progress, skyreels_progress_text],
         queue=True
@@ -1822,12 +1833,12 @@ with gr.Blocks(
     i2v_generate_btn.click(
         fn=process_batch,
         inputs=[
-            i2v_prompt, width, height,  # Add width, height here
+            i2v_prompt, width, height,
             i2v_batch_size, i2v_video_length, 
             i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
-            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength
+            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_use_fp8
         ],
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
         queue=True
@@ -1988,9 +1999,9 @@ with gr.Blocks(
         fn=process_batch,
         inputs=[
             prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
-            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,  # Added dit_folder
+            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
             output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-            lora_folder, *lora_weights, *lora_multipliers
+            lora_folder, *lora_weights, *lora_multipliers, gr.Textbox(visible=False), gr.Number(visible=False), use_fp8
         ],
         outputs=[video_output, batch_progress, progress_text],
         queue=True
@@ -2217,7 +2228,7 @@ with gr.Blocks(
             v2v_save_path, v2v_flow_shift, v2v_cfg_scale, v2v_output_type, v2v_attn_mode, 
             v2v_block_swap, v2v_exclude_single_blocks, v2v_use_split_attn, v2v_lora_folder, 
             *v2v_lora_weights, *v2v_lora_multipliers, v2v_input, v2v_strength,
-            v2v_negative_prompt, v2v_cfg_scale, v2v_split_uncond  # Add these new parameters
+            v2v_negative_prompt, v2v_cfg_scale, v2v_split_uncond, v2v_use_fp8
         ],
         outputs=[v2v_output, v2v_batch_progress, v2v_progress_text],
         queue=True
