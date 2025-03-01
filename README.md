@@ -27,16 +27,16 @@ https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hun
 
 Place the models inside the hunyuan folder inside of H1111 and select them at the bottom of the page by clicking DIT model
 
-Use the i2v model for image to video.
+Use the i2v model for image to video.  
 Use the t2v model for video to video and text to video.
 
 Most of the lora's for hunyuan will work with skyreels also.
 
 ## changlog
 
-3/1/2025
-    Added support for Skyreels Video to Video and Text to Video. 
-2/23/2025
+3/1/2025  
+    Added support for Skyreels Video to Video and Text to Video.   
+2/23/2025  
     Added initial support for skyreels using musubi's skyreel implementation. (thanks  sdbds && Kijai :D)
 download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and add them to your hunyuan folder
 skyreels_hunyuan_i2v_bf16.safetensors
