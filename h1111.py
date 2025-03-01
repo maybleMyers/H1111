@@ -533,15 +533,18 @@ def process_batch(
     strength = float(extra_args[1]) if len(extra_args) > 1 else None
     
     # Get SkyReels specific parameters if applicable
-    embedded_cfg_scale = 1.0 if is_skyreels else cfg_scale
-    
     if is_skyreels:
+        # Always set embedded_cfg_scale to 1.0 for SkyReels models
+        embedded_cfg_scale = 1.0
+        
         negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else ""
+        # Use cfg_scale for guidance_scale parameter
         guidance_scale = float(extra_args[3]) if len(extra_args) > 3 and extra_args[3] is not None else cfg_scale
         split_uncond = True if len(extra_args) > 4 and extra_args[4] else False
     else:
         negative_prompt = str(extra_args[2]) if len(extra_args) > 2 else None
         guidance_scale = cfg_scale
+        embedded_cfg_scale = cfg_scale
         split_uncond = bool(extra_args[4]) if len(extra_args) > 4 else None
 
     for i in range(batch_size):
