@@ -597,6 +597,308 @@ def process_batch(
 
     yield all_videos, "Batch complete", ""
 
+def update_wanx_dimensions(size):
+    """Update width and height based on selected size"""
+    width, height = map(int, size.split('*'))
+    return gr.update(value=width), gr.update(value=height)
+
+def recommend_wanx_flow_shift(width, height):
+    """Get recommended flow shift value based on dimensions"""
+    recommended_shift = 3.0 if (width == 832 and height == 480) or (width == 480 and height == 832) else 5.0
+    return gr.update(value=recommended_shift)
+
+def handle_wanx_gallery_select(evt: gr.SelectData) -> int:
+    """Track selected index when gallery item is clicked"""
+    return evt.index
+
+def wanx_generate_video(
+    prompt, 
+    negative_prompt,
+    input_image,
+    width,
+    height,
+    video_length,
+    fps,
+    infer_steps,
+    flow_shift,
+    guidance_scale,
+    seed,
+    task,
+    dit_path,
+    vae_path,
+    t5_path,
+    clip_path,
+    save_path,
+    output_type,
+    sample_solver,
+    attn_mode,
+    block_swap,
+    fp8,
+    fp8_t5
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate video with WanX model (supports both i2v and t2v)"""
+    global stop_event
+    
+    if stop_event.is_set():
+        yield [], "", ""
+        return
+
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    else:
+        current_seed = seed
+        
+    # Check if we need input image (required for i2v, not for t2v)
+    if "i2v" in task and not input_image:
+        yield [], "Error: No input image provided", "Please provide an input image for image-to-video generation"
+        return
+
+    # Prepare environment
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    
+    clear_cuda_cache()
+
+    command = [
+        sys.executable,
+        "wan_generate_video.py",
+        "--task", task,
+        "--prompt", prompt,
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", save_path,
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift),
+        "--guidance_scale", str(guidance_scale),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(block_swap),
+        "--dit", dit_path,
+        "--vae", vae_path,
+        "--t5", t5_path,
+        "--sample_solver", sample_solver
+    ]
+    
+    # Add image path only for i2v task and if input image is provided
+    if "i2v" in task and input_image:
+        command.extend(["--image_path", input_image])
+        command.extend(["--clip", clip_path])  # CLIP is only needed for i2v
+    
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+    
+    if fp8:
+        command.append("--fp8")
+    
+    if fp8_t5:
+        command.append("--fp8_t5")
+    
+    print(f"Running: {' '.join(command)}")
+
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    videos = []
+    
+    while True:
+        if stop_event.is_set():
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
+
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
+            
+        print(line, end='')
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+
+    p.stdout.close()
+    p.wait()
+
+    clear_cuda_cache()
+    time.sleep(0.5)
+
+    # Collect generated video
+    save_path_abs = os.path.abspath(save_path)
+    if os.path.exists(save_path_abs):
+        all_videos = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
+        if matching_videos:
+            video_path = os.path.join(save_path_abs, matching_videos[0])
+            
+            # Collect parameters for metadata
+            parameters = {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "video_length": video_length,
+                "fps": fps,
+                "infer_steps": infer_steps,
+                "seed": current_seed,
+                "task": task,
+                "flow_shift": flow_shift,
+                "guidance_scale": guidance_scale,
+                "output_type": output_type,
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "input_image": input_image if "i2v" in task else None
+            }
+            
+            add_metadata_to_video(video_path, parameters)
+            videos.append((str(video_path), f"Seed: {current_seed}"))
+
+    yield videos, f"Completed (seed: {current_seed})", ""
+
+def send_wanx_to_v2v(
+    gallery: list,
+    prompt: str,
+    selected_index: int,
+    width: int,
+    height: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    flow_shift: float,
+    guidance_scale: float,
+    negative_prompt: str
+) -> Tuple:
+    """Send the selected WanX video to Video2Video tab"""
+    if not gallery or selected_index is None or selected_index >= len(gallery):
+        return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, guidance_scale, negative_prompt)
+
+    selected_item = gallery[selected_index]
+
+    if isinstance(selected_item, dict):
+        video_path = selected_item.get("name", selected_item.get("data", None))
+    elif isinstance(selected_item, (tuple, list)):
+        video_path = selected_item[0]
+    else:
+        video_path = selected_item
+
+    if isinstance(video_path, tuple):
+        video_path = video_path[0]
+
+    return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
+            flow_shift, guidance_scale, negative_prompt)
+
+def wanx_generate_video_batch(
+    prompt, 
+    negative_prompt,
+    width,
+    height,
+    video_length,
+    fps,
+    infer_steps,
+    flow_shift,
+    guidance_scale,
+    seed,
+    task,
+    dit_path,
+    vae_path,
+    t5_path,
+    clip_path,
+    save_path,
+    output_type,
+    sample_solver,
+    attn_mode,
+    block_swap,
+    fp8,
+    fp8_t5,
+    batch_size=1,
+    input_image=None  # Make input_image optional and place it at the end
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate videos with WanX with support for batches"""
+    global stop_event
+    stop_event.clear()
+    
+    all_videos = []
+    progress_text = "Starting generation..."
+    yield [], "Preparing...", progress_text
+    
+    # Process each item in the batch
+    for i in range(batch_size):
+        if stop_event.is_set():
+            yield all_videos, "Generation stopped by user", ""
+            return
+            
+        # Calculate seed for this batch item
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1:
+            current_seed = seed + i
+            
+        batch_text = f"Generating video {i + 1} of {batch_size}"
+        yield all_videos.copy(), batch_text, progress_text
+        
+        # Generate a single video using the existing function
+        for videos, status, progress in wanx_generate_video(
+            prompt, negative_prompt, input_image, width, height, 
+            video_length, fps, infer_steps, flow_shift, guidance_scale, 
+            current_seed, task, dit_path, vae_path, t5_path, clip_path, 
+            save_path, output_type, sample_solver, attn_mode, 
+            block_swap, fp8, fp8_t5
+        ):
+            if videos:
+                all_videos.extend(videos)
+            yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+    
+    yield all_videos, "Batch complete", ""
+
+def update_wanx_t2v_dimensions(size):
+    """Update width and height based on selected size"""
+    width, height = map(int, size.split('*'))
+    return gr.update(value=width), gr.update(value=height)
+
+def handle_wanx_t2v_gallery_select(evt: gr.SelectData) -> int:
+    """Track selected index when gallery item is clicked"""
+    return evt.index
+
+def send_wanx_t2v_to_v2v(
+    gallery, prompt, selected_index, width, height, video_length,
+    fps, infer_steps, seed, flow_shift, guidance_scale, negative_prompt
+) -> Tuple:
+    """Send the selected WanX T2V video to Video2Video tab"""
+    if not gallery or selected_index is None or selected_index >= len(gallery):
+        return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, guidance_scale, negative_prompt)
+
+    selected_item = gallery[selected_index]
+
+    if isinstance(selected_item, dict):
+        video_path = selected_item.get("name", selected_item.get("data", None))
+    elif isinstance(selected_item, (tuple, list)):
+        video_path = selected_item[0]
+    else:
+        video_path = selected_item
+
+    if isinstance(video_path, tuple):
+        video_path = video_path[0]
+
+    return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
+            flow_shift, guidance_scale, negative_prompt)
 
 # UI setup
 with gr.Blocks(
@@ -957,7 +1259,7 @@ with gr.Blocks(
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 v2v_split_uncond = gr.Checkbox(label="Split Unconditional (for SkyReels)", value=True)
 
-        with gr.Tab(label="SKYREELS") as skyreels_tab:
+        with gr.Tab(label="SkyReels-i2v") as skyreels_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     skyreels_prompt = gr.Textbox(
@@ -1066,6 +1368,194 @@ with gr.Blocks(
                 skyreels_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 skyreels_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
+
+        # WanX Image to Video Tab
+        with gr.Tab(label="WanX-i2v") as wanx_i2v_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wanx_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A person walking on a beach at sunset", 
+                        lines=5
+                    )
+                    wanx_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="",
+                        lines=3,
+                        info="Leave empty to use default negative prompt"
+                    )
+
+                with gr.Column(scale=1):
+                    wanx_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wanx_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    wanx_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    wanx_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+
+            with gr.Row():
+                wanx_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                wanx_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    wanx_input = gr.Image(label="Input Image", type="filepath")
+                    wanx_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength", visible=False)
+
+                    # Size selection
+                    wanx_size = gr.Dropdown(
+                        label="Video Size",
+                        choices=["480*832", "832*480", "512*896", "896*512"],
+                        value="832*480",
+                        info="Width*Height - 832*480 is landscape, 480*832 is portrait"
+                    )
+                    
+                    # Scale slider as percentage 
+                    wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %", visible=False)
+                    wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                    # Width and height display
+                    with gr.Row():
+                        wanx_width = gr.Number(label="Width", value=832, interactive=False)
+                        wanx_height = gr.Number(label="Height", value=480, interactive=False)
+                        wanx_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
+
+                    wanx_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                    wanx_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wanx_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
+                    wanx_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=3.0, 
+                                            info="Recommended: 3.0 for 480p, 5.0 for others")
+                    wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+
+                with gr.Column():
+                    wanx_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2],
+                        rows=[2],
+                        object_fit="contain",
+                        height="auto",
+                        show_label=True,
+                        elem_id="gallery",
+                        allow_preview=True,
+                        preview=True
+                    )
+                    wanx_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+
+            with gr.Row():
+                wanx_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                wanx_task = gr.Dropdown(
+                    label="Task",
+                    choices=["i2v-14B"],
+                    value="i2v-14B",
+                    info="Currently only i2v-14B is supported"
+                )
+                wanx_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_i2v_480p_14B_bf16.safetensors")
+                wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
+                wanx_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                wanx_clip_path = gr.Textbox(label="CLIP Path", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
+                wanx_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Row():
+                wanx_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                wanx_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                wanx_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                wanx_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
+                wanx_fp8 = gr.Checkbox(label="Use FP8", value=True)
+                wanx_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)                
+
+        #WanX-t2v Tab
+
+        # WanX Text to Video Tab
+        with gr.Tab(label="WanX-t2v") as wanx_t2v_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wanx_t2v_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A person walking on a beach at sunset", 
+                        lines=5
+                    )
+                    wanx_t2v_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="",
+                        lines=3,
+                        info="Leave empty to use default negative prompt"
+                    )
+
+                with gr.Column(scale=1):
+                    wanx_t2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wanx_t2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    wanx_t2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    wanx_t2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+
+            with gr.Row():
+                wanx_t2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                wanx_t2v_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    # Size selection
+                    wanx_t2v_size = gr.Dropdown(
+                        label="Video Size",
+                        choices=["480*832", "832*480", "512*896", "896*512"],
+                        value="832*480",
+                        info="Width*Height - 832*480 is landscape, 480*832 is portrait"
+                    )
+
+                    # Width and height display
+                    with gr.Row():
+                        wanx_t2v_width = gr.Number(label="Width", value=832, interactive=False)
+                        wanx_t2v_height = gr.Number(label="Height", value=480, interactive=False)
+                        wanx_t2v_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
+
+                    wanx_t2v_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                    wanx_t2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wanx_t2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
+                    wanx_t2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0, 
+                                             info="Recommended: 3.0 for I2V with 480p, 5.0 for others")
+                    wanx_t2v_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+
+                with gr.Column():
+                    wanx_t2v_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2],
+                        rows=[2],
+                        object_fit="contain",
+                        height="auto",
+                        show_label=True,
+                        elem_id="gallery",
+                        allow_preview=True,
+                        preview=True
+                    )
+                    wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+
+            with gr.Row():
+                wanx_t2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                wanx_t2v_task = gr.Dropdown(
+                    label="Task",
+                    choices=["t2v-1.3B", "t2v-14B", "t2i-14B"],
+                    value="t2v-14B",
+                    info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
+                )
+                wanx_t2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_bf16.safetensors")
+                wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/wan_2.1_vae.safetensors")
+                wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
+                wanx_t2v_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Row():
+                wanx_t2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                wanx_t2v_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                wanx_t2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                wanx_t2v_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0, 
+                                         info="Max 39 for 14B model, 29 for 1.3B model")
+                wanx_t2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
+                wanx_t2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
 
         #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
@@ -2268,6 +2758,216 @@ with gr.Blocks(
         fn=update_dit_and_lora_dropdowns,
         inputs=[v2v_dit_folder, v2v_lora_folder, v2v_model] + v2v_lora_weights + v2v_lora_multipliers,
         outputs=v2v_refresh_outputs
+    )
+
+    # WanX-i2v tab connections
+    wanx_prompt.change(fn=count_prompt_tokens, inputs=wanx_prompt, outputs=wanx_token_counter)
+    wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    
+    # Size dropdown handler
+    wanx_size.change(
+        fn=update_wanx_dimensions,
+        inputs=[wanx_size],
+        outputs=[wanx_width, wanx_height]
+    )
+    
+    # Flow shift recommendation button
+    wanx_recommend_flow_btn.click(
+        fn=recommend_wanx_flow_shift,
+        inputs=[wanx_width, wanx_height],
+        outputs=[wanx_flow_shift]
+    )
+    
+    # Generate button handler
+    wanx_generate_btn.click(
+        fn=wanx_generate_video_batch,
+        inputs=[
+            wanx_prompt, 
+            wanx_negative_prompt,
+            wanx_width,
+            wanx_height,
+            wanx_video_length,
+            wanx_fps,
+            wanx_infer_steps,
+            wanx_flow_shift,
+            wanx_guidance_scale,
+            wanx_seed,
+            wanx_task,
+            wanx_dit_path,
+            wanx_vae_path,
+            wanx_t5_path,
+            wanx_clip_path,
+            wanx_save_path,
+            wanx_output_type,
+            wanx_sample_solver,
+            wanx_attn_mode,
+            wanx_block_swap,
+            wanx_fp8,
+            wanx_fp8_t5,
+            wanx_batch_size,
+            wanx_input  # Include the image input for this tab
+        ],
+        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
+        queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[wanx_batch_size],
+        outputs=skyreels_selected_index
+    )
+    
+    # Gallery selection handling
+    wanx_output.select(
+        fn=handle_wanx_gallery_select,
+        outputs=skyreels_selected_index  # Reuse the skyreels_selected_index
+    )
+    
+    # Send to Video2Video handler
+    wanx_send_to_v2v_btn.click(
+        fn=send_wanx_to_v2v,
+        inputs=[
+            wanx_output, 
+            wanx_prompt, 
+            skyreels_selected_index,  # Reuse the skyreels_selected_index
+            wanx_width, 
+            wanx_height, 
+            wanx_video_length,
+            wanx_fps, 
+            wanx_infer_steps, 
+            wanx_seed,
+            wanx_flow_shift, 
+            wanx_guidance_scale,
+            wanx_negative_prompt
+        ],
+        outputs=[
+            v2v_input, 
+            v2v_prompt, 
+            v2v_width, 
+            v2v_height,
+            v2v_video_length, 
+            v2v_fps, 
+            v2v_infer_steps,
+            v2v_seed, 
+            v2v_flow_shift, 
+            v2v_cfg_scale,
+            v2v_negative_prompt
+        ]
+    ).then(
+        fn=change_to_tab_two,
+        inputs=None,
+        outputs=[tabs]
+    )
+
+        # Add state for T2V tab selected index
+    wanx_t2v_selected_index = gr.State(value=None)
+
+    # Connect prompt token counter
+    wanx_t2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_t2v_prompt, outputs=wanx_t2v_token_counter)
+
+    # Stop button handler
+    wanx_t2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Size dropdown handler
+    wanx_t2v_size.change(
+        fn=update_wanx_dimensions,
+        inputs=[wanx_t2v_size],
+        outputs=[wanx_t2v_width, wanx_t2v_height]
+    )
+
+    # Flow shift recommendation button
+    wanx_t2v_recommend_flow_btn.click(
+        fn=recommend_wanx_flow_shift,
+        inputs=[wanx_t2v_width, wanx_t2v_height],
+        outputs=[wanx_t2v_flow_shift]
+    )
+
+    # Task change handler to update CLIP visibility and path
+    def update_clip_visibility(task):
+        is_i2v = "i2v" in task
+        return gr.update(visible=is_i2v)
+
+    wanx_t2v_task.change(
+        fn=update_clip_visibility,
+        inputs=[wanx_t2v_task],
+        outputs=[wanx_t2v_clip_path]
+    )
+
+    # Generate button handler for T2V
+    wanx_t2v_generate_btn.click(
+        fn=wanx_generate_video_batch,
+        inputs=[
+            wanx_t2v_prompt, 
+            wanx_t2v_negative_prompt,
+            wanx_t2v_width,
+            wanx_t2v_height,
+            wanx_t2v_video_length,
+            wanx_t2v_fps,
+            wanx_t2v_infer_steps,
+            wanx_t2v_flow_shift,
+            wanx_t2v_guidance_scale,
+            wanx_t2v_seed,
+            wanx_t2v_task,
+            wanx_t2v_dit_path,
+            wanx_t2v_vae_path,
+            wanx_t2v_t5_path,
+            wanx_t2v_clip_path,
+            wanx_t2v_save_path,
+            wanx_t2v_output_type,
+            wanx_t2v_sample_solver,
+            wanx_t2v_attn_mode,
+            wanx_t2v_block_swap,
+            wanx_t2v_fp8,
+            wanx_t2v_fp8_t5,
+            wanx_t2v_batch_size,
+            # input_image is now optional and not included here
+        ],
+        outputs=[wanx_t2v_output, wanx_t2v_batch_progress, wanx_t2v_progress_text],
+        queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[wanx_t2v_batch_size],
+        outputs=wanx_t2v_selected_index
+    )
+
+    # Gallery selection handling
+    wanx_t2v_output.select(
+        fn=handle_wanx_t2v_gallery_select,
+        outputs=wanx_t2v_selected_index
+    )
+
+    # Send to Video2Video handler
+    wanx_t2v_send_to_v2v_btn.click(
+        fn=send_wanx_t2v_to_v2v,
+        inputs=[
+            wanx_t2v_output, 
+            wanx_t2v_prompt, 
+            wanx_t2v_selected_index,
+            wanx_t2v_width, 
+            wanx_t2v_height, 
+            wanx_t2v_video_length,
+            wanx_t2v_fps, 
+            wanx_t2v_infer_steps, 
+            wanx_t2v_seed,
+            wanx_t2v_flow_shift, 
+            wanx_t2v_guidance_scale,
+            wanx_t2v_negative_prompt
+        ],
+        outputs=[
+            v2v_input, 
+            v2v_prompt, 
+            v2v_width, 
+            v2v_height,
+            v2v_video_length, 
+            v2v_fps, 
+            v2v_infer_steps,
+            v2v_seed, 
+            v2v_flow_shift, 
+            v2v_cfg_scale,
+            v2v_negative_prompt
+        ]
+    ).then(
+        fn=change_to_tab_two,
+        inputs=None,
+        outputs=[tabs]
     )
 
 demo.queue().launch(server_name="0.0.0.0", share=False)
