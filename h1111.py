@@ -597,10 +597,42 @@ def process_batch(
 
     yield all_videos, "Batch complete", ""
 
-def update_wanx_dimensions(size):
-    """Update width and height based on selected size"""
-    width, height = map(int, size.split('*'))
-    return gr.update(value=width), gr.update(value=height)
+def update_wanx_image_dimensions(image):
+    """Update dimensions from uploaded image"""
+    if image is None:
+        return "", gr.update(value=832), gr.update(value=480)
+    img = Image.open(image)
+    w, h = img.size
+    w = (w // 32) * 32
+    h = (h // 32) * 32
+    return f"{w}x{h}", w, h
+
+def calculate_wanx_width(height, original_dims):
+    """Calculate width based on height maintaining aspect ratio"""
+    if not original_dims:
+        return gr.update()
+    orig_w, orig_h = map(int, original_dims.split('x'))
+    aspect_ratio = orig_w / orig_h
+    new_width = math.floor((height * aspect_ratio) / 32) * 32
+    return gr.update(value=new_width)
+
+def calculate_wanx_height(width, original_dims):
+    """Calculate height based on width maintaining aspect ratio"""
+    if not original_dims:
+        return gr.update()
+    orig_w, orig_h = map(int, original_dims.split('x'))
+    aspect_ratio = orig_w / orig_h
+    new_height = math.floor((width / aspect_ratio) / 32) * 32
+    return gr.update(value=new_height)
+
+def update_wanx_from_scale(scale, original_dims):
+    """Update dimensions based on scale percentage"""
+    if not original_dims:
+        return gr.update(), gr.update()
+    orig_w, orig_h = map(int, original_dims.split('x'))
+    new_w = math.floor((orig_w * scale / 100) / 32) * 32
+    new_h = math.floor((orig_h * scale / 100) / 32) * 32
+    return gr.update(value=new_w), gr.update(value=new_h)
 
 def recommend_wanx_flow_shift(width, height):
     """Get recommended flow shift value based on dimensions"""
@@ -1402,24 +1434,15 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     wanx_input = gr.Image(label="Input Image", type="filepath")
-                    wanx_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength", visible=False)
-
-                    # Size selection
-                    wanx_size = gr.Dropdown(
-                        label="Video Size",
-                        choices=["480*832", "832*480", "512*896", "896*512"],
-                        value="832*480",
-                        info="Width*Height - 832*480 is landscape, 480*832 is portrait"
-                    )
-                    
-                    # Scale slider as percentage 
-                    wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %", visible=False)
-                    wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
-
+                    wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
+        
                     # Width and height display
                     with gr.Row():
-                        wanx_width = gr.Number(label="Width", value=832, interactive=False)
-                        wanx_height = gr.Number(label="Height", value=480, interactive=False)
+                        wanx_width = gr.Number(label="Width", value=832, interactive=True)
+                        wanx_calc_height_btn = gr.Button("→")
+                        wanx_calc_width_btn = gr.Button("←")
+                        wanx_height = gr.Number(label="Height", value=480, interactive=True)
                         wanx_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
 
                     wanx_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
@@ -1499,18 +1522,9 @@ with gr.Blocks(
 
             with gr.Row():
                 with gr.Column():
-                    # Size selection
-                    wanx_t2v_size = gr.Dropdown(
-                        label="Video Size",
-                        choices=["480*832", "832*480", "512*896", "896*512"],
-                        value="832*480",
-                        info="Width*Height - 832*480 is landscape, 480*832 is portrait"
-                    )
-
-                    # Width and height display
                     with gr.Row():
-                        wanx_t2v_width = gr.Number(label="Width", value=832, interactive=False)
-                        wanx_t2v_height = gr.Number(label="Height", value=480, interactive=False)
+                        wanx_t2v_width = gr.Number(label="Width", value=832, interactive=True, info="Should be divisible by 32")
+                        wanx_t2v_height = gr.Number(label="Height", value=480, interactive=True, info="Should be divisible by 32")
                         wanx_t2v_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
 
                     wanx_t2v_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
@@ -2764,18 +2778,44 @@ with gr.Blocks(
     wanx_prompt.change(fn=count_prompt_tokens, inputs=wanx_prompt, outputs=wanx_token_counter)
     wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     
-    # Size dropdown handler
-    wanx_size.change(
-        fn=update_wanx_dimensions,
-        inputs=[wanx_size],
+    # Image input handling for WanX-i2v
+    wanx_input.change(
+        fn=update_wanx_image_dimensions,
+        inputs=[wanx_input],
+        outputs=[wanx_original_dims, wanx_width, wanx_height]
+    )
+
+    # Scale slider handling for WanX-i2v
+    wanx_scale_slider.change(
+        fn=update_wanx_from_scale,
+        inputs=[wanx_scale_slider, wanx_original_dims],
         outputs=[wanx_width, wanx_height]
     )
-    
-    # Flow shift recommendation button
+
+    # Width/height calculation buttons for WanX-i2v
+    wanx_calc_width_btn.click(
+        fn=calculate_wanx_width,
+        inputs=[wanx_height, wanx_original_dims],
+        outputs=[wanx_width]
+    )
+
+    wanx_calc_height_btn.click(
+        fn=calculate_wanx_height,
+        inputs=[wanx_width, wanx_original_dims],
+        outputs=[wanx_height]
+    )
+
+    # Flow shift recommendation buttons
     wanx_recommend_flow_btn.click(
         fn=recommend_wanx_flow_shift,
         inputs=[wanx_width, wanx_height],
         outputs=[wanx_flow_shift]
+    )
+
+    wanx_t2v_recommend_flow_btn.click(
+        fn=recommend_wanx_flow_shift,
+        inputs=[wanx_t2v_width, wanx_t2v_height],
+        outputs=[wanx_t2v_flow_shift]
     )
     
     # Generate button handler
@@ -2865,13 +2905,6 @@ with gr.Blocks(
 
     # Stop button handler
     wanx_t2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-
-    # Size dropdown handler
-    wanx_t2v_size.change(
-        fn=update_wanx_dimensions,
-        inputs=[wanx_t2v_size],
-        outputs=[wanx_t2v_width, wanx_t2v_height]
-    )
 
     # Flow shift recommendation button
     wanx_t2v_recommend_flow_btn.click(
