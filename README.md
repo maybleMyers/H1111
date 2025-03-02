@@ -47,7 +47,7 @@ I have tested the 14B i2v and t2v models so far to be working
 ## changlog
 
 3/2/2025  
-    Added initial support for wanX-2.1 Image to Video and Text to Video inference.
+    Added initial support for wanX-2.1 Image to Video and Text to Video inference.  
 3/1/2025  
     Added support for Skyreels Video to Video and Text to Video.   
 2/23/2025  
