@@ -396,9 +396,11 @@ def process_single_video(
         command.extend(["--video_path", video_path])
         if strength is not None:
             command.extend(["--strength", str(strength)])
-    elif image_path and is_skyreels:
+    elif image_path:
         command.extend(["--image_path", image_path])
-        if strength is not None:
+        # Only add strength parameter for non-SkyReels I2V models
+        # SkyReels I2V doesn't use strength parameter for image-to-video generation
+        if strength is not None and not is_skyreels_i2v:
             command.extend(["--strength", str(strength)])
             
     print(f"{command}")
