@@ -1543,7 +1543,7 @@ with gr.Blocks(
                     info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
                 )
                 wanx_t2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_bf16.safetensors")
-                wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/wan_2.1_vae.safetensors")
+                wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
                 wanx_t2v_save_path = gr.Textbox(label="Save Path", value="outputs")
