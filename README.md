@@ -32,8 +32,22 @@ Use the t2v model for video to video and text to video.
 
 Most of the lora's for hunyuan will work with skyreels also.
 
+## To Use WanX
+
+To use wanX download these and toss them in the wan subfolder:
+Download the T5 `models_t5_umt5-xxl-enc-bf16.pth`, vae `Wan2.1_VAE.pth` and CLIP `models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` from the following page: https://huggingface.co/Wan-AI/Wan2.1-T2V-14B/tree/main  
+
+Download the DiT weights from the following page: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models  
+
+git pull to update the installation
+pip install -r requirements.txt
+
+I have tested the 14B i2v and t2v models so far to be working
+
 ## changlog
 
+3/2/2025  
+    Added initial support for wanX-2.1 Image to Video and Text to Video inference.
 3/1/2025  
     Added support for Skyreels Video to Video and Text to Video.   
 2/23/2025  
