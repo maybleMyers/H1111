@@ -13,14 +13,16 @@ from PIL import Image
 from wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.vae import WanVAE
+from networks import lora
 
-# try:
-#     from lycoris.kohya import create_network_from_weights
-# except:
-#     pass
+try:
+    from lycoris.kohya import create_network_from_weights
+except ImportError:
+    pass
 
 from utils.model_utils import str_to_dtype
-from utils.device_utils import clean_memory_on_device
+from utils.device_utils import clean_memory_on_device, synchronize_device
+from utils.safetensors_utils import mem_eff_save_file
 from hv_generate_video import save_images_grid, save_videos_grid
 
 import logging
@@ -45,16 +47,17 @@ def parse_args():
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
     parser.add_argument("--t5", type=str, default=None, help="text encoder (T5) checkpoint path")
     parser.add_argument("--clip", type=str, default=None, help="text encoder (CLIP) checkpoint path")
-    # # LoRA
-    # parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    # parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
-    # parser.add_argument(
-    #     "--save_merged_model",
-    #     type=str,
-    #     default=None,
-    #     help="Save merged model to path. If specified, no inference will be performed.",
-    # )
-    # parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
+    # LoRA
+    parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument(
+        "--save_merged_model",
+        type=str,
+        default=None,
+        help="Save merged model to path. If specified, no inference will be performed.",
+    )
+    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
+    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
 
     # inference
     parser.add_argument("--prompt", type=str, required=True, help="prompt for generation")
@@ -119,7 +122,6 @@ def parse_args():
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    # parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
 
     args = parser.parse_args()
 
@@ -143,6 +145,55 @@ def check_inputs(args):
     video_length = args.video_length
 
     return height, width, video_length
+
+
+def load_transformer_with_lora(
+    transformer, lora_weights, lora_multipliers, device, dit_weight_dtype, exclude_single_blocks=False, use_lycoris=False
+):
+    """Load transformer model and apply LoRA weights"""
+    if lora_weights is None or len(lora_weights) == 0:
+        return transformer
+    
+    logger.info(f"Loading {len(lora_weights)} LoRA weight(s) for Wan model")
+
+    for i, lora_weight in enumerate(lora_weights):
+        if lora_multipliers is None or not isinstance(lora_multipliers, list) or len(lora_multipliers) <= i:
+            lora_multiplier = 1.0
+        else:
+            lora_multiplier = lora_multipliers[i]
+
+        logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
+        weights_sd = load_file(lora_weight)
+        
+        # Filter to exclude keys that are part of single_blocks
+        if exclude_single_blocks:
+            filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
+            weights_sd = filtered_weights
+            
+        if use_lycoris:
+            from lycoris.kohya import create_network_from_weights
+            lycoris_net, _ = create_network_from_weights(
+                multiplier=lora_multiplier,
+                file=None,
+                weights_sd=weights_sd,
+                unet=transformer,
+                text_encoder=None,
+                vae=None,
+                for_inference=True,
+            )
+            logger.info("Merging LyCORIS weights to transformer model")
+            lycoris_net.merge_to(None, transformer, weights_sd, dtype=None, device=device)
+        else:
+            network = lora.create_network_from_weights_wan(
+                lora_multiplier, weights_sd, transformer=transformer, for_inference=True
+            )
+            logger.info("Merging LoRA weights to transformer model")
+            network.merge_to(None, transformer, weights_sd, device=device, non_blocking=True)
+
+        synchronize_device(device)
+        logger.info(f"LoRA weights from {lora_weight} loaded and merged")
+
+    return transformer
 
 
 def main():
@@ -249,6 +300,33 @@ def main():
                 t5_path=args.t5,
                 t5_fp8=args.fp8_t5,
             )
+            
+            # Apply LoRA weights if provided
+            if args.lora_weight and len(args.lora_weight) > 0:
+                # Access the internal DiT model
+                transformer = None
+                if hasattr(wan_t2v, 'model') and wan_t2v.model is not None:
+                    transformer = wan_t2v.model
+                
+                if transformer is not None:
+                    transformer = load_transformer_with_lora(
+                        transformer, 
+                        args.lora_weight, 
+                        args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier],
+                        device, 
+                        dit_weight_dtype,
+                        args.exclude_single_blocks,
+                        args.lycoris
+                    )
+                    
+                    # Save merged model if requested
+                    if args.save_merged_model:
+                        logger.info(f"Saving merged model to {args.save_merged_model}")
+                        mem_eff_save_file(transformer.state_dict(), args.save_merged_model)
+                        logger.info("Merged model saved")
+                        return
+                else:
+                    logger.warning("Could not access transformer model in WanT2V. LoRA weights not applied.")
 
             logging.info(f"Generating {'image' if 't2i' in args.task else 'video'} ...")
             latents = wan_t2v.generate(
@@ -277,6 +355,33 @@ def main():
                 clip_path=args.clip,
                 t5_fp8=args.fp8_t5,
             )
+            
+            # Apply LoRA weights if provided
+            if args.lora_weight and len(args.lora_weight) > 0:
+                # Access the internal DiT model
+                transformer = None
+                if hasattr(wan_i2v, 'model') and wan_i2v.model is not None:
+                    transformer = wan_i2v.model
+                
+                if transformer is not None:
+                    transformer = load_transformer_with_lora(
+                        transformer, 
+                        args.lora_weight, 
+                        args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier],
+                        device, 
+                        dit_weight_dtype,
+                        args.exclude_single_blocks,
+                        args.lycoris
+                    )
+                    
+                    # Save merged model if requested
+                    if args.save_merged_model:
+                        logger.info(f"Saving merged model to {args.save_merged_model}")
+                        mem_eff_save_file(transformer.state_dict(), args.save_merged_model)
+                        logger.info("Merged model saved")
+                        return
+                else:
+                    logger.warning("Could not access transformer model in WanI2V. LoRA weights not applied.")
 
             # i2v inference
             logger.info(f"Image2Video inference: {args.image_path}")
@@ -348,6 +453,14 @@ def main():
             }
             if args.negative_prompt is not None:
                 metadata["negative_prompt"] = f"{args.negative_prompt}"
+            # Add LoRA information to metadata
+            if args.lora_weight and len(args.lora_weight) > 0:
+                metadata["lora_weights"] = ",".join(args.lora_weight)
+                if isinstance(args.lora_multiplier, list):
+                    metadata["lora_multipliers"] = ",".join(map(str, args.lora_multiplier))
+                else:
+                    metadata["lora_multipliers"] = str(args.lora_multiplier)
+                    
         sd = {"latent": latents[0]}
         save_file(sd, latent_path, metadata=metadata)
 
