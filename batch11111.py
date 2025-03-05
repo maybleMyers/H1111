@@ -19,6 +19,7 @@ import math
 import cv2
 import glob
 
+
 # Add global stop event
 stop_event = threading.Event()
 
@@ -42,7 +43,7 @@ def get_random_image_from_folder(folder_path):
     return random_image, f"Selected: {os.path.basename(random_image)}"
 
 def resize_image_keeping_aspect_ratio(image_path, max_width, max_height):
-    """Resize image keeping aspect ratio and ensuring dimensions are divisible by 32"""
+    """Resize image keeping aspect ratio and ensuring dimensions are divisible by 16"""
     try:
         img = Image.open(image_path)
         width, height = img.size
@@ -58,13 +59,13 @@ def resize_image_keeping_aspect_ratio(image_path, max_width, max_height):
             new_height = min(max_height, height)
             new_width = int(new_height * aspect_ratio)
         
-        # Make dimensions divisible by 32
-        new_width = math.floor(new_width / 32) * 32
-        new_height = math.floor(new_height / 32) * 32
+        # Make dimensions divisible by 16
+        new_width = math.floor(new_width / 16) * 16
+        new_height = math.floor(new_height / 16) * 16
         
         # Ensure minimum size
-        new_width = max(32, new_width)
-        new_height = max(32, new_height)
+        new_width = max(16, new_width)
+        new_height = max(16, new_height)
         
         # Resize image
         resized_img = img.resize((new_width, new_height), Image.LANCZOS)
@@ -76,10 +77,11 @@ def resize_image_keeping_aspect_ratio(image_path, max_width, max_height):
         return temp_path, (new_width, new_height)
     except Exception as e:
         return None, f"Error: {str(e)}"
-
-def process_random_image_batch(
+# Function to process a batch of images from a folder
+def batch_handler(
+    use_random,
     prompt, negative_prompt, 
-    max_width, max_height, 
+    width, height, 
     video_length, fps, infer_steps, 
     seed, flow_shift, guidance_scale, embedded_cfg_scale,
     batch_size, input_folder_path,
@@ -87,79 +89,383 @@ def process_random_image_batch(
     block_swap, exclude_single_blocks, use_split_attn, use_fp8, split_uncond,
     lora_folder, *lora_params
 ):
-    """Process a batch of videos using random images from a folder"""
+    """Handle both folder-based batch processing and regular batch processing"""
     global stop_event
-    stop_event.clear()
-
-    all_videos = []
-    progress_text = "Starting generation..."
-    yield [], "Preparing...", progress_text
-
-    # Extract lora weights and multipliers
-    num_lora_weights = 4
-    lora_weights = lora_params[:num_lora_weights]
-    lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
     
-    for i in range(batch_size):
-        if stop_event.is_set():
-            break
+    # Check if this is a SkyReels model that needs special handling
+    is_skyreels = "skyreels" in model.lower()
+    is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
+    
+    if use_random:
+        # Random image from folder mode
+        stop_event.clear()
 
-        batch_text = f"Generating video {i + 1} of {batch_size}"
-        yield all_videos.copy(), batch_text, progress_text
+        all_videos = []
+        progress_text = "Starting generation..."
+        yield [], "Preparing...", progress_text
 
-        # Get random image from folder
-        random_image, status = get_random_image_from_folder(input_folder_path)
-        if random_image is None:
-            yield all_videos, f"Error in batch {i+1}: {status}", ""
-            continue
+        for i in range(batch_size):
+            if stop_event.is_set():
+                break
 
-        # Resize image
-        resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, max_width, max_height)
-        if resized_image is None:
-            yield all_videos, f"Error resizing image in batch {i+1}: {size_info}", ""
-            continue
+            batch_text = f"Generating video {i + 1} of {batch_size}"
+            yield all_videos.copy(), batch_text, progress_text
 
-        # If we have dimensions, update them
-        if isinstance(size_info, tuple):
-            width, height = size_info
-            progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {width}x{height}"
+            # Get random image from folder
+            random_image, status = get_random_image_from_folder(input_folder_path)
+            if random_image is None:
+                yield all_videos, f"Error in batch {i+1}: {status}", ""
+                continue
+
+            # Resize image
+            resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, width, height)
+            if resized_image is None:
+                yield all_videos, f"Error resizing image in batch {i+1}: {size_info}", ""
+                continue
+
+            # If we have dimensions, update them
+            local_width, local_height = width, height
+            if isinstance(size_info, tuple):
+                local_width, local_height = size_info
+                progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height}"
+            else:
+                progress_text = f"Using image: {os.path.basename(random_image)}"
+            
+            yield all_videos.copy(), batch_text, progress_text
+
+            # Calculate seed for this batch item
+            current_seed = seed
+            if seed == -1:
+                current_seed = random.randint(0, 2**32 - 1)
+            elif batch_size > 1:
+                current_seed = seed + i
+
+            # Process the image
+            # For SkyReels models, we need to create a command with dit_in_channels=32
+            if is_skyreels_i2v:
+                env = os.environ.copy()
+                env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+                env["PYTHONIOENCODING"] = "utf-8"
+                
+                model_path = os.path.join(dit_folder, model) if not os.path.isabs(model) else model
+                
+                # Extract parameters from lora_params
+                num_lora_weights = 4
+                lora_weights = lora_params[:num_lora_weights]
+                lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+                
+                cmd = [
+                    sys.executable,
+                    "hv_generate_video.py",
+                    "--dit", model_path,
+                    "--vae", vae,
+                    "--text_encoder1", te1,
+                    "--text_encoder2", te2,
+                    "--prompt", prompt,
+                    "--video_size", str(local_height), str(local_width),
+                    "--video_length", str(video_length),
+                    "--fps", str(fps),
+                    "--infer_steps", str(infer_steps),
+                    "--save_path", save_path,
+                    "--seed", str(current_seed),
+                    "--flow_shift", str(flow_shift),
+                    "--embedded_cfg_scale", str(embedded_cfg_scale),
+                    "--output_type", output_type,
+                    "--attn_mode", attn_mode,
+                    "--blocks_to_swap", str(block_swap),
+                    "--fp8_llm",
+                    "--vae_chunk_size", "32",
+                    "--vae_spatial_tile_sample_min_size", "128",
+                    "--dit_in_channels", "32",  # This is crucial for SkyReels i2v
+                    "--image_path", resized_image  # Pass the image directly
+                ]
+                
+                if use_fp8:
+                    cmd.append("--fp8")
+                
+                if split_uncond:
+                    cmd.append("--split_uncond")
+                
+                if use_split_attn:
+                    cmd.append("--split_attn")
+                
+                if exclude_single_blocks:
+                    cmd.append("--exclude_single_blocks")
+                
+                if negative_prompt:
+                    cmd.extend(["--negative_prompt", negative_prompt])
+                    
+                if guidance_scale is not None:
+                    cmd.extend(["--guidance_scale", str(guidance_scale)])
+                
+                # Add LoRA weights and multipliers if provided
+                valid_loras = []
+                for weight, mult in zip(lora_weights, lora_multipliers):
+                    if weight and weight != "None":
+                        valid_loras.append((os.path.join(lora_folder, weight), mult))
+                
+                if valid_loras:
+                    weights = [weight for weight, _ in valid_loras]
+                    multipliers = [str(mult) for _, mult in valid_loras]
+                    cmd.extend(["--lora_weight"] + weights)
+                    cmd.extend(["--lora_multiplier"] + multipliers)
+                
+                print(f"Running command: {' '.join(cmd)}")
+                
+                # Run the process
+                p = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1
+                )
+                
+                while True:
+                    if stop_event.is_set():
+                        p.terminate()
+                        p.wait()
+                        yield all_videos, "Generation stopped by user.", ""
+                        return
+                        
+                    line = p.stdout.readline()
+                    if not line:
+                        if p.poll() is not None:
+                            break
+                        continue
+                        
+                    print(line, end='')
+                    if '|' in line and '%' in line and '[' in line and ']' in line:
+                        yield all_videos.copy(), f"Processing video {i+1} (seed: {current_seed})", line.strip()
+                
+                p.stdout.close()
+                p.wait()
+                
+                # Collect generated video
+                save_path_abs = os.path.abspath(save_path)
+                if os.path.exists(save_path_abs):
+                    all_videos_files = sorted(
+                        [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+                        key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+                        reverse=True
+                    )
+                    matching_videos = [v for v in all_videos_files if f"_{current_seed}" in v]
+                    if matching_videos:
+                        video_path = os.path.join(save_path_abs, matching_videos[0])
+                        all_videos.append((str(video_path), f"Seed: {current_seed}"))
+            else:
+                # For non-SkyReels models, use the regular process_single_video function
+                num_lora_weights = 4
+                lora_weights = lora_params[:num_lora_weights]
+                lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+                
+                single_video_args = [
+                    prompt, local_width, local_height, 1, video_length, fps, infer_steps,
+                    current_seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, embedded_cfg_scale,
+                    output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+                    lora_folder
+                ]
+                single_video_args.extend(lora_weights)
+                single_video_args.extend(lora_multipliers)
+                single_video_args.extend([None, resized_image, None, negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale, use_fp8])
+
+                for videos, status, progress in process_single_video(*single_video_args):
+                    if videos:
+                        all_videos.extend(videos)
+                    yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+
+            # Clean up temporary file
+            try:
+                if os.path.exists(resized_image):
+                    os.remove(resized_image)
+            except:
+                pass
+            
+            # Clear CUDA cache between generations
+            clear_cuda_cache()
+            time.sleep(0.5)
+
+        yield all_videos, "Batch complete", ""
+    else:
+        # Regular image input - this is the part we need to fix
+        # When a SkyReels I2V model is used, we need to use the direct command approach
+        # with dit_in_channels=32 explicitly specified, just like in the folder processing branch
+        if is_skyreels_i2v:
+            stop_event.clear()
+            
+            all_videos = []
+            progress_text = "Starting generation..."
+            yield [], "Preparing...", progress_text
+            
+            # Extract lora parameters
+            num_lora_weights = 4
+            lora_weights = lora_params[:num_lora_weights]
+            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+            extra_args = list(lora_params[num_lora_weights*2:]) if len(lora_params) > num_lora_weights*2 else []
+            
+            # Print extra_args for debugging
+            print(f"Extra args: {extra_args}")
+            
+            # Get input image path from extra args - this is where we need to fix
+            # In skyreels_generate_btn.click, we're passing skyreels_input which
+            # should be the image path
+            image_path = None
+            if len(extra_args) > 0 and extra_args[0] is not None:
+                image_path = extra_args[0]
+                print(f"Image path found in extra_args[0]: {image_path}")
+            
+            # If we still don't have an image path, this is a problem
+            if not image_path:
+                # Let's try to debug what's happening - in the future, you can remove these
+                # debug prints once everything works correctly
+                print("No image path found in extra_args[0]")
+                print(f"Full lora_params: {lora_params}")
+                yield [], "Error: No input image provided", "An input image is required for SkyReels I2V models"
+                return
+            
+            for i in range(batch_size):
+                if stop_event.is_set():
+                    yield all_videos, "Generation stopped by user", ""
+                    return
+                
+                # Calculate seed for this batch item
+                current_seed = seed
+                if seed == -1:
+                    current_seed = random.randint(0, 2**32 - 1)
+                elif batch_size > 1:
+                    current_seed = seed + i
+                
+                batch_text = f"Generating video {i + 1} of {batch_size}"
+                yield all_videos.copy(), batch_text, progress_text
+                
+                # Set up environment
+                env = os.environ.copy()
+                env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+                env["PYTHONIOENCODING"] = "utf-8"
+                
+                model_path = os.path.join(dit_folder, model) if not os.path.isabs(model) else model
+                
+                # Build the command with dit_in_channels=32
+                cmd = [
+                    sys.executable,
+                    "hv_generate_video.py",
+                    "--dit", model_path,
+                    "--vae", vae,
+                    "--text_encoder1", te1,
+                    "--text_encoder2", te2,
+                    "--prompt", prompt,
+                    "--video_size", str(height), str(width),
+                    "--video_length", str(video_length),
+                    "--fps", str(fps),
+                    "--infer_steps", str(infer_steps),
+                    "--save_path", save_path,
+                    "--seed", str(current_seed),
+                    "--flow_shift", str(flow_shift),
+                    "--embedded_cfg_scale", str(embedded_cfg_scale),
+                    "--output_type", output_type,
+                    "--attn_mode", attn_mode,
+                    "--blocks_to_swap", str(block_swap),
+                    "--fp8_llm",
+                    "--vae_chunk_size", "32",
+                    "--vae_spatial_tile_sample_min_size", "128",
+                    "--dit_in_channels", "32",  # This is crucial for SkyReels i2v
+                    "--image_path", image_path
+                ]
+                
+                if use_fp8:
+                    cmd.append("--fp8")
+                
+                if split_uncond:
+                    cmd.append("--split_uncond")
+                
+                if use_split_attn:
+                    cmd.append("--split_attn")
+                
+                if exclude_single_blocks:
+                    cmd.append("--exclude_single_blocks")
+                
+                if negative_prompt:
+                    cmd.extend(["--negative_prompt", negative_prompt])
+                    
+                if guidance_scale is not None:
+                    cmd.extend(["--guidance_scale", str(guidance_scale)])
+                
+                # Add LoRA weights and multipliers if provided
+                valid_loras = []
+                for weight, mult in zip(lora_weights, lora_multipliers):
+                    if weight and weight != "None":
+                        valid_loras.append((os.path.join(lora_folder, weight), mult))
+                
+                if valid_loras:
+                    weights = [weight for weight, _ in valid_loras]
+                    multipliers = [str(mult) for _, mult in valid_loras]
+                    cmd.extend(["--lora_weight"] + weights)
+                    cmd.extend(["--lora_multiplier"] + multipliers)
+                
+                print(f"Running command: {' '.join(cmd)}")
+                
+                # Run the process
+                p = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1
+                )
+                
+                while True:
+                    if stop_event.is_set():
+                        p.terminate()
+                        p.wait()
+                        yield all_videos, "Generation stopped by user.", ""
+                        return
+                        
+                    line = p.stdout.readline()
+                    if not line:
+                        if p.poll() is not None:
+                            break
+                        continue
+                        
+                    print(line, end='')
+                    if '|' in line and '%' in line and '[' in line and ']' in line:
+                        yield all_videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+                
+                p.stdout.close()
+                p.wait()
+                
+                # Collect generated video
+                save_path_abs = os.path.abspath(save_path)
+                if os.path.exists(save_path_abs):
+                    all_videos_files = sorted(
+                        [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+                        key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+                        reverse=True
+                    )
+                    matching_videos = [v for v in all_videos_files if f"_{current_seed}" in v]
+                    if matching_videos:
+                        video_path = os.path.join(save_path_abs, matching_videos[0])
+                        all_videos.append((str(video_path), f"Seed: {current_seed}"))
+                
+                # Clear CUDA cache between generations
+                clear_cuda_cache()
+                time.sleep(0.5)
+            
+            yield all_videos, "Batch complete", ""
         else:
-            width, height = max_width, max_height
-            progress_text = f"Using image: {os.path.basename(random_image)}"
-        
-        yield all_videos.copy(), batch_text, progress_text
-
-        # Calculate seed for this batch item
-        current_seed = seed
-        if seed == -1:
-            current_seed = random.randint(0, 2**32 - 1)
-        elif batch_size > 1:
-            current_seed = seed + i
-
-        # Generate video with the random image
-        single_video_args = [
-            prompt, width, height, 1, video_length, fps, infer_steps,
-            current_seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, embedded_cfg_scale,
-            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-            lora_folder
-        ]
-        single_video_args.extend(lora_weights)
-        single_video_args.extend(lora_multipliers)
-        single_video_args.extend([resized_image, None, None, negative_prompt, guidance_scale, split_uncond, use_fp8])
-
-        for videos, status, progress in process_single_video(*single_video_args):
-            if videos:
-                all_videos.extend(videos)
-            yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
-
-        # Clean up temporary file
-        try:
-            if os.path.exists(resized_image):
-                os.remove(resized_image)
-        except:
-            pass
-
-    yield all_videos, "Batch complete", ""
+            # For regular non-SkyReels models, use the original process_batch function
+            regular_args = [
+                prompt, width, height, batch_size, video_length, fps, infer_steps,
+                seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, guidance_scale,
+                output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+                lora_folder
+            ]
+            yield from process_batch(*(regular_args + list(lora_params)))
 
 def get_dit_models(dit_folder: str) -> List[str]:
     """Get list of available DiT models in the specified folder"""
@@ -1431,6 +1737,8 @@ with gr.Blocks(
                 v2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 v2v_split_uncond = gr.Checkbox(label="Split Unconditional (for SkyReels)", value=True)
 
+### SKYREELS
+
         with gr.Tab(label="SkyReels-i2v") as skyreels_tab:
             with gr.Row():
                 with gr.Column(scale=4):
@@ -1476,7 +1784,6 @@ with gr.Blocks(
                             visible=False
                         )
                         skyreels_validate_folder_btn = gr.Button("Validate Folder", visible=False)
-
                     skyreels_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
 
                     # Scale slider as percentage 
@@ -1912,25 +2219,6 @@ with gr.Blocks(
         outputs=[drop for _ in range(4) for drop in [skyreels_lora_weights[_], skyreels_lora_multipliers[_]]]
     )      
     # Skyreels dimension handling
-    # Handle checkbox visibility toggling
-    skyreels_use_random_folder.change(
-        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=not x)),
-        inputs=[skyreels_use_random_folder],
-        outputs=[skyreels_input_folder, skyreels_folder_status, skyreels_input]
-    )
-
-    # Validate folder button click handler
-    skyreels_validate_folder_btn.click(
-        fn=lambda folder: get_random_image_from_folder(folder)[1],
-        inputs=[skyreels_input_folder],
-        outputs=[skyreels_folder_status]
-    )
-
-    skyreels_use_random_folder.change(
-        fn=lambda x: gr.update(visible=x),
-        inputs=[skyreels_use_random_folder],
-        outputs=[skyreels_validate_folder_btn]
-    )
     def calculate_skyreels_width(height, original_dims):
         if not original_dims:
             return gr.update()
@@ -2041,12 +2329,32 @@ with gr.Blocks(
         outputs=[skyreels_height]
     )
 
-    # SKYREELS tab generator button handler
+    # Handle checkbox visibility toggling
+    skyreels_use_random_folder.change(
+        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=not x)),
+        inputs=[skyreels_use_random_folder],
+        outputs=[skyreels_input_folder, skyreels_folder_status, skyreels_input]
+    )
+
+    # Validate folder button click handler
+    skyreels_validate_folder_btn.click(
+        fn=lambda folder: get_random_image_from_folder(folder)[1],
+        inputs=[skyreels_input_folder],
+        outputs=[skyreels_folder_status]
+    )
+
+    skyreels_use_random_folder.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[skyreels_use_random_folder],
+        outputs=[skyreels_validate_folder_btn]
+    )
+
+    # Modify the skyreels_generate_btn.click event handler to use process_random_image_batch when folder mode is on
     skyreels_generate_btn.click(
-        fn=lambda use_random, *args: process_random_image_batch(*args) if use_random else process_batch(*args),
+        fn=batch_handler,
         inputs=[
             skyreels_use_random_folder,
-            # Arguments for random folder batch processing
+            # Rest of the arguments
             skyreels_prompt,
             skyreels_negative_prompt,
             skyreels_width,
@@ -2076,37 +2384,7 @@ with gr.Blocks(
             skyreels_lora_folder,
             *skyreels_lora_weights,
             *skyreels_lora_multipliers,
-            # Regular arguments for when not using random folder
-            skyreels_prompt,
-            skyreels_width,
-            skyreels_height,
-            skyreels_batch_size,
-            skyreels_video_length,
-            skyreels_fps,
-            skyreels_infer_steps,
-            skyreels_seed,
-            skyreels_dit_folder,
-            skyreels_model,
-            skyreels_vae,
-            skyreels_te1,
-            skyreels_te2,
-            skyreels_save_path,
-            skyreels_flow_shift,
-            skyreels_embedded_cfg_scale,
-            skyreels_output_type,
-            skyreels_attn_mode,
-            skyreels_block_swap,
-            skyreels_exclude_single_blocks,
-            skyreels_use_split_attn,
-            skyreels_lora_folder,
-            *skyreels_lora_weights,
-            *skyreels_lora_multipliers,
-            skyreels_input,
-            skyreels_strength,
-            skyreels_negative_prompt,
-            skyreels_guidance_scale,
-            skyreels_split_uncond,
-            skyreels_use_fp8
+            skyreels_input  # Add the input image path
         ],
         outputs=[skyreels_output, skyreels_batch_progress, skyreels_progress_text],
         queue=True
