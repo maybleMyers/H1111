@@ -733,6 +733,14 @@ def process_single_video(
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate a single video with the given parameters"""
     global stop_event
+
+    print(f"DEBUG: process_single_video parameters:")
+    print(f"Prompt: {prompt}")
+    print(f"Image Path: {image_path}")
+    print(f"I2V Mode: {i2v_mode}")
+    print(f"Width: {width}, Height: {height}")
+    print(f"Video Length: {video_length}")
+    print(f"Model: {model}")
     
     if stop_event.is_set():
         yield [], "", ""
@@ -742,6 +750,12 @@ def process_single_video(
     is_skyreels = "skyreels" in model.lower()
     is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
     is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
+
+    is_hunyuan_i2v = not is_skyreels and i2v_mode and image_path is not None
+    
+    print(f"DEBUG: Model Type Checks:")
+    print(f"Is SkyReels I2V: {is_skyreels_i2v}")
+    print(f"Is Hunyuan I2V: {is_hunyuan_i2v}")
     
     if is_skyreels:
         # Force certain parameters for SkyReels
@@ -982,13 +996,21 @@ def process_batch(
     lora_multipliers = args[num_lora_weights:num_lora_weights*2]
     extra_args = args[num_lora_weights*2:]
 
+    print(f"DEBUG: process_batch parameters:")
+    print(f"Prompt: {prompt}")
+    print(f"Width: {width}, Height: {height}")
+    print(f"Extra Args Length: {len(extra_args)}")
+    print(f"Extra Args: {extra_args}")
+
     # Determine if this is a SkyReels model and what type
     is_skyreels = "skyreels" in model.lower()
     is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
     is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
-    
-    # Determine if this is a Hunyuan I2V mode
     is_hunyuan_i2v = not is_skyreels and len(extra_args) > 0 and extra_args[0] is not None and extra_args[0].lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))
+
+    print(f"DEBUG: Model Type Checks:")
+    print(f"Is SkyReels I2V: {is_skyreels_i2v}")
+    print(f"Is Hunyuan I2V: {is_hunyuan_i2v}")
 
     # Handle input paths and additional parameters
     input_path = extra_args[0] if extra_args else None
@@ -996,6 +1018,11 @@ def process_batch(
     
     # Get use_fp8 flag (it should be the last parameter)
     use_fp8 = bool(extra_args[-1]) if extra_args and len(extra_args) >= 3 else True
+
+    print(f"DEBUG: Input Details:")
+    print(f"Input Path: {input_path}")
+    print(f"Strength: {strength}")
+    print(f"Use FP8: {use_fp8}")
     
     # Get SkyReels specific parameters if applicable
     if is_skyreels:
@@ -2866,7 +2893,11 @@ with gr.Blocks(
             i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
-            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_use_fp8
+            *i2v_lora_weights, *i2v_lora_multipliers, 
+            i2v_input,  # Image input
+            gr.Number(value=0.75),  # Default strength 
+            i2v_use_fp8,  # FP8 flag
+            i2v_mode_checkbox  # Added this to explicitly pass Hunyuan I2V mode flag
         ],
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
         queue=True

@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 def preprocess_image_for_i2v(image_path, resolution="720p"):
+    logger.info(f"Preprocessing image for I2V: {image_path}")
+    logger.info(f"Target Resolution: {resolution}")
     """Process image for i2v model with proper aspect ratio handling"""
     from PIL import Image
     import numpy as np
@@ -698,6 +700,8 @@ def main():
         # Handle image input for i2v mode
         img_latents = None
         if args.i2v_mode:
+            logger.info(f"I2V Mode Activated with Image: {args.image_path}")
+            logger.info(f"I2V Resolution: {args.i2v_resolution}")
             if args.image_path is None:
                 raise ValueError("Image path is required for i2v mode")
             
