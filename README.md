@@ -46,6 +46,8 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 
+3/5/2025  
+    Added ability to batch a folder of images with skyreels i2v, so you can make a video with every image in a folder.
 3/2/2025  
     Added initial support for wanX-2.1 Image to Video and Text to Video inference.  
 3/1/2025  
