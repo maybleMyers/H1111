@@ -967,11 +967,18 @@ def load_state_dict(model, model_path):
     return model
 
 
-def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels=16) -> HYVideoDiffusionTransformer:
+def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels=None, i2v_mode=False):
     # =========================== Build main model ===========================
     factor_kwargs = {"device": device, "dtype": dtype, "attn_mode": attn_mode, "split_attn": split_attn}
-    latent_channels = 16
-    out_channels = latent_channels
+    
+    # If i2v_mode is enabled, the in_channels needs to be adjusted
+    if i2v_mode:
+        in_channels = in_channels * 2 + 1 if in_channels else 33  # Default for i2v is 16*2+1=33
+        factor_kwargs["guidance_embed"] = True  # i2v models use guidance embedding
+    else:
+        in_channels = in_channels if in_channels else 16  # Default for t2v or v2v is 16
+    
+    out_channels = 16
 
     with accelerate.init_empty_weights():
         transformer = load_dit_model(

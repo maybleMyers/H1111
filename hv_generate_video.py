@@ -42,6 +42,71 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+def preprocess_image_for_i2v(image_path, resolution="720p"):
+    """Process image for i2v model with proper aspect ratio handling"""
+    from PIL import Image
+    import numpy as np
+    from dataset.image_video_dataset import resize_image_to_bucket
+    import torchvision.transforms as transforms
+    
+    # Set base size based on resolution
+    if resolution == "720p":
+        bucket_hw_base_size = 960
+    elif resolution == "540p":
+        bucket_hw_base_size = 720
+    elif resolution == "360p":
+        bucket_hw_base_size = 480
+    else:
+        raise ValueError(f"i2v_resolution: {resolution} must be in [360p, 540p, 720p]")
+    
+    # Open and convert image
+    image = Image.open(image_path).convert('RGB')
+    origin_size = image.size  # (width, height)
+    
+    # Generate crop size list and find closest aspect ratio
+    crop_size_list = generate_crop_size_list(bucket_hw_base_size, 32)
+    aspect_ratios = np.array([round(float(h)/float(w), 5) for h, w in crop_size_list])
+    closest_size, closest_ratio = get_closest_ratio(origin_size[1], origin_size[0], aspect_ratios, crop_size_list)
+    
+    # Transform image
+    transform = transforms.Compose([
+        transforms.Resize(closest_size),
+        transforms.CenterCrop(closest_size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+    
+    # Process the image
+    processed_image = transform(image).unsqueeze(0).unsqueeze(2)  # Add batch and time dimensions
+    
+    return processed_image, closest_size
+
+def generate_crop_size_list(base_size, aligned_size):
+    """Generate a list of crop sizes with different aspect ratios"""
+    crop_size_list = []
+    
+    # Add square size
+    crop_size_list.append((base_size, base_size))
+    
+    # Add portrait and landscape sizes
+    for ratio in [4/3, 3/2, 16/9, 2/1]:
+        h = int(base_size * ratio)
+        h = (h // aligned_size) * aligned_size
+        crop_size_list.append((h, base_size))  # Portrait
+        
+        w = int(base_size * ratio)
+        w = (w // aligned_size) * aligned_size
+        crop_size_list.append((base_size, w))  # Landscape
+    
+    return crop_size_list
+
+def get_closest_ratio(h, w, aspect_ratios, crop_size_list):
+    """Find the closest aspect ratio and corresponding size"""
+    img_ratio = round(float(h) / float(w), 5)
+    closest_idx = np.argmin(np.abs(aspect_ratios - img_ratio))
+    closest_size = crop_size_list[closest_idx]
+    closest_ratio = aspect_ratios[closest_idx]
+    return closest_size, closest_ratio
 
 def clean_memory_on_device(device):
     if device.type == "cuda":
@@ -252,8 +317,8 @@ def encode_prompt(prompt: Union[str, list[str]], device: torch.device, num_video
 
 def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=False, accelerator=None):
     # constants
-    prompt_template_video = "dit-llm-encode-video"
-    prompt_template = "dit-llm-encode"
+    prompt_template_video = args.prompt_template_video or "dit-llm-encode-video"
+    prompt_template = args.prompt_template or "dit-llm-encode"
     text_encoder_dtype = torch.float16
     text_encoder_type = "llm"
     text_len = 256
@@ -272,6 +337,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     #     crop_start = PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
     # else:
     #     crop_start = 0
+    # Get crop start from the prompt template
     crop_start = PROMPT_TEMPLATE[prompt_template_video].get("crop_start", 0)
     max_length = text_len + crop_start
 
@@ -279,8 +345,8 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     prompt_template = PROMPT_TEMPLATE[prompt_template]
 
     # prompt_template_video
-    prompt_template_video = PROMPT_TEMPLATE[prompt_template_video]  # if args.prompt_template_video is not None else None
-
+    prompt_template_video = PROMPT_TEMPLATE[prompt_template_video]
+    
     # load text encoders
     logger.info(f"loading text encoder: {args.text_encoder1}")
     text_encoder = TextEncoder(
@@ -294,6 +360,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
         hidden_state_skip_layer=hidden_state_skip_layer,
         apply_final_norm=apply_final_norm,
         reproduce=reproduce,
+        i2v_mode=args.i2v_mode  # Pass i2v_mode to text encoder
     )
     text_encoder.eval()
     if fp8_llm:
@@ -453,6 +520,14 @@ def decode_latents(args, latents, device):
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanVideo inference script")
 
+    parser.add_argument("--i2v_mode", action="store_true", help="Use image-to-video mode for Hunyuan model")
+    parser.add_argument("--i2v_resolution", type=str, default="720p", choices=["360p", "540p", "720p"], 
+                        help="Resolution for i2v inference")
+    parser.add_argument("--prompt_template_video", type=str, default=None, 
+                        help="Prompt template for video generation")
+    parser.add_argument("--prompt_template", type=str, default=None,
+                        help="Prompt template for text conditioning")
+
     parser.add_argument("--dit", type=str, required=True, help="DiT checkpoint path or directory")
     parser.add_argument(
         "--dit_in_channels",
@@ -591,7 +666,7 @@ def main():
         accelerator = accelerate.Accelerator(mixed_precision=mixed_precision)
 
         # load prompt
-        prompt = args.prompt  # TODO load prompts from file
+        prompt = args.prompt
         assert prompt is not None, "prompt is required"
 
         # check inputs: may be height, width, video_length etc will be changed for each generation in future
@@ -604,8 +679,12 @@ def main():
         if do_classifier_free_guidance:
             negative_prompt = args.negative_prompt
             if negative_prompt is None:
-                logger.info("Negative prompt is not provided, using empty prompt")
-                negative_prompt = ""
+                if args.i2v_mode:
+                    logger.info("Using default i2v negative prompt")
+                    negative_prompt = "Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion"
+                else:
+                    logger.info("Negative prompt is not provided, using empty prompt")
+                    negative_prompt = ""
             logger.info(f"Encoding negative prompt: {negative_prompt}")
             prompt = [negative_prompt, prompt]
         else:
@@ -616,20 +695,37 @@ def main():
             prompt, args, device, args.fp8_llm, accelerator
         )
 
+        # Handle image input for i2v mode
+        img_latents = None
+        if args.i2v_mode:
+            if args.image_path is None:
+                raise ValueError("Image path is required for i2v mode")
+            
+            logger.info(f"Processing image for i2v: {args.image_path}")
+            processed_image, (target_height, target_width) = preprocess_image_for_i2v(
+                args.image_path, args.i2v_resolution
+            )
+            
+            # Override height and width with the processed image dimensions
+            height, width = target_height, target_width
+            
+            # Encode image to latents
+            processed_image = processed_image.to(device=device, dtype=dit_dtype)
+            with torch.no_grad():
+                vae, vae_dtype = prepare_vae(args, device)
+                vae.to(device=device, dtype=dit_dtype)
+                img_latents = vae.encode(processed_image).latent_dist.mode()
+                img_latents = img_latents * vae.config.scaling_factor
+            
+            clean_memory_on_device(device)
+        
+        # encode latents for video2video inference
         video_latents = None
-        if args.video_path is not None:
+        if args.video_path is not None and not args.i2v_mode:
             # v2v inference
             logger.info(f"Video2Video inference: {args.video_path}")
+            # Load and extend video if necessary
             video = load_and_extend_video(args, video_length)
-
-            if not isinstance(video, torch.Tensor):
-                video = np.stack(video, axis=0)  # F, H, W, C
-                video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
-                video = video / 255.0
-
-            # Verify the video length after extension
-            if video.shape[2] < video_length:  # Check tensor dimension F
-                raise ValueError(f"Video length {video.shape[2]} is less than target length {video_length} after extension")
 
             logger.info(f"Encoding video to latents")
             video_latents = encode_to_latents(args, video, device)
@@ -637,11 +733,11 @@ def main():
 
             clean_memory_on_device(device)
 
-        # encode latents for image2video inference
+        # encode latents for image2video inference (for SkyReels style)
         image_latents = None
-        if args.image_path is not None:
-            # i2v inference
-            logger.info(f"Image2Video inference: {args.image_path}")
+        if args.image_path is not None and not args.i2v_mode:
+            # SkyReels i2v inference
+            logger.info(f"SkyReels Image2Video inference: {args.image_path}")
 
             image = Image.open(args.image_path)
             image = resize_image_to_bucket(image, (width, height))  # returns a numpy array
@@ -662,14 +758,25 @@ def main():
         if args.attn_mode == "sdpa":
             args.attn_mode = "torch"
 
-        # if image_latents is given, the model should be I2V model, so the in_channels should be 32
-        dit_in_channels = args.dit_in_channels if args.dit_in_channels is not None else (32 if image_latents is not None else 16)
+        # Determine input channels based on mode
+        dit_in_channels = None
+        if args.dit_in_channels is not None:
+            dit_in_channels = args.dit_in_channels
+        elif args.i2v_mode:
+            dit_in_channels = 33  # 16*2+1 for i2v
+        elif args.image_path is not None and not args.i2v_mode:
+            dit_in_channels = 32  # For SkyReels I2V
+        else:
+            dit_in_channels = 16  # Default for t2v or v2v
 
-        # if we use LoRA, weigths should be bf16 instead of fp8, because merging should be done in bf16
-        # the model is too large, so we load the model to cpu. in addition, the .pt file is loaded to cpu anyway
-        # on the fly merging will be a solution for this issue for .safetenors files (not implemented yet)
         transformer = load_transformer(
-            args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype, in_channels=dit_in_channels
+            args.dit, 
+            args.attn_mode, 
+            args.split_attn, 
+            loading_device, 
+            dit_dtype, 
+            in_channels=dit_in_channels,
+            i2v_mode=args.i2v_mode
         )
         transformer.eval()
 
@@ -704,13 +811,6 @@ def main():
                     )
                 logger.info("Merging LoRA weights to DiT model")
 
-                # try:
-                #     network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-                #     info = network.load_state_dict(weights_sd, strict=True)
-                #     logger.info(f"Loaded LoRA weights from {weights_file}: {info}")
-                #     network.eval()
-                #     network.to(device)
-                # except Exception as e:
                 if args.lycoris:
                     lycoris_net.merge_to(None, transformer, weights_sd, dtype=None, device=device)
                 else:
@@ -773,15 +873,6 @@ def main():
         else:
             latent_video_length = video_length
 
-        # shape = (
-        #     num_videos_per_prompt,
-        #     num_channels_latents,
-        #     latent_video_length,
-        #     height // vae_scale_factor,
-        #     width // vae_scale_factor,
-        # )
-        # latents = randn_tensor(shape, generator=generator, device=device, dtype=dit_dtype)
-
         # make first N frames to be the same if the given seed is same
         shape_of_frame = (num_videos_per_prompt, num_channels_latents, 1, height // vae_scale_factor, width // vae_scale_factor)
         latents = []
@@ -789,13 +880,37 @@ def main():
             latents.append(randn_tensor(shape_of_frame, generator=generator, device=device, dtype=dit_dtype))
         latents = torch.cat(latents, dim=2)
 
-        # pad image_latents to match the length of video_latents
-        if image_latents is not None:
+        # For Hunyuan i2v mode
+        if args.i2v_mode and img_latents is not None:
+            logger.info("Preparing combined latents for i2v mode")
+            
+            # Repeat the image latents for batch size if needed
+            batch_size = latents.shape[0]
+            img_latents = img_latents.repeat(batch_size, 1, 1, 1, 1)
+            
+            # Expand temporal dimension to match video length
+            if img_latents.shape[2] < latent_video_length:
+                img_latents = img_latents.repeat(1, 1, latent_video_length, 1, 1)
+                # Zero out image content for frames after the first one
+                img_latents[:, :, 1:, :, :] = 0
+            
+            # Create timestep channel (all ones)
+            t_channel = torch.ones((batch_size, 1, latent_video_length, 
+                                     height // vae_scale_factor, 
+                                     width // vae_scale_factor), 
+                                    device=device, dtype=dit_dtype)
+            
+            # Combine image latents, noise latents, and timestep channel
+            combined_latents = torch.cat([img_latents, latents, t_channel], dim=1)
+            latents = combined_latents
+        
+        # pad image_latents to match the length of video_latents (for SkyReels I2V)
+        elif image_latents is not None and not args.i2v_mode:
             zero_latents = torch.zeros_like(latents)
             zero_latents[:, :, :1, :, :] = image_latents
             image_latents = zero_latents
 
-        if args.video_path is not None:
+        if args.video_path is not None and not args.i2v_mode:
             # v2v inference
             noise = latents
             assert noise.shape == video_latents.shape, f"noise shape {noise.shape} != video_latents shape {video_latents.shape}"
@@ -839,7 +954,6 @@ def main():
             logger.warning("split_attn is enabled, split_uncond will be enabled as well.")
             args.split_uncond = True
 
-        # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as p:
         with tqdm(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 latents = scheduler.scale_model_input(latents, t)
@@ -847,7 +961,9 @@ def main():
                 # predict the noise residual
                 with torch.no_grad(), accelerator.autocast():
                     latents_input = latents if not do_classifier_free_guidance else torch.cat([latents, latents], dim=0)
-                    if image_latents is not None:
+                    
+                    # For SkyReels I2V - don't use this approach for Hunyuan I2V
+                    if image_latents is not None and not args.i2v_mode:
                         latents_image_input = (
                             image_latents if not do_classifier_free_guidance else torch.cat([image_latents, image_latents], dim=0)
                         )
@@ -857,15 +973,15 @@ def main():
 
                     noise_pred_list = []
                     for j in range(0, latents_input.shape[0], batch_size):
-                        noise_pred = transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                            latents_input[j : j + batch_size],  # [1, 16, 33, 24, 42]
-                            t.repeat(batch_size).to(device=device, dtype=dit_dtype),  # [1]
-                            text_states=prompt_embeds[j : j + batch_size],  # [1, 256, 4096]
-                            text_mask=prompt_mask[j : j + batch_size],  # [1, 256]
-                            text_states_2=prompt_embeds_2[j : j + batch_size],  # [1, 768]
-                            freqs_cos=freqs_cos,  # [seqlen, head_dim]
-                            freqs_sin=freqs_sin,  # [seqlen, head_dim]
-                            guidance=guidance_expand[j : j + batch_size],  # [1]
+                        noise_pred = transformer(
+                            latents_input[j : j + batch_size],
+                            t.repeat(batch_size).to(device=device, dtype=dit_dtype),
+                            text_states=prompt_embeds[j : j + batch_size],
+                            text_mask=prompt_mask[j : j + batch_size],
+                            text_states_2=prompt_embeds_2[j : j + batch_size],
+                            freqs_cos=freqs_cos,
+                            freqs_sin=freqs_sin,
+                            guidance=guidance_expand[j : j + batch_size] if guidance_expand is not None else None,
                             return_dict=True,
                         )["x"]
                         noise_pred_list.append(noise_pred)
@@ -876,15 +992,6 @@ def main():
                     noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                    # # SkyReels' rescale noise config is omitted for now
-                    # if guidance_rescale > 0.0:
-                    #     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    #     noise_pred = rescale_noise_cfg(
-                    #         noise_pred,
-                    #         noise_pred_cond,
-                    #         guidance_rescale=self.guidance_rescale,
-                    #     )
-
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
@@ -892,9 +999,6 @@ def main():
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % scheduler.order == 0):
                     if progress_bar is not None:
                         progress_bar.update()
-
-        # print(p.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))
-        # print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
         latents = latents.detach().cpu()
         transformer = None
@@ -926,6 +1030,9 @@ def main():
                 }
                 if args.negative_prompt is not None:
                     metadata["negative_prompt"] = f"{args.negative_prompt}"
+                if args.i2v_mode:
+                    metadata["i2v_mode"] = "True"
+                    metadata["i2v_resolution"] = args.i2v_resolution
             sd = {"latent": latent}
             save_file(sd, latent_path, metadata=metadata)
 
@@ -950,7 +1057,3 @@ def main():
             logger.info(f"Sample images save to: {save_path}/{image_name}")
 
     logger.info("Done!")
-
-
-if __name__ == "__main__":
-    main()
