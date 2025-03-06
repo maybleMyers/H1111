@@ -189,8 +189,15 @@ def encode_prompt(prompt: str, device: torch.device, num_videos_per_prompt: int,
 def encode_input_prompt(prompt, device, args, fp8_llm=False, accelerator=None):
     """Encode input prompt with text encoders"""
     # Constants from config
-    prompt_template_video = args.prompt_template_video or "dit-llm-encode-video-i2v"
-    prompt_template = args.prompt_template or "dit-llm-encode-i2v"
+    # Check if the templates exist in PROMPT_TEMPLATE, if not use defaults
+    prompt_template_video = "dit-llm-encode-video"  # Default template for video
+    if hasattr(args, 'prompt_template_video') and args.prompt_template_video in PROMPT_TEMPLATE:
+        prompt_template_video = args.prompt_template_video
+    
+    prompt_template = "dit-llm-encode"  # Default template
+    if hasattr(args, 'prompt_template') and args.prompt_template in PROMPT_TEMPLATE:
+        prompt_template = args.prompt_template
+    
     text_encoder_dtype = torch.float16
     text_encoder_type = "llm"
     text_len = 256
