@@ -45,7 +45,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
-
+3/8/2025  
+    Added support for wan lora's. Remember to convert them first in the convert lora tab.
 3/5/2025  
     Added ability to batch a folder of images with skyreels i2v, so you can make a video with every image in a folder.
 3/2/2025  
