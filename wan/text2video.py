@@ -8,10 +8,12 @@ import math
 import os
 import random
 import sys
+from typing import Optional, Union
 
 import torch
 from tqdm import tqdm
 from accelerate import Accelerator, init_empty_weights
+from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from utils.safetensors_utils import load_safetensors
 
 # from .distributed.fsdp import shard_model
@@ -116,6 +118,8 @@ class WanT2V:
     def generate(
         self,
         accelerator: Accelerator,
+        merge_lora: Optional[callable],
+        dit_loading_dtype: Optional[torch.dtype],
         input_prompt,
         size=(1280, 720),
         frame_num=81,
@@ -187,6 +191,7 @@ class WanT2V:
         clean_memory_on_device(self.device)
 
         # load DiT model
+        dit_loading_dtype = dit_loading_dtype if dit_loading_dtype is not None else self.dit_dtype
         with init_empty_weights():
             # if self.checkpoint_dir is not None:
             #     logger.info(f"Creating WanModel from {self.checkpoint_dir}")
@@ -206,11 +211,12 @@ class WanT2V:
                 text_len=512,
                 attn_mode=self.dit_attn_mode,
             )
-            self.model.to(self.dit_dtype)
+            self.model.to(dit_loading_dtype)
 
-        loading_device = self.device if blocks_to_swap == 0 else "cpu"
-        logger.info(f"Loading DiT model from {self.dit_path}, device={loading_device}, dtype={self.dit_dtype}")
-        sd = load_safetensors(self.dit_path, loading_device, disable_mmap=True, dtype=self.dit_dtype)
+        # if LoRA is enabled, load the model on CPU with bfloat16
+        loading_device = self.device if (blocks_to_swap == 0 and merge_lora is None) else "cpu"
+        logger.info(f"Loading DiT model from {self.dit_path}, device={loading_device}, dtype={dit_loading_dtype}")
+        sd = load_safetensors(self.dit_path, loading_device, disable_mmap=True, dtype=dit_loading_dtype)
 
         # remove "model.diffusion_model." prefix: 1.3B model has this prefix
         for key in list(sd.keys()):
@@ -219,6 +225,14 @@ class WanT2V:
 
         info = self.model.load_state_dict(sd, strict=True, assign=True)
         logger.info(f"Loaded DiT model from {self.dit_path}, info={info}")
+
+        if merge_lora is not None:
+            # merge LoRA to the model, cast and move to the device
+            merge_lora(self.model)
+            if blocks_to_swap == 0:
+                self.model.to(self.device, self.dit_dtype)
+            else:
+                self.model.to(self.dit_dtype)
 
         if blocks_to_swap > 0:
             logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {self.device}")
@@ -259,6 +273,23 @@ class WanT2V:
                 )
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(sample_scheduler, device=self.device, sigmas=sampling_sigmas)
+            elif sample_solver == "vanilla":
+                sample_scheduler = FlowMatchDiscreteScheduler(num_train_timesteps=self.num_train_timesteps, shift=shift)
+                sample_scheduler.set_timesteps(sampling_steps, device=self.device)
+                timesteps = sample_scheduler.timesteps
+
+                org_step = sample_scheduler.step
+
+                def step_wrapper(
+                    model_output: torch.Tensor,
+                    timestep: Union[int, torch.Tensor],
+                    sample: torch.Tensor,
+                    return_dict: bool = True,
+                    generator=None,
+                ):
+                    return org_step(model_output, timestep, sample, return_dict=return_dict)
+
+                sample_scheduler.step = step_wrapper
             else:
                 raise NotImplementedError("Unsupported solver.")
 

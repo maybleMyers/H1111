@@ -2,10 +2,8 @@
 import math
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
+from torch.utils.checkpoint import checkpoint
 
 from .attention import flash_attention
 from utils.device_utils import clean_memory_on_device
@@ -69,6 +67,45 @@ def rope_apply(x, grid_sizes, freqs):
         return torch.stack(output).float()
 
 
+def calculate_freqs_i(fhw, c, freqs):
+    f, h, w = fhw
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_i = torch.cat(
+        [
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ],
+        dim=-1,
+    ).reshape(f * h * w, 1, -1)
+    return freqs_i
+
+
+# inplace version of rope_apply
+def rope_apply_inplace_cached(x, grid_sizes, freqs_list):
+    # with torch.amp.autocast(device_type=device_type, enabled=False):
+    rope_dtype = torch.float64  # float32 does not reduce memory usage significantly
+
+    n, c = x.size(2), x.size(3) // 2
+
+    # loop over samples
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(x[i, :seq_len].to(rope_dtype).reshape(seq_len, n, -1, 2))
+        freqs_i = freqs_list[i]
+
+        # apply rotary embedding
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        # x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        # inplace update
+        x[i, :seq_len] = x_i.to(x.dtype)
+
+    return x
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -88,6 +125,22 @@ class WanRMSNorm(nn.Module):
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+    # def forward(self, x):
+    #     r"""
+    #     Args:
+    #         x(Tensor): Shape [B, L, C]
+    #     """
+    #     # inplace version, also supports fp8 -> does not have significant performance improvement
+    #     original_dtype = x.dtype
+    #     x = x.float()
+    #     y = x.pow(2).mean(dim=-1, keepdim=True)
+    #     y.add_(self.eps)
+    #     y.rsqrt_()
+    #     x *= y
+    #     x = x.to(original_dtype)
+    #     x *= self.weight.to(original_dtype)
+    #     return x
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -135,22 +188,33 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
+        # # query, key, value function
+        # def qkv_fn(x):
+        #     q = self.norm_q(self.q(x)).view(b, s, n, d)
+        #     k = self.norm_k(self.k(x)).view(b, s, n, d)
+        #     v = self.v(x).view(b, s, n, d)
+        #     return q, k, v
+        # q, k, v = qkv_fn(x)
+        # del x
         # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
 
-        q, k, v = qkv_fn(x)
+        q = self.q(x)
+        k = self.k(x)
+        v = self.v(x)
         del x
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+        q = q.view(b, s, n, d)
+        k = k.view(b, s, n, d)
+        v = v.view(b, s, n, d)
 
-        q = rope_apply(q, grid_sizes, freqs)
-        k = rope_apply(k, grid_sizes, freqs)
-        x = flash_attention(
-            q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn
-        )
+        rope_apply_inplace_cached(q, grid_sizes, freqs)
+        rope_apply_inplace_cached(k, grid_sizes, freqs)
+        qkv = [q, k, v]
         del q, k, v
+        x = flash_attention(
+            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn
+        )
 
         # output
         x = x.flatten(2)
@@ -170,14 +234,24 @@ class WanT2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        del x, context
+        # q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        # k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        # v = self.v(context).view(b, -1, n, d)
+        q = self.q(x)
+        del x
+        k = self.k(context)
+        v = self.v(context)
+        del context
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+        q = q.view(b, -1, n, d)
+        k = k.view(b, -1, n, d)
+        v = v.view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
+        qkv = [q, k, v]
         del q, k, v
+        x = flash_attention(qkv, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
 
         # output
         x = x.flatten(2)
@@ -207,26 +281,37 @@ class WanI2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        q = self.q(x)
+        del x
+        q = self.norm_q(q)
+        q = q.view(b, -1, n, d)
+        k = self.k(context)
+        k = self.norm_k(k).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
-        del x, context
+        del context
 
+        # compute attention
+        qkv = [q, k, v]
+        del k, v
+        x = flash_attention(qkv, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
+
+        # compute query, key, value
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
         del context_img
 
-        img_x = flash_attention(q, k_img, v_img, k_lens=None, attn_mode=self.attn_mode, split_attn=self.split_attn)
-        del k_img, v_img
-
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
-        del q, k, v
+        qkv = [q, k_img, v_img]
+        del q, k_img, v_img
+        img_x = flash_attention(qkv, k_lens=None, attn_mode=self.attn_mode, split_attn=self.split_attn)
 
         # output
         x = x.flatten(2)
         img_x = img_x.flatten(2)
-        x = x + img_x
+        if self.training:
+            x = x + img_x  # avoid inplace
+        else:
+            x += img_x
         del img_x
 
         x = self.o(x)
@@ -265,7 +350,7 @@ class WanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, attn_mode, split_attn)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps, attn_mode, split_attn)
         self.norm2 = WanLayerNorm(dim, eps)
@@ -274,16 +359,15 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        context,
-        context_lens,
-    ):
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
+    def _forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -308,16 +392,27 @@ class WanAttentionBlock(nn.Module):
         del y
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            # with amp.autocast(dtype=torch.float32):
-            #     x = x + y * e[5]
-            x = x + y.to(torch.float32) * e[5]
-            return x
+        # def cross_attn_ffn(x, context, context_lens, e):
+        #     x += self.cross_attn(self.norm3(x), context, context_lens)
+        #     y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        #     # with amp.autocast(dtype=torch.float32):
+        #     #     x = x + y * e[5]
+        #     x += y.to(torch.float32) * e[5]
+        #     return x
+        # x = cross_attn_ffn(x, context, context_lens, e)
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        # x += self.cross_attn(self.norm3(x), context, context_lens) # backward error
+        x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        del context
+        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        x = x + y.to(torch.float32) * e[5]
+        del y
         return x
+
+    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
+        if self.training and self.gradient_checkpointing:
+            return checkpoint(self._forward, x, e, seq_lens, grid_sizes, freqs, context, context_lens, use_reentrant=False)
+        return self._forward(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
 
 
 class Head(nn.Module):
@@ -485,6 +580,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         self.freqs = torch.cat(
             [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))], dim=1
         )
+        self.freqs_fhw = {}
 
         if model_type == "i2v":
             self.img_emb = MLPProj(1280, dim)
@@ -492,9 +588,35 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+        self.gradient_checkpointing = False
+
         # offloading
         self.blocks_to_swap = None
         self.offloader = None
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+        for block in self.blocks:
+            block.enable_gradient_checkpointing()
+
+        print(f"WanModel: Gradient checkpointing enabled.")
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
+        for block in self.blocks:
+            block.disable_gradient_checkpointing()
+
+        print(f"WanModel: Gradient checkpointing disabled.")
 
     def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
         self.blocks_to_swap = blocks_to_swap
@@ -575,6 +697,15 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+
+        freqs_list = []
+        for fhw in grid_sizes:
+            fhw = tuple(fhw.tolist())
+            if fhw not in self.freqs_fhw:
+                c = self.dim // self.num_heads // 2
+                self.freqs_fhw[fhw] = calculate_freqs_i(fhw, c, self.freqs)
+            freqs_list.append(self.freqs_fhw[fhw])
+
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len, f"Sequence length exceeds maximum allowed length {seq_len}. Got {seq_lens.max()}"
@@ -589,9 +720,9 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         # context
         context_lens = None
-        context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
-        )
+        if type(context) is list:
+            context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+        context = self.text_embedding(context)
 
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
@@ -600,9 +731,11 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             context_clip = None
 
         # arguments
-        kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=self.freqs, context=context, context_lens=context_lens)
+        kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs_list, context=context, context_lens=context_lens)
 
-        clean_memory_on_device(device)
+        if self.blocks_to_swap:
+            clean_memory_on_device(device)
+
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:

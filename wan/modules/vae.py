@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import os
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -640,7 +641,7 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
         sd = load_file(pretrained_path)
         model.load_state_dict(sd, strict=False, assign=True)
     else:
-        model.load_state_dict(torch.load(pretrained_path, map_location=device), assign=True)
+        model.load_state_dict(torch.load(pretrained_path, map_location=device, weights_only=True), assign=True)
 
     return model
 
@@ -707,6 +708,37 @@ class WanVAE:
     def to_device(self, device):
         self.device = device
         self.model.to(device)
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
+        self.scale = [t.to(device) for t in self.scale]
+
+    def to_dtype(self, dtype):
+        self.dtype = dtype
+        self.model.to(dtype=dtype)
+        self.mean = self.mean.to(dtype)
+        self.std = self.std.to(dtype)
+        self.scale = [t.to(dtype) for t in self.scale]
+
+    def eval(self):
+        self.model.eval()
+
+    def train(self, mode: bool = True):
+        self.model.train(mode)
+
+    def requires_grad_(self, requires_grad: bool = True):
+        self.model.requires_grad_(requires_grad)
+
+    def to(self, device_or_dtype: Union[torch.device, torch.dtype, str], dtype: Optional[torch.dtype] = None):
+        """
+        Add nn.Module.to() support for device and dtype.
+        """
+        if isinstance(device_or_dtype, str) or isinstance(device_or_dtype, torch.device):
+            self.to_device(device_or_dtype)
+        else:
+            self.to_dtype(device_or_dtype)
+
+        if dtype is not None:
+            self.to_dtype(dtype)
 
     def encode(self, videos):
         """

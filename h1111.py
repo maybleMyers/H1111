@@ -728,10 +728,19 @@ def process_single_video(
     embedded_cfg_scale: Optional[float] = None,
     split_uncond: Optional[bool] = None,
     guidance_scale: Optional[float] = None,
-    use_fp8: bool = True
+    use_fp8: bool = True,
+    i2v_mode: bool = False
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate a single video with the given parameters"""
     global stop_event
+
+    print(f"DEBUG: process_single_video parameters:")
+    print(f"Prompt: {prompt}")
+    print(f"Image Path: {image_path}")
+    print(f"I2V Mode: {i2v_mode}")
+    print(f"Width: {width}, Height: {height}")
+    print(f"Video Length: {video_length}")
+    print(f"Model: {model}")
     
     if stop_event.is_set():
         yield [], "", ""
@@ -741,6 +750,12 @@ def process_single_video(
     is_skyreels = "skyreels" in model.lower()
     is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
     is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
+
+    is_hunyuan_i2v = not is_skyreels and i2v_mode and image_path is not None
+    
+    print(f"DEBUG: Model Type Checks:")
+    print(f"Is SkyReels I2V: {is_skyreels_i2v}")
+    print(f"Is Hunyuan I2V: {is_hunyuan_i2v}")
     
     if is_skyreels:
         # Force certain parameters for SkyReels
@@ -807,6 +822,13 @@ def process_single_video(
         "--vae_spatial_tile_sample_min_size", "128"
     ]
     
+    # Add i2v_mode flag if needed
+    if i2v_mode:
+        command.append("--i2v_mode")
+        command.append("--i2v_resolution")
+        command.append("720p")  # Default to 720p resolution
+        command.extend(["--dit_in_channels", "33"])  # Hunyuan I2V uses 33 channels (16*2+1)
+    
     if use_fp8:
         command.append("--fp8")
 
@@ -844,9 +866,8 @@ def process_single_video(
             command.extend(["--strength", str(strength)])
     elif image_path:
         command.extend(["--image_path", image_path])
-        # Only add strength parameter for non-SkyReels I2V models
-        # SkyReels I2V doesn't use strength parameter for image-to-video generation
-        if strength is not None and not is_skyreels_i2v:
+        # Handle strength parameter appropriately based on model type
+        if strength is not None and not is_skyreels_i2v and not i2v_mode:
             command.extend(["--strength", str(strength)])
             
     print(f"{command}")
@@ -924,7 +945,8 @@ def process_single_video(
                 "input_image": image_path if image_path else None,
                 "strength": strength,
                 "negative_prompt": negative_prompt if is_skyreels else None,
-                "embedded_cfg_scale": embedded_cfg_scale if is_skyreels else None
+                "embedded_cfg_scale": embedded_cfg_scale if is_skyreels else None,
+                "i2v_mode": i2v_mode
             }
             
             add_metadata_to_video(video_path, parameters)
@@ -974,10 +996,21 @@ def process_batch(
     lora_multipliers = args[num_lora_weights:num_lora_weights*2]
     extra_args = args[num_lora_weights*2:]
 
+    print(f"DEBUG: process_batch parameters:")
+    print(f"Prompt: {prompt}")
+    print(f"Width: {width}, Height: {height}")
+    print(f"Extra Args Length: {len(extra_args)}")
+    print(f"Extra Args: {extra_args}")
+
     # Determine if this is a SkyReels model and what type
     is_skyreels = "skyreels" in model.lower()
     is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
     is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
+    is_hunyuan_i2v = not is_skyreels and len(extra_args) > 0 and extra_args[0] is not None and extra_args[0].lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))
+
+    print(f"DEBUG: Model Type Checks:")
+    print(f"Is SkyReels I2V: {is_skyreels_i2v}")
+    print(f"Is Hunyuan I2V: {is_hunyuan_i2v}")
 
     # Handle input paths and additional parameters
     input_path = extra_args[0] if extra_args else None
@@ -985,6 +1018,11 @@ def process_batch(
     
     # Get use_fp8 flag (it should be the last parameter)
     use_fp8 = bool(extra_args[-1]) if extra_args and len(extra_args) >= 3 else True
+
+    print(f"DEBUG: Input Details:")
+    print(f"Input Path: {input_path}")
+    print(f"Strength: {strength}")
+    print(f"Use FP8: {use_fp8}")
     
     # Get SkyReels specific parameters if applicable
     if is_skyreels:
@@ -1019,8 +1057,8 @@ def process_batch(
             image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
             is_image = any(lower_path.endswith(ext) for ext in image_extensions)
             
-            # Only use image_path for SkyReels I2V models and actual image files
-            if is_skyreels_i2v and is_image:
+            # Determine how to handle the input path based on model type
+            if (is_skyreels_i2v or is_hunyuan_i2v) and is_image:
                 image_path = input_path
             else:
                 video_path = input_path
@@ -1034,7 +1072,21 @@ def process_batch(
         ]
         single_video_args.extend(lora_weights)
         single_video_args.extend(lora_multipliers)
-        single_video_args.extend([video_path, image_path, strength, negative_prompt, embedded_cfg_scale, split_uncond, guidance_scale, use_fp8])
+        
+        # Add i2v_mode flag if using Hunyuan I2V
+        i2v_mode = is_hunyuan_i2v
+        
+        single_video_args.extend([
+            video_path, 
+            image_path, 
+            strength, 
+            negative_prompt, 
+            embedded_cfg_scale, 
+            split_uncond, 
+            guidance_scale, 
+            use_fp8,
+            i2v_mode if is_hunyuan_i2v else False
+        ])
 
         for videos, status, progress in process_single_video(*single_video_args):
             if videos:
@@ -1564,6 +1616,8 @@ with gr.Blocks(
             with gr.Row():
                 i2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
                 i2v_stop_btn = gr.Button("Stop Generation", variant="stop")
+                i2v_mode_checkbox = gr.Checkbox(label="Use Hunyuan I2V Mode", value=True, 
+                                                info="Enable to use Hunyuan I2V model (recommended for better quality)")
 
             with gr.Row():
                 with gr.Column():
@@ -2551,7 +2605,7 @@ with gr.Blocks(
         fn=calculate_height,
         inputs=[width, original_dims],
         outputs=[height]
-    )            
+    )
 
     # Function to get available DiT models
     def get_dit_models(dit_folder: str) -> List[str]:
@@ -2628,6 +2682,17 @@ with gr.Blocks(
     def update_dit_dropdown(dit_folder: str) -> Dict:
         models = get_dit_models(dit_folder)
         return gr.update(choices=models, value=models[0] if models else None)
+    
+    def update_i2v_ui_based_on_mode(use_hunyuan_i2v):
+        # When using Hunyuan I2V, we don't need strength parameter
+        return gr.update(visible=not use_hunyuan_i2v)
+
+    # Add event handler for mode change
+    i2v_mode_checkbox.change(
+        fn=update_i2v_ui_based_on_mode,
+        inputs=[i2v_mode_checkbox],
+        outputs=[i2v_strength]
+    )
 
     # Connect events
     merge_btn.click(
@@ -2814,7 +2879,7 @@ with gr.Blocks(
         if isinstance(video_path, tuple):
             video_path = video_path[0]
 
-        # Use the original width and height without doubling
+        # Use the original width and height
         return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
                 flow_shift, cfg_scale, lora1, lora2, lora3, lora4, 
                 lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
@@ -2828,7 +2893,11 @@ with gr.Blocks(
             i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
-            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_use_fp8
+            *i2v_lora_weights, *i2v_lora_multipliers, 
+            i2v_input,  # Image input
+            gr.Number(value=0.75),  # Default strength 
+            i2v_use_fp8,  # FP8 flag
+            i2v_mode_checkbox  # Added this to explicitly pass Hunyuan I2V mode flag
         ],
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
         queue=True
@@ -2837,12 +2906,12 @@ with gr.Blocks(
         inputs=[i2v_batch_size],
         outputs=i2v_selected_index
     )
-    # Send to Video2Video
+        # Send to Video2Video
     i2v_output.select(
         fn=handle_i2v_gallery_select,
         outputs=i2v_selected_index
     )
-
+    
     i2v_send_to_v2v_btn.click(
         fn=send_i2v_to_v2v,
         inputs=[

@@ -40,9 +40,7 @@ __all__ = [
 
 
 def flash_attention(
-    q,
-    k,
-    v,
+    qkv,
     q_lens=None,
     k_lens=None,
     dropout_p=0.0,
@@ -69,6 +67,9 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    q, k, v = qkv
+    qkv.clear()
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     # assert q.device.type == "cuda" and q.size(-1) <= 256
@@ -97,17 +98,16 @@ def flash_attention(
         v = half(v.transpose(1, 2))
 
         if not split_attn:
-            x = torch.nn.functional.scaled_dot_product_attention(
+            q = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
             )
+            x = q
         else:
-            xs = []
+            x = torch.empty_like(q)
             for i in range(q.size(0)):
-                x = torch.nn.functional.scaled_dot_product_attention(
+                x[i : i + 1] = torch.nn.functional.scaled_dot_product_attention(
                     q[i : i + 1], k[i : i + 1], v[i : i + 1], is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
                 )
-                xs.append(x)
-            x = torch.cat(xs, dim=0)
 
         del q, k, v
         x = x.transpose(1, 2).contiguous()
@@ -117,14 +117,17 @@ def flash_attention(
     if attn_mode == "flash" or attn_mode == "flash2":
         if q_scale is not None:
             q = q * q_scale
-        q, k, v = half(q), half(k), half(v)
+        q = half(q)
+        k = half(k)
+        v = half(v)
 
         if not split_attn:
-            x = flash_attn.flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, deterministic=deterministic)
+            q = flash_attn.flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, deterministic=deterministic)
+            x = q
         else:
-            xs = []
+            x = torch.empty_like(q)
             for i in range(q.size(0)):
-                x = flash_attn.flash_attn_func(
+                x[i : i + 1] = flash_attn.flash_attn_func(
                     q[i : i + 1],
                     k[i : i + 1],
                     v[i : i + 1],
@@ -134,8 +137,6 @@ def flash_attention(
                     window_size,
                     deterministic=deterministic,
                 )
-                xs.append(x)
-            x = torch.cat(xs, dim=0)
         del q, k, v
         return x.type(out_dtype)
 
@@ -145,16 +146,19 @@ def flash_attention(
         assert not causal, "causal is not supported in xformers."
         if q_scale is not None:
             q = q * q_scale
-        q, k, v = half(q), half(k), half(v)
+        q = half(q)
+        k = half(k)
+        v = half(v)
 
         if not split_attn:
-            x = xops.memory_efficient_attention(q, k, v, p=dropout_p, scale=softmax_scale)
+            q = xops.memory_efficient_attention(q, k, v, p=dropout_p, scale=softmax_scale)
+            x = q
         else:
-            xs = []
+            x = torch.empty_like(q)
             for i in range(q.size(0)):
-                x = xops.memory_efficient_attention(q[i : i + 1], k[i : i + 1], v[i : i + 1], p=dropout_p, scale=softmax_scale)
-                xs.append(x)
-            x = torch.cat(xs, dim=0)
+                x[i : i + 1] = xops.memory_efficient_attention(
+                    q[i : i + 1], k[i : i + 1], v[i : i + 1], p=dropout_p, scale=softmax_scale
+                )
 
         del q, k, v
         return x.type(out_dtype)
