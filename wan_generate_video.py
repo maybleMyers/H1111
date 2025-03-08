@@ -10,20 +10,20 @@ from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from PIL import Image
 
+from networks import lora_wan
+from utils.safetensors_utils import mem_eff_save_file
 from wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.vae import WanVAE
-from networks import lora
 
 try:
     from lycoris.kohya import create_network_from_weights
-except ImportError:
+except:
     pass
 
 from utils.model_utils import str_to_dtype
-from utils.device_utils import clean_memory_on_device, synchronize_device
-from utils.safetensors_utils import mem_eff_save_file
-from hv_generate_video import save_images_grid, save_videos_grid
+from utils.device_utils import clean_memory_on_device
+from hv_generate_video import save_images_grid, save_videos_grid, synchronize_device
 
 import logging
 
@@ -39,7 +39,9 @@ def parse_args():
     parser.add_argument("--task", type=str, default="t2v-14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     # parser.add_argument("--use_prompt_extend", action="store_true", default=False, help="Whether to use prompt extend.")
     # prompt extend is not supported
-    parser.add_argument("--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++"], help="The solver used to sample.")
+    parser.add_argument(
+        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla"], help="The solver used to sample."
+    )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
@@ -56,8 +58,6 @@ def parse_args():
         default=None,
         help="Save merged model to path. If specified, no inference will be performed.",
     )
-    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
-    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
 
     # inference
     parser.add_argument("--prompt", type=str, required=True, help="prompt for generation")
@@ -122,6 +122,7 @@ def parse_args():
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
+    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
 
     args = parser.parse_args()
 
@@ -144,207 +145,9 @@ def check_inputs(args):
         logger.warning(f"Size {size} is not supported for task {args.task}. Supported sizes are {SUPPORTED_SIZES[args.task]}.")
     video_length = args.video_length
 
+    if height % 8 != 0 or width % 8 != 0:
+        raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
     return height, width, video_length
-
-
-def load_transformer_with_lora(
-    transformer, lora_weights, lora_multipliers, device, dit_weight_dtype, exclude_single_blocks=False, use_lycoris=False
-):
-    """Load transformer model and apply LoRA weights"""
-    if lora_weights is None or len(lora_weights) == 0:
-        return transformer
-    
-    logger.info(f"Loading {len(lora_weights)} LoRA weight(s) for Wan model")
-
-    for i, lora_weight in enumerate(lora_weights):
-        if lora_multipliers is None or not isinstance(lora_multipliers, list) or len(lora_multipliers) <= i:
-            lora_multiplier = 1.0
-        else:
-            lora_multiplier = lora_multipliers[i]
-
-        logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
-        weights_sd = load_file(lora_weight)
-        
-        # Filter to exclude keys that are part of single_blocks
-        if exclude_single_blocks:
-            filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
-            weights_sd = filtered_weights
-            
-        if use_lycoris:
-            from lycoris.kohya import create_network_from_weights
-            lycoris_net, _ = create_network_from_weights(
-                multiplier=lora_multiplier,
-                file=None,
-                weights_sd=weights_sd,
-                unet=transformer,
-                text_encoder=None,
-                vae=None,
-                for_inference=True,
-            )
-            logger.info("Merging LyCORIS weights to transformer model")
-            lycoris_net.merge_to(None, transformer, weights_sd, dtype=None, device=device)
-        else:
-            network = lora.create_network_from_weights_wan(
-                lora_multiplier, weights_sd, transformer=transformer, for_inference=True
-            )
-            logger.info("Merging LoRA weights to transformer model")
-            network.merge_to(None, transformer, weights_sd, device=device, non_blocking=True)
-
-        synchronize_device(device)
-        logger.info(f"LoRA weights from {lora_weight} loaded and merged")
-
-    return transformer
-
-
-def apply_lora_to_wan_model(model_obj, lora_weight, lora_multiplier, device, dtype, exclude_single_blocks=False, use_lycoris=False):
-    """
-    Apply LoRA weights to Wan model by accessing the transformer correctly
-    
-    Args:
-        model_obj: The Wan model instance (WanI2V or WanT2V)
-        lora_weight: List of LoRA weight paths to apply
-        lora_multiplier: List of multipliers for each LoRA
-        device: The device to use
-        dtype: The data type to use
-        exclude_single_blocks: Whether to exclude single blocks
-        use_lycoris: Whether to use LyCORIS
-    
-    Returns:
-        The modified model object
-    """
-    # Debug the model structure
-    logger.info(f"Inspecting model structure for LoRA application...")
-    logger.info(f"Model object type: {type(model_obj)}")
-    
-    # List the key attributes of the model object to find the transformer
-    transformer = None
-    
-    # Try different possible attribute names
-    if hasattr(model_obj, 'model'):
-        transformer = model_obj.model
-        logger.info("Found transformer at model_obj.model")
-    elif hasattr(model_obj, 'transformer'):
-        transformer = model_obj.transformer
-        logger.info("Found transformer at model_obj.transformer")
-    elif hasattr(model_obj, 'diffusion_model'):
-        transformer = model_obj.diffusion_model
-        logger.info("Found transformer at model_obj.diffusion_model")
-    elif hasattr(model_obj, 'pipeline') and 'model' in model_obj.pipeline:
-        transformer = model_obj.pipeline['model']
-        logger.info("Found transformer at model_obj.pipeline['model']")
-    elif hasattr(model_obj, 'hybrid_seq_parallel_attn'):
-        transformer = model_obj  # The model_obj itself might be the transformer
-        logger.info("Model object appears to be the transformer itself")
-    else:
-        # As a last resort, check all attributes for a likely transformer
-        for attr_name in dir(model_obj):
-            if not attr_name.startswith('_'):  # Skip private attributes
-                attr = getattr(model_obj, attr_name)
-                if isinstance(attr, torch.nn.Module) and hasattr(attr, 'blocks'):
-                    transformer = attr
-                    logger.info(f"Found possible transformer at model_obj.{attr_name}")
-                    break
-    
-    if transformer is None:
-        logger.warning("Could not identify transformer model. LoRA weights not applied.")
-        logger.info("Available attributes:")
-        for attr_name in dir(model_obj):
-            if not attr_name.startswith('_'):  # Skip private attributes
-                logger.info(f"  {attr_name}: {type(getattr(model_obj, attr_name))}")
-        return model_obj
-    
-    # Apply LoRA weights to the transformer model
-    transformer = load_transformer_with_lora(
-        transformer, 
-        lora_weight, 
-        lora_multiplier if isinstance(lora_multiplier, list) else [lora_multiplier],
-        device, 
-        dtype,
-        exclude_single_blocks,
-        use_lycoris
-    )
-    
-    # Update the model with the modified transformer
-    # Match how we found the transformer to how we update it
-    if hasattr(model_obj, 'model'):
-        model_obj.model = transformer
-    elif hasattr(model_obj, 'transformer'):
-        model_obj.transformer = transformer
-    elif hasattr(model_obj, 'diffusion_model'):
-        model_obj.diffusion_model = transformer
-    elif hasattr(model_obj, 'pipeline') and 'model' in model_obj.pipeline:
-        model_obj.pipeline['model'] = transformer
-    elif hasattr(model_obj, 'hybrid_seq_parallel_attn'):
-        # If the model_obj itself is the transformer, we don't need to update anything
-        pass
-    else:
-        for attr_name in dir(model_obj):
-            if not attr_name.startswith('_'):
-                attr = getattr(model_obj, attr_name)
-                if attr is transformer:
-                    setattr(model_obj, attr_name, transformer)
-                    break
-    
-    return model_obj
-
-
-def debug_model_structure(model_obj, logger):
-    """
-    Debug the model structure to help identify issues with LoRA application
-    
-    Args:
-        model_obj: The model object to debug
-        logger: Logger instance for output
-    """
-    logger.info(f"Model object type: {type(model_obj)}")
-    
-    # Check if model attribute exists
-    if hasattr(model_obj, 'model'):
-        logger.info(f"Model attribute type: {type(model_obj.model)}")
-        
-        # Check if the model has blocks attribute (common in transformer models)
-        if hasattr(model_obj.model, 'blocks'):
-            logger.info(f"Model has {len(model_obj.model.blocks)} blocks")
-            
-            # Check the type of the first block
-            if len(model_obj.model.blocks) > 0:
-                logger.info(f"First block type: {type(model_obj.model.blocks[0])}")
-    else:
-        logger.warning("Model does not have a 'model' attribute")
-    
-    # List all attributes of the model object
-    logger.info("Model attributes:")
-    for attr_name in dir(model_obj):
-        if not attr_name.startswith('_'):  # Skip private attributes
-            logger.info(f"  {attr_name}: {type(getattr(model_obj, attr_name))}")
-
-
-def debug_lora_weights(lora_weights, logger):
-    """
-    Debug the LoRA weights structure
-    
-    Args:
-        lora_weights: The LoRA weights to debug
-        logger: Logger instance for output
-    """
-    # Print some stats about the lora weights
-    if isinstance(lora_weights, dict):
-        logger.info(f"LoRA weights has {len(lora_weights)} keys")
-        
-        # Show some example keys
-        sample_keys = list(lora_weights.keys())[:5]
-        logger.info(f"Sample keys: {sample_keys}")
-        
-        # Check key formats
-        key_prefixes = set()
-        for key in lora_weights.keys():
-            if '.' in key:
-                prefix = key.split('.')[0]
-                key_prefixes.add(prefix)
-        
-        logger.info(f"Key prefixes found: {key_prefixes}")
-    else:
-        logger.info(f"LoRA weights is not a dict: {type(lora_weights)}")
 
 
 def main():
@@ -439,6 +242,58 @@ def main():
 
         blocks_to_swap = args.blocks_to_swap if args.blocks_to_swap else 0
 
+        # load LoRA weights
+        merge_lora = None
+        if args.lora_weight is not None and len(args.lora_weight) > 0:
+
+            def merge_lora(transformer):
+                for i, lora_weight in enumerate(args.lora_weight):
+                    if args.lora_multiplier is not None and len(args.lora_multiplier) > i:
+                        lora_multiplier = args.lora_multiplier[i]
+                    else:
+                        lora_multiplier = 1.0
+
+                    logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
+                    weights_sd = load_file(lora_weight)
+                    if args.lycoris:
+                        lycoris_net, _ = create_network_from_weights(
+                            multiplier=lora_multiplier,
+                            file=None,
+                            weights_sd=weights_sd,
+                            unet=transformer,
+                            text_encoder=None,
+                            vae=None,
+                            for_inference=True,
+                        )
+                    else:
+                        network = lora_wan.create_arch_network_from_weights(
+                            lora_multiplier, weights_sd, unet=transformer, for_inference=True
+                        )
+                    logger.info("Merging LoRA weights to DiT model")
+
+                    # try:
+                    #     network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+                    #     info = network.load_state_dict(weights_sd, strict=True)
+                    #     logger.info(f"Loaded LoRA weights from {weights_file}: {info}")
+                    #     network.eval()
+                    #     network.to(device)
+                    # except Exception as e:
+                    if args.lycoris:
+                        lycoris_net.merge_to(None, transformer, weights_sd, dtype=None, device=device)
+                    else:
+                        network.merge_to(None, transformer, weights_sd, device=device, non_blocking=True)
+
+                    synchronize_device(device)
+
+                    logger.info("LoRA weights loaded")
+
+                # save model here before casting to dit_weight_dtype
+                if args.save_merged_model:
+                    logger.info(f"Saving merged model to {args.save_merged_model}")
+                    mem_eff_save_file(transformer.state_dict(), args.save_merged_model)  # save_file needs a lot of memory
+                    logger.info("Merged model saved")
+                    return
+
         # create pipeline
         if "t2v" in args.task or "t2i" in args.task:
             wan_t2v = wan.WanT2V(
@@ -451,40 +306,12 @@ def main():
                 t5_path=args.t5,
                 t5_fp8=args.fp8_t5,
             )
-            
-            # Apply LoRA weights if provided - using the updated function
-            if args.lora_weight and len(args.lora_weight) > 0:
-                logger.info(f"Applying LoRA weights to WanT2V model: {args.lora_weight}")
-                wan_t2v = apply_lora_to_wan_model(
-                    wan_t2v,
-                    args.lora_weight,
-                    args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier],
-                    device,
-                    dit_weight_dtype,
-                    args.exclude_single_blocks,
-                    args.lycoris
-                )
-                
-                # If we found a transformer and save_merged_model is specified, save the model
-                if args.save_merged_model:
-                    # We need to search for the transformer again
-                    transformer_found = False
-                    for attr_name in dir(wan_t2v):
-                        if not attr_name.startswith('_'):  # Skip private attributes
-                            attr = getattr(wan_t2v, attr_name)
-                            if isinstance(attr, torch.nn.Module) and hasattr(attr, 'blocks'):
-                                logger.info(f"Saving merged model transformer from {attr_name} to {args.save_merged_model}")
-                                mem_eff_save_file(attr.state_dict(), args.save_merged_model)
-                                transformer_found = True
-                                logger.info("Merged model saved")
-                                return
-                    
-                    if not transformer_found:
-                        logger.warning("No suitable transformer found to save as merged model.")
 
             logging.info(f"Generating {'image' if 't2i' in args.task else 'video'} ...")
             latents = wan_t2v.generate(
                 accelerator,
+                merge_lora,
+                torch.bfloat16 if merge_lora is not None else None,
                 prompt,
                 size=size,
                 frame_num=video_length,
@@ -509,36 +336,6 @@ def main():
                 clip_path=args.clip,
                 t5_fp8=args.fp8_t5,
             )
-            
-            # Apply LoRA weights if provided - using the updated function
-            if args.lora_weight and len(args.lora_weight) > 0:
-                logger.info(f"Applying LoRA weights to WanI2V model: {args.lora_weight}")
-                wan_i2v = apply_lora_to_wan_model(
-                    wan_i2v,
-                    args.lora_weight,
-                    args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier],
-                    device,
-                    dit_weight_dtype,
-                    args.exclude_single_blocks,
-                    args.lycoris
-                )
-                
-                # If we found a transformer and save_merged_model is specified, save the model
-                if args.save_merged_model:
-                    # We need to search for the transformer again
-                    transformer_found = False
-                    for attr_name in dir(wan_i2v):
-                        if not attr_name.startswith('_'):  # Skip private attributes
-                            attr = getattr(wan_i2v, attr_name)
-                            if isinstance(attr, torch.nn.Module) and hasattr(attr, 'blocks'):
-                                logger.info(f"Saving merged model transformer from {attr_name} to {args.save_merged_model}")
-                                mem_eff_save_file(attr.state_dict(), args.save_merged_model)
-                                transformer_found = True
-                                logger.info("Merged model saved")
-                                return
-                    
-                    if not transformer_found:
-                        logger.warning("No suitable transformer found to save as merged model.")
 
             # i2v inference
             logger.info(f"Image2Video inference: {args.image_path}")
@@ -549,6 +346,8 @@ def main():
             logging.info(f"Generating video ...")
             latents = wan_i2v.generate(
                 accelerator,
+                merge_lora,
+                torch.bfloat16 if merge_lora is not None else None,
                 prompt,
                 img=image,
                 size=size,
@@ -564,7 +363,9 @@ def main():
             del wan_i2v
             latents = latents.unsqueeze(0)
 
-    clean_memory_on_device(device)
+        logger.info(f"wait for 5s to clean memory")
+        time.sleep(5.0)
+        clean_memory_on_device(device)
 
     # prepare accelerator for decode
     output_type = args.output_type
@@ -610,14 +411,6 @@ def main():
             }
             if args.negative_prompt is not None:
                 metadata["negative_prompt"] = f"{args.negative_prompt}"
-            # Add LoRA information to metadata
-            if args.lora_weight and len(args.lora_weight) > 0:
-                metadata["lora_weights"] = ",".join(args.lora_weight)
-                if isinstance(args.lora_multiplier, list):
-                    metadata["lora_multipliers"] = ",".join(map(str, args.lora_multiplier))
-                else:
-                    metadata["lora_multipliers"] = str(args.lora_multiplier)
-                    
         sd = {"latent": latents[0]}
         save_file(sd, latent_path, metadata=metadata)
 

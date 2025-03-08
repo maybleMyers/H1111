@@ -500,7 +500,7 @@ def clip_xlm_roberta_vit_h_14(pretrained=False, pretrained_name="open-clip-xlm-r
 
 class CLIPModel:
 
-    def __init__(self, dtype, device, checkpoint_path, tokenizer_path, weight_path):
+    def __init__(self, dtype, device, checkpoint_path=None, tokenizer_path=None, weight_path=None):
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
