@@ -1,48 +1,38 @@
-#!/usr/bin/env python3
-
 import sys
 import subprocess
 import random
+import os
 
 def main():
-    """
-    Usage:
-      python run_hv_generate_video.py "Your prompt text here"
-    """
-    if len(sys.argv) < 2:
-        print("Error: No prompt provided.")
-        print("Usage: python run_hv_generate_video.py \"<prompt>\"")
-        #sys.exit(1)
-
-    # Capture the prompt from command-line arguments
-    #prompt = sys.argv[1]
-    SkyReelsModel = "Skywork/SkyReels-V1-Hunyuan-I2V"
-        # Generate a random seed
-    random_seed = random.randint(0, 2**32 - 1)
- # Construct the command
+    # Hardcoded default values for Hunyuan I2V
     cmd = [
-        # quant: Enable FP8 weight-only quantization
-        # offload: Enable offload model
-        # high_cpu_memory: Enable pinned memory to reduce the overhead of model offloading.
-        # parameters_level: Further reduce GPU VRAM usage.
-        "python3", "video_generate.py",
-            "--model_id", SkyReelsModel,
-            "--guidance_scale", "6.0",
-            "--height", "720",
-            "--width", "720",
-            "--num_frames", "97",
-            "--prompt", "FPS-24, In a serene scene along a detailed oceanfront, a feral female alicorn Twilight Sparkle from My Little Pony stands alone. The waves crash against the shore, splashing her face with salty water, as she gazes out at the vast, indifferent sea. ",
-            "--embedded_guidance_scale", "1.0",
-            "--quant",
-            "--offload",
-            "--high_cpu_memory",
-            "--parameters_level",
-            "--image", "img/ocean.webp",
-            "--seed", str(random_seed),
-            "--task_type", "i2v"
+        sys.executable,
+        "newhun_gen.py",
+        "--i2v_mode",
+        "--i2v_image_path", "boy.png",
+        "--prompt", "A detailed, cinematic scene showcasing a vibrant landscape",
+        "--dit", "hunyuan/I2Vmp_rank_00_model_states.pt",
+        "--vae", "hunyuan/I2Vpytorch_model.pt",
+        "--text_encoder1", "hunyuan/llava_llama3_fp16.safetensors",
+        "--text_encoder2", "hunyuan/clip_l.safetensors",
+        #"--video_size", "544", "544",
+        "--video_length", "977",
+        "--fps", "24",
+        "--infer_steps", "30",
+        "--save_path", "outputs",
+        "--seed", str(random.randint(0, 2**32 - 1)),
+        "--flow_shift", "5.0",
+        "--guidance_scale", "7.0",
+        "--embedded_cfg_scale", "1.0",
+        "--output_type", "video",
+        "--i2v_resolution", "360p",
+        "--attn_mode", "sdpa",
+        "--blocks_to_swap", "0",
+        "--fp8"
     ]
- # Print the exact command (for debugging/logging)
-    print("Executing command with random seed:", random_seed)
+
+    # Print the command for logging
+    print("Executing video generation command:")
     print(" ".join(cmd))
 
     # Run the command
