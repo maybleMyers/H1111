@@ -690,6 +690,247 @@ def clear_cuda_cache():
         # Optional: synchronize to ensure cache is cleared
         torch.cuda.synchronize()
 
+def wanx_batch_handler(
+    use_random,
+    prompt, 
+    negative_prompt,
+    width,
+    height,
+    video_length,
+    fps,
+    infer_steps,
+    flow_shift,
+    guidance_scale,
+    seed,
+    batch_size,
+    input_folder_path,
+    task,
+    dit_path,
+    vae_path,
+    t5_path,
+    clip_path,
+    save_path,
+    output_type,
+    sample_solver,
+    exclude_single_blocks,
+    attn_mode,
+    block_swap,
+    fp8,
+    fp8_t5,
+    lora_folder,
+    *lora_params
+):
+    """Handle both folder-based batch processing and regular processing for WanX"""
+    global stop_event
+    
+    if use_random:
+        # Random image from folder mode
+        stop_event.clear()
+
+        all_videos = []
+        progress_text = "Starting generation..."
+        yield [], "Preparing...", progress_text
+
+        # Ensure batch_size is treated as an integer
+        batch_size = int(batch_size)
+        
+        # Process each item in the batch separately
+        for i in range(batch_size):
+            if stop_event.is_set():
+                yield all_videos, "Generation stopped by user", ""
+                return
+
+            batch_text = f"Generating video {i + 1} of {batch_size}"
+            yield all_videos.copy(), batch_text, progress_text
+
+            # Get random image from folder
+            random_image, status = get_random_image_from_folder(input_folder_path)
+            if random_image is None:
+                yield all_videos, f"Error in batch {i+1}: {status}", ""
+                continue
+
+            # Resize image
+            resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, width, height)
+            if resized_image is None:
+                yield all_videos, f"Error resizing image in batch {i+1}: {size_info}", ""
+                continue
+
+            # Use the dimensions returned from the resize function
+            local_width, local_height = width, height  # Default fallback
+            if isinstance(size_info, tuple):
+                local_width, local_height = size_info
+                progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height} (maintaining aspect ratio)"
+            else:
+                progress_text = f"Using image: {os.path.basename(random_image)}"
+            
+            yield all_videos.copy(), batch_text, progress_text
+
+            # Calculate seed for this batch item
+            current_seed = seed
+            if seed == -1:
+                current_seed = random.randint(0, 2**32 - 1)
+            elif batch_size > 1:
+                current_seed = seed + i
+
+            # Extract LoRA weights and multipliers
+            num_lora_weights = 4
+            lora_weights = lora_params[:num_lora_weights]
+            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+
+            # Generate video for this image - one at a time
+            for videos, status, progress in wanx_generate_video(
+                prompt, 
+                negative_prompt, 
+                resized_image, 
+                local_width,
+                local_height,
+                video_length,
+                fps,
+                infer_steps,
+                flow_shift,
+                guidance_scale, 
+                current_seed,
+                task,
+                dit_path,
+                vae_path,
+                t5_path,
+                clip_path,
+                save_path,
+                output_type,
+                sample_solver,
+                exclude_single_blocks,
+                attn_mode,
+                block_swap,
+                fp8,
+                fp8_t5,
+                lora_folder,
+                *lora_weights,
+                *lora_multipliers
+            ):
+                if videos:
+                    all_videos.extend(videos)
+                yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+
+            # Clean up temporary file
+            try:
+                if os.path.exists(resized_image):
+                    os.remove(resized_image)
+            except:
+                pass
+            
+            # Clear CUDA cache between generations
+            clear_cuda_cache()
+            time.sleep(0.5)
+
+        yield all_videos, "Batch complete", ""
+    else:
+        # For non-random mode, if batch_size > 1, we need to process multiple times
+        # with the same input image but different seeds
+        if int(batch_size) > 1:
+            stop_event.clear()
+            
+            all_videos = []
+            progress_text = "Starting generation..."
+            yield [], "Preparing...", progress_text
+            
+            # Extract LoRA weights and multipliers and input image
+            num_lora_weights = 4
+            lora_weights = lora_params[:num_lora_weights]
+            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+            input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
+            
+            # Process each batch item
+            for i in range(int(batch_size)):
+                if stop_event.is_set():
+                    yield all_videos, "Generation stopped by user", ""
+                    return
+                
+                # Calculate seed for this batch item
+                current_seed = seed
+                if seed == -1:
+                    current_seed = random.randint(0, 2**32 - 1)
+                elif batch_size > 1:
+                    current_seed = seed + i
+                
+                batch_text = f"Generating video {i + 1} of {batch_size}"
+                yield all_videos.copy(), batch_text, progress_text
+                
+                # Generate a single video with the current seed
+                for videos, status, progress in wanx_generate_video(
+                    prompt, 
+                    negative_prompt, 
+                    input_image, 
+                    width,
+                    height,
+                    video_length,
+                    fps,
+                    infer_steps,
+                    flow_shift,
+                    guidance_scale, 
+                    current_seed,
+                    task,
+                    dit_path,
+                    vae_path,
+                    t5_path,
+                    clip_path,
+                    save_path,
+                    output_type,
+                    sample_solver,
+                    exclude_single_blocks,
+                    attn_mode,
+                    block_swap,
+                    fp8,
+                    fp8_t5,
+                    lora_folder,
+                    *lora_weights,
+                    *lora_multipliers
+                ):
+                    if videos:
+                        all_videos.extend(videos)
+                    yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+                
+                # Clear CUDA cache between generations
+                clear_cuda_cache()
+                time.sleep(0.5)
+            
+            yield all_videos, "Batch complete", ""
+        else:
+            # Single image, single generation - use existing function
+            num_lora_weights = 4
+            lora_weights = lora_params[:num_lora_weights]
+            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+            input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
+            
+            yield from wanx_generate_video(
+                prompt, 
+                negative_prompt,
+                input_image,
+                width,
+                height,
+                video_length,
+                fps,
+                infer_steps,
+                flow_shift,
+                guidance_scale,
+                seed,
+                task,
+                dit_path,
+                vae_path,
+                t5_path,
+                clip_path,
+                save_path,
+                output_type,
+                sample_solver,
+                exclude_single_blocks,
+                attn_mode,
+                block_swap,
+                fp8,
+                fp8_t5, 
+                lora_folder,
+                *lora_weights,
+                *lora_multipliers
+            )
+
 def process_single_video(
     prompt: str,
     width: int,
@@ -1940,6 +2181,20 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     wanx_input = gr.Image(label="Input Image", type="filepath")
+                    with gr.Row():
+                        wanx_use_random_folder = gr.Checkbox(label="Use Random Images from Folder", value=False)
+                        wanx_input_folder = gr.Textbox(
+                            label="Image Folder Path", 
+                            placeholder="Path to folder containing images",
+                            visible=False
+                        )
+                        wanx_folder_status = gr.Textbox(
+                            label="Folder Status", 
+                            placeholder="Status will appear here",
+                            interactive=False,
+                            visible=False
+                        )
+                        wanx_validate_folder_btn = gr.Button("Validate Folder", visible=False)
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -3378,6 +3633,19 @@ with gr.Blocks(
         inputs=[wanx_width, wanx_original_dims],
         outputs=[wanx_height]
     )
+    # Add visibility toggle for the folder input components
+    wanx_use_random_folder.change(
+        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=x), gr.update(visible=not x)),
+        inputs=[wanx_use_random_folder],
+        outputs=[wanx_input_folder, wanx_folder_status, wanx_validate_folder_btn, wanx_input]
+    )
+
+    # Validate folder button handler
+    wanx_validate_folder_btn.click(
+        fn=lambda folder: get_random_image_from_folder(folder)[1],
+        inputs=[wanx_input_folder],
+        outputs=[wanx_folder_status]
+    )
 
     # Flow shift recommendation buttons
     wanx_recommend_flow_btn.click(
@@ -3394,8 +3662,9 @@ with gr.Blocks(
     
     # Generate button handler
     wanx_generate_btn.click(
-        fn=wanx_generate_video_batch,
+        fn=wanx_batch_handler,
         inputs=[
+            wanx_use_random_folder,
             wanx_prompt, 
             wanx_negative_prompt,
             wanx_width,
@@ -3406,6 +3675,8 @@ with gr.Blocks(
             wanx_flow_shift,
             wanx_guidance_scale,
             wanx_seed,
+            wanx_batch_size,
+            wanx_input_folder,
             wanx_task,
             wanx_dit_path,
             wanx_vae_path,
@@ -3418,19 +3689,18 @@ with gr.Blocks(
             wanx_attn_mode,
             wanx_block_swap,
             wanx_fp8,
-            wanx_fp8_t5, 
+            wanx_fp8_t5,
             wanx_lora_folder,
             *wanx_lora_weights,
             *wanx_lora_multipliers,
-            wanx_batch_size,
-            wanx_input  # Include the image input for this tab
+            wanx_input  # Include input image path for non-batch mode
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
         queue=True
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
         inputs=[wanx_batch_size],
-        outputs=skyreels_selected_index
+        outputs=skyreels_selected_index  # Reusing existing state variable
     )
     
     # Add refresh button handler for WanX-i2v tab

@@ -45,8 +45,10 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/9/2025  
+    Added batching ability for a folder full of images in WanX-i2v tab. Added flash attn for windows prebuilt wheel.  
 3/8/2025  
-    Added support for wan lora's. Remember to convert them first in the convert lora tab.
+    Added support for wan lora's. Remember to convert them first in the convert lora tab.  
 3/5/2025  
     Added ability to batch a folder of images with skyreels i2v, so you can make a video with every image in a folder.
 3/2/2025  
@@ -140,8 +142,15 @@ pip install --no-deps xformers --index-url https://download.pytorch.org/whl/cu12
 ```
 
 ### Optional: Install Flash Attention
-Note: This can take 1-5 hour to install even on a good CPU, but provides faster generation.
+Note: This can take 1-5 hour to install even on a good CPU, but provides faster generation.  
+I have uploaded a wheel for windows users to match cuda 12.4 and python 3.10.(thanks lldacing)
+https://huggingface.co/maybleMyers/wan_files_for_h1111/resolve/main/flash_attn-2.7.4%2Bcu124torch2.5.1cxx11abiFALSE-cp310-cp310-win_amd64.whl?download=true  
+
 ```powershell
 pip install flash-attn --no-build-isolation
+
+If you have downloaded the wheel you can install it with:
+
+pip install "flash_attn-2.7.4+cu124torch2.5.1cxx11abiFALSE-cp310-cp310-win_amd64.whl"
 ```
 ```
