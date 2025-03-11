@@ -2149,7 +2149,7 @@ with gr.Blocks(
                 skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
 
         # WanX Image to Video Tab
-        with gr.Tab(label="WanX-i2v") as wanx_i2v_tab:
+        with gr.Tab(id=4, label="WanX-i2v") as wanx_i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     wanx_prompt = gr.Textbox(
@@ -2275,7 +2275,7 @@ with gr.Blocks(
         #WanX-t2v Tab
 
         # WanX Text to Video Tab
-        with gr.Tab(label="WanX-t2v") as wanx_t2v_tab:
+        with gr.Tab(id=5, label="WanX-t2v") as wanx_t2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     wanx_t2v_prompt = gr.Textbox(
@@ -2387,6 +2387,8 @@ with gr.Blocks(
             with gr.Row():
                 send_to_t2v_btn = gr.Button("Send to Text2Video", variant="primary")
                 send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
+                send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
+                send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
@@ -2511,6 +2513,104 @@ with gr.Blocks(
                 with gr.Row():
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+
+    ### Video Info
+
+    # 2. Add a simplified function to handle all tab transfers
+    def handle_send_to_wanx_tab(metadata, target_tab):
+        """Common handler for sending video parameters to WanX tabs"""
+        if not metadata:
+            return "No parameters to send", {}
+
+        # Tab names for clearer messages
+        tab_names = {
+            'wanx_i2v': 'WanX-i2v',
+            'wanx_t2v': 'WanX-t2v'
+        }
+
+        # Just pass through all parameters - we'll use them in the .then() function
+        return f"Parameters ready for {tab_names.get(target_tab, target_tab)}", metadata
+
+    def change_to_wanx_i2v_tab():
+        return gr.Tabs(selected=4)  # WanX-i2v tab index
+
+    def change_to_wanx_t2v_tab():
+        return gr.Tabs(selected=5)  # WanX-t2v tab index
+
+    send_to_wanx_i2v_btn.click(
+        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_i2v'),
+        inputs=[metadata_output],
+        outputs=[status, params_state]
+    ).then(
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("width", 832),
+            params.get("height", 480),
+            params.get("video_length", 81),
+            params.get("fps", 16),
+            params.get("infer_steps", 40),
+            params.get("seed", -1),
+            params.get("flow_shift", 3.0),
+            params.get("guidance_scale", 5.0),
+            params.get("attn_mode", "sdpa"),
+            params.get("block_swap", 0),
+            params.get("task", "i2v-14B")
+        ] if params else [gr.update()]*12,
+        inputs=params_state,
+        outputs=[
+            wanx_prompt, 
+            wanx_width, 
+            wanx_height, 
+            wanx_video_length, 
+            wanx_fps, 
+            wanx_infer_steps,
+            wanx_seed,
+            wanx_flow_shift, 
+            wanx_guidance_scale,
+            wanx_attn_mode,
+            wanx_block_swap,
+            wanx_task
+        ]
+    ).then(
+        fn=change_to_wanx_i2v_tab, inputs=None, outputs=[tabs]
+    )
+
+    # 3. Update the WanX-t2v button handler
+    send_to_wanx_t2v_btn.click(
+        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_t2v'),
+        inputs=[metadata_output],
+        outputs=[status, params_state]
+    ).then(
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("width", 832), 
+            params.get("height", 480),
+            params.get("video_length", 81),
+            params.get("fps", 16),
+            params.get("infer_steps", 50),
+            params.get("seed", -1),
+            params.get("flow_shift", 5.0),
+            params.get("guidance_scale", 5.0),
+            params.get("attn_mode", "sdpa"),
+            params.get("block_swap", 0)
+        ] if params else [gr.update()]*11,
+        inputs=params_state,
+        outputs=[
+            wanx_t2v_prompt,
+            wanx_t2v_width,
+            wanx_t2v_height,
+            wanx_t2v_video_length,
+            wanx_t2v_fps,
+            wanx_t2v_infer_steps,
+            wanx_t2v_seed,
+            wanx_t2v_flow_shift,
+            wanx_t2v_guidance_scale,
+            wanx_t2v_attn_mode,
+            wanx_t2v_block_swap
+        ]
+    ).then(
+        fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
+    )
 
     #text to video
     def change_to_tab_one():
