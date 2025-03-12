@@ -18,10 +18,129 @@ from PIL import Image
 import math
 import cv2
 import glob
+import shutil
+from pathlib import Path
+import logging
+from datetime import datetime
 
 
 # Add global stop event
 stop_event = threading.Event()
+
+logger = logging.getLogger(__name__)
+
+def send_last_frame_handler(gallery, selected_idx):
+    """Handle sending last frame to input with better error handling"""
+    if gallery is None or not gallery:
+        return None, None
+        
+    if selected_idx is None and len(gallery) == 1:
+        selected_idx = 0
+        
+    if selected_idx is None or selected_idx >= len(gallery):
+        return None, None
+        
+    # Get the frame and video path
+    frame = handle_last_frame_transfer(gallery, selected_idx)
+    video_path = None
+    
+    if selected_idx < len(gallery):
+        item = gallery[selected_idx]
+        video_path = parse_video_path(item)
+        
+    return frame, video_path
+
+def extract_last_frame(video_path: str) -> Optional[str]:
+    """Extract last frame from video and return temporary image path with error handling"""
+    print(f"\n=== Starting frame extraction ===")
+    print(f"Input video path: {video_path}")
+    
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Error: Video file does not exist")
+        return None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("❌ Error: Failed to open video file")
+            return None
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Total frames detected: {total_frames}")
+        
+        if total_frames < 1:
+            print("❌ Error: Video contains 0 frames")
+            return None
+
+        # Extract last frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+        success, frame = cap.read()
+        
+        if not success or frame is None:
+            print("❌ Error: Failed to read last frame")
+            return None
+
+        # Prepare output path
+        temp_dir = os.path.abspath("temp_frames")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"last_frame_{os.path.basename(video_path)}.png")
+        print(f"Saving frame to: {temp_path}")
+
+        # Write and verify
+        if not cv2.imwrite(temp_path, frame):
+            print("❌ Error: Failed to write frame to file")
+            return None
+            
+        if not os.path.exists(temp_path):
+            print("❌ Error: Output file not created")
+            return None
+
+        print("✅ Frame extraction successful")
+        return temp_path
+
+    except Exception as e:
+        print(f"❌ Unexpected error: {str(e)}")
+        return None
+    finally:
+        if 'cap' in locals():
+            cap.release()
+
+def handle_last_frame_transfer(gallery: list, selected_idx: int) -> Optional[str]:
+    """Improved frame transfer with video input validation"""
+    try:
+        if gallery is None or not gallery:
+            raise ValueError("No videos generated yet")
+            
+        if selected_idx is None:
+            # Auto-select last generated video if batch_size=1
+            if len(gallery) == 1:
+                selected_idx = 0
+            else:
+                raise ValueError("Please select a video first")
+                
+        if selected_idx >= len(gallery):
+            raise ValueError("Invalid selection index")
+            
+        item = gallery[selected_idx]
+        
+        # Video file existence check
+        video_path = parse_video_path(item)
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file missing: {video_path}")
+            
+        return extract_last_frame(video_path)
+        
+    except Exception as e:
+        print(f"Frame transfer failed: {str(e)}")
+        return None
+
+def parse_video_path(item) -> str:
+    """Parse different gallery item formats"""
+    if isinstance(item, tuple):
+        return item[0]
+    elif isinstance(item, dict):
+        return item.get('name') or item.get('data')
+    return str(item)
 
 def get_random_image_from_folder(folder_path):
     """Get a random image from the specified folder"""
@@ -1326,9 +1445,26 @@ def recommend_wanx_flow_shift(width, height):
     recommended_shift = 3.0 if (width == 832 and height == 480) or (width == 480 and height == 832) else 5.0
     return gr.update(value=recommended_shift)
 
-def handle_wanx_gallery_select(evt: gr.SelectData) -> int:
-    """Track selected index when gallery item is clicked"""
-    return evt.index
+def handle_wanx_gallery_select(evt: gr.SelectData, gallery) -> tuple:
+    """Track selected index and video path when gallery item is clicked"""
+    if gallery is None:
+        return None, None
+    
+    if evt.index >= len(gallery):
+        return None, None
+    
+    selected_item = gallery[evt.index]
+    video_path = None
+    
+    # Extract the video path based on the item type
+    if isinstance(selected_item, tuple):
+        video_path = selected_item[0]
+    elif isinstance(selected_item, dict):
+        video_path = selected_item.get("name", selected_item.get("data", None))
+    else:
+        video_path = selected_item
+    
+    return evt.index, video_path
 
 def wanx_generate_video(
     prompt, 
@@ -1528,23 +1664,36 @@ def send_wanx_to_v2v(
     negative_prompt: str
 ) -> Tuple:
     """Send the selected WanX video to Video2Video tab"""
-    if not gallery or selected_index is None or selected_index >= len(gallery):
+    if gallery is None or not gallery:
+        return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, guidance_scale, negative_prompt)
+    
+    # If no selection made but we have videos, use the first one
+    if selected_index is None and len(gallery) > 0:
+        selected_index = 0
+        
+    if selected_index is None or selected_index >= len(gallery):
         return (None, "", width, height, video_length, fps, infer_steps, seed, 
                 flow_shift, guidance_scale, negative_prompt)
 
     selected_item = gallery[selected_index]
-
-    if isinstance(selected_item, dict):
-        video_path = selected_item.get("name", selected_item.get("data", None))
-    elif isinstance(selected_item, (tuple, list)):
+    
+    # Handle different gallery item formats
+    if isinstance(selected_item, tuple):
         video_path = selected_item[0]
+    elif isinstance(selected_item, dict):
+        video_path = selected_item.get("name", selected_item.get("data", None))
     else:
         video_path = selected_item
 
+    # Clean up path for Video component
     if isinstance(video_path, tuple):
         video_path = video_path[0]
+        
+    # Make sure it's a string
+    video_path = str(video_path)
 
-    return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
+    return (video_path, prompt, width, height, video_length, fps, infer_steps, seed, 
             flow_shift, guidance_scale, negative_prompt)
 
 def wanx_generate_video_batch(
@@ -1663,6 +1812,131 @@ def send_wanx_t2v_to_v2v(
     return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
             flow_shift, guidance_scale, negative_prompt)
 
+def prepare_for_batch_extension(input_img, base_video, batch_size):
+    """Prepare inputs for batch video extension"""
+    if input_img is None:
+        return None, None, batch_size, "No input image found", ""
+        
+    if base_video is None:
+        return input_img, None, batch_size, "No base video selected for extension", ""
+        
+    return input_img, base_video, batch_size, "Preparing batch extension...", f"Will create {batch_size} variations of extended video"
+
+def concat_batch_videos(base_video_path, generated_videos, save_path, original_video_path=None):
+    """Concatenate multiple generated videos with the base video"""
+    if not base_video_path:
+        return [], "No base video provided"
+            
+    if not generated_videos or len(generated_videos) == 0:
+        return [], "No new videos generated"
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Track all extended videos
+    extended_videos = []
+    
+    # For each generated video, create an extended version
+    for i, video_item in enumerate(generated_videos):
+        try:
+            # Extract video path from gallery item
+            if isinstance(video_item, tuple):
+                new_video_path = video_item[0]
+                seed_info = video_item[1] if len(video_item) > 1 else ""
+            elif isinstance(video_item, dict):
+                new_video_path = video_item.get("name", video_item.get("data", None))
+                seed_info = ""
+            else:
+                new_video_path = video_item
+                seed_info = ""
+                
+            if not new_video_path or not os.path.exists(new_video_path):
+                print(f"Skipping missing video: {new_video_path}")
+                continue
+                
+            # Create unique output filename
+            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+            # Extract seed from seed_info if available
+            seed_match = re.search(r"Seed: (\d+)", seed_info)
+            seed_part = f"_seed{seed_match.group(1)}" if seed_match else f"_{i}"
+            
+            output_filename = f"extended_{timestamp}{seed_part}_{Path(base_video_path).stem}.mp4"
+            output_path = os.path.join(save_path, output_filename)
+            
+            # Create a temporary file list for ffmpeg
+            list_file = os.path.join(save_path, f"temp_list_{i}.txt")
+            with open(list_file, "w") as f:
+                f.write(f"file '{os.path.abspath(base_video_path)}'\n")
+                f.write(f"file '{os.path.abspath(new_video_path)}'\n")
+            
+            # Run ffmpeg concatenation
+            command = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c", "copy",
+                output_path
+            ]
+            
+            subprocess.run(command, check=True, capture_output=True)
+            
+            # Clean up temporary file
+            if os.path.exists(list_file):
+                os.remove(list_file)
+                
+            # Add to extended videos list if successful
+            if os.path.exists(output_path):
+                seed_display = f"Extended {seed_info}" if seed_info else f"Extended video #{i+1}"
+                extended_videos.append((output_path, seed_display))
+            
+        except Exception as e:
+            print(f"Error processing video {i}: {str(e)}")
+    
+    if not extended_videos:
+        return [], "Failed to create any extended videos"
+        
+    return extended_videos, f"Successfully created {len(extended_videos)} extended videos"
+
+def handle_extend_generation(base_video_path: str, new_videos: list, save_path: str, current_gallery: list) -> tuple:
+    """Combine generated video with base video and update gallery"""
+    if not base_video_path:
+        return current_gallery, "Extend failed: No base video provided"
+        
+    if not new_videos:
+        return current_gallery, "Extend failed: No new video generated"
+    
+    # Ensure save path exists
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Get the first video from new_videos (gallery item)
+    new_video_path = new_videos[0][0] if isinstance(new_videos[0], tuple) else new_videos[0]
+    
+    # Create a unique output filename
+    timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    output_filename = f"extended_{timestamp}_{Path(base_video_path).stem}.mp4"
+    output_path = str(Path(save_path) / output_filename)
+    
+    try:
+        # Concatenate the videos using ffmpeg
+        (
+            ffmpeg
+            .input(base_video_path)
+            .concat(
+                ffmpeg.input(new_video_path)
+            )
+            .output(output_path)
+            .run(overwrite_output=True, quiet=True)
+        )
+        
+        # Create a new gallery entry with the combined video
+        updated_gallery = [(output_path, f"Extended video: {Path(output_path).stem}")]
+        
+        return updated_gallery, f"Successfully extended video to {Path(output_path).name}"
+    except Exception as e:
+        print(f"Error extending video: {str(e)}")
+        return current_gallery, f"Failed to extend video: {str(e)}"
+
 # UI setup
 with gr.Blocks(
     theme=themes.Default(
@@ -1711,6 +1985,9 @@ with gr.Blocks(
     params_state = gr.State() #New addition
     i2v_selected_index = gr.State(value=None) 
     skyreels_selected_index = gr.State(value=None)
+    wanx_i2v_selected_index = gr.State(value=None)
+    extended_videos = gr.State(value=[])
+    wanx_base_video = gr.State(value=None)
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -2225,7 +2502,9 @@ with gr.Blocks(
                         allow_preview=True,
                         preview=True
                     )
-                    wanx_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+                    wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
+                    wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
+                    wanx_extend_btn = gr.Button("Extend Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
                     wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
@@ -2514,9 +2793,42 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
-    ### Video Info
+    #Video Extension
+    wanx_send_last_frame_btn.click(
+        fn=send_last_frame_handler,
+        inputs=[wanx_output, wanx_i2v_selected_index],
+        outputs=[wanx_input, wanx_base_video]
+    )
 
-    # 2. Add a simplified function to handle all tab transfers
+    wanx_extend_btn.click(
+        fn=prepare_for_batch_extension,
+        inputs=[wanx_input, wanx_base_video, wanx_batch_size],
+        outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
+    ).then(
+        fn=wanx_batch_handler,
+        inputs=[
+            gr.Checkbox(value=False), # Not using random folder
+            wanx_prompt, wanx_negative_prompt,
+            wanx_width, wanx_height, wanx_video_length,
+            wanx_fps, wanx_infer_steps, wanx_flow_shift,
+            wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_input_folder, # Not used but needed for function signature
+            wanx_task,
+            wanx_dit_path, wanx_vae_path, wanx_t5_path,
+            wanx_clip_path, wanx_save_path, wanx_output_type,
+            wanx_sample_solver, wanx_exclude_single_blocks,
+            wanx_attn_mode, wanx_block_swap, wanx_fp8,
+            wanx_fp8_t5, wanx_lora_folder, *wanx_lora_weights,
+            *wanx_lora_multipliers, wanx_input  # Include input image
+        ],
+        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
+    ).then(
+        fn=concat_batch_videos,
+        inputs=[wanx_base_video, wanx_output, wanx_save_path],
+        outputs=[wanx_output, wanx_progress_text]
+    )
+
+    #Video Info
     def handle_send_to_wanx_tab(metadata, target_tab):
         """Common handler for sending video parameters to WanX tabs"""
         if not metadata:
@@ -2875,10 +3187,7 @@ with gr.Blocks(
         inputs=[skyreels_dit_folder, skyreels_lora_folder, skyreels_model] + skyreels_lora_weights + skyreels_lora_multipliers,
         outputs=skyreels_refresh_outputs
     )
-
-    # Add skyreels_selected_index to the initial states at the beginning of the script
-    skyreels_selected_index = gr.State(value=None)  # Add this with other state declarations    
-    
+      
     def calculate_v2v_width(height, original_dims):
         if not original_dims:
             return gr.update()
@@ -3800,7 +4109,7 @@ with gr.Blocks(
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
         inputs=[wanx_batch_size],
-        outputs=skyreels_selected_index  # Reusing existing state variable
+        outputs=wanx_i2v_selected_index  # Update to use correct state
     )
     
     # Add refresh button handler for WanX-i2v tab
@@ -3817,16 +4126,17 @@ with gr.Blocks(
     # Gallery selection handling
     wanx_output.select(
         fn=handle_wanx_gallery_select,
-        outputs=skyreels_selected_index  # Reuse the skyreels_selected_index
+        inputs=[wanx_output],
+        outputs=[wanx_i2v_selected_index, wanx_base_video]
     )
     
     # Send to Video2Video handler
     wanx_send_to_v2v_btn.click(
         fn=send_wanx_to_v2v,
         inputs=[
-            wanx_output, 
-            wanx_prompt, 
-            skyreels_selected_index,  # Reuse the skyreels_selected_index
+            wanx_output,  # Gallery with videos
+            wanx_prompt,  # Prompt text
+            wanx_i2v_selected_index,  # Use the correct selected index state
             wanx_width, 
             wanx_height, 
             wanx_video_length,
@@ -3838,8 +4148,8 @@ with gr.Blocks(
             wanx_negative_prompt
         ],
         outputs=[
-            v2v_input, 
-            v2v_prompt, 
+            v2v_input,  # Video input in V2V tab
+            v2v_prompt,  # Prompt in V2V tab
             v2v_width, 
             v2v_height,
             v2v_video_length, 
@@ -3851,7 +4161,7 @@ with gr.Blocks(
             v2v_negative_prompt
         ]
     ).then(
-        fn=change_to_tab_two,
+        fn=change_to_tab_two,  # Function to switch to Video2Video tab
         inputs=None,
         outputs=[tabs]
     )

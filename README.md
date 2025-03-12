@@ -45,6 +45,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/12/2025  
+    Added ability to send the last frame of a video to the input in WanX-i2v. Also you can now use this to extend the video. You can do multiple batches at each step and pick the best extended video then generate an even longer one.  
 3/9/2025  
     Added batching ability for a folder full of images in WanX-i2v tab. Added flash attn for windows prebuilt wheel.  
 3/8/2025  
