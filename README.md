@@ -7,7 +7,15 @@
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
-It allows simple inference with hunyuan video model , with video2video, image2video, Skyreels and text2video support.
+It allows simple inference with these models:  
+Hunyuan-t2v  
+Hunyuan-v2v  
+WanX-t2v  
+WanX-i2v  
+SkyReels-i2v  
+SkyReels-t2v  
+
+I am working on supporting hunyuan i2v and WanX v2v but it is proving a bit troublesome.  
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
@@ -45,6 +53,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/13/2025  
+    Added extend video functionality to WanX-i2v. It kind of works .  
 3/12/2025  
     Added ability to send the last frame of a video to the input in WanX-i2v. Also you can now use this to extend the video. You can do multiple batches at each step and pick the best extended video then generate an even longer one.  
 3/9/2025  
