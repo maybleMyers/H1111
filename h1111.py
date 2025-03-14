@@ -22,12 +22,246 @@ import shutil
 from pathlib import Path
 import logging
 from datetime import datetime
+from tqdm import tqdm
 
 
 # Add global stop event
 stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
+
+def variance_of_laplacian(image):
+    """
+    Compute the variance of the Laplacian of the image.
+    Higher variance indicates a sharper image.
+    """
+    return cv2.Laplacian(image, cv2.CV_64F).var()
+
+def extract_sharpest_frame(video_path, frames_to_check=30):
+    """
+    Extract the sharpest frame from the last N frames of the video.
+    
+    Args:
+        video_path (str): Path to the video file
+        frames_to_check (int): Number of frames from the end to check
+        
+    Returns:
+        tuple: (temp_image_path, frame_number, sharpness_score)
+    """
+    print(f"\n=== Extracting sharpest frame from the last {frames_to_check} frames ===")
+    print(f"Input video path: {video_path}")
+    
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Error: Video file does not exist")
+        return None, None, None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("❌ Error: Failed to open video file")
+            return None, None, None
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"Total frames detected: {total_frames}, FPS: {fps:.2f}")
+        
+        if total_frames < 1:
+            print("❌ Error: Video contains 0 frames")
+            return None, None, None
+        
+        # Determine how many frames to check (the last N frames)
+        if frames_to_check > total_frames:
+            frames_to_check = total_frames
+            start_frame = 0
+        else:
+            start_frame = total_frames - frames_to_check
+        
+        print(f"Checking frames {start_frame} to {total_frames-1}")
+        
+        # Find the sharpest frame
+        sharpest_frame = None
+        max_sharpness = -1
+        sharpest_frame_number = -1
+        
+        # Set starting position
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        # Process frames with a progress bar
+        with tqdm(total=frames_to_check, desc="Finding sharpest frame") as pbar:
+            frame_idx = start_frame
+            while frame_idx < total_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Convert to grayscale and calculate sharpness
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                sharpness = variance_of_laplacian(gray)
+                
+                # Update if this is the sharpest frame so far
+                if sharpness > max_sharpness:
+                    max_sharpness = sharpness
+                    sharpest_frame = frame.copy()
+                    sharpest_frame_number = frame_idx
+                
+                frame_idx += 1
+                pbar.update(1)
+        
+        cap.release()
+        
+        if sharpest_frame is None:
+            print("❌ Error: Failed to find a sharp frame")
+            return None, None, None
+        
+        # Prepare output path
+        temp_dir = os.path.abspath("temp_frames")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"sharpest_frame_{os.path.basename(video_path)}.png")
+        print(f"Saving frame to: {temp_path}")
+        
+        # Write and verify
+        if not cv2.imwrite(temp_path, sharpest_frame):
+            print("❌ Error: Failed to write frame to file")
+            return None, None, None
+            
+        if not os.path.exists(temp_path):
+            print("❌ Error: Output file not created")
+            return None, None, None
+        
+        # Calculate frame time in seconds
+        frame_time = sharpest_frame_number / fps
+        
+        print(f"✅ Extracted sharpest frame: {sharpest_frame_number} (at {frame_time:.2f}s) with sharpness {max_sharpness:.2f}")
+        return temp_path, sharpest_frame_number, max_sharpness
+
+    except Exception as e:
+        print(f"❌ Unexpected error: {str(e)}")
+        return None, None, None
+    finally:
+        if 'cap' in locals():
+            cap.release()
+
+def trim_video_to_frame(video_path, frame_number, output_dir="outputs"):
+    """
+    Trim video up to the specified frame and save as a new video.
+    
+    Args:
+        video_path (str): Path to the video file
+        frame_number (int): Frame number to trim to
+        output_dir (str): Directory to save the trimmed video
+        
+    Returns:
+        str: Path to the trimmed video file
+    """
+    print(f"\n=== Trimming video to frame {frame_number} ===")
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Error: Video file does not exist")
+        return None
+    
+    try:
+        # Get video information
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("❌ Error: Failed to open video file")
+            return None
+            
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        
+        # Calculate time in seconds
+        time_seconds = frame_number / fps
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate output filename
+        timestamp = f"{int(time_seconds)}s"
+        base_name = Path(video_path).stem
+        output_file = os.path.join(output_dir, f"{base_name}_trimmed_to_{timestamp}.mp4")
+        
+        # Use ffmpeg to trim the video
+        (
+            ffmpeg
+            .input(video_path)
+            .output(output_file, to=time_seconds, c="copy")
+            .global_args('-y')  # Overwrite output files
+            .run(quiet=True)
+        )
+        
+        if not os.path.exists(output_file):
+            print("❌ Error: Failed to create trimmed video")
+            return None
+            
+        print(f"✅ Successfully trimmed video to {time_seconds:.2f}s: {output_file}")
+        return output_file
+        
+    except Exception as e:
+        print(f"❌ Error trimming video: {str(e)}")
+        return None
+
+def send_sharpest_frame_handler(gallery, selected_idx, frames_to_check=30):
+    """
+    Extract the sharpest frame from the last N frames of the selected video
+    
+    Args:
+        gallery: Gradio gallery component with videos
+        selected_idx: Index of the selected video
+        frames_to_check: Number of frames from the end to check
+        
+    Returns:
+        tuple: (image_path, video_path, frame_number, sharpness)
+    """
+    if gallery is None or not gallery:
+        return None, None, None, "No videos in gallery"
+        
+    if selected_idx is None and len(gallery) == 1:
+        selected_idx = 0
+        
+    if selected_idx is None or selected_idx >= len(gallery):
+        return None, None, None, "No video selected"
+    
+    # Get the video path
+    item = gallery[selected_idx]
+    if isinstance(item, tuple):
+        video_path = item[0]
+    elif isinstance(item, dict):
+        video_path = item.get('name') or item.get('data')
+    else:
+        video_path = str(item)
+    
+    # Extract the sharpest frame
+    image_path, frame_number, sharpness = extract_sharpest_frame(video_path, frames_to_check)
+    
+    if image_path is None:
+        return None, None, None, "Failed to extract sharpest frame"
+    
+    return image_path, video_path, frame_number, f"Extracted frame {frame_number} with sharpness {sharpness:.2f}"
+
+def trim_and_prepare_for_extension(video_path, frame_number, save_path="outputs"):
+    """
+    Trim the video to the specified frame and prepare for extension.
+    
+    Args:
+        video_path: Path to the video file
+        frame_number: Frame number to trim to
+        save_path: Directory to save the trimmed video
+        
+    Returns:
+        tuple: (trimmed_video_path, status_message)
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None, "No video selected or video file does not exist"
+    
+    if frame_number is None:
+        return None, "No frame number provided, please extract sharpest frame first"
+    
+    # Trim the video
+    trimmed_video = trim_video_to_frame(video_path, frame_number, save_path)
+    
+    if trimmed_video is None:
+        return None, "Failed to trim video"
+    
+    return trimmed_video, f"Video trimmed to frame {frame_number} and ready for extension"
 
 def send_last_frame_handler(gallery, selected_idx):
     """Handle sending last frame to input with better error handling"""
@@ -1898,6 +2132,155 @@ def concat_batch_videos(base_video_path, generated_videos, save_path, original_v
         
     return extended_videos, f"Successfully created {len(extended_videos)} extended videos"
 
+def wanx_extend_single_video(
+    prompt, negative_prompt, input_image, base_video_path,
+    width, height, video_length, fps, infer_steps, 
+    flow_shift, guidance_scale, seed, 
+    task, dit_path, vae_path, t5_path, clip_path,
+    save_path, output_type, sample_solver, exclude_single_blocks,
+    attn_mode, block_swap, fp8, fp8_t5, lora_folder,
+    *lora_params):
+    """Generate a single video and concatenate with base video"""
+    # First, generate the video
+    all_videos = []
+    
+    # Split lora params
+    num_lora_weights = 4
+    lora_weights = lora_params[:num_lora_weights]
+    lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+    
+    # Generate video
+    for videos, status, progress in wanx_generate_video(
+        prompt, negative_prompt, input_image, width, height, 
+        video_length, fps, infer_steps, flow_shift, guidance_scale, 
+        seed, task, dit_path, vae_path, t5_path, clip_path, 
+        save_path, output_type, sample_solver, exclude_single_blocks,
+        attn_mode, block_swap, fp8, fp8_t5, lora_folder,
+        *lora_weights, *lora_multipliers):
+        
+        # Keep track of generated videos
+        if videos:
+            all_videos = videos
+        
+        # Forward progress updates
+        yield all_videos, status, progress
+    
+    # Now concatenate with base video if we have something
+    if all_videos and base_video_path:
+        try:
+            print(f"Attempting to extend base video {base_video_path} with new video")
+            
+            # Create unique output filename
+            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+            output_filename = f"extended_{timestamp}_seed{seed}_{Path(base_video_path).stem}.mp4"
+            output_path = os.path.join(save_path, output_filename)
+            
+            # Extract the path from the gallery item
+            new_video_path = all_videos[0][0] if isinstance(all_videos[0], tuple) else all_videos[0]
+            
+            # Create a temporary file list for ffmpeg
+            list_file = os.path.join(save_path, f"temp_list_{seed}.txt")
+            with open(list_file, "w") as f:
+                f.write(f"file '{os.path.abspath(base_video_path)}'\n")
+                f.write(f"file '{os.path.abspath(new_video_path)}'\n")
+            
+            print(f"Created list file at {list_file} with content:")
+            print(f"file '{os.path.abspath(base_video_path)}'")
+            print(f"file '{os.path.abspath(new_video_path)}'")
+            
+            # Run ffmpeg concatenation
+            command = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c", "copy",
+                "-y",
+                output_path
+            ]
+            
+            print(f"Running command: {' '.join(command)}")
+            subprocess.run(command, check=True, capture_output=True)
+            
+            # Clean up temporary file
+            if os.path.exists(list_file):
+                os.remove(list_file)
+                
+            # Return the extended video if successful
+            if os.path.exists(output_path):
+                extended_video = [(output_path, f"Extended (Seed: {seed})")]
+                print(f"Successfully created extended video: {output_path}")
+                yield extended_video, "Extended video created successfully", ""
+                return
+            else:
+                print(f"Failed to create extended video at {output_path}")
+        except Exception as e:
+            print(f"Error creating extended video: {str(e)}")
+    
+    # If we got here, something went wrong with the concatenation
+    yield all_videos, "Generated video (extension failed)", ""
+
+def process_batch_extension(
+    prompt, negative_prompt, input_image, base_video,
+    width, height, video_length, fps, infer_steps,
+    flow_shift, guidance_scale, seed, batch_size,
+    task, dit_path, vae_path, t5_path, clip_path,
+    save_path, output_type, sample_solver, exclude_single_blocks,
+    attn_mode, block_swap, fp8, fp8_t5, lora_folder,
+    *lora_params):
+    """Process a batch of video extensions one at a time"""
+    global stop_event
+    stop_event.clear()
+    
+    all_extended_videos = []
+    progress_text = "Starting video extension batch..."
+    yield [], progress_text, ""
+    
+    # Ensure batch_size is treated as an integer
+    batch_size = int(batch_size)
+    
+    # Process each batch item independently
+    for i in range(batch_size):
+        if stop_event.is_set():
+            yield all_extended_videos, "Extension stopped by user", ""
+            return
+            
+        # Calculate seed for this batch item
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1:
+            current_seed = seed + i
+            
+        batch_text = f"Processing video {i+1}/{batch_size} (seed: {current_seed})"
+        yield all_extended_videos, batch_text, progress_text
+        
+        # Generate and extend one video
+        for videos, status, progress in wanx_extend_single_video(
+            prompt, negative_prompt, input_image, base_video,
+            width, height, video_length, fps, infer_steps,
+            flow_shift, guidance_scale, current_seed,
+            task, dit_path, vae_path, t5_path, clip_path,
+            save_path, output_type, sample_solver, exclude_single_blocks,
+            attn_mode, block_swap, fp8, fp8_t5, lora_folder,
+            *lora_params):
+            
+            # If we got extended videos, add them to our collection
+            if videos:
+                if any("Extended" in v[1] if isinstance(v, tuple) else False for v in videos):
+                    # This is an extended video
+                    all_extended_videos.extend(videos)
+                    print(f"Added extended video to collection (total: {len(all_extended_videos)})")
+            
+            # Forward progress information
+            yield all_extended_videos, f"Batch {i+1}/{batch_size}: {status}", progress
+        
+        # Clean CUDA cache between generations
+        clear_cuda_cache()
+        time.sleep(0.5)
+    
+    yield all_extended_videos, "Batch extension complete", ""
+
 def handle_extend_generation(base_video_path: str, new_videos: list, save_path: str, current_gallery: list) -> tuple:
     """Combine generated video with base video and update gallery"""
     if not base_video_path:
@@ -1988,6 +2371,9 @@ with gr.Blocks(
     wanx_i2v_selected_index = gr.State(value=None)
     extended_videos = gr.State(value=[])
     wanx_base_video = gr.State(value=None)
+    wanx_sharpest_frame_number = gr.State(value=None)  
+    wanx_sharpest_frame_path = gr.State(value=None)   
+    wanx_trimmed_video_path = gr.State(value=None) 
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -2067,7 +2453,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -2160,7 +2546,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -2255,7 +2641,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -2381,7 +2767,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -2505,9 +2891,18 @@ with gr.Blocks(
                     wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
                     wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
                     wanx_extend_btn = gr.Button("Extend Video")
+                    wanx_frames_to_check = gr.Slider(minimum=1, maximum=100, step=1, value=30, 
+                                                   label="Frames to Check from End", 
+                                                   info="Number of frames from the end to check for sharpness")
+                    wanx_send_sharpest_frame_btn = gr.Button("Extract Sharpest Frame")
+                    wanx_trim_and_extend_btn = gr.Button("Trim Video & Prepare for Extension")
+                    wanx_sharpest_frame_status = gr.Textbox(label="Status", interactive=False)
+
+                # Add a new button for directly extending with the trimmed video
+                    wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -2612,7 +3007,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -2761,7 +3156,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
@@ -2805,14 +3200,59 @@ with gr.Blocks(
         inputs=[wanx_input, wanx_base_video, wanx_batch_size],
         outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
     ).then(
+        fn=lambda batch_size, base_video: 
+            "Starting batch extension..." if base_video and batch_size > 0 else 
+            "Error: Missing base video or invalid batch size",
+        inputs=[wanx_batch_size, wanx_base_video],
+        outputs=[wanx_batch_progress]
+    ).then(
+        # Generate and extend videos one at a time
+        fn=process_batch_extension,
+        inputs=[
+            wanx_prompt, wanx_negative_prompt, wanx_input, wanx_base_video,
+            wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
+            wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
+            wanx_save_path, wanx_output_type, wanx_sample_solver,
+            wanx_exclude_single_blocks, wanx_attn_mode, wanx_block_swap,
+            wanx_fp8, wanx_fp8_t5, wanx_lora_folder, 
+            *wanx_lora_weights, *wanx_lora_multipliers
+        ],
+        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
+    )
+
+    # Extract and send sharpest frame to input
+    wanx_send_sharpest_frame_btn.click(
+        fn=send_sharpest_frame_handler,
+        inputs=[wanx_output, wanx_i2v_selected_index, wanx_frames_to_check],
+        outputs=[wanx_input, wanx_base_video, wanx_sharpest_frame_number, wanx_sharpest_frame_status]
+    )
+
+    # Trim video to sharpest frame and prepare for extension
+    wanx_trim_and_extend_btn.click(
+        fn=trim_and_prepare_for_extension,
+        inputs=[wanx_base_video, wanx_sharpest_frame_number, wanx_save_path],
+        outputs=[wanx_trimmed_video_path, wanx_sharpest_frame_status]
+    ).then(
+        fn=lambda path, status: (path, status if "Failed" in status else "Video trimmed successfully and ready for extension"),
+        inputs=[wanx_trimmed_video_path, wanx_sharpest_frame_status],
+        outputs=[wanx_base_video, wanx_sharpest_frame_status]
+    )
+
+    # Event handler for extending with the trimmed video
+    wanx_extend_with_trimmed_btn.click(
+        fn=prepare_for_batch_extension,
+        inputs=[wanx_input, wanx_trimmed_video_path, wanx_batch_size],
+        outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
+    ).then(
         fn=wanx_batch_handler,
         inputs=[
-            gr.Checkbox(value=False), # Not using random folder
+            gr.Checkbox(value=False),  # Not using random folder
             wanx_prompt, wanx_negative_prompt,
             wanx_width, wanx_height, wanx_video_length,
             wanx_fps, wanx_infer_steps, wanx_flow_shift,
             wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_input_folder, # Not used but needed for function signature
+            wanx_input_folder,  # Not used but needed for function signature
             wanx_task,
             wanx_dit_path, wanx_vae_path, wanx_t5_path,
             wanx_clip_path, wanx_save_path, wanx_output_type,
@@ -2824,7 +3264,7 @@ with gr.Blocks(
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
     ).then(
         fn=concat_batch_videos,
-        inputs=[wanx_base_video, wanx_output, wanx_save_path],
+        inputs=[wanx_trimmed_video_path, wanx_output, wanx_save_path],
         outputs=[wanx_output, wanx_progress_text]
     )
 
