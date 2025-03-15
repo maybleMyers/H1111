@@ -1875,7 +1875,15 @@ def wanx_generate_video(
                 "output_type": output_type,
                 "attn_mode": attn_mode,
                 "block_swap": block_swap,
-                "input_image": input_image if "i2v" in task else None
+                "input_image": input_image if "i2v" in task else None,
+                "lora_weights": [lora1, lora2, lora3, lora4],
+                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                "dit_path": dit_path,
+                "vae_path": vae_path,
+                "t5_path": t5_path,
+                "clip_path": clip_path if "i2v" in task else None,
+                "negative_prompt": negative_prompt if negative_prompt else None,
+                "sample_solver": sample_solver
             }
             
             add_metadata_to_video(video_path, parameters)
