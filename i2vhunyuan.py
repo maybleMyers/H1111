@@ -30,6 +30,383 @@ stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
 
+def process_hunyuani2v_video(
+    prompt: str,
+    width: int,
+    height: int,
+    batch_size: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    dit_folder: str,
+    model: str,
+    vae: str,
+    te1: str,
+    te2: str,
+    save_path: str,
+    flow_shift: float,
+    cfg_scale: float,
+    output_type: str,
+    attn_mode: str,
+    block_swap: int,
+    exclude_single_blocks: bool,
+    use_split_attn: bool,    
+    lora_folder: str,
+    lora1: str = "",
+    lora2: str = "",
+    lora3: str = "",
+    lora4: str = "",
+    lora1_multiplier: float = 1.0,
+    lora2_multiplier: float = 1.0,
+    lora3_multiplier: float = 1.0,
+    lora4_multiplier: float = 1.0,
+    video_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+    strength: Optional[float] = None,
+    negative_prompt: Optional[str] = None,
+    embedded_cfg_scale: Optional[float] = None,
+    split_uncond: Optional[bool] = None,
+    guidance_scale: Optional[float] = None,
+    use_fp8: bool = True,
+    clip_vision_path: Optional[str] = None,
+    i2v_stability: bool = False,
+    fp8_fast: bool = False,
+    compile_model: bool = False,
+    compile_backend: str = "inductor",
+    compile_mode: str = "max-autotune-no-cudagraphs",
+    compile_dynamic: bool = False,
+    compile_fullgraph: bool = False
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate a single video with the hunyuani2v script with updated parameters"""
+    global stop_event
+    
+    if stop_event.is_set():
+        yield [], "", ""
+        return
+
+    # Determine if this is a SkyReels model and what type
+    is_skyreels = "skyreels" in model.lower()
+    is_skyreels_i2v = is_skyreels and "i2v" in model.lower()
+    is_skyreels_t2v = is_skyreels and "t2v" in model.lower()
+    
+    # Set defaults for hunyuani2v specific parameters
+    if is_skyreels:
+        # Force certain parameters for SkyReels
+        if negative_prompt is None:
+            negative_prompt = ""
+        if embedded_cfg_scale is None:
+            embedded_cfg_scale = 1.0  # Force to 1.0 for SkyReels
+        if split_uncond is None:
+            split_uncond = True
+        if guidance_scale is None:
+            guidance_scale = cfg_scale  # Use cfg_scale as guidance_scale if not provided
+            
+    else:
+        embedded_cfg_scale = cfg_scale 
+
+    if os.path.isabs(model):
+        model_path = model
+    else:
+        model_path = os.path.normpath(os.path.join(dit_folder, model))
+    
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["BATCH_RUN_ID"] = f"{time.time()}"
+
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    else:
+        batch_id = int(env.get("BATCH_RUN_ID", "0").split('.')[-1])
+        if batch_size > 1:  # Only modify seed for batch generation
+            current_seed = (seed + batch_id * 100003) % (2**32)
+        else:
+            current_seed = seed
+
+    clear_cuda_cache()
+
+    # Now use hv_generate_video_with_hunyuani2v.py instead
+    command = [
+        sys.executable,
+        "hv_generate_video_with_hunyuani2v.py",
+        "--dit", model_path,
+        "--vae", vae,
+        "--text_encoder1", te1,
+        "--text_encoder2", te2,
+        "--prompt", prompt,
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", save_path,
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift),
+        "--embedded_cfg_scale", str(cfg_scale),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(block_swap),
+        "--fp8_llm",
+        "--vae_chunk_size", "32",
+        "--vae_spatial_tile_sample_min_size", "128"
+    ]
+    
+    if use_fp8:
+        command.append("--fp8")
+
+    # Add new parameters specific to hunyuani2v script
+    if clip_vision_path:
+        command.extend(["--clip_vision_path", clip_vision_path])
+    
+    if i2v_stability:
+        command.append("--i2v_stability")
+        
+    if fp8_fast:
+        command.append("--fp8_fast")
+        
+    if compile_model:
+        command.append("--compile")
+        command.extend([
+            "--compile_args", 
+            compile_backend, 
+            compile_mode, 
+            str(compile_dynamic).lower(), 
+            str(compile_fullgraph).lower()
+        ])
+
+    # Add negative prompt and embedded cfg scale
+    command.extend(["--guidance_scale", str(guidance_scale)])
+    
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+    if split_uncond:
+        command.append("--split_uncond")
+
+    # Add LoRA weights and multipliers if provided
+    valid_loras = []
+    for weight, mult in zip([lora1, lora2, lora3, lora4], 
+                          [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+        if weight and weight != "None":
+            valid_loras.append((os.path.join(lora_folder, weight), mult))
+    if valid_loras:
+        weights = [weight for weight, _ in valid_loras]
+        multipliers = [str(mult) for _, mult in valid_loras]
+        command.extend(["--lora_weight"] + weights)
+        command.extend(["--lora_multiplier"] + multipliers)
+
+    if exclude_single_blocks:
+        command.append("--exclude_single_blocks")
+    if use_split_attn:
+        command.append("--split_attn")
+
+    # Handle input paths
+    if video_path:
+        command.extend(["--video_path", video_path])
+        if strength is not None:
+            command.extend(["--strength", str(strength)])
+    elif image_path:
+        command.extend(["--image_path", image_path])
+        # Only add strength parameter for non-SkyReels I2V models
+        # SkyReels I2V doesn't use strength parameter for image-to-video generation
+        if strength is not None and not is_skyreels_i2v:
+            command.extend(["--strength", str(strength)])
+            
+    print(f"{command}")
+
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    videos = []
+    
+    while True:
+        if stop_event.is_set():
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
+
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
+            
+        print(line, end='')
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+
+    p.stdout.close()
+    p.wait()
+
+    clear_cuda_cache()
+    time.sleep(0.5)
+
+    # Collect generated video
+    save_path_abs = os.path.abspath(save_path)
+    if os.path.exists(save_path_abs):
+        all_videos = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
+        if matching_videos:
+            video_path = os.path.join(save_path_abs, matching_videos[0])
+            
+            # Collect parameters for metadata
+            parameters = {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "video_length": video_length,
+                "fps": fps,
+                "infer_steps": infer_steps,
+                "seed": current_seed,
+                "model": model,
+                "vae": vae,
+                "te1": te1,
+                "te2": te2,
+                "save_path": save_path,
+                "flow_shift": flow_shift,
+                "cfg_scale": cfg_scale,
+                "output_type": output_type,
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "lora_weights": [lora1, lora2, lora3, lora4],
+                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                "input_video": video_path if video_path else None,
+                "input_image": image_path if image_path else None,
+                "strength": strength,
+                "negative_prompt": negative_prompt,
+                "embedded_cfg_scale": embedded_cfg_scale,
+                "clip_vision_path": clip_vision_path,
+                "i2v_stability": i2v_stability,
+                "fp8_fast": fp8_fast,
+                "compile_model": compile_model
+            }
+            
+            add_metadata_to_video(video_path, parameters)
+            videos.append((str(video_path), f"Seed: {current_seed}"))
+
+    yield videos, f"Completed (seed: {current_seed})", ""
+
+# Now let's create a new batch processing function that uses the hunyuani2v function
+def process_hunyuani2v_batch(
+    prompt: str,
+    width: int,
+    height: int,
+    batch_size: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    dit_folder: str,
+    model: str,
+    vae: str,
+    te1: str,
+    te2: str,
+    save_path: str,
+    flow_shift: float,
+    cfg_scale: float,
+    output_type: str,
+    attn_mode: str,
+    block_swap: int,
+    exclude_single_blocks: bool,
+    use_split_attn: bool,
+    lora_folder: str,
+    *args
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Process a batch of videos using the hunyuani2v script"""
+    global stop_event
+    stop_event.clear()
+
+    all_videos = []
+    progress_text = "Starting generation..."
+    yield [], "Preparing...", progress_text
+
+    # Extract additional arguments
+    num_lora_weights = 4
+    lora_weights = args[:num_lora_weights]
+    lora_multipliers = args[num_lora_weights:num_lora_weights*2]
+    
+    # New parameters for hunyuani2v
+    # Base parameter list index after lora weights and multipliers
+    base_idx = num_lora_weights*2
+    
+    # Extract parameters
+    input_path = args[base_idx] if len(args) > base_idx else None
+    strength = float(args[base_idx+1]) if len(args) > base_idx+1 and args[base_idx+1] is not None else None
+    negative_prompt = str(args[base_idx+2]) if len(args) > base_idx+2 and args[base_idx+2] is not None else None
+    guidance_scale = float(args[base_idx+3]) if len(args) > base_idx+3 and args[base_idx+3] is not None else cfg_scale
+    split_uncond = bool(args[base_idx+4]) if len(args) > base_idx+4 else None
+    use_fp8 = bool(args[base_idx+5]) if len(args) > base_idx+5 else True
+    
+    # New hunyuani2v parameters
+    clip_vision_path = str(args[base_idx+6]) if len(args) > base_idx+6 and args[base_idx+6] is not None else None
+    i2v_stability = bool(args[base_idx+7]) if len(args) > base_idx+7 else False
+    fp8_fast = bool(args[base_idx+8]) if len(args) > base_idx+8 else False
+    compile_model = bool(args[base_idx+9]) if len(args) > base_idx+9 else False
+    compile_backend = str(args[base_idx+10]) if len(args) > base_idx+10 and args[base_idx+10] is not None else "inductor"
+    compile_mode = str(args[base_idx+11]) if len(args) > base_idx+11 and args[base_idx+11] is not None else "max-autotune-no-cudagraphs"  
+    compile_dynamic = bool(args[base_idx+12]) if len(args) > base_idx+12 else False
+    compile_fullgraph = bool(args[base_idx+13]) if len(args) > base_idx+13 else False
+
+    embedded_cfg_scale = cfg_scale
+
+    for i in range(batch_size):
+        if stop_event.is_set():
+            break
+
+        batch_text = f"Generating video {i + 1} of {batch_size}"
+        yield all_videos.copy(), batch_text, progress_text
+
+        # Handle different input types
+        video_path = None
+        image_path = None
+        
+        if input_path:
+            is_image = False
+            lower_path = input_path.lower()
+            image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
+            is_image = any(lower_path.endswith(ext) for ext in image_extensions)
+            
+            if is_image:
+                image_path = input_path
+            else:
+                video_path = input_path
+
+        # Prepare arguments for process_hunyuani2v_video
+        current_seed = seed + i if seed != -1 and batch_size > 1 else seed if seed != -1 else -1
+        
+        hunyuani2v_args = [
+            prompt, width, height, batch_size, video_length, fps, infer_steps,
+            current_seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+            lora_folder
+        ]
+        hunyuani2v_args.extend(lora_weights)
+        hunyuani2v_args.extend(lora_multipliers)
+        hunyuani2v_args.extend([
+            video_path, image_path, strength, negative_prompt, embedded_cfg_scale, 
+            split_uncond, guidance_scale, use_fp8, clip_vision_path, i2v_stability,
+            fp8_fast, compile_model, compile_backend, compile_mode, compile_dynamic, compile_fullgraph
+        ])
+
+        for videos, status, progress in process_hunyuani2v_video(*hunyuani2v_args):
+            if videos:
+                all_videos.extend(videos)
+            yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+
+    yield all_videos, "Batch complete", ""
+
 def variance_of_laplacian(image):
     """
     Compute the variance of the Laplacian of the image.
@@ -661,19 +1038,11 @@ def batch_handler(
             
             # Print extra_args for debugging
             print(f"Extra args: {extra_args}")
-            
-            # Get input image path from extra args - this is where we need to fix
-            # In skyreels_generate_btn.click, we're passing skyreels_input which
-            # should be the image path
             image_path = None
             if len(extra_args) > 0 and extra_args[0] is not None:
                 image_path = extra_args[0]
                 print(f"Image path found in extra_args[0]: {image_path}")
-            
-            # If we still don't have an image path, this is a problem
             if not image_path:
-                # Let's try to debug what's happening - in the future, you can remove these
-                # debug prints once everything works correctly
                 print("No image path found in extra_args[0]")
                 print(f"Full lora_params: {lora_params}")
                 yield [], "Error: No input image provided", "An input image is required for SkyReels I2V models"
@@ -899,7 +1268,11 @@ def create_parameter_transfer_map(metadata: Dict, target_tab: str) -> Dict:
             'cfg_scale': ('cfg_scale', 'v2v_cfg_scale'),
             'output_type': ('output_type', 'v2v_output_type'),
             'attn_mode': ('attn_mode', 'v2v_attn_mode'),
-            'block_swap': ('block_swap', 'v2v_block_swap')
+            'block_swap': ('block_swap', 'v2v_block_swap'),
+            'negative_prompt': ('i2v_negative_prompt', 'v2v_negative_prompt'),
+            'clip_vision_path': ('i2v_clip_vision_path', None),
+            'i2v_stability': ('i2v_stability', None),
+            'fp8_fast': ('i2v_fp8_fast', None)
         },
         'lora': {
             'lora_weights': [(f'lora{i+1}', f'v2v_lora_weights[{i}]') for i in range(4)],
@@ -2132,155 +2505,6 @@ def concat_batch_videos(base_video_path, generated_videos, save_path, original_v
         
     return extended_videos, f"Successfully created {len(extended_videos)} extended videos"
 
-def wanx_extend_single_video(
-    prompt, negative_prompt, input_image, base_video_path,
-    width, height, video_length, fps, infer_steps, 
-    flow_shift, guidance_scale, seed, 
-    task, dit_path, vae_path, t5_path, clip_path,
-    save_path, output_type, sample_solver, exclude_single_blocks,
-    attn_mode, block_swap, fp8, fp8_t5, lora_folder,
-    *lora_params):
-    """Generate a single video and concatenate with base video"""
-    # First, generate the video
-    all_videos = []
-    
-    # Split lora params
-    num_lora_weights = 4
-    lora_weights = lora_params[:num_lora_weights]
-    lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
-    
-    # Generate video
-    for videos, status, progress in wanx_generate_video(
-        prompt, negative_prompt, input_image, width, height, 
-        video_length, fps, infer_steps, flow_shift, guidance_scale, 
-        seed, task, dit_path, vae_path, t5_path, clip_path, 
-        save_path, output_type, sample_solver, exclude_single_blocks,
-        attn_mode, block_swap, fp8, fp8_t5, lora_folder,
-        *lora_weights, *lora_multipliers):
-        
-        # Keep track of generated videos
-        if videos:
-            all_videos = videos
-        
-        # Forward progress updates
-        yield all_videos, status, progress
-    
-    # Now concatenate with base video if we have something
-    if all_videos and base_video_path:
-        try:
-            print(f"Attempting to extend base video {base_video_path} with new video")
-            
-            # Create unique output filename
-            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
-            output_filename = f"extended_{timestamp}_seed{seed}_{Path(base_video_path).stem}.mp4"
-            output_path = os.path.join(save_path, output_filename)
-            
-            # Extract the path from the gallery item
-            new_video_path = all_videos[0][0] if isinstance(all_videos[0], tuple) else all_videos[0]
-            
-            # Create a temporary file list for ffmpeg
-            list_file = os.path.join(save_path, f"temp_list_{seed}.txt")
-            with open(list_file, "w") as f:
-                f.write(f"file '{os.path.abspath(base_video_path)}'\n")
-                f.write(f"file '{os.path.abspath(new_video_path)}'\n")
-            
-            print(f"Created list file at {list_file} with content:")
-            print(f"file '{os.path.abspath(base_video_path)}'")
-            print(f"file '{os.path.abspath(new_video_path)}'")
-            
-            # Run ffmpeg concatenation
-            command = [
-                "ffmpeg",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_file,
-                "-c", "copy",
-                "-y",
-                output_path
-            ]
-            
-            print(f"Running command: {' '.join(command)}")
-            subprocess.run(command, check=True, capture_output=True)
-            
-            # Clean up temporary file
-            if os.path.exists(list_file):
-                os.remove(list_file)
-                
-            # Return the extended video if successful
-            if os.path.exists(output_path):
-                extended_video = [(output_path, f"Extended (Seed: {seed})")]
-                print(f"Successfully created extended video: {output_path}")
-                yield extended_video, "Extended video created successfully", ""
-                return
-            else:
-                print(f"Failed to create extended video at {output_path}")
-        except Exception as e:
-            print(f"Error creating extended video: {str(e)}")
-    
-    # If we got here, something went wrong with the concatenation
-    yield all_videos, "Generated video (extension failed)", ""
-
-def process_batch_extension(
-    prompt, negative_prompt, input_image, base_video,
-    width, height, video_length, fps, infer_steps,
-    flow_shift, guidance_scale, seed, batch_size,
-    task, dit_path, vae_path, t5_path, clip_path,
-    save_path, output_type, sample_solver, exclude_single_blocks,
-    attn_mode, block_swap, fp8, fp8_t5, lora_folder,
-    *lora_params):
-    """Process a batch of video extensions one at a time"""
-    global stop_event
-    stop_event.clear()
-    
-    all_extended_videos = []
-    progress_text = "Starting video extension batch..."
-    yield [], progress_text, ""
-    
-    # Ensure batch_size is treated as an integer
-    batch_size = int(batch_size)
-    
-    # Process each batch item independently
-    for i in range(batch_size):
-        if stop_event.is_set():
-            yield all_extended_videos, "Extension stopped by user", ""
-            return
-            
-        # Calculate seed for this batch item
-        current_seed = seed
-        if seed == -1:
-            current_seed = random.randint(0, 2**32 - 1)
-        elif batch_size > 1:
-            current_seed = seed + i
-            
-        batch_text = f"Processing video {i+1}/{batch_size} (seed: {current_seed})"
-        yield all_extended_videos, batch_text, progress_text
-        
-        # Generate and extend one video
-        for videos, status, progress in wanx_extend_single_video(
-            prompt, negative_prompt, input_image, base_video,
-            width, height, video_length, fps, infer_steps,
-            flow_shift, guidance_scale, current_seed,
-            task, dit_path, vae_path, t5_path, clip_path,
-            save_path, output_type, sample_solver, exclude_single_blocks,
-            attn_mode, block_swap, fp8, fp8_t5, lora_folder,
-            *lora_params):
-            
-            # If we got extended videos, add them to our collection
-            if videos:
-                if any("Extended" in v[1] if isinstance(v, tuple) else False for v in videos):
-                    # This is an extended video
-                    all_extended_videos.extend(videos)
-                    print(f"Added extended video to collection (total: {len(all_extended_videos)})")
-            
-            # Forward progress information
-            yield all_extended_videos, f"Batch {i+1}/{batch_size}: {status}", progress
-        
-        # Clean CUDA cache between generations
-        clear_cuda_cache()
-        time.sleep(0.5)
-    
-    yield all_extended_videos, "Batch extension complete", ""
-
 def handle_extend_generation(base_video_path: str, new_videos: list, save_path: str, current_gallery: list) -> tuple:
     """Combine generated video with base video and update gallery"""
     if not base_video_path:
@@ -2408,7 +2632,7 @@ with gr.Blocks(
         
     with gr.Tabs() as tabs:
         # Text to Video Tab
-        with gr.Tab(id=1, label="Text to Video"):
+        with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
                 with gr.Column(scale=4):
                     prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -2453,7 +2677,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -2496,10 +2720,11 @@ with gr.Blocks(
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         #Image to Video Tab
-        with gr.Tab(label="Image to Video") as i2v_tab:
+        with gr.Tab(label="Hunyuan-i2v") as i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+                    i2v_negative_prompt = gr.Textbox(label="Negative Prompt", value="", lines=2, info="Negative prompt")
 
                 with gr.Column(scale=1):
                     i2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
@@ -2546,7 +2771,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -2579,8 +2804,9 @@ with gr.Blocks(
                 )
 
                 i2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
-                i2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
+                i2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava-llama-3-8b-text-encoder-tokenizer")
                 i2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
+                i2v_clip_vision_path = gr.Textbox(label="CLIP Vision Path", value="hunyuan/clip-vit-large-patch14", info="Path to CLIP vision model for HunyuanI2V")
                 i2v_save_path = gr.Textbox(label="Save Path", value="outputs")
             with gr.Row():
                 i2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
@@ -2589,9 +2815,17 @@ with gr.Blocks(
                 i2v_use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
                 i2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
-
+                i2v_split_uncond = gr.Checkbox(label="Split Unconditional", value=True, visible=True)
+            with gr.Row():
+                i2v_stability = gr.Checkbox(label="I2V Stability", value=False, info="Enable stability mode for HunyuanI2V")
+                i2v_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                i2v_compile = gr.Checkbox(label="Compile Model", value=False, info="Enable torch.compile for potentially faster generation")
+                i2v_compile_backend = gr.Dropdown(label="Compile Backend", choices=["inductor", "cudagraphs", "onnxrt", "nvfuser"], value="inductor", info="Torch compile backend")
+                i2v_compile_mode = gr.Dropdown(label="Compile Mode", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], value="max-autotune-no-cudagraphs", info="Torch compile mode")
+                i2v_compile_dynamic = gr.Checkbox(label="Dynamic Shapes", value=False, info="Use dynamic shapes in compilation")
+                i2v_compile_fullgraph = gr.Checkbox(label="Full Graph", value=False, info="Use full graph compilation")
         # Video to Video Tab
-        with gr.Tab(id=2, label="Video to Video") as v2v_tab:
+        with gr.Tab(id=2, label="Hunyuan-v2v") as v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     v2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -2641,7 +2875,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -2767,7 +3001,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -2902,7 +3136,7 @@ with gr.Blocks(
                     wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -3007,7 +3241,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -3156,7 +3390,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
@@ -3200,25 +3434,27 @@ with gr.Blocks(
         inputs=[wanx_input, wanx_base_video, wanx_batch_size],
         outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
     ).then(
-        fn=lambda batch_size, base_video: 
-            "Starting batch extension..." if base_video and batch_size > 0 else 
-            "Error: Missing base video or invalid batch size",
-        inputs=[wanx_batch_size, wanx_base_video],
-        outputs=[wanx_batch_progress]
-    ).then(
-        # Generate and extend videos one at a time
-        fn=process_batch_extension,
+        fn=wanx_batch_handler,
         inputs=[
-            wanx_prompt, wanx_negative_prompt, wanx_input, wanx_base_video,
-            wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
-            wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
-            wanx_save_path, wanx_output_type, wanx_sample_solver,
-            wanx_exclude_single_blocks, wanx_attn_mode, wanx_block_swap,
-            wanx_fp8, wanx_fp8_t5, wanx_lora_folder, 
-            *wanx_lora_weights, *wanx_lora_multipliers
+            gr.Checkbox(value=False), # Not using random folder
+            wanx_prompt, wanx_negative_prompt,
+            wanx_width, wanx_height, wanx_video_length,
+            wanx_fps, wanx_infer_steps, wanx_flow_shift,
+            wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_input_folder, # Not used but needed for function signature
+            wanx_task,
+            wanx_dit_path, wanx_vae_path, wanx_t5_path,
+            wanx_clip_path, wanx_save_path, wanx_output_type,
+            wanx_sample_solver, wanx_exclude_single_blocks,
+            wanx_attn_mode, wanx_block_swap, wanx_fp8,
+            wanx_fp8_t5, wanx_lora_folder, *wanx_lora_weights,
+            *wanx_lora_multipliers, wanx_input  # Include input image
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
+    ).then(
+        fn=concat_batch_videos,
+        inputs=[wanx_base_video, wanx_output, wanx_save_path],
+        outputs=[wanx_output, wanx_progress_text]
     )
 
     # Extract and send sharpest frame to input
@@ -3862,6 +4098,7 @@ with gr.Blocks(
     v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
     #Image_to_Video
+
     def image_to_video(image_path, output_path, width, height, frames=240):  # Add width, height parameters
         img = Image.open(image_path)
 
@@ -4015,14 +4252,17 @@ with gr.Blocks(
 
     # Generate button handler
     i2v_generate_btn.click(
-        fn=process_batch,
+        fn=process_hunyuani2v_batch,
         inputs=[
             i2v_prompt, width, height,
             i2v_batch_size, i2v_video_length, 
             i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
             i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
             i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
-            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_use_fp8
+            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_negative_prompt,
+            i2v_cfg_scale, i2v_split_uncond, i2v_use_fp8, i2v_clip_vision_path, i2v_stability,
+            i2v_fp8_fast, i2v_compile, i2v_compile_backend, i2v_compile_mode, 
+            i2v_compile_dynamic, i2v_compile_fullgraph
         ],
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
         queue=True

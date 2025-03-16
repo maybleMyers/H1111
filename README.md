@@ -99,8 +99,8 @@ wget https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial/resolve/
 
 python -m venv env
 #(if you have another version of python do python3.10 -m venv env after you install it with sudo apt install python3.10 python3.10-venv python3.10-distutils)
-source env/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
+source env/bin/activate 
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
 pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation

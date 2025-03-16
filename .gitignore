@@ -3,3 +3,16 @@ __pycache__/
 venv/
 logs/
 uv.lock
+.env
+env/
+outputs/
+GIMM-VFI/
+hunyuan/
+temp_frames/
+wan/wan2.1_i2v_480p_14B_bf16.safetensors
+wan/wan2.1_t2v_14B_bf16.safetensors
+wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+wan/models_t5_umt5-xxl-enc-bf16.pth
+triton-3.0.0-cp310-cp310-win_amd64.whl
+wan/Wan2.1_VAE.pth
+flash_attn-2.7.4+cu124torch2.5.1cxx11abiFALSE-cp310-cp310-win_amd64.whl

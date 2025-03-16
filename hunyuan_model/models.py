@@ -20,6 +20,11 @@ from hunyuan_model.posemb_layers import get_nd_rotary_pos_embed
 
 from utils.safetensors_utils import MemoryEfficientSafeOpen
 
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 
 class MMDoubleStreamBlock(nn.Module):
     """
@@ -132,17 +137,42 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
+        condition_type: str = None,
+        token_replace_vec: torch.Tensor = None,
+        frist_frame_token_num: int = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        (img_mod1_shift, img_mod1_scale, img_mod1_gate, img_mod2_shift, img_mod2_scale, img_mod2_gate) = self.img_mod(vec).chunk(
-            6, dim=-1
-        )
+        if condition_type == "token_replace":
+            img_mod1, token_replace_img_mod1 = self.img_mod(vec, condition_type=condition_type, token_replace_vec=token_replace_vec)
+            (img_mod1_shift, img_mod1_scale, img_mod1_gate, img_mod2_shift, img_mod2_scale, img_mod2_gate) = img_mod1.chunk(
+                6, dim=-1
+            )
+            (tr_img_mod1_shift, tr_img_mod1_scale, tr_img_mod1_gate, tr_img_mod2_shift, tr_img_mod2_scale, tr_img_mod2_gate) = (
+                token_replace_img_mod1.chunk(6, dim=-1)
+            )
+        else:
+            (img_mod1_shift, img_mod1_scale, img_mod1_gate, img_mod2_shift, img_mod2_scale, img_mod2_gate) = self.img_mod(
+                vec
+            ).chunk(6, dim=-1)
         (txt_mod1_shift, txt_mod1_scale, txt_mod1_gate, txt_mod2_shift, txt_mod2_scale, txt_mod2_gate) = self.txt_mod(vec).chunk(
             6, dim=-1
         )
 
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
-        img_modulated = modulate(img_modulated, shift=img_mod1_shift, scale=img_mod1_scale)
+
+        if condition_type == "token_replace":
+            img_modulated = modulate(
+                img_modulated,
+                shift=img_mod1_shift,
+                scale=img_mod1_scale,
+                condition_type=condition_type,
+                tr_shift=tr_img_mod1_shift,
+                tr_scale=tr_img_mod1_scale,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+        else:
+            img_modulated = modulate(img_modulated, shift=img_mod1_shift, scale=img_mod1_scale)
+
         img_qkv = self.img_attn_qkv(img_modulated)
         img_modulated = None
         img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
@@ -220,12 +250,39 @@ class MMDoubleStreamBlock(nn.Module):
         attn = None
 
         # Calculate the img bloks.
-        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
-        img_attn = None
-        img = img + apply_gate(
-            self.img_mlp(modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)),
-            gate=img_mod2_gate,
-        )
+        if condition_type == "token_replace":
+            img = img + apply_gate(
+                self.img_attn_proj(img_attn),
+                gate=img_mod1_gate,
+                condition_type=condition_type,
+                tr_gate=tr_img_mod1_gate,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+            img_attn = None
+            img = img + apply_gate(
+                self.img_mlp(
+                    modulate(
+                        self.img_norm2(img),
+                        shift=img_mod2_shift,
+                        scale=img_mod2_scale,
+                        condition_type=condition_type,
+                        tr_shift=tr_img_mod2_shift,
+                        tr_scale=tr_img_mod2_scale,
+                        frist_frame_token_num=frist_frame_token_num,
+                    )
+                ),
+                gate=img_mod2_gate,
+                condition_type=condition_type,
+                tr_gate=tr_img_mod2_gate,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+        else:
+            img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
+            img_attn = None
+            img = img + apply_gate(
+                self.img_mlp(modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)),
+                gate=img_mod2_gate,
+            )
 
         # Calculate the txt bloks.
         txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
@@ -332,9 +389,30 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
+        condition_type: str = None,
+        token_replace_vec: torch.Tensor = None,
+        frist_frame_token_num: int = None,
     ) -> torch.Tensor:
-        mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
-        x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
+        if condition_type == "token_replace":
+            mod, tr_mod = self.modulation(vec, condition_type=condition_type, token_replace_vec=token_replace_vec)
+            (mod_shift, mod_scale, mod_gate) = mod.chunk(3, dim=-1)
+            (tr_mod_shift, tr_mod_scale, tr_mod_gate) = tr_mod.chunk(3, dim=-1)
+        else:
+            mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
+
+        if condition_type == "token_replace":
+            x_mod = modulate(
+                self.pre_norm(x),
+                shift=mod_shift,
+                scale=mod_scale,
+                condition_type=condition_type,
+                tr_shift=tr_mod_shift,
+                tr_scale=tr_mod_scale,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+        else:
+            x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
+
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
         x_mod = None
         # mlp = mlp.to("cpu", non_blocking=True)
@@ -403,7 +481,18 @@ class MMSingleStreamBlock(nn.Module):
         mlp = None
         output = self.linear2(attn_mlp)
         attn_mlp = None
-        return x + apply_gate(output, gate=mod_gate)
+
+        if condition_type == "token_replace":
+            output = x + apply_gate(
+                output,
+                gate=mod_gate,
+                condition_type=condition_type,
+                tr_gate=tr_mod_gate,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+            return output
+        else:
+            return x + apply_gate(output, gate=mod_gate)
 
     # def forward(
     #     self,
@@ -505,6 +594,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         device: Optional[torch.device] = None,
         attn_mode: str = "flash",
         split_attn: bool = False,
+        i2v_mode: bool = False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -535,6 +625,8 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         self.attn_mode = attn_mode
         self.split_attn = split_attn
         print(f"Using {self.attn_mode} attention mode, split_attn: {self.split_attn}")
+
+        self.i2v_condition_type = "token_replace" if i2v_mode else None  # only support token_replace for i2v mode
 
         # image projection
         self.img_in = PatchEmbed(self.patch_size, self.in_channels, self.hidden_size, **factory_kwargs)
@@ -738,8 +830,22 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         # Prepare modulation vectors.
         vec = self.time_in(t)
 
+        if self.i2v_condition_type == "token_replace":
+            token_replace_t = torch.zeros_like(t)
+            token_replace_vec = self.time_in(token_replace_t)
+            frist_frame_token_num = th * tw
+        else:
+            token_replace_vec = None
+            frist_frame_token_num = None
+            # token_replace_mask_img = None
+            # token_replace_mask_txt = None
+
         # text modulation
-        vec = vec + self.vector_in(text_states_2)
+        vec_2 = self.vector_in(text_states_2)
+        vec = vec + vec_2
+        if self.i2v_condition_type == "token_replace":
+            token_replace_vec = token_replace_vec + vec_2
+        vec_2 = None
 
         # guidance modulation
         if self.guidance_embed:
@@ -807,6 +913,9 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
                 max_seqlen_q,
                 max_seqlen_kv,
                 freqs_cis,
+                self.i2v_condition_type,
+                token_replace_vec,
+                frist_frame_token_num,
             ]
 
             if self.blocks_to_swap:
@@ -836,7 +945,10 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
                     cu_seqlens_kv,
                     max_seqlen_q,
                     max_seqlen_kv,
-                    (freqs_cos, freqs_sin),
+                    freqs_cis,
+                    self.i2v_condition_type,
+                    token_replace_vec,
+                    frist_frame_token_num,
                 ]
                 if self.blocks_to_swap:
                     self.offloader_single.wait_for_block(block_idx)
@@ -923,16 +1035,18 @@ HUNYUAN_VIDEO_CONFIG = {
 }
 
 
-def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels, factor_kwargs):
+def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels, i2v_mode, factor_kwargs):
     """load hunyuan video model
 
     NOTE: Only support HYVideo-T/2-cfgdistill now.
+    The config of I2V model is "HYVideo-T/2", but if embedded_cfg_scale is not 1.0, it has guidance embed. So it is same as "HYVideo-T/2-cfgdistill".
 
     Args:
         text_state_dim (int): text state dimension
         text_state_dim_2 (int): text state dimension 2
         in_channels (int): input channels number
         out_channels (int): output channels number
+        i2v_mode (bool): whether to use i2v model
         factor_kwargs (dict): factor kwargs
 
     Returns:
@@ -944,6 +1058,7 @@ def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels
         text_states_dim_2=text_states_dim_2,
         in_channels=in_channels,
         out_channels=out_channels,
+        i2v_mode=i2v_mode,
         **HUNYUAN_VIDEO_CONFIG["HYVideo-T/2-cfgdistill"],
         **factor_kwargs,
     )
@@ -963,11 +1078,12 @@ def load_state_dict(model, model_path):
             f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
             f"are: {list(state_dict.keys())}."
         )
-    model.load_state_dict(state_dict, strict=True, assign=True)
+    info = model.load_state_dict(state_dict, strict=True, assign=True)
+    logger.info(f"Load state dict from {model_path} with info: {info}")
     return model
 
 
-def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels=16) -> HYVideoDiffusionTransformer:
+def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels=16, i2v_mode=False) -> HYVideoDiffusionTransformer:
     # =========================== Build main model ===========================
     factor_kwargs = {"device": device, "dtype": dtype, "attn_mode": attn_mode, "split_attn": split_attn}
     latent_channels = 16
@@ -979,6 +1095,7 @@ def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels
             text_states_dim_2=768,
             in_channels=in_channels,
             out_channels=out_channels,
+            i2v_mode=i2v_mode,
             factor_kwargs=factor_kwargs,
         )
 
@@ -993,7 +1110,8 @@ def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels
                 # if k.startswith("model.model."):
                 #     k = convert_comfy_model_key(k)
                 state_dict[k] = tensor
-        transformer.load_state_dict(state_dict, strict=True, assign=True)
+        info = transformer.load_state_dict(state_dict, strict=True, assign=True)
+        logger.info(f"Load state dict from {dit_path} with info: {info}")
     else:
         transformer = load_state_dict(transformer, dit_path)
 
