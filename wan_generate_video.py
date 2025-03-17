@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
     parser.add_argument(
         "--save_merged_model",
         type=str,
@@ -366,6 +367,10 @@ def merge_lora_weights(model: WanModel, args: argparse.Namespace, device: torch.
 
         logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
         weights_sd = load_file(lora_weight)
+        # Filter to exclude keys that are part of single_blocks
+        if args.exclude_single_blocks:
+            filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
+            weights_sd = filtered_weights        
         if args.lycoris:
             lycoris_net, _ = create_network_from_weights(
                 multiplier=lora_multiplier,
