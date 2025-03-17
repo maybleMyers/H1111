@@ -46,6 +46,7 @@ To use wanX download these and toss them in the wan subfolder:
 Download the T5 `models_t5_umt5-xxl-enc-bf16.pth`, vae `Wan2.1_VAE.pth` and CLIP `models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` from the following page: https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/tree/main    
 
 Download the DiT weights from the following page: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models  
+ie : wan2.1_i2v_720p_14B_fp16.safetensors  
 
 git pull to update the installation
 pip install -r requirements.txt
@@ -100,7 +101,7 @@ wget https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial/resolve/
 python -m venv env
 #(if you have another version of python do python3.10 -m venv env after you install it with sudo apt install python3.10 python3.10-venv python3.10-distutils)
 source env/bin/activate 
-pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
 pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation
@@ -134,7 +135,7 @@ git clone https://github.com/maybleMyers/H1111
 cd H1111
 python -m venv env
 ./env/scripts/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
 pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 

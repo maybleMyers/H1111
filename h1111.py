@@ -899,7 +899,8 @@ def create_parameter_transfer_map(metadata: Dict, target_tab: str) -> Dict:
             'cfg_scale': ('cfg_scale', 'v2v_cfg_scale'),
             'output_type': ('output_type', 'v2v_output_type'),
             'attn_mode': ('attn_mode', 'v2v_attn_mode'),
-            'block_swap': ('block_swap', 'v2v_block_swap')
+            'block_swap': ('block_swap', 'v2v_block_swap'),
+            'negative_prompt': ('negative_prompt', 'v2v_negative_prompt')
         },
         'lora': {
             'lora_weights': [(f'lora{i+1}', f'v2v_lora_weights[{i}]') for i in range(4)],
@@ -2947,7 +2948,7 @@ with gr.Blocks(
                     value="i2v-14B",
                     info="Currently only i2v-14B is supported"
                 )
-                wanx_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_i2v_480p_14B_bf16.safetensors")
+                wanx_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_i2v_720p_14B_fp16.safetensors")
                 wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_clip_path = gr.Textbox(label="CLIP Path", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
@@ -3053,7 +3054,7 @@ with gr.Blocks(
                     value="t2v-14B",
                     info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
                 )
-                wanx_t2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_bf16.safetensors")
+                wanx_t2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_fp16.safetensors")
                 wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
@@ -3326,8 +3327,9 @@ with gr.Blocks(
             params.get("guidance_scale", 5.0),
             params.get("attn_mode", "sdpa"),
             params.get("block_swap", 0),
-            params.get("task", "i2v-14B")
-        ] if params else [gr.update()]*12,
+            params.get("task", "i2v-14B"),
+            params.get("negative_prompt", "")
+        ] if params else [gr.update()]*13,
         inputs=params_state,
         outputs=[
             wanx_prompt, 
@@ -3341,7 +3343,8 @@ with gr.Blocks(
             wanx_guidance_scale,
             wanx_attn_mode,
             wanx_block_swap,
-            wanx_task
+            wanx_task,
+            wanx_negative_prompt
         ]
     ).then(
         fn=change_to_wanx_i2v_tab, inputs=None, outputs=[tabs]
@@ -3364,8 +3367,9 @@ with gr.Blocks(
             params.get("flow_shift", 5.0),
             params.get("guidance_scale", 5.0),
             params.get("attn_mode", "sdpa"),
-            params.get("block_swap", 0)
-        ] if params else [gr.update()]*11,
+            params.get("block_swap", 0),
+            params.get("negative_prompt", "")
+        ] if params else [gr.update()]*12,
         inputs=params_state,
         outputs=[
             wanx_t2v_prompt,
@@ -3378,7 +3382,8 @@ with gr.Blocks(
             wanx_t2v_flow_shift,
             wanx_t2v_guidance_scale,
             wanx_t2v_attn_mode,
-            wanx_t2v_block_swap
+            wanx_t2v_block_swap,
+            wanx_t2v_negative_prompt
         ]
     ).then(
         fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
