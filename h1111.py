@@ -1760,8 +1760,20 @@ def wanx_generate_video(
     slg_end = None if slg_end == 'None' or slg_end is None else slg_end
 
     # Now safely convert to float if not None
-    slg_start_float = float(slg_start) if slg_start is not None and isinstance(slg_start, (str, int, float)) else None
-    slg_end_float = float(slg_end) if slg_end is not None and isinstance(slg_end, (str, int, float)) else None
+    if isinstance(slg_start, (int, float)):
+        slg_start_float = float(slg_start)
+    elif isinstance(slg_start, str) and slg_start.lower() != "none":
+        slg_start_float = float(slg_start)
+    else:
+        slg_start_float = None
+        
+    if isinstance(slg_end, (int, float)):
+        slg_end_float = float(slg_end)
+    elif isinstance(slg_end, str) and slg_end.lower() != "none":
+        slg_end_float = float(slg_end)
+    else:
+        slg_end_float = None
+        
     print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
     
     if stop_event.is_set():
