@@ -1080,6 +1080,7 @@ def wanx_batch_handler(
 ):
     """Handle both folder-based batch processing and regular processing for WanX"""
     global stop_event
+    lora_params = [str(p) if p is not None else "None" for p in lora_params]
     
     if use_random:
         # Random image from folder mode
@@ -1132,7 +1133,7 @@ def wanx_batch_handler(
 
             # Extract LoRA weights and multipliers
             num_lora_weights = 4
-            lora_weights = lora_params[:num_lora_weights]
+            lora_weights = [str(w) if w is not None else "None" for w in lora_params[:num_lora_weights]]
             lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
 
             # Generate video for this image - one at a time
@@ -1741,9 +1742,9 @@ def wanx_generate_video(
     fp8_scaled,
     fp8_t5,
     lora_folder,
-    slg_layers="",
-    slg_start=0.0,
-    slg_end=1.0,
+    slg_layers: int,
+    slg_start: Optional[str],
+    slg_end: Optional[str],
     lora1="None",
     lora2="None",
     lora3="None",
@@ -1755,6 +1756,13 @@ def wanx_generate_video(
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v and t2v)"""
     global stop_event
+    slg_start = None if slg_start == 'None' or slg_start is None else slg_start
+    slg_end = None if slg_end == 'None' or slg_end is None else slg_end
+
+    # Now safely convert to float if not None
+    slg_start_float = float(slg_start) if slg_start is not None and isinstance(slg_start, (str, int, float)) else None
+    slg_end_float = float(slg_end) if slg_end is not None and isinstance(slg_end, (str, int, float)) else None
+    print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
     
     if stop_event.is_set():
         yield [], "", ""
@@ -1798,19 +1806,24 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
-    
-    # Add SLG parameters if provided - with type conversion
-    if slg_layers:
-        command.extend(["--slg-layers", slg_layers])
-    
-    # Convert to float to ensure proper comparison
-    slg_start_float = float(slg_start) if isinstance(slg_start, (str, int)) else slg_start
-    slg_end_float = float(slg_end) if isinstance(slg_end, (str, int)) else slg_end
-    
-    if slg_start_float > 0.0:
-        command.extend(["--slg-start", str(slg_start)])
-    if slg_end_float < 1.0:
-        command.extend(["--slg-end", str(slg_end)])
+    # Handle SLG parameters
+    if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
+        try:
+            command.extend(["--slg-layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
+        except ValueError as e:
+            print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
+
+    # Handle SLG start/end timings
+    try:
+        slg_start_float = float(slg_start) if slg_start and slg_start.lower() != "none" else None
+        slg_end_float = float(slg_end) if slg_end and slg_end.lower() != "none" else None
+        
+        if slg_start_float is not None and slg_start_float >= 0:
+            command.extend(["--slg-start", str(slg_start_float)])
+        if slg_end_float is not None and slg_end_float <= 1.0:
+            command.extend(["--slg-end", str(slg_end_float)])
+    except ValueError as e:
+        print(f"Invalid SLG timing values: {str(e)}")
     
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
@@ -1832,15 +1845,22 @@ def wanx_generate_video(
     if exclude_single_blocks:
         command.append("--exclude_single_blocks")
     
-    # Add LoRA weights and multipliers if provided
+    # Handle LoRA weights and multipliers
+    lora_weights = [lora1, lora2, lora3, lora4]
+    lora_multipliers = [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]
+    
     valid_loras = []
-    for weight, mult in zip([lora1, lora2, lora3, lora4], 
-                          [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+    for weight, mult in zip(lora_weights, lora_multipliers):
         if weight and weight != "None":
-            valid_loras.append((os.path.join(lora_folder, weight), mult))
+            full_path = os.path.join(lora_folder, weight)
+            if not os.path.exists(full_path):
+                print(f"LoRA file not found: {full_path}")
+                continue
+            valid_loras.append((full_path, mult))
+
     if valid_loras:
-        weights = [weight for weight, _ in valid_loras]
-        multipliers = [str(mult) for _, mult in valid_loras]
+        weights = [w for w, _ in valid_loras]
+        multipliers = [str(m) for _, m in valid_loras]
         command.extend(["--lora_weight"] + weights)
         command.extend(["--lora_multiplier"] + multipliers)
     
@@ -1998,9 +2018,9 @@ def wanx_generate_video_batch(
     fp8_scaled,
     fp8_t5,
     lora_folder,
-    slg_layers="",
-    slg_start=0.0,
-    slg_end=1.0,
+    slg_layers: int,
+    slg_start: Optional[str],
+    slg_end: Optional[str],
     lora1="None",
     lora2="None",
     lora3="None",
@@ -2013,6 +2033,13 @@ def wanx_generate_video_batch(
     input_image=None  # Make input_image optional and place it at the end
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate videos with WanX with support for batches"""
+    slg_start = None if slg_start == 'None' or slg_start is None else slg_start
+    slg_end = None if slg_end == 'None' or slg_end is None else slg_end
+
+    # Now safely convert to float if not None
+    slg_start_float = float(slg_start) if slg_start is not None and isinstance(slg_start, (str, int, float)) else None
+    slg_end_float = float(slg_end) if slg_end is not None and isinstance(slg_end, (str, int, float)) else None
+    print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
     global stop_event
     stop_event.clear()
     
