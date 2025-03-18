@@ -1742,9 +1742,9 @@ def wanx_generate_video(
     fp8_scaled,
     fp8_t5,
     lora_folder,
-    slg_layers: int,
-    slg_start: Optional[str],
-    slg_end: Optional[str],
+    slg_layers,
+    slg_start,
+    slg_end,
     lora1="None",
     lora2="None",
     lora3="None",
@@ -1756,29 +1756,27 @@ def wanx_generate_video(
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v and t2v)"""
     global stop_event
-    slg_start = None if slg_start == 'None' or slg_start is None else slg_start
-    slg_end = None if slg_end == 'None' or slg_end is None else slg_end
-
-    # Now safely convert to float if not None
-    if isinstance(slg_start, (int, float)):
-        slg_start_float = float(slg_start)
-    elif isinstance(slg_start, str) and slg_start.lower() != "none":
-        slg_start_float = float(slg_start)
-    else:
+    
+    # Convert values safely to float or None
+    try:
+        slg_start_float = float(slg_start) if slg_start is not None and str(slg_start).lower() != "none" else None
+    except (ValueError, TypeError):
         slg_start_float = None
-        
-    if isinstance(slg_end, (int, float)):
-        slg_end_float = float(slg_end)
-    elif isinstance(slg_end, str) and slg_end.lower() != "none":
-        slg_end_float = float(slg_end)
-    else:
+        print(f"Warning: Could not convert slg_start '{slg_start}' to float")
+    
+    try:
+        slg_end_float = float(slg_end) if slg_end is not None and str(slg_end).lower() != "none" else None
+    except (ValueError, TypeError):
         slg_end_float = None
-        
+        print(f"Warning: Could not convert slg_end '{slg_end}' to float")
+    
     print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
     
     if stop_event.is_set():
         yield [], "", ""
         return
+
+    # Rest of the function continues...
 
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
