@@ -707,27 +707,11 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
 
-    def forward(self, x, t, context, seq_len, clip_fea=None, y=None):
-        r"""
+    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, is_uncond=False, slg_layers=None):
+        """
         Forward pass through the diffusion model
-
-        Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-
-        Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+        
+        [documentation...]
         """
         if self.model_type == "i2v":
             assert clip_fea is not None and y is not None
@@ -735,15 +719,15 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
-
+    
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
             y = None
-
+    
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-
+    
         freqs_list = []
         for fhw in grid_sizes:
             fhw = tuple(fhw.tolist())
@@ -751,50 +735,52 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
                 c = self.dim // self.num_heads // 2
                 self.freqs_fhw[fhw] = calculate_freqs_i(fhw, c, self.freqs)
             freqs_list.append(self.freqs_fhw[fhw])
-
+    
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len, f"Sequence length exceeds maximum allowed length {seq_len}. Got {seq_lens.max()}"
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
-
+    
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
-
+    
         # context
         context_lens = None
         if type(context) is list:
             context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
         context = self.text_embedding(context)
-
+    
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
             clip_fea = None
             context_clip = None
-
+    
         # arguments
         kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs_list, context=context, context_lens=context_lens)
-
+    
         if self.blocks_to_swap:
             clean_memory_on_device(device)
-
+    
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
-
-            x = block(x, **kwargs)
-
+            
+            # Skip this layer when SLG is active and we're in unconditional mode
+            if not (slg_layers is not None and block_idx in slg_layers and is_uncond):
+                x = block(x, **kwargs)
+            
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
-
+    
         # head
         x = self.head(x, e)
-
+    
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]

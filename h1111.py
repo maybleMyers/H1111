@@ -1073,6 +1073,9 @@ def wanx_batch_handler(
     fp8_scaled,
     fp8_t5,
     lora_folder,
+    slg_layers,
+    slg_start,
+    slg_end,
     *lora_params
 ):
     """Handle both folder-based batch processing and regular processing for WanX"""
@@ -1160,6 +1163,9 @@ def wanx_batch_handler(
                 fp8_scaled,
                 fp8_t5,
                 lora_folder,
+                slg_layers,
+                slg_start,
+                slg_end,
                 *lora_weights,
                 *lora_multipliers
             ):
@@ -1285,6 +1291,9 @@ def wanx_batch_handler(
                 fp8_scaled,
                 fp8_t5, 
                 lora_folder,
+                slg_layers,
+                slg_start,
+                slg_end,
                 *lora_weights,
                 *lora_multipliers
             )
@@ -1732,6 +1741,9 @@ def wanx_generate_video(
     fp8_scaled,
     fp8_t5,
     lora_folder,
+    slg_layers="",
+    slg_start=0.0,
+    slg_end=1.0,
     lora1="None",
     lora2="None",
     lora3="None",
@@ -1787,6 +1799,13 @@ def wanx_generate_video(
         "--sample_solver", sample_solver
     ]
     
+    # Add SLG parameters if provided
+    if slg_layers:
+        command.extend(["--slg-layers", slg_layers])
+    if slg_start > 0.0:
+        command.extend(["--slg-start", str(slg_start)])
+    if slg_end < 1.0:
+        command.extend(["--slg-end", str(slg_end)])
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
         command.extend(["--image_path", input_image])
@@ -1948,7 +1967,7 @@ def send_wanx_to_v2v(
             flow_shift, guidance_scale, negative_prompt)
 
 def wanx_generate_video_batch(
-    prompt, 
+    prompt,
     negative_prompt,
     width,
     height,
@@ -1971,8 +1990,11 @@ def wanx_generate_video_batch(
     block_swap,
     fp8,
     fp8_scaled,
-    fp8_t5, 
+    fp8_t5,
     lora_folder,
+    slg_layers="",
+    slg_start=0.0,
+    slg_end=1.0,
     lora1="None",
     lora2="None",
     lora3="None",
@@ -2010,12 +2032,35 @@ def wanx_generate_video_batch(
         
         # Generate a single video using the existing function
         for videos, status, progress in wanx_generate_video(
-            prompt, negative_prompt, input_image, width, height, 
-            video_length, fps, infer_steps, flow_shift, guidance_scale, 
-            current_seed, task, dit_path, vae_path, t5_path, clip_path, 
-            save_path, output_type, sample_solver, exclude_single_blocks,
-            attn_mode, block_swap, fp8, fp8_scaled, fp8_t5,
+            prompt, 
+            negative_prompt, 
+            input_image, 
+            width, 
+            height, 
+            video_length, 
+            fps, 
+            infer_steps, 
+            flow_shift, 
+            guidance_scale, 
+            current_seed,
+            task, 
+            dit_path, 
+            vae_path, 
+            t5_path, 
+            clip_path, 
+            save_path, 
+            output_type, 
+            sample_solver, 
+            exclude_single_blocks,
+            attn_mode, 
+            block_swap, 
+            fp8, 
+            fp8_scaled, 
+            fp8_t5,
             lora_folder,
+            slg_layers,
+            slg_start,
+            slg_end,
             lora1,
             lora2,
             lora3,
@@ -2157,7 +2202,9 @@ def wanx_extend_single_video(
     task, dit_path, vae_path, t5_path, clip_path,
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
-    *lora_params):
+    slg_layers="", slg_start=0.0, slg_end=1.0,
+    lora1="None", lora2="None", lora3="None", lora4="None",
+    lora1_multiplier=1.0, lora2_multiplier=1.0, lora3_multiplier=1.0, lora4_multiplier=1.0):
     """Generate a single video and concatenate with base video"""
     # First, generate the video
     all_videos = []
@@ -2174,7 +2221,8 @@ def wanx_extend_single_video(
         seed, task, dit_path, vae_path, t5_path, clip_path, 
         save_path, output_type, sample_solver, exclude_single_blocks,
         attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
-        *lora_weights, *lora_multipliers):
+        slg_layers, slg_start, slg_end,
+        lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
         
         # Keep track of generated videos
         if videos:
@@ -2241,11 +2289,12 @@ def wanx_extend_single_video(
 def process_batch_extension(
     prompt, negative_prompt, input_image, base_video,
     width, height, video_length, fps, infer_steps,
-    flow_shift, guidance_scale, seed, batch_size,
+    flow_shift, guidance_scale, seed, batch_size,  # Added batch_size parameter here
     task, dit_path, vae_path, t5_path, clip_path,
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
-    *lora_params):
+    slg_layers, slg_start, slg_end,
+    lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
     """Process a batch of video extensions one at a time"""
     global stop_event
     stop_event.clear()
@@ -2281,7 +2330,8 @@ def process_batch_extension(
             task, dit_path, vae_path, t5_path, clip_path,
             save_path, output_type, sample_solver, exclude_single_blocks,
             attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
-            *lora_params):
+            slg_layers, slg_start, slg_end,
+            lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
             
             # If we got extended videos, add them to our collection
             if videos:
@@ -2961,9 +3011,17 @@ with gr.Blocks(
                 wanx_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
                 wanx_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 wanx_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
-                wanx_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                wanx_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False, info="For mixing fp16/bf16 and fp8 weights")
-                wanx_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)                
+                
+                with gr.Column():
+                    wanx_fp8 = gr.Checkbox(label="Use FP8", value=True)
+                    wanx_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False, info="For mixing fp16/bf16 and fp8 weights")
+                    wanx_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+
+            # Add new row for Skip Layer Guidance options
+            with gr.Row():
+                wanx_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
+                wanx_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
+                wanx_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")    
 
         #WanX-t2v Tab
 
@@ -3068,10 +3126,18 @@ with gr.Blocks(
                 wanx_t2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 wanx_t2v_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0, 
                                          info="Max 39 for 14B model, 29 for 1.3B model")
-                wanx_t2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                wanx_t2v_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False,
-                                            info="For mixing fp16/bf16 and fp8 weights")
-                wanx_t2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                
+                with gr.Column():
+                    wanx_t2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
+                    wanx_t2v_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False,
+                                                info="For mixing fp16/bf16 and fp8 weights")
+                    wanx_t2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+            
+            # Add new row for Skip Layer Guidance options
+            with gr.Row():
+                wanx_t2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
+                wanx_t2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
+                wanx_t2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
 
         #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
@@ -3228,18 +3294,28 @@ with gr.Blocks(
         outputs=[wanx_batch_progress]
     ).then(
         # Generate and extend videos one at a time
-        fn=process_batch_extension,
+        fn=wanx_batch_handler,  # Use wanx_batch_handler instead of process_batch_extension
         inputs=[
-            wanx_prompt, wanx_negative_prompt, wanx_input, wanx_base_video,
-            wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
-            wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
-            wanx_save_path, wanx_output_type, wanx_sample_solver,
-            wanx_exclude_single_blocks, wanx_attn_mode, wanx_block_swap,
-            wanx_fp8, wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,  # Add the new parameter
-            *wanx_lora_weights, *wanx_lora_multipliers
+            gr.Checkbox(value=False),  # Not using random folder
+            wanx_prompt, wanx_negative_prompt,
+            wanx_width, wanx_height, wanx_video_length,
+            wanx_fps, wanx_infer_steps, wanx_flow_shift,
+            wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_input_folder,  # Not used but needed for function signature
+            wanx_task,
+            wanx_dit_path, wanx_vae_path, wanx_t5_path,
+            wanx_clip_path, wanx_save_path, wanx_output_type,
+            wanx_sample_solver, wanx_exclude_single_blocks,
+            wanx_attn_mode, wanx_block_swap, wanx_fp8,
+            wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
+            wanx_slg_layers, wanx_slg_start, wanx_slg_end,  
+            *wanx_lora_weights, *wanx_lora_multipliers, wanx_input  # Include input image
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
+    ).then(
+        fn=concat_batch_videos,
+        inputs=[wanx_base_video, wanx_output, wanx_save_path],
+        outputs=[wanx_output, wanx_progress_text]
     )
 
     # Extract and send sharpest frame to input
@@ -4563,9 +4639,12 @@ with gr.Blocks(
             wanx_attn_mode,
             wanx_block_swap,
             wanx_fp8,
-            wanx_fp8_scaled,  # Add the new parameter
+            wanx_fp8_scaled,
             wanx_fp8_t5,
             wanx_lora_folder,
+            wanx_slg_layers,
+            wanx_slg_start,
+            wanx_slg_end,
             *wanx_lora_weights,
             *wanx_lora_multipliers,
             wanx_input  # Include input image path for non-batch mode
@@ -4685,13 +4764,15 @@ with gr.Blocks(
             wanx_t2v_attn_mode,
             wanx_t2v_block_swap,
             wanx_t2v_fp8,
-            wanx_t2v_fp8_scaled,  # Add the new parameter
+            wanx_t2v_fp8_scaled,
             wanx_t2v_fp8_t5, 
             wanx_t2v_lora_folder,
+            wanx_t2v_slg_layers,
+            wanx_t2v_slg_start,
+            wanx_t2v_slg_end,
             *wanx_t2v_lora_weights,
             *wanx_t2v_lora_multipliers,
             wanx_t2v_batch_size,
-            # input_image is now optional and not included here
         ],
         outputs=[wanx_t2v_output, wanx_t2v_batch_progress, wanx_t2v_progress_text],
         queue=True
