@@ -1826,7 +1826,6 @@ def wanx_generate_video(
     # Handle SLG start/end timings
     try:
         slg_start_float = float(slg_start) if slg_start and slg_start.lower() != "none" else None
-        slg_end_float = float(slg_end) if slg_end and slg_end.lower() != "none" else None
         
         if slg_start_float is not None and slg_start_float >= 0:
             command.extend(["--slg-start", str(slg_start_float)])
