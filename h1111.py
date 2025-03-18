@@ -1799,13 +1799,19 @@ def wanx_generate_video(
         "--sample_solver", sample_solver
     ]
     
-    # Add SLG parameters if provided
+    # Add SLG parameters if provided - with type conversion
     if slg_layers:
         command.extend(["--slg-layers", slg_layers])
-    if slg_start > 0.0:
+    
+    # Convert to float to ensure proper comparison
+    slg_start_float = float(slg_start) if isinstance(slg_start, (str, int)) else slg_start
+    slg_end_float = float(slg_end) if isinstance(slg_end, (str, int)) else slg_end
+    
+    if slg_start_float > 0.0:
         command.extend(["--slg-start", str(slg_start)])
-    if slg_end < 1.0:
+    if slg_end_float < 1.0:
         command.extend(["--slg-end", str(slg_end)])
+    
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
         command.extend(["--image_path", input_image])
