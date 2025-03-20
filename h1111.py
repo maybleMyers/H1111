@@ -4025,7 +4025,7 @@ with gr.Blocks(
 
     # Generate button handler
     wanx_v2v_generate_btn.click(
-        fn=wanx_batch_handler,
+        fn=wanx_v2v_batch_handler,
         inputs=[
             wanx_v2v_prompt,
             wanx_v2v_negative_prompt,
