@@ -1480,14 +1480,49 @@ def wanx_batch_handler(
     fp8_scaled,
     fp8_t5,
     lora_folder,
-    slg_layers,
-    slg_start,
-    slg_end,
+    slg_layers: str,
+    slg_start: Optional[str],
+    slg_end: Optional[str],
     *lora_params
 ):
     """Handle both folder-based batch processing and regular processing for WanX"""
     global stop_event
-    lora_params = [str(p) if p is not None else "None" for p in lora_params]
+    
+    # Convert None strings to actual None
+    slg_layers = None if slg_layers == "None" else slg_layers
+    slg_start = None if slg_start == "None" else slg_start
+    slg_end = None if slg_end == "None" else slg_end
+    
+    # Clean up LoRA params to proper format
+    clean_lora_params = []
+    for param in lora_params:
+        # Convert None strings to "None" for consistency
+        if param is None or str(param).lower() == "none":
+            clean_lora_params.append("None")
+        else:
+            clean_lora_params.append(str(param))
+    
+    # Extract LoRA weights and multipliers
+    num_lora_weights = 4
+    lora_weights = clean_lora_params[:num_lora_weights]
+    lora_multipliers = []
+    
+    # Convert multipliers to float
+    for mult in clean_lora_params[num_lora_weights:num_lora_weights*2]:
+        try:
+            lora_multipliers.append(float(mult))
+        except (ValueError, TypeError):
+            lora_multipliers.append(1.0)  # Default multiplier
+    
+    # Fill with defaults if not enough provided
+    while len(lora_weights) < 4:
+        lora_weights.append("None")
+    while len(lora_multipliers) < 4:
+        lora_multipliers.append(1.0)
+        
+    # Debug the parameters
+    print(f"DEBUG - Cleaned LoRA weights: {lora_weights}")
+    print(f"DEBUG - Cleaned LoRA multipliers: {lora_multipliers}")
     
     if use_random:
         # Random image from folder mode
@@ -1538,11 +1573,6 @@ def wanx_batch_handler(
             elif batch_size > 1:
                 current_seed = seed + i
 
-            # Extract LoRA weights and multipliers
-            num_lora_weights = 4
-            lora_weights = [str(w) if w is not None else "None" for w in lora_params[:num_lora_weights]]
-            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
-
             # Generate video for this image - one at a time
             for videos, status, progress in wanx_generate_video(
                 prompt, 
@@ -1574,8 +1604,14 @@ def wanx_batch_handler(
                 slg_layers,
                 slg_start,
                 slg_end,
-                *lora_weights,
-                *lora_multipliers
+                lora_weights[0],
+                lora_weights[1],
+                lora_weights[2], 
+                lora_weights[3],
+                lora_multipliers[0],
+                lora_multipliers[1],
+                lora_multipliers[2],
+                lora_multipliers[3]
             ):
                 if videos:
                     all_videos.extend(videos)
@@ -1594,8 +1630,8 @@ def wanx_batch_handler(
 
         yield all_videos, "Batch complete", ""
     else:
-        # For non-random mode, if batch_size > 1, we need to process multiple times
-        # with the same input image but different seeds
+        # For non-random mode, if batch_size > 1, we process multiple times with the same input image
+        # but different seeds
         if int(batch_size) > 1:
             stop_event.clear()
             
@@ -1603,10 +1639,7 @@ def wanx_batch_handler(
             progress_text = "Starting generation..."
             yield [], "Preparing...", progress_text
             
-            # Extract LoRA weights and multipliers and input image
-            num_lora_weights = 4
-            lora_weights = lora_params[:num_lora_weights]
-            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+            # Get the input image from the remaining parameters if available
             input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
             
             # Process each batch item
@@ -1653,8 +1686,17 @@ def wanx_batch_handler(
                     fp8_scaled,
                     fp8_t5,
                     lora_folder,
-                    *lora_weights,
-                    *lora_multipliers
+                    slg_layers,
+                    slg_start,
+                    slg_end,
+                    lora_weights[0],
+                    lora_weights[1],
+                    lora_weights[2], 
+                    lora_weights[3],
+                    lora_multipliers[0],
+                    lora_multipliers[1],
+                    lora_multipliers[2],
+                    lora_multipliers[3]
                 ):
                     if videos:
                         all_videos.extend(videos)
@@ -1667,9 +1709,6 @@ def wanx_batch_handler(
             yield all_videos, "Batch complete", ""
         else:
             # Single image, single generation - use existing function
-            num_lora_weights = 4
-            lora_weights = lora_params[:num_lora_weights]
-            lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
             input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
             
             yield from wanx_generate_video(
@@ -1702,8 +1741,14 @@ def wanx_batch_handler(
                 slg_layers,
                 slg_start,
                 slg_end,
-                *lora_weights,
-                *lora_multipliers
+                lora_weights[0],
+                lora_weights[1],
+                lora_weights[2], 
+                lora_weights[3],
+                lora_multipliers[0],
+                lora_multipliers[1],
+                lora_multipliers[2],
+                lora_multipliers[3]
             )
 
 def process_single_video(
@@ -2164,6 +2209,11 @@ def wanx_generate_video(
     """Generate video with WanX model (supports both i2v and t2v)"""
     global stop_event
     
+    # Debug LoRA parameters
+    print(f"DEBUG - LoRA params: {lora1}, {lora2}, {lora3}, {lora4}")
+    print(f"DEBUG - LoRA multipliers: {lora1_multiplier}, {lora2_multiplier}, {lora3_multiplier}, {lora4_multiplier}")
+    print(f"DEBUG - LoRA folder: {lora_folder}")
+    
     # Convert values safely to float or None
     try:
         slg_start_float = float(slg_start) if slg_start is not None and str(slg_start).lower() != "none" else None
@@ -2183,12 +2233,10 @@ def wanx_generate_video(
         yield [], "", ""
         return
 
-    # Rest of the function continues...
-
+    # Get current seed or use provided seed
+    current_seed = seed
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
-    else:
-        current_seed = seed
         
     # Check if we need input image (required for i2v, not for t2v)
     if "i2v" in task and not input_image:
@@ -2223,17 +2271,23 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
+    
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
-            command.extend(["--slg-layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
+            # Make sure slg_layers is parsed as a list of integers
+            slg_list = []
+            for layer in str(slg_layers).split(","):
+                layer = layer.strip()
+                if layer.isdigit():  # Only add if it's a valid integer
+                    slg_list.append(int(layer))
+            if slg_list:  # Only add if we have valid layers
+                command.extend(["--slg-layers", ",".join(map(str, slg_list))])
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
 
     # Handle SLG start/end timings
     try:
-        slg_start_float = float(slg_start) if slg_start and slg_start.lower() != "none" else None
-        
         if slg_start_float is not None and slg_start_float >= 0:
             command.extend(["--slg-start", str(slg_start_float)])
         if slg_end_float is not None and slg_end_float <= 1.0:
@@ -2267,13 +2321,20 @@ def wanx_generate_video(
     
     valid_loras = []
     for weight, mult in zip(lora_weights, lora_multipliers):
-        if weight and weight != "None":
-            full_path = os.path.join(lora_folder, weight)
-            if not os.path.exists(full_path):
-                print(f"LoRA file not found: {full_path}")
-                continue
-            valid_loras.append((full_path, mult))
+        # Skip None, empty, or "None" values
+        if not weight or weight == "None":
+            continue
+        
+        # Construct full path and verify file exists
+        full_path = os.path.join(lora_folder, weight)
+        if not os.path.exists(full_path):
+            print(f"LoRA file not found: {full_path}")
+            continue
+            
+        # Add valid LoRA to the list
+        valid_loras.append((full_path, mult))
 
+    # Only add LoRA parameters if we have valid LoRAs
     if valid_loras:
         weights = [w for w, _ in valid_loras]
         multipliers = [str(m) for _, m in valid_loras]
