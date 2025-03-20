@@ -12,10 +12,9 @@ Hunyuan-t2v
 Hunyuan-v2v  
 WanX-t2v  
 WanX-i2v  
+WanX-v2v  
 SkyReels-i2v  
 SkyReels-t2v  
-
-I am working on supporting hunyuan i2v and WanX v2v but it is proving a bit troublesome.  
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
