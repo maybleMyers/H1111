@@ -30,6 +30,414 @@ stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
 
+def wanx_v2v_generate_video(
+    prompt, 
+    negative_prompt,
+    input_video,
+    width,
+    height,
+    video_length,
+    fps,
+    infer_steps,
+    flow_shift,
+    guidance_scale,
+    strength,
+    seed,
+    task,
+    dit_path,
+    vae_path,
+    t5_path,
+    save_path,
+    output_type,
+    sample_solver,
+    exclude_single_blocks,
+    attn_mode,
+    block_swap,
+    fp8,
+    fp8_scaled,
+    fp8_t5,
+    lora_folder,
+    slg_layers,
+    slg_start,
+    slg_end,
+    lora1="None",
+    lora2="None",
+    lora3="None",
+    lora4="None",
+    lora1_multiplier=1.0,
+    lora2_multiplier=1.0,
+    lora3_multiplier=1.0,
+    lora4_multiplier=1.0
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate video with WanX model in video-to-video mode"""
+    global stop_event
+    
+    # Convert values safely to float or None
+    try:
+        slg_start_float = float(slg_start) if slg_start is not None and str(slg_start).lower() != "none" else None
+    except (ValueError, TypeError):
+        slg_start_float = None
+        print(f"Warning: Could not convert slg_start '{slg_start}' to float")
+    
+    try:
+        slg_end_float = float(slg_end) if slg_end is not None and str(slg_end).lower() != "none" else None
+    except (ValueError, TypeError):
+        slg_end_float = None
+        print(f"Warning: Could not convert slg_end '{slg_end}' to float")
+    
+    print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
+    
+    if stop_event.is_set():
+        yield [], "", ""
+        return
+
+    # Check if we need input video (required for v2v)
+    if not input_video:
+        yield [], "Error: No input video provided", "Please provide an input video for video-to-video generation"
+        return
+
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    else:
+        current_seed = seed
+
+    # Prepare environment
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    
+    clear_cuda_cache()
+
+    command = [
+        sys.executable,
+        "wan_generate_video.py",
+        "--task", task,
+        "--prompt", prompt,
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", save_path,
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift),
+        "--guidance_scale", str(guidance_scale),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(block_swap),
+        "--dit", dit_path,
+        "--vae", vae_path,
+        "--t5", t5_path,
+        "--sample_solver", sample_solver,
+        "--video_path", input_video,  # This is the key for v2v mode
+        "--strength", str(strength)   # Strength parameter for v2v
+    ]
+    # Handle SLG parameters
+    if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
+        try:
+            command.extend(["--slg-layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
+        except ValueError as e:
+            print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
+
+    # Handle SLG start/end timings
+    try:
+        if slg_start_float is not None and slg_start_float >= 0:
+            command.extend(["--slg-start", str(slg_start_float)])
+        if slg_end_float is not None and slg_end_float <= 1.0:
+            command.extend(["--slg-end", str(slg_end_float)])
+    except ValueError as e:
+        print(f"Invalid SLG timing values: {str(e)}")
+    
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+    
+    if fp8:
+        command.append("--fp8")
+    
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    
+    if fp8_t5:
+        command.append("--fp8_t5")
+        
+    if exclude_single_blocks:
+        command.append("--exclude_single_blocks")
+    
+    # Handle LoRA weights and multipliers
+    lora_weights = [lora1, lora2, lora3, lora4]
+    lora_multipliers = [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]
+    
+    valid_loras = []
+    for weight, mult in zip(lora_weights, lora_multipliers):
+        if weight and weight != "None":
+            full_path = os.path.join(lora_folder, weight)
+            if not os.path.exists(full_path):
+                print(f"LoRA file not found: {full_path}")
+                continue
+            valid_loras.append((full_path, mult))
+
+    if valid_loras:
+        weights = [w for w, _ in valid_loras]
+        multipliers = [str(m) for _, m in valid_loras]
+        command.extend(["--lora_weight"] + weights)
+        command.extend(["--lora_multiplier"] + multipliers)
+    
+    print(f"Running: {' '.join(command)}")
+
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    videos = []
+    
+    while True:
+        if stop_event.is_set():
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
+
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
+            
+        print(line, end='')
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+
+    p.stdout.close()
+    p.wait()
+
+    clear_cuda_cache()
+    time.sleep(0.5)
+
+    # Collect generated video
+    save_path_abs = os.path.abspath(save_path)
+    if os.path.exists(save_path_abs):
+        all_videos = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
+        if matching_videos:
+            video_path = os.path.join(save_path_abs, matching_videos[0])
+            
+            # Collect parameters for metadata
+            parameters = {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "video_length": video_length,
+                "fps": fps,
+                "infer_steps": infer_steps,
+                "seed": current_seed,
+                "task": task,
+                "flow_shift": flow_shift,
+                "guidance_scale": guidance_scale,
+                "output_type": output_type,
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "input_video": input_video,
+                "strength": strength,
+                "lora_weights": [lora1, lora2, lora3, lora4],
+                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                "dit_path": dit_path,
+                "vae_path": vae_path,
+                "t5_path": t5_path,
+                "negative_prompt": negative_prompt if negative_prompt else None,
+                "sample_solver": sample_solver
+            }
+            
+            add_metadata_to_video(video_path, parameters)
+            videos.append((str(video_path), f"Seed: {current_seed}"))
+
+    yield videos, f"Completed (seed: {current_seed})", ""
+
+def wanx_v2v_batch_handler(
+    prompt,
+    negative_prompt,
+    input_video,
+    width,
+    height,
+    video_length,
+    fps,
+    infer_steps,
+    flow_shift,
+    guidance_scale,
+    strength,
+    seed,
+    batch_size,
+    task,
+    dit_path,
+    vae_path,
+    t5_path,
+    save_path,
+    output_type,
+    sample_solver,
+    exclude_single_blocks,
+    attn_mode,
+    block_swap,
+    fp8,
+    fp8_scaled,
+    fp8_t5,
+    lora_folder,
+    slg_layers: str,
+    slg_start: Optional[str],
+    slg_end: Optional[str],
+    *lora_params
+):
+    """Handle batch generation for WanX v2v"""
+    global stop_event
+    stop_event.clear()
+    
+    # Extract LoRA parameters
+    num_lora_weights = 4
+    lora_weights = lora_params[:num_lora_weights]
+    lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+    
+    all_videos = []
+    progress_text = "Starting generation..."
+    yield [], "Preparing...", progress_text
+    
+    # Process each item in the batch
+    for i in range(batch_size):
+        if stop_event.is_set():
+            yield all_videos, "Generation stopped by user", ""
+            return
+            
+        # Calculate seed for this batch item
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1:
+            current_seed = seed + i
+            
+        batch_text = f"Generating video {i + 1} of {batch_size}"
+        yield all_videos.copy(), batch_text, progress_text
+        
+        # Generate a single video
+        for videos, status, progress in wanx_v2v_generate_video(
+            prompt, 
+            negative_prompt, 
+            input_video, 
+            width, 
+            height, 
+            video_length, 
+            fps, 
+            infer_steps, 
+            flow_shift, 
+            guidance_scale,
+            strength,
+            current_seed,
+            task, 
+            dit_path, 
+            vae_path, 
+            t5_path, 
+            save_path, 
+            output_type, 
+            sample_solver, 
+            exclude_single_blocks,
+            attn_mode, 
+            block_swap, 
+            fp8, 
+            fp8_scaled, 
+            fp8_t5,
+            lora_folder,
+            slg_layers,
+            slg_start,
+            slg_end,
+            *lora_weights,
+            *lora_multipliers
+        ):
+            if videos:
+                all_videos.extend(videos)
+            yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+        
+        # Clear CUDA cache between generations
+        clear_cuda_cache()
+        time.sleep(0.5)
+    
+    yield all_videos, "Batch complete", ""
+
+def update_wanx_v2v_dimensions(video):
+    """Update dimensions from uploaded video"""
+    if video is None:
+        return "", gr.update(value=832), gr.update(value=480)
+    
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        return "Error opening video", gr.update(), gr.update()
+    
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    # Make dimensions divisible by 32
+    w = (w // 32) * 32
+    h = (h // 32) * 32
+    
+    return f"{w}x{h}", w, h
+
+def send_wanx_v2v_to_hunyuan_v2v(
+    gallery: list,
+    prompt: str,
+    selected_index: int,
+    width: int,
+    height: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    flow_shift: float,
+    guidance_scale: float,
+    negative_prompt: str
+) -> Tuple:
+    """Send the selected WanX v2v video to Hunyuan v2v tab"""
+    if gallery is None or not gallery:
+        return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, guidance_scale, negative_prompt)
+    
+    # If no selection made but we have videos, use the first one
+    if selected_index is None and len(gallery) > 0:
+        selected_index = 0
+        
+    if selected_index is None or selected_index >= len(gallery):
+        return (None, "", width, height, video_length, fps, infer_steps, seed, 
+                flow_shift, guidance_scale, negative_prompt)
+
+    selected_item = gallery[selected_index]
+    
+    # Handle different gallery item formats
+    if isinstance(selected_item, tuple):
+        video_path = selected_item[0]
+    elif isinstance(selected_item, dict):
+        video_path = selected_item.get("name", selected_item.get("data", None))
+    else:
+        video_path = selected_item
+
+    # Clean up path for Video component
+    if isinstance(video_path, tuple):
+        video_path = video_path[0]
+        
+    # Make sure it's a string
+    video_path = str(video_path)
+
+    return (video_path, prompt, width, height, video_length, fps, infer_steps, seed, 
+            flow_shift, guidance_scale, negative_prompt)
+
+def handle_wanx_v2v_gallery_select(evt: gr.SelectData) -> int:
+    """Track selected index when gallery item is clicked"""
+    return evt.index
+
 def variance_of_laplacian(image):
     """
     Compute the variance of the Laplacian of the image.
@@ -882,29 +1290,22 @@ def create_parameter_transfer_map(metadata: Dict, target_tab: str) -> Dict:
     """Map metadata parameters to Gradio components for different tabs"""
     mapping = {
         'common': {
-            'prompt': ('prompt', 'v2v_prompt'),
-            'width': ('width', 'v2v_width'),
-            'height': ('height', 'v2v_height'),
-            'batch_size': ('batch_size', 'v2v_batch_size'),
-            'video_length': ('video_length', 'v2v_video_length'),
-            'fps': ('fps', 'v2v_fps'),
-            'infer_steps': ('infer_steps', 'v2v_infer_steps'),
-            'seed': ('seed', 'v2v_seed'),
-            'model': ('model', 'v2v_model'),
-            'vae': ('vae', 'v2v_vae'),
-            'te1': ('te1', 'v2v_te1'),
-            'te2': ('te2', 'v2v_te2'),
-            'save_path': ('save_path', 'v2v_save_path'),
-            'flow_shift': ('flow_shift', 'v2v_flow_shift'),
-            'cfg_scale': ('cfg_scale', 'v2v_cfg_scale'),
-            'output_type': ('output_type', 'v2v_output_type'),
-            'attn_mode': ('attn_mode', 'v2v_attn_mode'),
-            'block_swap': ('block_swap', 'v2v_block_swap'),
-            'negative_prompt': ('negative_prompt', 'v2v_negative_prompt')
+            'prompt': ('prompt', 'v2v_prompt', 'wanx_v2v_prompt'),  # Add WanX-v2v mapping
+            'width': ('width', 'v2v_width', 'wanx_v2v_width'),
+            'height': ('height', 'v2v_height', 'wanx_v2v_height'),
+            'batch_size': ('batch_size', 'v2v_batch_size', 'wanx_v2v_batch_size'),
+            'video_length': ('video_length', 'v2v_video_length', 'wanx_v2v_video_length'),
+            'fps': ('fps', 'v2v_fps', 'wanx_v2v_fps'),
+            'infer_steps': ('infer_steps', 'v2v_infer_steps', 'wanx_v2v_infer_steps'),
+            'seed': ('seed', 'v2v_seed', 'wanx_v2v_seed'),
+            'flow_shift': ('flow_shift', 'v2v_flow_shift', 'wanx_v2v_flow_shift'),
+            'guidance_scale': ('cfg_scale', 'v2v_cfg_scale', 'wanx_v2v_guidance_scale'),
+            'negative_prompt': ('negative_prompt', 'v2v_negative_prompt', 'wanx_v2v_negative_prompt'),
+            'strength': ('strength', 'v2v_strength', 'wanx_v2v_strength')
         },
         'lora': {
-            'lora_weights': [(f'lora{i+1}', f'v2v_lora_weights[{i}]') for i in range(4)],
-            'lora_multipliers': [(f'lora{i+1}_multiplier', f'v2v_lora_multipliers[{i}]') for i in range(4)]
+            'lora_weights': [(f'lora{i+1}', f'v2v_lora_weights[{i}]', f'wanx_v2v_lora_weights[{i}]') for i in range(4)],
+            'lora_multipliers': [(f'lora{i+1}_multiplier', f'v2v_lora_multipliers[{i}]', f'wanx_v2v_lora_multipliers[{i}]') for i in range(4)]
         }
     }
     
@@ -912,19 +1313,25 @@ def create_parameter_transfer_map(metadata: Dict, target_tab: str) -> Dict:
     for param, value in metadata.items():
         # Handle common parameters
         if param in mapping['common']:
-            target = mapping['common'][param][0 if target_tab == 't2v' else 1]
-            results[target] = value
+            target_idx = 0 if target_tab == 't2v' else 1 if target_tab == 'v2v' else 2
+            if target_idx < len(mapping['common'][param]):
+                target = mapping['common'][param][target_idx]
+                results[target] = value
         
         # Handle LoRA parameters
         if param == 'lora_weights':
             for i, weight in enumerate(value[:4]):
-                target = mapping['lora']['lora_weights'][i][1 if target_tab == 'v2v' else 0]
-                results[target] = weight
+                target_idx = 0 if target_tab == 't2v' else 1 if target_tab == 'v2v' else 2
+                if target_idx < len(mapping['lora']['lora_weights'][i]):
+                    target = mapping['lora']['lora_weights'][i][target_idx]
+                    results[target] = weight
                 
         if param == 'lora_multipliers':
             for i, mult in enumerate(value[:4]):
-                target = mapping['lora']['lora_multipliers'][i][1 if target_tab == 'v2v' else 0]
-                results[target] = float(mult)
+                target_idx = 0 if target_tab == 't2v' else 1 if target_tab == 'v2v' else 2
+                if target_idx < len(mapping['lora']['lora_multipliers'][i]):
+                    target = mapping['lora']['lora_multipliers'][i][target_idx]
+                    results[target] = float(mult)
                 
     return results
 
@@ -2484,6 +2891,8 @@ with gr.Blocks(
     wanx_sharpest_frame_number = gr.State(value=None)  
     wanx_sharpest_frame_path = gr.State(value=None)   
     wanx_trimmed_video_path = gr.State(value=None) 
+    wanx_v2v_selected_index = gr.State(value=None)
+    wanx_t2v_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -2999,6 +3408,7 @@ with gr.Blocks(
                         preview=True
                     )
                     wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
+                    wanx_i2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
                     wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
                     wanx_extend_btn = gr.Button("Extend Video")
                     wanx_frames_to_check = gr.Slider(minimum=1, maximum=100, step=1, value=30, 
@@ -3123,7 +3533,8 @@ with gr.Blocks(
                         allow_preview=True,
                         preview=True
                     )
-                    wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+                    wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan v2v")
+                    wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
                     # Add LoRA section for WanX-t2v
                     wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
@@ -3181,6 +3592,128 @@ with gr.Blocks(
                 wanx_t2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
                 wanx_t2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
 
+        #WanX-v2v Tab
+        with gr.Tab(id=6, label="WanX-v2v") as wanx_v2v_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wanx_v2v_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A person walking on a beach at sunset", 
+                        lines=5
+                    )
+                    wanx_v2v_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="",
+                        lines=3,
+                        info="Leave empty to use default negative prompt"
+                    )
+
+                with gr.Column(scale=1):
+                    wanx_v2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wanx_v2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    wanx_v2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
+                    wanx_v2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+
+            with gr.Row():
+                wanx_v2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                wanx_v2v_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    wanx_v2v_input = gr.Video(label="Input Video", format="mp4")
+                    wanx_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength", 
+                                                info="0 = keep original, 1 = full generation")
+                    wanx_v2v_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    wanx_v2v_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
+
+                    # Width and Height Inputs
+                    with gr.Row():
+                        wanx_v2v_width = gr.Number(label="New Width", value=832, step=32)
+                        wanx_v2v_calc_height_btn = gr.Button("→")
+                        wanx_v2v_calc_width_btn = gr.Button("←")
+                        wanx_v2v_height = gr.Number(label="New Height", value=480, step=32)
+                        wanx_v2v_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
+
+                    wanx_v2v_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                    wanx_v2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wanx_v2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=40)
+                    wanx_v2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0,
+                                               info="Recommended: 3.0 for 480p, 5.0 for others")
+                    wanx_v2v_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+
+                with gr.Column():
+                    wanx_v2v_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2],
+                        rows=[2],
+                        object_fit="contain",
+                        height="auto",
+                        show_label=True,
+                        elem_id="gallery",
+                        allow_preview=True,
+                        preview=True
+                    )
+                    wanx_v2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
+
+                    # Add LoRA section for WanX-v2v
+                    wanx_v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_v2v_lora_weights = []
+                    wanx_v2v_lora_multipliers = []
+                    for i in range(4):
+                        with gr.Column():
+                            wanx_v2v_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", 
+                                choices=get_lora_options(), 
+                                value="None", 
+                                allow_custom_value=True,
+                                interactive=True
+                            ))
+                            wanx_v2v_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier", 
+                                minimum=0.0, 
+                                maximum=2.0, 
+                                step=0.05, 
+                                value=1.0
+                            ))
+
+            with gr.Row():
+                wanx_v2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                wanx_v2v_task = gr.Dropdown(
+                    label="Task",
+                    choices=["t2v-14B", "t2v-1.3B"],
+                    value="t2v-14B",
+                    info="Model size: t2v-1.3B is faster, t2v-14B has higher quality"
+                )
+                wanx_v2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_fp16.safetensors")
+                wanx_v2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
+                wanx_v2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                wanx_v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                wanx_v2v_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Row():
+                wanx_v2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                wanx_v2v_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                wanx_v2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
+                wanx_v2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                wanx_v2v_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0,
+                                           info="Max 39 for 14B model, 29 for 1.3B model")
+
+                with gr.Column():
+                    wanx_v2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
+                    wanx_v2v_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False,
+                                                  info="For mixing fp16/bf16 and fp8 weights")
+                    wanx_v2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+
+            # Add Skip Layer Guidance options
+            with gr.Row():
+                wanx_v2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
+                wanx_v2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
+                wanx_v2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
+
         #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
             with gr.Row():
@@ -3192,6 +3725,8 @@ with gr.Blocks(
                 send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
+                send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
+
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
@@ -3316,6 +3851,278 @@ with gr.Blocks(
                 with gr.Row():
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+
+    #WanX-v2v tab functions
+    wanx_v2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_v2v_prompt, outputs=wanx_v2v_token_counter)
+
+    # Stop button handler
+    wanx_v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Video input handling
+    wanx_v2v_input.change(
+        fn=update_wanx_v2v_dimensions,
+        inputs=[wanx_v2v_input],
+        outputs=[wanx_v2v_original_dims, wanx_v2v_width, wanx_v2v_height]
+    )
+
+    # Flow shift recommendation button
+    wanx_v2v_recommend_flow_btn.click(
+        fn=recommend_wanx_flow_shift,
+        inputs=[wanx_v2v_width, wanx_v2v_height],
+        outputs=[wanx_v2v_flow_shift]
+    )
+
+    # Width/height calculation buttons
+    wanx_v2v_calc_width_btn.click(
+        fn=calculate_wanx_width,  # Reuse function from WanX tabs
+        inputs=[wanx_v2v_height, wanx_v2v_original_dims],
+        outputs=[wanx_v2v_width]
+    )
+
+    wanx_v2v_calc_height_btn.click(
+        fn=calculate_wanx_height,  # Reuse function from WanX tabs
+        inputs=[wanx_v2v_width, wanx_v2v_original_dims],
+        outputs=[wanx_v2v_height]
+    )
+
+    # Scale slider handling for adjusting dimensions
+    wanx_v2v_scale_slider.change(
+        fn=update_wanx_from_scale,  # Reuse function from WanX tabs
+        inputs=[wanx_v2v_scale_slider, wanx_v2v_original_dims],
+        outputs=[wanx_v2v_width, wanx_v2v_height]
+    )
+
+    def change_to_wanx_v2v_tab():
+        return gr.Tabs(selected=6) 
+
+    def send_wanx_t2v_to_v2v_input(gallery, selected_index):
+        """Send the selected WanX-t2v video to WanX-v2v input"""
+        if gallery is None or not gallery:
+            return None, None
+
+        if selected_index is None and len(gallery) == 1:
+            selected_index = 0
+
+        if selected_index is None or selected_index >= len(gallery):
+            return None, None
+
+        # Get the video path
+        item = gallery[selected_index]
+        video_path = parse_video_path(item)
+
+        return video_path, "Video sent from WanX-t2v tab"
+    
+    wanx_t2v_send_to_wanx_v2v_btn.click(
+        fn=send_wanx_t2v_to_v2v_input,
+        inputs=[wanx_t2v_output, wanx_t2v_selected_index],
+        outputs=[wanx_v2v_input, wanx_v2v_batch_progress]
+    ).then(
+        fn=lambda prompt: prompt,
+        inputs=[wanx_t2v_prompt],
+        outputs=[wanx_v2v_prompt]
+    ).then(
+        fn=change_to_wanx_v2v_tab,
+        inputs=None,
+        outputs=[tabs]
+    )
+
+    # Send video from WanX-i2v to WanX-v2v
+    wanx_i2v_send_to_wanx_v2v_btn.click(
+        fn=send_wanx_t2v_to_v2v_input,  # Reuse the same function
+        inputs=[wanx_output, wanx_i2v_selected_index],
+        outputs=[wanx_v2v_input, wanx_v2v_batch_progress]
+    ).then(
+        fn=lambda prompt: prompt,
+        inputs=[wanx_prompt],
+        outputs=[wanx_v2v_prompt]
+    ).then(
+        fn=change_to_wanx_v2v_tab,
+        inputs=None,
+        outputs=[tabs]
+    )
+
+    # Update model paths when task changes
+    def update_model_paths_for_task(task):
+        if "1.3B" in task:
+            return gr.update(value="wan/wan2.1_t2v_1.3B_fp16.safetensors")
+        else:
+            return gr.update(value="wan/wan2.1_t2v_14B_fp16.safetensors")
+
+    wanx_v2v_task.change(
+        fn=update_model_paths_for_task,
+        inputs=[wanx_v2v_task],
+        outputs=[wanx_v2v_dit_path]
+    )
+
+    # Generate button handler
+    wanx_v2v_generate_btn.click(
+        fn=wanx_v2v_batch_handler,
+        inputs=[
+            wanx_v2v_prompt,
+            wanx_v2v_negative_prompt,
+            wanx_v2v_input,
+            wanx_v2v_width,
+            wanx_v2v_height,
+            wanx_v2v_video_length,
+            wanx_v2v_fps,
+            wanx_v2v_infer_steps,
+            wanx_v2v_flow_shift,
+            wanx_v2v_guidance_scale,
+            wanx_v2v_strength,
+            wanx_v2v_seed,
+            wanx_v2v_batch_size,
+            wanx_v2v_task,
+            wanx_v2v_dit_path,
+            wanx_v2v_vae_path,
+            wanx_v2v_t5_path,
+            wanx_v2v_save_path,
+            wanx_v2v_output_type,
+            wanx_v2v_sample_solver,
+            wanx_v2v_exclude_single_blocks,
+            wanx_v2v_attn_mode,
+            wanx_v2v_block_swap,
+            wanx_v2v_fp8,
+            wanx_v2v_fp8_scaled,
+            wanx_v2v_fp8_t5,
+            wanx_v2v_lora_folder,
+            wanx_v2v_slg_layers,
+            wanx_v2v_slg_start,
+            wanx_v2v_slg_end,
+            *wanx_v2v_lora_weights,
+            *wanx_v2v_lora_multipliers
+        ],
+        outputs=[wanx_v2v_output, wanx_v2v_batch_progress, wanx_v2v_progress_text],
+        queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[wanx_v2v_batch_size],
+        outputs=wanx_v2v_selected_index
+    )
+
+    # Gallery selection handling
+    wanx_v2v_output.select(
+        fn=handle_wanx_v2v_gallery_select,
+        outputs=wanx_v2v_selected_index
+    )
+    def change_to_tab_two():
+        return gr.Tabs(selected=2)
+
+    # Send to Hunyuan v2v tab
+    wanx_v2v_send_to_v2v_btn.click(
+        fn=send_wanx_v2v_to_hunyuan_v2v,
+        inputs=[
+            wanx_v2v_output,
+            wanx_v2v_prompt,
+            wanx_v2v_selected_index,
+            wanx_v2v_width,
+            wanx_v2v_height,
+            wanx_v2v_video_length,
+            wanx_v2v_fps,
+            wanx_v2v_infer_steps,
+            wanx_v2v_seed,
+            wanx_v2v_flow_shift,
+            wanx_v2v_guidance_scale,
+            wanx_v2v_negative_prompt
+        ],
+        outputs=[
+            v2v_input,
+            v2v_prompt,
+            v2v_width,
+            v2v_height,
+            v2v_video_length,
+            v2v_fps,
+            v2v_infer_steps,
+            v2v_seed,
+            v2v_flow_shift,
+            v2v_cfg_scale,
+            v2v_negative_prompt
+        ]
+    ).then(
+        fn=change_to_tab_two,
+        inputs=None,
+        outputs=[tabs]
+    )
+
+    # Add refresh button handler for WanX-v2v tab
+    wanx_v2v_refresh_outputs = []
+    for i in range(4):
+        wanx_v2v_refresh_outputs.extend([wanx_v2v_lora_weights[i], wanx_v2v_lora_multipliers[i]])
+
+    wanx_v2v_refresh_btn.click(
+        fn=update_lora_dropdowns,
+        inputs=[wanx_v2v_lora_folder] + wanx_v2v_lora_weights + wanx_v2v_lora_multipliers,
+        outputs=wanx_v2v_refresh_outputs
+    ) 
+
+    # Add function to send videos from Video Info tab to WanX-v2v
+    def send_to_wanx_v2v(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+        """Handle both parameters and video transfer from Video Info to WanX-v2v tab with debugging"""
+        if not video_path:
+            return "No video selected", {}, None
+
+        # Print debug information
+        print(f"VIDEO INFO TO WANX-V2V TRANSFER:")
+        print(f"Original metadata: {metadata}")
+        print(f"Video path: {video_path}")
+
+        # Special handling for WanX-v2v prompt fields
+        # Create a copy of metadata with explicit prompt fields
+        enhanced_metadata = metadata.copy()
+        if "prompt" in metadata:
+            enhanced_metadata["wanx_v2v_prompt"] = metadata["prompt"]
+        if "negative_prompt" in metadata:
+            enhanced_metadata["wanx_v2v_negative_prompt"] = metadata["negative_prompt"]
+
+        print(f"Enhanced metadata: {enhanced_metadata}")
+
+        status_msg, params = send_parameters_to_tab(enhanced_metadata, "wanx_v2v")
+        print(f"Mapped parameters: {params}")
+
+        return f"Parameters ready for WanX-v2v (DEBUG INFO IN CONSOLE)", enhanced_metadata, video_path
+
+    # Then, implement a proper handler to change to the WanX-v2v tab
+    def change_to_wanx_v2v_tab():
+        return gr.Tabs(selected=6)  # WanX-v2v is tab index 6
+
+    # Next, connect the button to the functions with proper parameter mapping
+    send_to_wanx_v2v_btn.click(
+        fn=send_to_wanx_v2v,
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, wanx_v2v_input]
+    ).then(
+        # Direct parameter mapping approach that doesn't rely on the mapping function
+        lambda metadata: [
+            metadata.get("prompt", metadata.get("wanx_v2v_prompt", "")),
+            metadata.get("width", 832),
+            metadata.get("height", 480),
+            metadata.get("video_length", 81),
+            metadata.get("fps", 16),
+            metadata.get("infer_steps", 40),
+            metadata.get("seed", -1),
+            metadata.get("flow_shift", 5.0),
+            metadata.get("guidance_scale", metadata.get("cfg_scale", 5.0)),
+            metadata.get("negative_prompt", metadata.get("wanx_v2v_negative_prompt", "")),
+            metadata.get("strength", 0.75)
+        ] if metadata else [gr.update()]*12,
+        inputs=params_state,
+        outputs=[
+            wanx_v2v_prompt,
+            wanx_v2v_width,
+            wanx_v2v_height,
+            wanx_v2v_video_length,
+            wanx_v2v_fps,
+            wanx_v2v_infer_steps,
+            wanx_v2v_seed,
+            wanx_v2v_flow_shift,
+            wanx_v2v_guidance_scale,
+            wanx_v2v_negative_prompt,
+            wanx_v2v_strength
+        ]
+    ).then(
+        fn=change_to_wanx_v2v_tab,
+        inputs=None,
+        outputs=[tabs]
+    )
 
     #Video Extension
     wanx_send_last_frame_btn.click(
@@ -3511,8 +4318,7 @@ with gr.Blocks(
     def change_to_tab_one():
         return gr.Tabs(selected=1) #This will navigate
     #video to video
-    def change_to_tab_two():
-        return gr.Tabs(selected=2) #This will navigate
+
     def change_to_skyreels_tab():
         return gr.Tabs(selected=3) 
     
@@ -4752,10 +5558,6 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
-
-        # Add state for T2V tab selected index
-    wanx_t2v_selected_index = gr.State(value=None)
-
     # Connect prompt token counter
     wanx_t2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_t2v_prompt, outputs=wanx_t2v_token_counter)
 

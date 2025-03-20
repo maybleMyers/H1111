@@ -54,6 +54,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/20/2025  
+    Added WanX-v2v functionality.  
 3/18/2025  
     Added Skip Layer Guidance for WanX-i2v.  
 3/13/2025  
@@ -103,7 +105,7 @@ wget https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial/resolve/
 python -m venv env
 #(if you have another version of python do python3.10 -m venv env after you install it with sudo apt install python3.10 python3.10-venv python3.10-distutils)
 source env/bin/activate 
-pip install torch==2.5.1 torchvision--index-url https://download.pytorch.org/whl/cu124 
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
 pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation
