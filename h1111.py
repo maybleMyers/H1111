@@ -1485,7 +1485,7 @@ def wanx_batch_handler(
     slg_end: Optional[str],
     *lora_params
 ):
-    """Handle both folder-based batch processing and regular processing for WanX"""
+    """Handle both folder-based batch processing and regular processing for all WanX tabs"""
     global stop_event
     
     # Convert None strings to actual None
@@ -1639,8 +1639,8 @@ def wanx_batch_handler(
             progress_text = "Starting generation..."
             yield [], "Preparing...", progress_text
             
-            # Get the input image from the remaining parameters if available
-            input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
+            # Get the input image/video from the remaining parameters if available
+            input_file = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
             
             # Process each batch item
             for i in range(int(batch_size)):
@@ -1662,7 +1662,7 @@ def wanx_batch_handler(
                 for videos, status, progress in wanx_generate_video(
                     prompt, 
                     negative_prompt, 
-                    input_image, 
+                    input_file, 
                     width,
                     height,
                     video_length,
@@ -1708,13 +1708,13 @@ def wanx_batch_handler(
             
             yield all_videos, "Batch complete", ""
         else:
-            # Single image, single generation - use existing function
-            input_image = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
+            # Single image/video, single generation - use existing function
+            input_file = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
             
             yield from wanx_generate_video(
                 prompt, 
                 negative_prompt,
-                input_image,
+                input_file,
                 width,
                 height,
                 video_length,
@@ -2300,6 +2300,13 @@ def wanx_generate_video(
         command.extend(["--image_path", input_image])
         command.extend(["--clip", clip_path])  # CLIP is only needed for i2v
     
+    # Add video path for v2v task
+    if "v2v" in task and input_image:
+        command.extend(["--video_path", input_image])
+        # Add strength parameter for video-to-video
+        if isinstance(guidance_scale, (int, float)) and guidance_scale > 0:
+            command.extend(["--strength", str(guidance_scale)])
+    
     if negative_prompt:
         command.extend(["--negative_prompt", negative_prompt])
     
@@ -2407,6 +2414,7 @@ def wanx_generate_video(
                 "attn_mode": attn_mode,
                 "block_swap": block_swap,
                 "input_image": input_image if "i2v" in task else None,
+                "input_video": input_image if "v2v" in task else None,
                 "lora_weights": [lora1, lora2, lora3, lora4],
                 "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
                 "dit_path": dit_path,
@@ -4017,7 +4025,7 @@ with gr.Blocks(
 
     # Generate button handler
     wanx_v2v_generate_btn.click(
-        fn=wanx_v2v_batch_handler,
+        fn=wanx_batch_handler,
         inputs=[
             wanx_v2v_prompt,
             wanx_v2v_negative_prompt,
@@ -5645,7 +5653,7 @@ with gr.Blocks(
 
     # Generate button handler for T2V
     wanx_t2v_generate_btn.click(
-        fn=wanx_generate_video_batch,
+        fn=wanx_batch_handler,
         inputs=[
             wanx_t2v_prompt, 
             wanx_t2v_negative_prompt,
