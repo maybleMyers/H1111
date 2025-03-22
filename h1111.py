@@ -1634,18 +1634,25 @@ def wanx_batch_handler(
     else:
         # For non-random mode, if batch_size > 1, we process multiple times with the same input image
         # but different seeds
-        if int(batch_size) > 1:
+        batch_size = int(batch_size)  # Ensure batch_size is treated as an integer
+        input_file = None
+        
+        # Get the input image/video from the remaining parameters if available
+        # The position depends on the number of LoRA parameters passed
+        remaining_params = lora_params[num_lora_weights*2:]  # After LoRA weights and multipliers
+        if len(remaining_params) > 0 and remaining_params[0] is not None:
+            input_file = remaining_params[0]
+            print(f"Found input file in remaining params: {input_file}")
+        
+        if batch_size > 1:
             stop_event.clear()
             
             all_videos = []
             progress_text = "Starting generation..."
             yield [], "Preparing...", progress_text
             
-            # Get the input image/video from the remaining parameters if available
-            input_file = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
-            
             # Process each batch item
-            for i in range(int(batch_size)):
+            for i in range(batch_size):
                 if stop_event.is_set():
                     yield all_videos, "Generation stopped by user", ""
                     return
@@ -1657,8 +1664,8 @@ def wanx_batch_handler(
                 elif batch_size > 1:
                     current_seed = seed + i
                 
-                batch_text = f"Generating video {i + 1} of {batch_size}"
-                yield all_videos.copy(), batch_text, progress_text
+                batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
+                yield all_videos, batch_text, progress_text
                 
                 # Generate a single video with the current seed
                 for videos, status, progress in wanx_generate_video(
@@ -1711,9 +1718,13 @@ def wanx_batch_handler(
             
             yield all_videos, "Batch complete", ""
         else:
-            # Single image/video, single generation - use existing function
-            input_file = lora_params[num_lora_weights*2] if len(lora_params) > num_lora_weights*2 else None
+            # Single image/video, single generation
+            stop_event.clear()
             
+            # Debug the input file
+            print(f"Processing single video with input file: {input_file}")
+            
+            # Call wanx_generate_video directly with the input file
             yield from wanx_generate_video(
                 prompt, 
                 negative_prompt,
@@ -5521,7 +5532,7 @@ with gr.Blocks(
     def toggle_end_image(use_end_image):
         return (
             gr.update(visible=use_end_image, interactive=use_end_image),  # wanx_input_end
-            gr.update(visible=use_end_image)  # wanx_trim_frames
+            gr.update(visible=False)  # wanx_trim_frames
         )
     wanx_use_end_image.change(
         fn=toggle_end_image,
