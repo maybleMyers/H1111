@@ -2276,8 +2276,8 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
-    if wanx_input_end != "none":
-        command.extend(["--end_image_path", wanx_input_end])
+    if wanx_input_end and wanx_input_end != "none" and os.path.exists(wanx_input_end):
+        command.extend(["--end_image_path", str(wanx_input_end)])
         command.extend(["--trim_tail_frames", "3"])
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
