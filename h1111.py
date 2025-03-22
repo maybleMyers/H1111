@@ -4177,24 +4177,27 @@ with gr.Blocks(
 
     # Next, connect the button to the functions with proper parameter mapping
     send_to_wanx_v2v_btn.click(
-        fn=send_to_wanx_v2v,
-        inputs=[metadata_output, video_input],
-        outputs=[status, params_state, wanx_v2v_input]
+        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_v2v'),
+        inputs=[metadata_output],
+        outputs=[status, params_state]
     ).then(
-        # Direct parameter mapping approach that doesn't rely on the mapping function
-        lambda metadata: [
-            metadata.get("prompt", metadata.get("wanx_v2v_prompt", "")),
-            metadata.get("width", 832),
-            metadata.get("height", 480),
-            metadata.get("video_length", 81),
-            metadata.get("fps", 16),
-            metadata.get("infer_steps", 40),
-            metadata.get("seed", -1),
-            metadata.get("flow_shift", 5.0),
-            metadata.get("guidance_scale", metadata.get("cfg_scale", 5.0)),
-            metadata.get("negative_prompt", metadata.get("wanx_v2v_negative_prompt", "")),
-            metadata.get("strength", 0.75)
-        ] if metadata else [gr.update()]*12,
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("width", 832),
+            params.get("height", 480),
+            params.get("video_length", 81),
+            params.get("fps", 16),
+            params.get("infer_steps", 40),
+            params.get("seed", -1),
+            params.get("flow_shift", 5.0),
+            params.get("guidance_scale", 5.0),
+            params.get("attn_mode", "sdpa"),
+            params.get("block_swap", 0),
+            params.get("negative_prompt", ""),
+            params.get("strength", 0.75),
+            *[params.get("lora_weights", ["None"]*4)[i] if isinstance(params.get("lora_weights", []), list) and i < len(params.get("lora_weights", [])) else "None" for i in range(4)],
+            *[params.get("lora_multipliers", [1.0]*4)[i] if isinstance(params.get("lora_multipliers", []), list) and i < len(params.get("lora_multipliers", [])) else 1.0 for i in range(4)]
+        ] if params else [gr.update()]*21,
         inputs=params_state,
         outputs=[
             wanx_v2v_prompt,
@@ -4206,13 +4209,15 @@ with gr.Blocks(
             wanx_v2v_seed,
             wanx_v2v_flow_shift,
             wanx_v2v_guidance_scale,
+            wanx_v2v_attn_mode,
+            wanx_v2v_block_swap,
             wanx_v2v_negative_prompt,
-            wanx_v2v_strength
+            wanx_v2v_strength,
+            *wanx_v2v_lora_weights,
+            *wanx_v2v_lora_multipliers
         ]
     ).then(
-        fn=change_to_wanx_v2v_tab,
-        inputs=None,
-        outputs=[tabs]
+        fn=change_to_wanx_v2v_tab, inputs=None, outputs=[tabs]
     )
 
     #Video Extension
@@ -4327,11 +4332,13 @@ with gr.Blocks(
     def change_to_wanx_t2v_tab():
         return gr.Tabs(selected=5)  # WanX-t2v tab index
 
+
     send_to_wanx_i2v_btn.click(
-        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_i2v'),
+        fn=lambda m: ("Parameters ready for WanX-i2v", m),
         inputs=[metadata_output],
         outputs=[status, params_state]
     ).then(
+        # Reusing the same pattern as other tab transfers with LoRA handling
         lambda params: [
             params.get("prompt", ""),
             params.get("width", 832),
@@ -4345,26 +4352,23 @@ with gr.Blocks(
             params.get("attn_mode", "sdpa"),
             params.get("block_swap", 0),
             params.get("task", "i2v-14B"),
-            params.get("negative_prompt", "")
-        ] if params else [gr.update()]*13,
+            params.get("negative_prompt", ""),
+            *[params.get("lora_weights", ["None"]*4)[i] if isinstance(params.get("lora_weights", []), list) and i < len(params.get("lora_weights", [])) else "None" for i in range(4)],
+            *[params.get("lora_multipliers", [1.0]*4)[i] if isinstance(params.get("lora_multipliers", []), list) and i < len(params.get("lora_multipliers", [])) else 1.0 for i in range(4)]
+        ] if params else [gr.update()]*20,
         inputs=params_state,
         outputs=[
-            wanx_prompt, 
-            wanx_width, 
-            wanx_height, 
-            wanx_video_length, 
-            wanx_fps, 
-            wanx_infer_steps,
-            wanx_seed,
-            wanx_flow_shift, 
-            wanx_guidance_scale,
-            wanx_attn_mode,
-            wanx_block_swap,
-            wanx_task,
-            wanx_negative_prompt
+            wanx_prompt, wanx_width, wanx_height, wanx_video_length, 
+            wanx_fps, wanx_infer_steps, wanx_seed, wanx_flow_shift, 
+            wanx_guidance_scale, wanx_attn_mode, wanx_block_swap,
+            wanx_task, wanx_negative_prompt, 
+            *wanx_lora_weights,
+            *wanx_lora_multipliers
         ]
     ).then(
-        fn=change_to_wanx_i2v_tab, inputs=None, outputs=[tabs]
+        fn=change_to_wanx_i2v_tab, 
+        inputs=None, 
+        outputs=[tabs]
     )
 
     # 3. Update the WanX-t2v button handler
@@ -4375,7 +4379,7 @@ with gr.Blocks(
     ).then(
         lambda params: [
             params.get("prompt", ""),
-            params.get("width", 832), 
+            params.get("width", 832),
             params.get("height", 480),
             params.get("video_length", 81),
             params.get("fps", 16),
@@ -4385,8 +4389,10 @@ with gr.Blocks(
             params.get("guidance_scale", 5.0),
             params.get("attn_mode", "sdpa"),
             params.get("block_swap", 0),
-            params.get("negative_prompt", "")
-        ] if params else [gr.update()]*12,
+            params.get("negative_prompt", ""),
+            *[params.get("lora_weights", ["None"]*4)[i] if isinstance(params.get("lora_weights", []), list) and i < len(params.get("lora_weights", [])) else "None" for i in range(4)],
+            *[params.get("lora_multipliers", [1.0]*4)[i] if isinstance(params.get("lora_multipliers", []), list) and i < len(params.get("lora_multipliers", [])) else 1.0 for i in range(4)]
+        ] if params else [gr.update()]*20,
         inputs=params_state,
         outputs=[
             wanx_t2v_prompt,
@@ -4400,7 +4406,9 @@ with gr.Blocks(
             wanx_t2v_guidance_scale,
             wanx_t2v_attn_mode,
             wanx_t2v_block_swap,
-            wanx_t2v_negative_prompt
+            wanx_t2v_negative_prompt,
+            *wanx_t2v_lora_weights,
+            *wanx_t2v_lora_multipliers
         ]
     ).then(
         fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
