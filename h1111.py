@@ -2278,6 +2278,7 @@ def wanx_generate_video(
     ]
     if wanx_input_end != "none":
         command.extend(["--end_image_path", wanx_input_end])
+        command.extend(["--trim_tail_frames", "3"])
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
