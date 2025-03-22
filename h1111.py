@@ -3682,6 +3682,9 @@ with gr.Blocks(
                 wanx_t2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
                 wanx_t2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
                 wanx_t2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
+                wanx_t2v_use_random_folder = gr.Checkbox(visible=False, value=False, label="Use Random Images")
+                wanx_t2v_input_folder = gr.Textbox(visible=False, value="", label="Image Folder")
+                wanx_t2v_input_end = gr.Textbox(visible=False, value="none", label="End Frame")
 
         #WanX-v2v Tab
         with gr.Tab(id=6, label="WanX-v2v") as wanx_v2v_tab:
@@ -5696,6 +5699,7 @@ with gr.Blocks(
     wanx_t2v_generate_btn.click(
         fn=wanx_batch_handler,
         inputs=[
+            wanx_t2v_use_random_folder,  # First parameter - the checkbox
             wanx_t2v_prompt, 
             wanx_t2v_negative_prompt,
             wanx_t2v_width,
@@ -5706,6 +5710,9 @@ with gr.Blocks(
             wanx_t2v_flow_shift,
             wanx_t2v_guidance_scale,
             wanx_t2v_seed,
+            wanx_t2v_batch_size,
+            wanx_t2v_input_folder,    # The input folder textbox
+            wanx_t2v_input_end,       # The end frame parameter
             wanx_t2v_task,
             wanx_t2v_dit_path,
             wanx_t2v_vae_path,
@@ -5725,15 +5732,10 @@ with gr.Blocks(
             wanx_t2v_slg_start,
             wanx_t2v_slg_end,
             *wanx_t2v_lora_weights,
-            *wanx_t2v_lora_multipliers,
-            wanx_t2v_batch_size,
+            *wanx_t2v_lora_multipliers
         ],
         outputs=[wanx_t2v_output, wanx_t2v_batch_progress, wanx_t2v_progress_text],
         queue=True
-    ).then(
-        fn=lambda batch_size: 0 if batch_size == 1 else None,
-        inputs=[wanx_t2v_batch_size],
-        outputs=wanx_t2v_selected_index
     )
     
     # Add refresh button handler for WanX-t2v tab
