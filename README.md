@@ -53,6 +53,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/22/2025  
+    Added WanX-i2v end frame functionality  
 3/20/2025  
     Added WanX-v2v functionality.  
 3/18/2025  

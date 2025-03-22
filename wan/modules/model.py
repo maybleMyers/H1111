@@ -879,8 +879,8 @@ def load_wan_model(
             in_dim=36 if i2v else 16,  # 36 for I2V, 16 for T2V
             num_heads=config.num_heads,
             num_layers=config.num_layers,
-            out_dim=16,
-            text_len=512,
+            out_dim=config.out_dim,
+            text_len=config.text_len,
             attn_mode=attn_mode,
             split_attn=split_attn,
         )

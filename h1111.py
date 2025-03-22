@@ -1465,6 +1465,7 @@ def wanx_batch_handler(
     seed,
     batch_size,
     input_folder_path,
+    wanx_input_end,
     task,
     dit_path,
     vae_path,
@@ -1586,6 +1587,7 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale, 
                 current_seed,
+                wanx_input_end,
                 task,
                 dit_path,
                 vae_path,
@@ -1671,6 +1673,7 @@ def wanx_batch_handler(
                     flow_shift,
                     guidance_scale, 
                     current_seed,
+                    wanx_input_end,
                     task,
                     dit_path,
                     vae_path,
@@ -1723,6 +1726,7 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale,
                 seed,
+                wanx_input_end,
                 task,
                 dit_path,
                 vae_path,
@@ -2179,6 +2183,7 @@ def wanx_generate_video(
     flow_shift,
     guidance_scale,
     seed,
+    wanx_input_end,
     task,
     dit_path,
     vae_path,
@@ -2271,7 +2276,8 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
-    
+    if wanx_input_end != "none":
+        command.extend(["--end_image_path", wanx_input_end])
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
@@ -3446,6 +3452,10 @@ with gr.Blocks(
                             visible=False
                         )
                         wanx_validate_folder_btn = gr.Button("Validate Folder", visible=False)
+                    with gr.Row():
+                        wanx_use_end_image = gr.Checkbox(label="use ending image", value=False)
+                        wanx_input_end = gr.Image(label="End Image", type="filepath", visible=False)
+                        wanx_trim_frames = gr.Checkbox(label="trim last 3 frames", value=True, visible=False, interactive=True)
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -4220,6 +4230,7 @@ with gr.Blocks(
             wanx_fps, wanx_infer_steps, wanx_flow_shift,
             wanx_guidance_scale, wanx_seed, wanx_batch_size,
             wanx_input_folder,  # Not used but needed for function signature
+            wanx_input_end,
             wanx_task,
             wanx_dit_path, wanx_vae_path, wanx_t5_path,
             wanx_clip_path, wanx_save_path, wanx_output_type,
@@ -5506,7 +5517,16 @@ with gr.Blocks(
         inputs=[wanx_use_random_folder],
         outputs=[wanx_input_folder, wanx_folder_status, wanx_validate_folder_btn, wanx_input]
     )
-
+    def toggle_end_image(use_end_image):
+        return (
+            gr.update(visible=use_end_image, interactive=use_end_image),  # wanx_input_end
+            gr.update(visible=use_end_image)  # wanx_trim_frames
+        )
+    wanx_use_end_image.change(
+        fn=toggle_end_image,
+        inputs=[wanx_use_end_image],
+        outputs=[wanx_input_end, wanx_trim_frames]
+    )
     # Validate folder button handler
     wanx_validate_folder_btn.click(
         fn=lambda folder: get_random_image_from_folder(folder)[1],
@@ -5544,6 +5564,7 @@ with gr.Blocks(
             wanx_seed,
             wanx_batch_size,
             wanx_input_folder,
+            wanx_input_end,
             wanx_task,
             wanx_dit_path,
             wanx_vae_path,
