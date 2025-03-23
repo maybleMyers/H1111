@@ -7,7 +7,7 @@
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
-It allows simple inference with these models:  
+It allows inference with these models:  
 Hunyuan-t2v  
 Hunyuan-v2v  
 WanX-t2v  
@@ -53,6 +53,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/23/2025  
+    Added Wanx cfg skip functionality to skip cfg guidance during inference for faster generations but less following of the prompt  
 3/22/2025  
     Added WanX-i2v end frame functionality  
 3/20/2025  

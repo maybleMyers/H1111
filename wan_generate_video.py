@@ -3,6 +3,7 @@ from datetime import datetime
 import gc
 import random
 import os
+import re
 import time
 import math
 from typing import Tuple, Optional, List, Union, Any
@@ -51,9 +52,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Wan 2.1 inference script")
 
     # WAN arguments
-    parser.add_argument("--slg-layers", type=str, default=None, help="Which layers to use for skip layer guidance (comma-separated list of indices)")
-    parser.add_argument("--slg-start", type=float, default=0.0, help="Percentage in to start SLG")
-    parser.add_argument("--slg-end", type=float, default=1.0, help="Percentage in to end SLG")
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     parser.add_argument(
@@ -70,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
     parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
+    parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
+    parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
         "--save_merged_model",
         type=str,
@@ -102,6 +102,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
     parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
     parser.add_argument("--trim_tail_frames", type=int, default=0, help="trim tail N frames from the video before saving")
+    parser.add_argument(
+        "--cfg_skip_mode",
+        type=str,
+        default="none",
+        choices=["early", "late", "middle", "early_late", "alternate", "none"],
+        help="CFG skip mode. each mode skips different parts of the CFG. "
+        " early: initial steps, late: later steps, middle: middle steps, early_late: both early and late, alternate: alternate, none: no skip (default)",
+    )
+    parser.add_argument(
+        "--cfg_apply_ratio",
+        type=float,
+        default=None,
+        help="The ratio of steps to apply CFG (0.0 to 1.0). Default is None (apply all steps).",
+    )
+    parser.add_argument(
+        "--slg_layers", type=str, default=None, help="Skip block (layer) indices for SLG (Skip Layer Guidance), comma separated"
+    )
+    parser.add_argument(
+        "--slg_scale",
+        type=float,
+        default=3.0,
+        help="scale for SLG classifier free guidance. Default is 3.0. Ignored if slg_mode is None or uncond",
+    )
+    parser.add_argument("--slg_start", type=float, default=0.0, help="start ratio for inference steps for SLG. Default is 0.0.")
+    parser.add_argument("--slg_end", type=float, default=0.3, help="end ratio for inference steps for SLG. Default is 0.3.")
+    parser.add_argument(
+        "--slg_mode",
+        type=str,
+        default=None,
+        choices=["original", "uncond"],
+        help="SLG mode. original: same as SD3, uncond: replace uncond pred with SLG pred",
+    )
+
     # Flow Matching
     parser.add_argument(
         "--flow_shift",
@@ -183,10 +216,6 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
     infer_steps, flow_shift, video_length, _ = get_task_defaults(args.task, tuple(args.video_size))
 
     # Apply default values to unset arguments
-    if args.slg_layers:
-        args.slg_list = [int(x) for x in args.slg_layers.split(",")]
-    else:
-        args.slg_list = None
     if args.infer_steps is None:
         args.infer_steps = infer_steps
     if args.flow_shift is None:
@@ -197,6 +226,10 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
     # Force video_length to 1 for t2i tasks
     if "t2i" in args.task:
         assert args.video_length == 1, f"video_length should be 1 for task {args.task}"
+
+    # parse slg_layers
+    if args.slg_layers is not None:
+        args.slg_layers = list(map(int, args.slg_layers.split(",")))
 
     return args
 
@@ -353,7 +386,7 @@ def load_dit_model(
         loading_weight_dtype = dit_dtype  # load as-is
 
     # do not fp8 optimize because we will merge LoRA weights
-    model = load_wan_model(config, is_i2v, device, args.dit, args.attn_mode, False, loading_device, loading_weight_dtype, False)
+    model = load_wan_model(config, device, args.dit, args.attn_mode, False, loading_device, loading_weight_dtype, False)
 
     return model
 
@@ -377,10 +410,31 @@ def merge_lora_weights(model: WanModel, args: argparse.Namespace, device: torch.
 
         logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
         weights_sd = load_file(lora_weight)
-        # Filter to exclude keys that are part of single_blocks
-        if args.exclude_single_blocks:
-            filtered_weights = {k: v for k, v in weights_sd.items() if "single_blocks" not in k}
-            weights_sd = filtered_weights        
+
+        # apply include/exclude patterns
+        original_key_count = len(weights_sd.keys())
+        if args.include_patterns is not None and len(args.include_patterns) > i:
+            include_pattern = args.include_patterns[i]
+            regex_include = re.compile(include_pattern)
+            weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
+            logger.info(
+                f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}"
+            )
+        if args.exclude_patterns is not None and len(args.exclude_patterns) > i:
+            original_key_count_ex = len(weights_sd.keys())
+            exclude_pattern = args.exclude_patterns[i]
+            regex_exclude = re.compile(exclude_pattern)
+            weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
+            logger.info(
+                f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}"
+            )
+        if len(weights_sd) != original_key_count:
+            remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
+            remaining_keys.sort()
+            logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
+            if len(weights_sd) == 0:
+                logger.warning(f"No keys left after filtering.")
+
         if args.lycoris:
             lycoris_net, _ = create_network_from_weights(
                 multiplier=lora_multiplier,
@@ -734,6 +788,9 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
     return scheduler, timesteps
 
 
+# Modify the run_sampling function in wan_generate_video.py
+# Replace the entire function with this implementation that properly handles tensor dimensions
+
 def run_sampling(
     model: WanModel,
     noise: torch.Tensor,
@@ -766,25 +823,76 @@ def run_sampling(
     arg_c, arg_null = inputs
 
     latent = noise
-    if use_cpu_offload:
-        latent = latent.to("cpu")
+    latent_storage_device = device if not use_cpu_offload else "cpu"
+    latent = latent.to(latent_storage_device)
 
+    # Get SLG parameters if available
+    slg_list = getattr(args, 'slg_layers', None)
+    slg_start = getattr(args, 'slg_start', 0.0)
+    slg_end = getattr(args, 'slg_end', 0.3)
     total_steps = len(timesteps)
 
-    for step_idx, t in enumerate(tqdm(timesteps)):
+    # cfg skip
+    apply_cfg_array = []
+    num_timesteps = len(timesteps)
+
+    if hasattr(args, 'cfg_skip_mode') and args.cfg_skip_mode != "none" and hasattr(args, 'cfg_apply_ratio') and args.cfg_apply_ratio is not None:
+        # Calculate thresholds based on cfg_apply_ratio
+        apply_steps = int(num_timesteps * args.cfg_apply_ratio)
+
+        if args.cfg_skip_mode == "early":
+            # Skip CFG in early steps, apply in late steps
+            start_index = num_timesteps - apply_steps
+            end_index = num_timesteps
+        elif args.cfg_skip_mode == "late":
+            # Skip CFG in late steps, apply in early steps
+            start_index = 0
+            end_index = apply_steps
+        elif args.cfg_skip_mode == "early_late":
+            # Skip CFG in early and late steps, apply in middle steps
+            start_index = (num_timesteps - apply_steps) // 2
+            end_index = start_index + apply_steps
+        elif args.cfg_skip_mode == "middle":
+            # Skip CFG in middle steps, apply in early and late steps
+            skip_steps = num_timesteps - apply_steps
+            middle_start = (num_timesteps - skip_steps) // 2
+            middle_end = middle_start + skip_steps
+
+        w = 0.0
+        for step_idx in range(num_timesteps):
+            if args.cfg_skip_mode == "alternate":
+                # accumulate w and apply CFG when w >= 1.0
+                w += args.cfg_apply_ratio
+                apply = w >= 1.0
+                if apply:
+                    w -= 1.0
+            elif args.cfg_skip_mode == "middle":
+                # Skip CFG in early and late steps, apply in middle steps
+                apply = step_idx < middle_start or step_idx >= middle_end
+            else:
+                # Apply CFG on some steps based on ratio
+                apply = step_idx >= start_index and step_idx < end_index
+
+            apply_cfg_array.append(apply)
+
+        pattern = ["A" if apply else "S" for apply in apply_cfg_array]
+        pattern = "".join(pattern)
+        logger.info(f"CFG skip mode: {args.cfg_skip_mode}, apply ratio: {args.cfg_apply_ratio}, pattern: {pattern}")
+    else:
+        # Apply CFG on all steps
+        apply_cfg_array = [True] * num_timesteps
+
+    for i, t in enumerate(tqdm(timesteps)):
         # Determine if SLG should be applied for this step
         slg_layers_local = None
-        if hasattr(args, 'slg_list') and args.slg_list is not None:
-            if int(args.slg_start * total_steps) <= step_idx < int(args.slg_end * total_steps):
-                slg_layers_local = args.slg_list
-        
-        # latent is on CPU if use_cpu_offload is True
-        # Important: model expects a list of latents in format [C, F, H, W]
-        # But our latent might be [1, C, F, H, W] or [C, F, H, W]
-        
-        # Check latent shape and ensure it's properly formatted for the model
+        if slg_list is not None:
+            if int(slg_start * total_steps) <= i < int(slg_end * total_steps):
+                slg_layers_local = slg_list
+
+        # Process latent tensor to ensure correct dimensionality
+        # Check if latent needs batch dimension adjustment
         if len(latent.shape) == 5 and latent.shape[0] == 1:  # [1, C, F, H, W]
-            # Remove the batch dimension to get [C, F, H, W]
+            # Remove batch dimension to get [C, F, H, W]
             latent_for_model = latent.squeeze(0)
         else:
             latent_for_model = latent
@@ -797,47 +905,52 @@ def run_sampling(
         timestep = torch.stack([t]).to(device)
 
         with accelerator.autocast(), torch.no_grad():
+            # Get conditional prediction
             noise_pred_cond = model(
                 latent_model_input, 
                 t=timestep, 
-                is_uncond=False, 
-                slg_layers=None, 
                 **arg_c
             )[0]
             
-            noise_pred_uncond = model(
-                latent_model_input, 
-                t=timestep, 
-                is_uncond=True, 
-                slg_layers=slg_layers_local, 
-                **arg_null
-            )[0]
-            
-            del latent_model_input
-
             if use_cpu_offload:
-                noise_pred_cond = noise_pred_cond.to("cpu")
-                noise_pred_uncond = noise_pred_uncond.to("cpu")
+                noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
-            # apply guidance
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            apply_cfg = apply_cfg_array[i]  # apply CFG or not
+            
+            if apply_cfg:
+                # Get unconditional prediction
+                noise_pred_uncond = model(
+                    latent_model_input, 
+                    t=timestep, 
+                    skip_block_indices=slg_layers_local,
+                    **arg_null
+                )[0]
+                
+                if use_cpu_offload:
+                    noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                
+                # Apply guidance
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred = noise_pred_cond
 
-            # step
             # Check if we need to add a batch dimension for the scheduler
             if len(latent.shape) == 4:  # [C, F, H, W]
-                latent_input = latent.unsqueeze(0)  # Add batch dimension [1, C, F, H, W]
+                latent_input = latent.unsqueeze(0)  # [1, C, F, H, W]
             else:
                 latent_input = latent
                 
+            # Step
             temp_x0 = scheduler.step(noise_pred.unsqueeze(0), t, latent_input, return_dict=False, generator=seed_g)[0]
 
-            # update latent - keep the same shape as input latent
+            # Update latent - preserve shape
             if len(latent.shape) == 4:  # [C, F, H, W]
-                latent = temp_x0.squeeze(0)  # Remove batch dimension
+                latent = temp_x0.squeeze(0)
             else:
                 latent = temp_x0
 
     return latent
+
 
 def generate(args: argparse.Namespace) -> torch.Tensor:
     """main function for generation

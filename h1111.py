@@ -67,7 +67,10 @@ def wanx_v2v_generate_video(
     lora1_multiplier=1.0,
     lora2_multiplier=1.0,
     lora3_multiplier=1.0,
-    lora4_multiplier=1.0
+    lora4_multiplier=1.0,
+    enable_cfg_skip=False,
+    cfg_skip_mode="none",
+    cfg_apply_ratio=0.7,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model in video-to-video mode"""
     global stop_event
@@ -131,19 +134,24 @@ def wanx_v2v_generate_video(
         "--video_path", input_video,  # This is the key for v2v mode
         "--strength", str(strength)   # Strength parameter for v2v
     ]
+    if enable_cfg_skip and cfg_skip_mode != "none":
+        command.extend([
+            "--cfg_skip_mode", cfg_skip_mode,
+            "--cfg_apply_ratio", str(cfg_apply_ratio)
+        ])
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
-            command.extend(["--slg-layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
+            command.extend(["--slg_layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
 
     # Handle SLG start/end timings
     try:
         if slg_start_float is not None and slg_start_float >= 0:
-            command.extend(["--slg-start", str(slg_start_float)])
+            command.extend(["--slg_start", str(slg_start_float)])
         if slg_end_float is not None and slg_end_float <= 1.0:
-            command.extend(["--slg-end", str(slg_end_float)])
+            command.extend(["--slg_end", str(slg_end_float)])
     except ValueError as e:
         print(f"Invalid SLG timing values: {str(e)}")
     
@@ -293,6 +301,9 @@ def wanx_v2v_batch_handler(
     slg_layers: str,
     slg_start: Optional[str],
     slg_end: Optional[str],
+    enable_cfg_skip: bool,
+    cfg_skip_mode: str,
+    cfg_apply_ratio: float,
     *lora_params
 ):
     """Handle batch generation for WanX v2v"""
@@ -356,7 +367,10 @@ def wanx_v2v_batch_handler(
             slg_start,
             slg_end,
             *lora_weights,
-            *lora_multipliers
+            *lora_multipliers,
+            enable_cfg_skip,
+            cfg_skip_mode,
+            cfg_apply_ratio,
         ):
             if videos:
                 all_videos.extend(videos)
@@ -1484,6 +1498,9 @@ def wanx_batch_handler(
     slg_layers: str,
     slg_start: Optional[str],
     slg_end: Optional[str],
+    enable_cfg_skip: bool,
+    cfg_skip_mode: str,
+    cfg_apply_ratio: float,
     *lora_params
 ):
     """Handle both folder-based batch processing and regular processing for all WanX tabs"""
@@ -1613,7 +1630,10 @@ def wanx_batch_handler(
                 lora_multipliers[0],
                 lora_multipliers[1],
                 lora_multipliers[2],
-                lora_multipliers[3]
+                lora_multipliers[3],
+                enable_cfg_skip,
+                cfg_skip_mode,
+                cfg_apply_ratio,
             ):
                 if videos:
                     all_videos.extend(videos)
@@ -1706,7 +1726,10 @@ def wanx_batch_handler(
                     lora_multipliers[0],
                     lora_multipliers[1],
                     lora_multipliers[2],
-                    lora_multipliers[3]
+                    lora_multipliers[3],
+                    enable_cfg_skip,
+                    cfg_skip_mode,
+                    cfg_apply_ratio,                    
                 ):
                     if videos:
                         all_videos.extend(videos)
@@ -2220,7 +2243,10 @@ def wanx_generate_video(
     lora1_multiplier=1.0,
     lora2_multiplier=1.0,
     lora3_multiplier=1.0,
-    lora4_multiplier=1.0
+    lora4_multiplier=1.0,
+    enable_cfg_skip=False,
+    cfg_skip_mode="none",
+    cfg_apply_ratio=0.7,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v and t2v)"""
     global stop_event
@@ -2287,6 +2313,11 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
+    if enable_cfg_skip and cfg_skip_mode != "none":
+        command.extend([
+            "--cfg_skip_mode", cfg_skip_mode,
+            "--cfg_apply_ratio", str(cfg_apply_ratio)
+        ])
     if wanx_input_end and wanx_input_end != "none" and os.path.exists(wanx_input_end):
         command.extend(["--end_image_path", str(wanx_input_end)])
         command.extend(["--trim_tail_frames", "3"])
@@ -2300,16 +2331,16 @@ def wanx_generate_video(
                 if layer.isdigit():  # Only add if it's a valid integer
                     slg_list.append(int(layer))
             if slg_list:  # Only add if we have valid layers
-                command.extend(["--slg-layers", ",".join(map(str, slg_list))])
+                command.extend(["--slg_layers", ",".join(map(str, slg_list))])
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
 
     # Handle SLG start/end timings
     try:
         if slg_start_float is not None and slg_start_float >= 0:
-            command.extend(["--slg-start", str(slg_start_float)])
+            command.extend(["--slg_start", str(slg_start_float)])
         if slg_end_float is not None and slg_end_float <= 1.0:
-            command.extend(["--slg-end", str(slg_end_float)])
+            command.extend(["--slg_end", str(slg_end_float)])
     except ValueError as e:
         print(f"Invalid SLG timing values: {str(e)}")
     
@@ -3430,9 +3461,8 @@ with gr.Blocks(
                     wanx_negative_prompt = gr.Textbox(
                         scale=3,
                         label="Negative Prompt",
-                        value="",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
                         lines=3,
-                        info="Leave empty to use default negative prompt"
                     )
 
                 with gr.Column(scale=1):
@@ -3565,6 +3595,21 @@ with gr.Blocks(
                 wanx_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
                 wanx_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
                 wanx_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")    
+            
+            with gr.Row():
+                wanx_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
+                with gr.Column(visible=False) as wanx_cfg_skip_options:
+                    wanx_cfg_skip_mode = gr.Radio(
+                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
+                        label="CFG Skip Mode",
+                        value="none",
+                        info="Controls which steps to apply CFG on"
+                    )
+                    wanx_cfg_apply_ratio = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
+                        label="CFG Apply Ratio", 
+                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
+                    )
 
         #WanX-t2v Tab
 
@@ -3685,6 +3730,21 @@ with gr.Blocks(
                 wanx_t2v_use_random_folder = gr.Checkbox(visible=False, value=False, label="Use Random Images")
                 wanx_t2v_input_folder = gr.Textbox(visible=False, value="", label="Image Folder")
                 wanx_t2v_input_end = gr.Textbox(visible=False, value="none", label="End Frame")
+            
+            with gr.Row():
+                wanx_t2v_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
+                with gr.Column(visible=False) as wanx_t2v_cfg_skip_options:
+                    wanx_t2v_cfg_skip_mode = gr.Radio(
+                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
+                        label="CFG Skip Mode",
+                        value="none",
+                        info="Controls which steps to apply CFG on"
+                    )
+                    wanx_t2v_cfg_apply_ratio = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
+                        label="CFG Apply Ratio", 
+                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
+                    )
 
         #WanX-v2v Tab
         with gr.Tab(id=6, label="WanX-v2v") as wanx_v2v_tab:
@@ -3807,6 +3867,21 @@ with gr.Blocks(
                 wanx_v2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
                 wanx_v2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
                 wanx_v2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
+
+            with gr.Row():
+                wanx_v2v_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
+                with gr.Column(visible=False) as wanx_v2v_cfg_skip_options:
+                    wanx_v2v_cfg_skip_mode = gr.Radio(
+                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
+                        label="CFG Skip Mode",
+                        value="none",
+                        info="Controls which steps to apply CFG on"
+                    )
+                    wanx_v2v_cfg_apply_ratio = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
+                        label="CFG Apply Ratio", 
+                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
+                    )
 
         #Video Info Tab
         with gr.Tab("Video Info") as video_info_tab:
@@ -3946,6 +4021,25 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
+    #Event handlers etc
+    wanx_enable_cfg_skip.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[wanx_enable_cfg_skip],
+        outputs=[wanx_cfg_skip_options]
+    )
+
+    wanx_t2v_enable_cfg_skip.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[wanx_t2v_enable_cfg_skip],
+        outputs=[wanx_t2v_cfg_skip_options]
+    )
+
+    wanx_v2v_enable_cfg_skip.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[wanx_v2v_enable_cfg_skip],
+        outputs=[wanx_v2v_cfg_skip_options]
+    )
+
     #WanX-v2v tab functions
     wanx_v2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_v2v_prompt, outputs=wanx_v2v_token_counter)
 
@@ -4082,6 +4176,9 @@ with gr.Blocks(
             wanx_v2v_slg_layers,
             wanx_v2v_slg_start,
             wanx_v2v_slg_end,
+            wanx_v2v_enable_cfg_skip,
+            wanx_v2v_cfg_skip_mode,
+            wanx_v2v_cfg_apply_ratio,
             *wanx_v2v_lora_weights,
             *wanx_v2v_lora_multipliers
         ],
@@ -5606,6 +5703,9 @@ with gr.Blocks(
             wanx_slg_layers,
             wanx_slg_start,
             wanx_slg_end,
+            wanx_enable_cfg_skip,
+            wanx_cfg_skip_mode,
+            wanx_cfg_apply_ratio,
             *wanx_lora_weights,
             *wanx_lora_multipliers,
             wanx_input  # Include input image path for non-batch mode
@@ -5731,6 +5831,9 @@ with gr.Blocks(
             wanx_t2v_slg_layers,
             wanx_t2v_slg_start,
             wanx_t2v_slg_end,
+            wanx_t2v_enable_cfg_skip,
+            wanx_t2v_cfg_skip_mode,
+            wanx_t2v_cfg_apply_ratio,
             *wanx_t2v_lora_weights,
             *wanx_t2v_lora_multipliers
         ],
