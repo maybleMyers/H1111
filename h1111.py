@@ -30,6 +30,321 @@ stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
 
+def wanx_extend_video_wrapper(
+    prompt, negative_prompt, input_image, base_video_path,
+    width, height, video_length, fps, infer_steps, 
+    flow_shift, guidance_scale, seed, 
+    task, dit_path, vae_path, t5_path, clip_path,
+    save_path, output_type, sample_solver, exclude_single_blocks,
+    attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
+    slg_layers="", slg_start=0.0, slg_end=1.0,
+    lora1="None", lora2="None", lora3="None", lora4="None",
+    lora1_multiplier=1.0, lora2_multiplier=1.0, lora3_multiplier=1.0, lora4_multiplier=1.0,
+    enable_cfg_skip=False, cfg_skip_mode="none", cfg_apply_ratio=0.7
+):
+    """Direct wrapper that bypasses the problematic wanx_generate_video function"""
+    global stop_event
+    
+    # All videos generated
+    all_videos = []
+    
+    # Debug print to understand what we're getting
+    print(f"DEBUG - Received parameters:")
+    print(f"  task: {task}")
+    print(f"  dit_path: {dit_path}")
+    print(f"  vae_path: {vae_path}")
+    print(f"  t5_path: {t5_path}")
+    print(f"  output_type: {output_type}")
+    print(f"  sample_solver: {sample_solver}")
+    print(f"  attn_mode: {attn_mode}")
+    print(f"  block_swap: {block_swap}")
+    print(f"  enable_cfg_skip: {enable_cfg_skip}")
+    print(f"  cfg_skip_mode: {cfg_skip_mode}")
+    print(f"  cfg_apply_ratio: {cfg_apply_ratio}")
+    
+    # Get current seed
+    current_seed = seed
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    
+    # Correct known parameter issues
+    # 1. Fix task - ensure it's just the task name, not a path
+    corrected_task = "i2v-14B"
+    if isinstance(task, str) and not "/" in task and not "\\" in task:
+        corrected_task = task
+    
+    # 2. Fix file paths - use proper paths when necessary
+    corrected_dit_path = dit_path
+    if not isinstance(dit_path, str) or "mp_rank" in dit_path or not dit_path.endswith((".safetensors", ".pt")):
+        corrected_dit_path = "wan/wan2.1_i2v_480p_14B_bf16.safetensors"
+        
+    corrected_vae_path = vae_path
+    if not isinstance(vae_path, str) or not vae_path.endswith((".pth", ".safetensors")):
+        corrected_vae_path = "wan/Wan2.1_VAE.pth"
+        
+    corrected_t5_path = t5_path
+    if not isinstance(t5_path, str) or not "t5" in t5_path.lower():
+        corrected_t5_path = "wan/models_t5_umt5-xxl-enc-bf16.pth"
+        
+    corrected_clip_path = clip_path
+    if not isinstance(clip_path, str) or not "clip" in clip_path.lower():
+        corrected_clip_path = "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    
+    # 3. Fix attention mode - ensure it's a valid string
+    attn_modes = ["flash", "sdpa", "sageattn", "xformers", "torch"]
+    corrected_attn_mode = "flash"  # Use flash as default since it worked
+    if isinstance(attn_mode, str) and attn_mode in attn_modes:
+        corrected_attn_mode = attn_mode
+    
+    # 4. Fix sample solver - ensure it's a valid string
+    corrected_sample_solver = "unipc"
+    sample_solvers = ["unipc", "dpm++", "vanilla"]
+    if isinstance(sample_solver, str) and sample_solver in sample_solvers:
+        corrected_sample_solver = sample_solver
+    elif isinstance(output_type, str) and output_type in sample_solvers:
+        corrected_sample_solver = output_type
+        
+    # 5. Fix block swap - ensure it's an integer and keep the original value if it's reasonable
+    corrected_block_swap = 26  # Default to 26 which seems to work well
+    if isinstance(block_swap, (int, float)) and 0 <= int(block_swap) <= 39:
+        corrected_block_swap = int(block_swap)
+    
+    # 6. Fix output type - ensure it's a valid string
+    corrected_output_type = "video"
+    output_types = ["video", "images", "latent", "both"]
+    if isinstance(output_type, str) and output_type in output_types:
+        corrected_output_type = output_type
+    
+    # 7. Fix save path - preserve original if it looks valid
+    corrected_save_path = save_path
+    if not isinstance(save_path, str) or len(save_path) < 1:
+        corrected_save_path = "outputs"
+    
+    # Prepare environment
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    
+    # Clear CUDA cache
+    clear_cuda_cache()
+    
+    # Build command array with explicit string conversions for EVERY parameter
+    command = [
+        sys.executable,
+        "wan_generate_video.py",
+        "--task", corrected_task,
+        "--prompt", str(prompt),
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", corrected_save_path,
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift),
+        "--guidance_scale", str(guidance_scale),
+        "--output_type", corrected_output_type,
+        "--attn_mode", corrected_attn_mode,
+        "--blocks_to_swap", str(corrected_block_swap),
+        "--dit", corrected_dit_path,
+        "--vae", corrected_vae_path,
+        "--t5", corrected_t5_path,
+        "--sample_solver", corrected_sample_solver
+    ]
+    
+    # Add image path
+    if input_image:
+        command.extend(["--image_path", str(input_image)])
+        command.extend(["--clip", corrected_clip_path])
+    
+    # Add negative prompt
+    if negative_prompt:
+        command.extend(["--negative_prompt", str(negative_prompt)])
+    
+    # Handle boolean flags - keep original values
+    if fp8:
+        command.append("--fp8")
+    
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    
+    if fp8_t5:
+        command.append("--fp8_t5")
+        
+    if exclude_single_blocks:
+        command.append("--exclude_single_blocks")
+    
+    # Add SLG parameters
+    try:
+        if slg_start is not None and float(slg_start) >= 0:
+            command.extend(["--slg_start", str(float(slg_start))])
+    except (ValueError, TypeError):
+        pass
+        
+    try:
+        if slg_end is not None and float(slg_end) <= 1.0:
+            command.extend(["--slg_end", str(float(slg_end))])
+    except (ValueError, TypeError):
+        pass
+    
+    # Handle LoRA weights and multipliers
+    valid_loras = []
+    if lora_folder and isinstance(lora_folder, str):
+        for weight, mult in zip([lora1, lora2, lora3, lora4], 
+                               [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+            # Skip None or empty values
+            if not weight or str(weight).lower() == "none":
+                continue
+                
+            # Construct path and check existence
+            full_path = os.path.join(str(lora_folder), str(weight))
+            if not os.path.exists(full_path):
+                print(f"LoRA file not found: {full_path}")
+                continue
+                
+            # Add valid LoRA
+            valid_loras.append((full_path, str(mult)))
+    
+    if valid_loras:
+        weights = [w for w, _ in valid_loras]
+        multipliers = [m for _, m in valid_loras]
+        command.extend(["--lora_weight"] + weights)
+        command.extend(["--lora_multiplier"] + multipliers)
+    
+    # Final conversion to ensure all elements are strings
+    command = [str(item) for item in command]
+    
+    print(f"Running: {' '.join(command)}")
+    
+    # Process execution
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+    
+    videos = []
+    
+    # Process stdout in real time
+    while True:
+        if stop_event.is_set():
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
+        
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
+            
+        print(line, end='')
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+    
+    p.stdout.close()
+    p.wait()
+    
+    # Clean CUDA cache and wait
+    clear_cuda_cache()
+    time.sleep(0.5)
+    
+    # Find generated video
+    save_path_abs = os.path.abspath(corrected_save_path)
+    if os.path.exists(save_path_abs):
+        all_videos = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        
+        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
+        if matching_videos:
+            video_path = os.path.join(save_path_abs, matching_videos[0])
+            
+            # Add metadata
+            parameters = {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "video_length": video_length,
+                "fps": fps,
+                "infer_steps": infer_steps,
+                "seed": current_seed,
+                "task": corrected_task,
+                "flow_shift": flow_shift,
+                "guidance_scale": guidance_scale,
+                "negative_prompt": negative_prompt if negative_prompt else None
+            }
+            
+            add_metadata_to_video(video_path, parameters)
+            videos.append((str(video_path), f"Seed: {current_seed}"))
+    
+    # Stop here if no videos were generated
+    if not videos:
+        yield [], "Failed to generate any videos", ""
+        return
+    
+    # Now concatenate with base video if we have videos and base_video_path
+    if videos and base_video_path and os.path.exists(base_video_path):
+        try:
+            print(f"Extending base video: {base_video_path}")
+            
+            # Create unique output filename
+            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+            output_filename = f"extended_{timestamp}_seed{current_seed}_{Path(base_video_path).stem}.mp4"
+            output_path = os.path.join(corrected_save_path, output_filename)
+            
+            # Extract the path from the gallery item
+            new_video_path = videos[0][0] if isinstance(videos[0], tuple) else videos[0]
+            
+            # Create a temporary file list for ffmpeg
+            list_file = os.path.join(corrected_save_path, f"temp_list_{current_seed}.txt")
+            with open(list_file, "w") as f:
+                f.write(f"file '{os.path.abspath(base_video_path)}'\n")
+                f.write(f"file '{os.path.abspath(new_video_path)}'\n")
+            
+            print(f"Concatenating: {base_video_path} + {new_video_path}")
+            
+            # Run ffmpeg concatenation
+            concat_command = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c", "copy",
+                "-y",
+                output_path
+            ]
+            
+            # Convert all to strings
+            concat_command = [str(item) for item in concat_command]
+            
+            subprocess.run(concat_command, check=True, capture_output=True)
+            
+            # Clean up temporary file
+            if os.path.exists(list_file):
+                os.remove(list_file)
+                
+            # Return the extended video if successful
+            if os.path.exists(output_path):
+                extended_video = [(output_path, f"Extended (Seed: {current_seed})")]
+                print(f"Successfully created extended video: {output_path}")
+                yield extended_video, "Extended video created successfully", ""
+                return
+            else:
+                print(f"Failed to create extended video at {output_path}")
+        except Exception as e:
+            print(f"Error creating extended video: {str(e)}")
+    
+    # If we got here, extension failed but generation succeeded
+    yield videos, "Generated video (extension failed)", ""
+
 def wanx_v2v_generate_video(
     prompt, 
     negative_prompt,
@@ -2378,16 +2693,19 @@ def wanx_generate_video(
     valid_loras = []
     for weight, mult in zip(lora_weights, lora_multipliers):
         # Skip None, empty, or "None" values
-        if not weight or weight == "None":
+        if weight is None or not str(weight) or str(weight).lower() == "none":
             continue
         
+        # Ensure weight is a string
+        weight_str = str(weight)
+
         # Construct full path and verify file exists
-        full_path = os.path.join(lora_folder, weight)
+        full_path = os.path.join(lora_folder, weight_str)
         if not os.path.exists(full_path):
             print(f"LoRA file not found: {full_path}")
             continue
-            
-        # Add valid LoRA to the list
+
+            # Add valid LoRA to the list
         valid_loras.append((full_path, mult))
 
     # Only add LoRA parameters if we have valid LoRAs
@@ -2397,7 +2715,8 @@ def wanx_generate_video(
         command.extend(["--lora_weight"] + weights)
         command.extend(["--lora_multiplier"] + multipliers)
     
-    print(f"Running: {' '.join(command)}")
+    str_command = [str(arg) for arg in command]
+    print(f"Running: {' '.join(str_command)}")
 
     p = subprocess.Popen(
         command,
@@ -2771,15 +3090,29 @@ def wanx_extend_single_video(
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
     slg_layers="", slg_start=0.0, slg_end=1.0,
     lora1="None", lora2="None", lora3="None", lora4="None",
-    lora1_multiplier=1.0, lora2_multiplier=1.0, lora3_multiplier=1.0, lora4_multiplier=1.0):
+    lora1_multiplier=1.0, lora2_multiplier=1.0, lora3_multiplier=1.0, lora4_multiplier=1.0
+):
     """Generate a single video and concatenate with base video"""
-    # First, generate the video
+    # First, generate the video with proper parameter handling
     all_videos = []
     
-    # Split lora params
-    num_lora_weights = 4
-    lora_weights = lora_params[:num_lora_weights]
-    lora_multipliers = lora_params[num_lora_weights:num_lora_weights*2]
+    # Sanitize lora parameters
+    lora_weights = [str(lora1) if lora1 is not None else "None", 
+                   str(lora2) if lora2 is not None else "None", 
+                   str(lora3) if lora3 is not None else "None", 
+                   str(lora4) if lora4 is not None else "None"]
+    
+    # Convert multipliers to float
+    try:
+        lora_multipliers = [float(lora1_multiplier), float(lora2_multiplier), 
+                           float(lora3_multiplier), float(lora4_multiplier)]
+    except (ValueError, TypeError):
+        # Fallback to defaults if conversion fails
+        lora_multipliers = [1.0, 1.0, 1.0, 1.0]
+    
+    # Debug print
+    print(f"Sanitized LoRA weights: {lora_weights}")
+    print(f"Sanitized LoRA multipliers: {lora_multipliers}")
     
     # Generate video
     for videos, status, progress in wanx_generate_video(
@@ -2789,7 +3122,12 @@ def wanx_extend_single_video(
         save_path, output_type, sample_solver, exclude_single_blocks,
         attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
         slg_layers, slg_start, slg_end,
-        lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
+        lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+        lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3],
+        enable_cfg_skip=False,
+        cfg_skip_mode="none",
+        cfg_apply_ratio=0.7
+    ):
         
         # Keep track of generated videos
         if videos:
@@ -2799,9 +3137,9 @@ def wanx_extend_single_video(
         yield all_videos, status, progress
     
     # Now concatenate with base video if we have something
-    if all_videos and base_video_path:
+    if all_videos and base_video_path and os.path.exists(base_video_path):
         try:
-            print(f"Attempting to extend base video {base_video_path} with new video")
+            print(f"Extending base video: {base_video_path}")
             
             # Create unique output filename
             timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
@@ -2817,9 +3155,7 @@ def wanx_extend_single_video(
                 f.write(f"file '{os.path.abspath(base_video_path)}'\n")
                 f.write(f"file '{os.path.abspath(new_video_path)}'\n")
             
-            print(f"Created list file at {list_file} with content:")
-            print(f"file '{os.path.abspath(base_video_path)}'")
-            print(f"file '{os.path.abspath(new_video_path)}'")
+            print(f"Concatenating: {base_video_path} + {new_video_path}")
             
             # Run ffmpeg concatenation
             command = [
@@ -2832,7 +3168,6 @@ def wanx_extend_single_video(
                 output_path
             ]
             
-            print(f"Running command: {' '.join(command)}")
             subprocess.run(command, check=True, capture_output=True)
             
             # Clean up temporary file
@@ -2856,12 +3191,14 @@ def wanx_extend_single_video(
 def process_batch_extension(
     prompt, negative_prompt, input_image, base_video,
     width, height, video_length, fps, infer_steps,
-    flow_shift, guidance_scale, seed, batch_size,  # Added batch_size parameter here
+    flow_shift, guidance_scale, seed, batch_size,
     task, dit_path, vae_path, t5_path, clip_path,
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
     slg_layers, slg_start, slg_end,
-    lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
+    lora1, lora2, lora3, lora4, 
+    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier
+):
     """Process a batch of video extensions one at a time"""
     global stop_event
     stop_event.clear()
@@ -2870,8 +3207,16 @@ def process_batch_extension(
     progress_text = "Starting video extension batch..."
     yield [], progress_text, ""
     
-    # Ensure batch_size is treated as an integer
-    batch_size = int(batch_size)
+    try:
+        # Ensure batch_size is treated as an integer
+        batch_size = int(batch_size)
+    except (ValueError, TypeError):
+        batch_size = 1
+    
+    # Ensure base_video exists
+    if not base_video or not os.path.exists(base_video):
+        yield [], "Error: Base video not found", f"Cannot find video at {base_video}"
+        return
     
     # Process each batch item independently
     for i in range(batch_size):
@@ -2889,8 +3234,8 @@ def process_batch_extension(
         batch_text = f"Processing video {i+1}/{batch_size} (seed: {current_seed})"
         yield all_extended_videos, batch_text, progress_text
         
-        # Generate and extend one video
-        for videos, status, progress in wanx_extend_single_video(
+        # Use the direct wrapper
+        for videos, status, progress in wanx_extend_video_wrapper(
             prompt, negative_prompt, input_image, base_video,
             width, height, video_length, fps, infer_steps,
             flow_shift, guidance_scale, current_seed,
@@ -2898,8 +3243,9 @@ def process_batch_extension(
             save_path, output_type, sample_solver, exclude_single_blocks,
             attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
             slg_layers, slg_start, slg_end,
-            lora1, lora2, lora3, lora4, lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier):
-            
+            lora1, lora2, lora3, lora4,
+            lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier
+        ):
             # If we got extended videos, add them to our collection
             if videos:
                 if any("Extended" in v[1] if isinstance(v, tuple) else False for v in videos):
@@ -4338,30 +4684,20 @@ with gr.Blocks(
         inputs=[wanx_batch_size, wanx_base_video],
         outputs=[wanx_batch_progress]
     ).then(
-        # Generate and extend videos one at a time
-        fn=wanx_batch_handler,  # Use wanx_batch_handler instead of process_batch_extension
+        # Process batch extension one at a time
+        fn=process_batch_extension,
         inputs=[
-            gr.Checkbox(value=False),  # Not using random folder
-            wanx_prompt, wanx_negative_prompt,
-            wanx_width, wanx_height, wanx_video_length,
-            wanx_fps, wanx_infer_steps, wanx_flow_shift,
-            wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_input_folder,  # Not used but needed for function signature
-            wanx_input_end,
-            wanx_task,
-            wanx_dit_path, wanx_vae_path, wanx_t5_path,
-            wanx_clip_path, wanx_save_path, wanx_output_type,
-            wanx_sample_solver, wanx_exclude_single_blocks,
-            wanx_attn_mode, wanx_block_swap, wanx_fp8,
-            wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
-            wanx_slg_layers, wanx_slg_start, wanx_slg_end,  
-            *wanx_lora_weights, *wanx_lora_multipliers, wanx_input  # Include input image
+            wanx_prompt, wanx_negative_prompt, wanx_input, wanx_base_video,
+            wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
+            wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
+            wanx_save_path, wanx_output_type, wanx_sample_solver, wanx_exclude_single_blocks,
+            wanx_attn_mode, wanx_block_swap, wanx_fp8, wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
+            wanx_slg_layers, wanx_slg_start, wanx_slg_end,
+            wanx_lora_weights[0], wanx_lora_weights[1], wanx_lora_weights[2], wanx_lora_weights[3],
+            wanx_lora_multipliers[0], wanx_lora_multipliers[1], wanx_lora_multipliers[2], wanx_lora_multipliers[3]
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
-    ).then(
-        fn=concat_batch_videos,
-        inputs=[wanx_base_video, wanx_output, wanx_save_path],
-        outputs=[wanx_output, wanx_progress_text]
     )
 
     # Extract and send sharpest frame to input
