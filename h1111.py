@@ -4738,20 +4738,20 @@ with gr.Blocks(
     )
 
     #Video Info
-    def handle_send_to_wanx_tab(metadata, target_tab):
+    def handle_send_to_wanx_tab(metadata, target_tab, video_path=None):
         """Common handler for sending video parameters to WanX tabs"""
         if not metadata:
-            return "No parameters to send", {}
-
+            return "No parameters to send", {}, None  # Return three values
+    
         # Tab names for clearer messages
         tab_names = {
             'wanx_i2v': 'WanX-i2v',
             'wanx_t2v': 'WanX-t2v',
             'wanx_v2v': 'WanX-v2v'
         }
-
+    
         # Just pass through all parameters - we'll use them in the .then() function
-        return f"Parameters ready for {tab_names.get(target_tab, target_tab)}", metadata
+        return f"Parameters ready for {tab_names.get(target_tab, target_tab)}", metadata, video_path
 
     def change_to_wanx_i2v_tab():
         return gr.Tabs(selected=4)  # WanX-i2v tab index
