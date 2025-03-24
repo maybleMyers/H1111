@@ -4623,9 +4623,9 @@ with gr.Blocks(
 
     # Next, connect the button to the functions with proper parameter mapping
     send_to_wanx_v2v_btn.click(
-        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_v2v'),
-        inputs=[metadata_output],
-        outputs=[status, params_state]
+        fn=lambda m, v: handle_send_to_wanx_tab(m, 'wanx_v2v', v),
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, wanx_v2v_input]
     ).then(
         lambda params: [
             params.get("prompt", ""),
@@ -4718,33 +4718,23 @@ with gr.Blocks(
         outputs=[wanx_base_video, wanx_sharpest_frame_status]
     )
 
-    # Event handler for extending with the trimmed video
     wanx_extend_with_trimmed_btn.click(
         fn=prepare_for_batch_extension,
         inputs=[wanx_input, wanx_trimmed_video_path, wanx_batch_size],
         outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
     ).then(
-        fn=wanx_batch_handler,
+        fn=process_batch_extension,
         inputs=[
-            gr.Checkbox(value=False),  # Not using random folder
-            wanx_prompt, wanx_negative_prompt,
-            wanx_width, wanx_height, wanx_video_length,
-            wanx_fps, wanx_infer_steps, wanx_flow_shift,
-            wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_input_folder,  # Not used but needed for function signature
-            wanx_task,
-            wanx_dit_path, wanx_vae_path, wanx_t5_path,
-            wanx_clip_path, wanx_save_path, wanx_output_type,
-            wanx_sample_solver, wanx_exclude_single_blocks,
-            wanx_attn_mode, wanx_block_swap, wanx_fp8,
-            wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,  # Add the new parameter
-            *wanx_lora_weights, *wanx_lora_multipliers, wanx_input  # Include input image
+            wanx_prompt, wanx_negative_prompt, wanx_input, wanx_trimmed_video_path,
+            wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
+            wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
+            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
+            wanx_save_path, wanx_output_type, wanx_sample_solver, wanx_exclude_single_blocks,
+            wanx_attn_mode, wanx_block_swap, wanx_fp8, wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
+            wanx_slg_layers, wanx_slg_start, wanx_slg_end,
+            *wanx_lora_weights, *wanx_lora_multipliers
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
-    ).then(
-        fn=concat_batch_videos,
-        inputs=[wanx_trimmed_video_path, wanx_output, wanx_save_path],
-        outputs=[wanx_output, wanx_progress_text]
     )
 
     #Video Info
@@ -4756,7 +4746,8 @@ with gr.Blocks(
         # Tab names for clearer messages
         tab_names = {
             'wanx_i2v': 'WanX-i2v',
-            'wanx_t2v': 'WanX-t2v'
+            'wanx_t2v': 'WanX-t2v',
+            'wanx_v2v': 'WanX-v2v'
         }
 
         # Just pass through all parameters - we'll use them in the .then() function
