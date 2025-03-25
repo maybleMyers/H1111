@@ -172,6 +172,8 @@ def parse_args() -> argparse.Namespace:
         default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
         help="Torch.compile settings",
     )
+    parser.add_argument("--v2v_with_i2v", action="store_true", help="Use I2V model for video-to-video inference")
+
 
     args = parser.parse_args()
 
@@ -180,6 +182,7 @@ def parse_args() -> argparse.Namespace:
     ), "latent_path is only supported for images or video output"
 
     return args
+
 
 
 def get_task_defaults(task: str, size: Optional[Tuple[int, int]] = None) -> Tuple[int, float, int, bool]:
@@ -742,6 +745,178 @@ def prepare_i2v_inputs(
 
     return noise, context, context_null, y, (arg_c, arg_null)
 
+def prepare_v2v_i2v_inputs(
+    args: argparse.Namespace, 
+    cfg, 
+    accelerator: Accelerator, 
+    device: torch.device, 
+    vae: WanVAE,
+    video_latents: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+    """Prepare inputs for Video2Video using I2V model
+    
+    This function prepares the inputs needed for video-to-video inference using the I2V model.
+    It extracts the first frame from the video and uses it as the image condition for I2V.
+    
+    Args:
+        args: Command line arguments
+        cfg: Model configuration
+        accelerator: Accelerator instance
+        device: Device to use
+        vae: VAE model, used for image encoding
+        video_latents: Encoded latent representation of input video
+        
+    Returns:
+        Tuple containing (noise, context, context_null, y, (arg_c, arg_null))
+    """
+    # Get dimensions directly from the latent
+    if len(video_latents.shape) == 5:  # [B, C, F, H, W]
+        batch_size, channels, lat_f, lat_h, lat_w = video_latents.shape
+        video_latents = video_latents.squeeze(0)  # Remove batch dimension if present
+    else:  # [C, F, H, W]
+        channels, lat_f, lat_h, lat_w = video_latents.shape
+    
+    logger.info(f"Video latent dimensions: channels={channels}, frames={lat_f}, height={lat_h}, width={lat_w}")
+    
+    # Calculate equivalent pixel dimensions
+    h = lat_h * cfg.vae_stride[1]
+    w = lat_w * cfg.vae_stride[2]
+    frames = (lat_f - 1) * cfg.vae_stride[0] + 1
+    
+    # Calculate spatial tokens per frame using the model's patch size
+    patch_h, patch_w = cfg.patch_size[1], cfg.patch_size[2]
+    spatial_tokens = (lat_h * lat_w) // (patch_h * patch_w)
+    
+    # Calculate the sequence length based on actual latent dimensions
+    seq_len = spatial_tokens * lat_f
+    logger.info(f"Calculated sequence length: {seq_len} (spatial tokens per frame: {spatial_tokens})")
+    
+    # Configure negative prompt
+    n_prompt = args.negative_prompt if args.negative_prompt else cfg.sample_neg_prompt
+    
+    # Set seed
+    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    args.seed = seed  # Update args for consistency
+    
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
+    
+    # Load text encoder
+    text_encoder = load_text_encoder(args, cfg, device)
+    text_encoder.model.to(device)
+    
+    # Encode prompt
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=cfg.t5_dtype):
+                context = text_encoder([args.prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        else:
+            context = text_encoder([args.prompt], device)
+            context_null = text_encoder([n_prompt], device)
+    
+    # Free text encoder and clean memory
+    del text_encoder
+    clean_memory_on_device(device)
+    
+    # Extract the first frame from the video latents for I2V conditioning
+    logger.info("Extracting first frame from video for I2V conditioning")
+    
+    # Move VAE to device for decoding/encoding
+    vae.to_device(device)
+    
+    # Get the first frame latent
+    first_frame_latent = video_latents[:, 0:1].clone()  # [C, 1, H, W]
+    
+    # Decode first frame to pixels (we need it for CLIP)
+    with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+        # Decode first frame to pixels
+        first_frame_pixels = vae.decode([first_frame_latent])[0]  # [C, 1, H, W]
+        first_frame_pixels = first_frame_pixels[:, 0]  # [C, H, W]
+        logger.info(f"Decoded first frame from latent: {first_frame_pixels.shape}")
+    
+    # Generate noise
+    noise = torch.randn(channels, lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=device)
+    
+    # Apply strength parameter by mixing noise with video latents if requested
+    if args.strength < 1.0:
+        # Calculate number of inference steps based on strength
+        num_inference_steps = max(1, int(args.infer_steps * args.strength))
+        
+        # Get timesteps
+        if args.sample_solver == "unipc":
+            scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=cfg.num_train_timesteps, shift=1, use_dynamic_shifting=False)
+            scheduler.set_timesteps(args.infer_steps, device=device, shift=args.flow_shift)
+            timesteps = scheduler.timesteps
+        elif args.sample_solver == "dpm++":
+            sampling_sigmas = get_sampling_sigmas(args.infer_steps, args.flow_shift)
+            timesteps, _ = retrieve_timesteps(
+                FlowDPMSolverMultistepScheduler(num_train_timesteps=cfg.num_train_timesteps), 
+                device=device, 
+                sigmas=sampling_sigmas
+            )
+        else:
+            scheduler = FlowMatchDiscreteScheduler(num_train_timesteps=cfg.num_train_timesteps, shift=args.flow_shift)
+            scheduler.set_timesteps(args.infer_steps, device=device)
+            timesteps = scheduler.timesteps
+        
+        # Get starting timestep based on strength
+        t_start_idx = len(timesteps) - num_inference_steps
+        t_start = timesteps[t_start_idx]
+        
+        # Mix noise and video latents based on starting timestep
+        t_value = t_start / 1000.0  # Normalize to 0-1 range
+        logger.info(f"Mixing noise and video latents with t_value: {t_value} (strength: {args.strength})")
+        noise = noise * t_value + video_latents * (1.0 - t_value)
+    
+    # Load CLIP model
+    clip = load_clip_model(args, cfg, device)
+    clip.model.to(device)
+    
+    # Encode image to CLIP context
+    logger.info(f"Encoding first frame to CLIP context")
+    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+        clip_context = clip.visual([first_frame_pixels])
+    logger.info(f"CLIP encoding complete")
+    
+    # Free CLIP model and clean memory
+    del clip
+    clean_memory_on_device(device)
+    
+    # Create conditioning mask for I2V
+    # For I2V, we need to create a mask where the first frame is 1 and others are 0
+    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device)
+    msk[:, 0] = 1
+    
+    # Create y tensor for conditioning
+    # We use the first 4 channels of video_latents for conditioning
+    # If there are less than 4 channels, we pad with zeros
+    if channels >= 4:
+        latent_conditioning = video_latents[:4].clone()
+    else:
+        latent_conditioning = torch.zeros(4, lat_f, lat_h, lat_w, device=device)
+        latent_conditioning[:channels] = video_latents
+    
+    # Combine mask and conditioning
+    y = torch.cat([msk, latent_conditioning], dim=0)
+    
+    # Prepare model input arguments for I2V
+    arg_c = {
+        "context": [context[0]],  # Conditional context
+        "clip_fea": clip_context,  # CLIP image features
+        "seq_len": seq_len,        # Sequence length
+        "y": [y],                  # Image conditioning
+    }
+    
+    arg_null = {
+        "context": context_null,   # Unconditional context
+        "clip_fea": clip_context,  # CLIP image features (same for both)
+        "seq_len": seq_len,        # Sequence length
+        "y": [y],                  # Image conditioning (same for both)
+    }
+    
+    return noise, context, context_null, y, (arg_c, arg_null)
+
 
 def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> Tuple[Any, torch.Tensor]:
     """setup scheduler for sampling
@@ -788,9 +963,6 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
     return scheduler, timesteps
 
 
-# Modify the run_sampling function in wan_generate_video.py
-# Replace the entire function with this implementation that properly handles tensor dimensions
-
 def run_sampling(
     model: WanModel,
     noise: torch.Tensor,
@@ -804,7 +976,8 @@ def run_sampling(
     is_i2v: bool = False,
     use_cpu_offload: bool = True,
 ) -> torch.Tensor:
-    """run sampling
+    """run sampling with support for both T2V and I2V (including V2V with I2V) modes
+    
     Args:
         model: dit model
         noise: initial noise
@@ -817,11 +990,13 @@ def run_sampling(
         accelerator: Accelerator instance
         is_i2v: I2V mode (False means T2V mode)
         use_cpu_offload: Whether to offload tensors to CPU during processing
+        
     Returns:
         torch.Tensor: generated latent
     """
     arg_c, arg_null = inputs
 
+    # Ensure noise has correct dimensions regardless of mode
     latent = noise
     latent_storage_device = device if not use_cpu_offload else "cpu"
     latent = latent.to(latent_storage_device)
@@ -831,6 +1006,8 @@ def run_sampling(
     slg_start = getattr(args, 'slg_start', 0.0)
     slg_end = getattr(args, 'slg_end', 0.3)
     total_steps = len(timesteps)
+    slg_mode = getattr(args, 'slg_mode', None)
+    slg_scale = getattr(args, 'slg_scale', 3.0)
 
     # cfg skip
     apply_cfg_array = []
@@ -885,9 +1062,14 @@ def run_sampling(
     for i, t in enumerate(tqdm(timesteps)):
         # Determine if SLG should be applied for this step
         slg_layers_local = None
-        if slg_list is not None:
+        if slg_list is not None and slg_mode is not None:
             if int(slg_start * total_steps) <= i < int(slg_end * total_steps):
                 slg_layers_local = slg_list
+                if slg_mode != "original" and slg_mode != "uncond":
+                    logger.warning(f"Unsupported SLG mode: {slg_mode}, defaulting to 'original'")
+                    slg_mode = "original"
+                
+                logger.debug(f"Applying SLG at step {i} with mode {slg_mode}")
 
         # Process latent tensor to ensure correct dimensionality
         # Check if latent needs batch dimension adjustment
@@ -918,20 +1100,63 @@ def run_sampling(
             apply_cfg = apply_cfg_array[i]  # apply CFG or not
             
             if apply_cfg:
-                # Get unconditional prediction
-                noise_pred_uncond = model(
-                    latent_model_input, 
-                    t=timestep, 
-                    skip_block_indices=slg_layers_local,
-                    **arg_null
-                )[0]
-                
-                if use_cpu_offload:
-                    noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
-                
-                # Apply guidance
-                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                # Handle SLG mode
+                if slg_layers_local is not None and slg_mode == "uncond":
+                    # In uncond mode, we use SLG prediction as the unconditional prediction
+                    noise_pred_uncond = model(
+                        latent_model_input, 
+                        t=timestep, 
+                        skip_block_indices=slg_layers_local,
+                        **arg_null
+                    )[0]
+                    
+                    if use_cpu_offload:
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                    
+                    # Apply guidance
+                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                elif slg_layers_local is not None and slg_mode == "original":
+                    # Get unconditional prediction
+                    noise_pred_uncond = model(
+                        latent_model_input, 
+                        t=timestep, 
+                        **arg_null
+                    )[0]
+                    
+                    if use_cpu_offload:
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                    
+                    # Get SLG prediction (skip specified blocks)
+                    noise_pred_slg = model(
+                        latent_model_input, 
+                        t=timestep, 
+                        skip_block_indices=slg_layers_local,
+                        **arg_c
+                    )[0]
+                    
+                    if use_cpu_offload:
+                        noise_pred_slg = noise_pred_slg.to(latent_storage_device)
+                    
+                    # Combine predictions:
+                    # 1. Standard CFG: uncond + guidance_scale * (cond - uncond)
+                    # 2. SLG influence: slg_scale * (standard_cfg - slg)
+                    standard_cfg = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = standard_cfg + slg_scale * (standard_cfg - noise_pred_slg)
+                else:
+                    # Standard CFG without SLG
+                    noise_pred_uncond = model(
+                        latent_model_input, 
+                        t=timestep, 
+                        **arg_null
+                    )[0]
+                    
+                    if use_cpu_offload:
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                    
+                    # Apply guidance
+                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
+                # No CFG, just use conditional prediction
                 noise_pred = noise_pred_cond
 
             # Check if we need to add a batch dimension for the scheduler
@@ -963,6 +1188,8 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     """
     device = torch.device(args.device)
 
+    # Get original task for configuration
+    original_task = args.task
     cfg = WAN_CONFIGS[args.task]
 
     # select dtype
@@ -993,6 +1220,19 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     # I2V or T2V or V2V
     is_i2v = "i2v" in args.task
     is_v2v = args.video_path is not None
+    v2v_with_i2v = is_v2v and args.v2v_with_i2v
+    
+    # If we're using v2v_with_i2v mode, switch to the i2v task
+    if v2v_with_i2v and not is_i2v:
+        logger.info(f"Switching from task {args.task} to the corresponding I2V task for V2V+I2V mode")
+        # Extract the model size part (e.g., 14B from t2v-14B)
+        model_size = args.task.split('-')[1]
+        # Switch to i2v task with same model size
+        args.task = f"i2v-{model_size}"
+        # Reload config for the new task
+        cfg = WAN_CONFIGS[args.task]
+        is_i2v = True
+        logger.info(f"Switched to task: {args.task}")
 
     # prepare seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
@@ -1048,8 +1288,17 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
         del video
         clean_memory_on_device(device)
 
-        # Prepare inputs for V2V 
-        noise, context, context_null, inputs, seed_g = prepare_v2v_inputs(args, cfg, accelerator, device, vae, video_latents)
+        # Prepare inputs based on inference mode
+        if v2v_with_i2v:
+            logger.info("Using I2V model for video-to-video inference")
+            noise, context, context_null, y, inputs = prepare_v2v_i2v_inputs(
+                args, cfg, accelerator, device, vae, video_latents
+            )
+        else:
+            # Standard V2V approach
+            noise, context, context_null, inputs, seed_g = prepare_v2v_inputs(
+                args, cfg, accelerator, device, vae, video_latents
+            )
     elif is_i2v:
         # I2V: need text encoder, VAE and CLIP
         # vae was already loaded above
@@ -1082,7 +1331,8 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     seed_g.manual_seed(seed)
 
     # Adjust timesteps for V2V if needed
-    if is_v2v and args.strength < 1.0:
+    if is_v2v and args.strength < 1.0 and not v2v_with_i2v:
+        # Only do this for standard V2V (not v2v_with_i2v which handles this in prepare_v2v_i2v_inputs)
         # Calculate number of inference steps based on strength
         num_inference_steps = max(1, int(args.infer_steps * args.strength))
         logger.info(f"Strength: {args.strength}, adjusted inference steps: {num_inference_steps}")
@@ -1104,7 +1354,8 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
         latent = noise  # Use regular noise for standard generation
 
     # run sampling
-    latent = run_sampling(model, latent, scheduler, timesteps, args, inputs, device, seed_g, accelerator, is_i2v)
+    use_cpu_offload = not device.type == "cuda"  # Only use CPU offload if not on CUDA
+    latent = run_sampling(model, latent, scheduler, timesteps, args, inputs, device, seed_g, accelerator, is_i2v, use_cpu_offload)
 
     # free memory
     del model
@@ -1123,6 +1374,9 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
         args._vae = None
     else:
         args._vae = vae
+        
+    # Restore original task 
+    args.task = original_task
 
     return latent
 

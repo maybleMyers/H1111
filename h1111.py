@@ -386,6 +386,7 @@ def wanx_v2v_generate_video(
     enable_cfg_skip=False,
     cfg_skip_mode="none",
     cfg_apply_ratio=0.7,
+    use_i2v=False,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model in video-to-video mode"""
     global stop_event
@@ -449,6 +450,8 @@ def wanx_v2v_generate_video(
         "--video_path", input_video,  # This is the key for v2v mode
         "--strength", str(strength)   # Strength parameter for v2v
     ]
+    if use_i2v:
+        command.append("--v2v_with_i2v")
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
             "--cfg_skip_mode", cfg_skip_mode,
@@ -619,6 +622,7 @@ def wanx_v2v_batch_handler(
     enable_cfg_skip: bool,
     cfg_skip_mode: str,
     cfg_apply_ratio: float,
+    use_i2v: bool,
     *lora_params
 ):
     """Handle batch generation for WanX v2v"""
@@ -686,6 +690,7 @@ def wanx_v2v_batch_handler(
             enable_cfg_skip,
             cfg_skip_mode,
             cfg_apply_ratio,
+            use_i2v,
         ):
             if videos:
                 all_videos.extend(videos)
@@ -4125,6 +4130,7 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     wanx_v2v_input = gr.Video(label="Input Video", format="mp4")
+                    wanx_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Use I2V model architecture for video-to-video generation")
                     wanx_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength", 
                                                 info="0 = keep original, 1 = full generation")
                     wanx_v2v_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
@@ -4525,6 +4531,7 @@ with gr.Blocks(
             wanx_v2v_enable_cfg_skip,
             wanx_v2v_cfg_skip_mode,
             wanx_v2v_cfg_apply_ratio,
+            wanx_v2v_use_i2v,
             *wanx_v2v_lora_weights,
             *wanx_v2v_lora_multipliers
         ],
