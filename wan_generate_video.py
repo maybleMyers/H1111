@@ -819,22 +819,6 @@ def prepare_v2v_i2v_inputs(
     del text_encoder
     clean_memory_on_device(device)
     
-    # Extract the first frame from the video latents for I2V conditioning
-    logger.info("Extracting first frame from video for I2V conditioning")
-    
-    # Move VAE to device for decoding/encoding
-    vae.to_device(device)
-    
-    # Get the first frame latent
-    first_frame_latent = video_latents[:, 0:1].clone()  # [C, 1, H, W]
-    
-    # Decode first frame to pixels (we need it for CLIP)
-    with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
-        # Decode first frame to pixels
-        first_frame_pixels = vae.decode([first_frame_latent])[0]  # [C, 1, H, W]
-        first_frame_pixels = first_frame_pixels[:, 0]  # [C, H, W]
-        logger.info(f"Decoded first frame from latent: {first_frame_pixels.shape}")
-    
     # Generate noise
     noise = torch.randn(channels, lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=device)
     
@@ -869,15 +853,58 @@ def prepare_v2v_i2v_inputs(
         logger.info(f"Mixing noise and video latents with t_value: {t_value} (strength: {args.strength})")
         noise = noise * t_value + video_latents * (1.0 - t_value)
     
+    # Extract the first frame from the video latents for I2V conditioning
+    # In I2V mode, we need both the CLIP encoding and proper conditioning mask
+    logger.info("Extracting first frame from video for I2V conditioning")
+    
+    # Move VAE to device for decoding
+    vae.to_device(device)
+    
+    # Get the first frame latent
+    first_frame_latent = video_latents[:, 0:1].clone()  # [C, 1, H, W]
+    
+    # Decode the first frame to pixels
+    with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+        first_frame = vae.decode([first_frame_latent])[0]  # [C, 1, H, W]
+        # Get only the first frame
+        first_frame = first_frame[:, 0]  # [C, H, W]
+        
+        # Convert from [-1, 1] to [0, 1] range
+        first_frame = (first_frame + 1.0) / 2.0
+        
+        logger.info(f"Decoded first frame shape: {first_frame.shape}")
+    
     # Load CLIP model
     clip = load_clip_model(args, cfg, device)
     clip.model.to(device)
     
-    # Encode image to CLIP context
-    logger.info(f"Encoding first frame to CLIP context")
-    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-        clip_context = clip.visual([first_frame_pixels])
-    logger.info(f"CLIP encoding complete")
+    # The key fix: Convert tensor to PIL Image for preprocessing
+    # This ensures the CLIP model gets the expected input format
+    logger.info(f"Preparing first frame for CLIP encoding")
+    
+    try:
+        # Convert tensor to PIL Image first, which is what CLIP preprocessing expects
+        pil_image = TF.to_pil_image(first_frame)
+        
+        # Now create a list of image tensors, which is the expected input format for the visual method
+        # The tensors must be in shape [B, C, H, W]
+        first_frame_list = [first_frame.unsqueeze(0)]
+        
+        # Encode image to CLIP context
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+            clip_context = clip.visual(first_frame_list)
+            logger.info(f"CLIP encoding complete")
+    except Exception as e:
+        logger.warning(f"Error in CLIP encoding with tensor input: {str(e)}")
+        logger.info("Trying alternate approach with PIL image...")
+        
+        try:
+            # Try with PIL image directly
+            clip_context = clip.visual([pil_image])
+            logger.info(f"CLIP encoding successful with PIL image")
+        except Exception as e2:
+            logger.error(f"Both CLIP encoding approaches failed: {str(e2)}")
+            raise RuntimeError(f"Unable to encode the first frame with CLIP: {str(e)}\nSecond error: {str(e2)}")
     
     # Free CLIP model and clean memory
     del clip
