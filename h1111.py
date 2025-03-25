@@ -386,7 +386,7 @@ def wanx_v2v_generate_video(
     enable_cfg_skip=False,
     cfg_skip_mode="none",
     cfg_apply_ratio=0.7,
-    use_i2v=False,
+    use_i2v=False,  # Add the new parameter here
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model in video-to-video mode"""
     global stop_event
@@ -450,8 +450,14 @@ def wanx_v2v_generate_video(
         "--video_path", input_video,  # This is the key for v2v mode
         "--strength", str(strength)   # Strength parameter for v2v
     ]
+    
+    # Add clip path if using i2v mode, as CLIPModel is required for I2V
     if use_i2v:
         command.append("--v2v_with_i2v")
+        # Add the CLIP model path - assuming it's in the same directory as T5 with a standard filename
+        clip_path = "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+        command.extend(["--clip", clip_path])
+        
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
             "--cfg_skip_mode", cfg_skip_mode,
@@ -580,7 +586,8 @@ def wanx_v2v_generate_video(
                 "vae_path": vae_path,
                 "t5_path": t5_path,
                 "negative_prompt": negative_prompt if negative_prompt else None,
-                "sample_solver": sample_solver
+                "sample_solver": sample_solver,
+                "use_i2v_model": use_i2v  # Add this to metadata
             }
             
             add_metadata_to_video(video_path, parameters)
