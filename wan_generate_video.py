@@ -1082,13 +1082,22 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     seed_g.manual_seed(seed)
 
     # Adjust timesteps for V2V if needed
-    if is_v2v:
-        # For V2V, we mix the noise and video latents based on strength
-        # Higher strength = more noise (more deviation from original)
-        # Lower strength = less noise (closer to original)
-        t_value = args.strength  # Just use strength directly
-        logger.info(f"Mixing noise and video latents with strength: {args.strength}")
+    if is_v2v and args.strength < 1.0:
+        # Calculate number of inference steps based on strength
+        num_inference_steps = max(1, int(args.infer_steps * args.strength))
+        logger.info(f"Strength: {args.strength}, adjusted inference steps: {num_inference_steps}")
+        
+        # Get starting timestep based on strength
+        t_start_idx = len(timesteps) - num_inference_steps
+        t_start = timesteps[t_start_idx]
+        
+        # Mix noise and video latents based on starting timestep
+        t_value = t_start / 1000.0  # Normalize to 0-1 range
+        logger.info(f"Mixing noise and video latents with t_value: {t_value}")
         noise = noise * t_value + video_latents * (1.0 - t_value)
+        
+        # Use only the required timesteps
+        timesteps = timesteps[-num_inference_steps:]
         
         latent = noise  # Initialize latent with the noise+video mixture
     else:
