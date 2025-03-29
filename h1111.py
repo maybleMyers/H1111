@@ -1675,6 +1675,14 @@ def add_metadata_to_video(video_path: str, parameters: dict) -> None:
     # Temporary output path
     temp_path = video_path.replace(".mp4", "_temp.mp4")
     
+    # Add Fun-Control information to metadata if applicable
+    task = parameters.get("task", "")
+    if task.endswith("-FC"):
+        parameters["fun_control"] = True
+        # Store the control path in metadata if available
+        if "control_path" in parameters:
+            parameters["control_video"] = os.path.basename(parameters["control_path"])
+    
     # FFmpeg command to add metadata without re-encoding
     cmd = [
         'ffmpeg',
@@ -1949,6 +1957,7 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
+                None  # No control video for random batch mode
             ):
                 if videos:
                     all_videos.extend(videos)
@@ -1971,13 +1980,32 @@ def wanx_batch_handler(
         # but different seeds
         batch_size = int(batch_size)  # Ensure batch_size is treated as an integer
         input_file = None
+        control_video = None  # Add parameter for control video
         
-        # Get the input image/video from the remaining parameters if available
+        # Get the input image/video and control video from the remaining parameters if available
         # The position depends on the number of LoRA parameters passed
-        remaining_params = lora_params[num_lora_weights*2:]  # After LoRA weights and multipliers
-        if len(remaining_params) > 0 and remaining_params[0] is not None:
+        remaining_params = clean_lora_params[num_lora_weights*2:]  # After LoRA weights and multipliers
+        
+        if len(remaining_params) > 0 and remaining_params[0] is not None and remaining_params[0] != "None":
             input_file = remaining_params[0]
             print(f"Found input file in remaining params: {input_file}")
+        
+        # Get control video if provided (for Fun-Control)
+        if len(remaining_params) > 1 and remaining_params[1] is not None and remaining_params[1] != "None":
+            control_video = remaining_params[1]
+            print(f"Found control video in remaining params: {control_video}")
+        
+        # If we still don't have an image path, this is a problem
+        if not input_file and "i2v" in task:
+            print("No image path found in extra_args")
+            print(f"Full lora_params: {lora_params}")
+            yield [], "Error: No input image provided", "An input image is required for I2V models"
+            return
+            
+        # Check for Fun-Control requirements
+        if "-FC" in task and not control_video:
+            yield [], "Error: No control video provided", "A control video is required for Fun-Control models"
+            return
         
         if batch_size > 1:
             stop_event.clear()
@@ -2044,7 +2072,8 @@ def wanx_batch_handler(
                     lora_multipliers[3],
                     enable_cfg_skip,
                     cfg_skip_mode,
-                    cfg_apply_ratio,                    
+                    cfg_apply_ratio,  
+                    control_video  # Pass control video for Fun-Control                 
                 ):
                     if videos:
                         all_videos.extend(videos)
@@ -2059,10 +2088,12 @@ def wanx_batch_handler(
             # Single image/video, single generation
             stop_event.clear()
             
-            # Debug the input file
+            # Debug the input file and control video
             print(f"Processing single video with input file: {input_file}")
+            if control_video:
+                print(f"Using control video: {control_video}")
             
-            # Call wanx_generate_video directly with the input file
+            # Call wanx_generate_video directly with the input file and control video
             yield from wanx_generate_video(
                 prompt, 
                 negative_prompt,
@@ -2101,7 +2132,11 @@ def wanx_batch_handler(
                 lora_multipliers[0],
                 lora_multipliers[1],
                 lora_multipliers[2],
-                lora_multipliers[3]
+                lora_multipliers[3],
+                enable_cfg_skip,
+                cfg_skip_mode,
+                cfg_apply_ratio,
+                control_video  # Pass control video for Fun-Control
             )
 
 def process_single_video(
@@ -2562,14 +2597,37 @@ def wanx_generate_video(
     enable_cfg_skip=False,
     cfg_skip_mode="none",
     cfg_apply_ratio=0.7,
+    control_video=None,  # New parameter for Fun-Control video
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
-    """Generate video with WanX model (supports both i2v and t2v)"""
+    """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
+
     
     # Debug LoRA parameters
     print(f"DEBUG - LoRA params: {lora1}, {lora2}, {lora3}, {lora4}")
     print(f"DEBUG - LoRA multipliers: {lora1_multiplier}, {lora2_multiplier}, {lora3_multiplier}, {lora4_multiplier}")
     print(f"DEBUG - LoRA folder: {lora_folder}")
+
+    
+    # Check if this is a Fun-Control task
+    is_fun_control = "-FC" in task and control_video is not None
+    if is_fun_control:
+        print(f"DEBUG - Using Fun-Control mode with control video: {control_video}")
+            # Verify control video is provided
+        if not control_video:
+            yield [], "Error: No control video provided", "Fun-Control requires a control video"
+            return
+        
+        # Verify needed files exist
+        for path_name, path in [
+            ("DIT", dit_path),
+            ("VAE", vae_path),
+            ("T5", t5_path),
+            ("CLIP", clip_path)
+        ]:
+            if not os.path.exists(path):
+                yield [], f"Error: {path_name} model not found", f"Model file doesn't exist: {path}"
+                return
     
     # Convert values safely to float or None
     try:
@@ -2598,6 +2656,11 @@ def wanx_generate_video(
     # Check if we need input image (required for i2v, not for t2v)
     if "i2v" in task and not input_image:
         yield [], "Error: No input image provided", "Please provide an input image for image-to-video generation"
+        return
+        
+    # Check for Fun-Control requirements
+    if is_fun_control and not control_video:
+        yield [], "Error: No control video provided", "Please provide a control video for Fun-Control generation"
         return
 
     # Prepare environment
@@ -2628,14 +2691,21 @@ def wanx_generate_video(
         "--t5", t5_path,
         "--sample_solver", sample_solver
     ]
+    
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
             "--cfg_skip_mode", cfg_skip_mode,
             "--cfg_apply_ratio", str(cfg_apply_ratio)
         ])
+        
     if wanx_input_end and wanx_input_end != "none" and os.path.exists(wanx_input_end):
         command.extend(["--end_image_path", str(wanx_input_end)])
         command.extend(["--trim_tail_frames", "3"])
+        
+    # Handle Fun-Control (control video path)
+    if is_fun_control and control_video:
+        command.extend(["--control_path", str(control_video)])
+
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
@@ -2662,7 +2732,7 @@ def wanx_generate_video(
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
         command.extend(["--image_path", input_image])
-        command.extend(["--clip", clip_path])  # CLIP is only needed for i2v
+        command.extend(["--clip", clip_path])  # CLIP is needed for i2v and Fun-Control
     
     # Add video path for v2v task
     if "v2v" in task and input_image:
@@ -2783,14 +2853,16 @@ def wanx_generate_video(
                 "block_swap": block_swap,
                 "input_image": input_image if "i2v" in task else None,
                 "input_video": input_image if "v2v" in task else None,
+                "control_video": control_video if "-FC" in task else None,  # Add Fun-Control info
                 "lora_weights": [lora1, lora2, lora3, lora4],
                 "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
                 "dit_path": dit_path,
                 "vae_path": vae_path,
                 "t5_path": t5_path,
-                "clip_path": clip_path if "i2v" in task else None,
+                "clip_path": clip_path if "i2v" in task or "-FC" in task else None,  # CLIP is used for both i2v and Fun-Control
                 "negative_prompt": negative_prompt if negative_prompt else None,
-                "sample_solver": sample_solver
+                "sample_solver": sample_solver,
+                "is_fun_control": "-FC" in task  # Clear flag for Fun-Control
             }
             
             add_metadata_to_video(video_path, parameters)
@@ -3844,6 +3916,10 @@ with gr.Blocks(
                         wanx_use_end_image = gr.Checkbox(label="use ending image", value=False)
                         wanx_input_end = gr.Image(label="End Image", type="filepath", visible=False)
                         wanx_trim_frames = gr.Checkbox(label="trim last 3 frames", value=True, visible=False, interactive=True)
+
+                    with gr.Row():
+                        wanx_use_fun_control = gr.Checkbox(label="Use Fun-Control Model", value=False)
+                        wanx_control_video = gr.Video(label="Control Video for Fun-Control", visible=False, format="mp4")
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -3911,11 +3987,12 @@ with gr.Blocks(
 
             with gr.Row():
                 wanx_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                # Update the wanx_task dropdown choices to include Fun-Control options
                 wanx_task = gr.Dropdown(
                     label="Task",
-                    choices=["i2v-14B"],
+                    choices=["i2v-14B", "i2v-14B-FC", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC"],
                     value="i2v-14B",
-                    info="Currently only i2v-14B is supported"
+                    info="Select model type. *-FC options enable Fun-Control features"
                 )
                 wanx_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_i2v_720p_14B_fp16.safetensors")
                 wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
@@ -4368,6 +4445,43 @@ with gr.Blocks(
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
     #Event handlers etc
+
+    def toggle_fun_control(use_fun_control):
+        """Toggle control video visibility and update task suffix"""
+        # Only update visibility, don't try to set paths
+        return gr.update(visible=use_fun_control)
+
+    def update_task_for_funcontrol(use_fun_control, current_task):
+        """Add or remove -FC suffix from task based on checkbox"""
+        if use_fun_control:
+            if not current_task.endswith("-FC"):
+                if "i2v" in current_task:
+                    return "i2v-14B-FC"
+                elif "t2v" in current_task:
+                    return "t2v-14B-FC"
+            return current_task
+        else:
+            if current_task.endswith("-FC"):
+                return current_task.replace("-FC", "")
+            return current_task
+
+    wanx_use_fun_control.change(
+        fn=update_task_for_funcontrol,
+        inputs=[wanx_use_fun_control, wanx_task],
+        outputs=[wanx_task]
+    )
+
+    # Make task change update checkbox state
+    def update_from_task(task):
+        """Update Fun-Control checkbox and control video visibility based on task"""
+        is_fun_control = "-FC" in task
+        return gr.update(value=is_fun_control), gr.update(visible=is_fun_control)
+
+    wanx_task.change(
+        fn=update_from_task,
+        inputs=[wanx_task],
+        outputs=[wanx_use_fun_control, wanx_control_video]
+    )
     wanx_enable_cfg_skip.change(
         fn=lambda x: gr.update(visible=x),
         inputs=[wanx_enable_cfg_skip],
@@ -6035,7 +6149,8 @@ with gr.Blocks(
             wanx_cfg_apply_ratio,
             *wanx_lora_weights,
             *wanx_lora_multipliers,
-            wanx_input  # Include input image path for non-batch mode
+            wanx_input,  # Input image
+            wanx_control_video  # Add control video
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
         queue=True

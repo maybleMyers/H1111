@@ -198,16 +198,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--video_path and --image_path cannot be used together.")
     if args.video_path is not None and args.control_path is not None:
         raise ValueError("--video_path (standard V2V) and --control_path (Fun-Control) cannot be used together.")
-    if args.image_path is not None and args.control_path is not None:
-        raise ValueError("--image_path (I2V) and --control_path (Fun-Control) cannot be used together.")
-    if args.video_path is not None and "i2v" in args.task:
-         logger.warning("--video_path is provided, but task is set to i2v. Task type does not directly affect V2V mode.")
+    #if args.image_path is not None and args.control_path is not None:
+    #    raise ValueError("--image_path (I2V) and --control_path (Fun-Control) cannot be used together.")
+    #if args.video_path is not None and "i2v" in args.task:
+    #     logger.warning("--video_path is provided, but task is set to i2v. Task type does not directly affect V2V mode.")
     if args.image_path is not None and "t2v" in args.task:
          logger.warning("--image_path is provided, but task is set to t2v. Task type does not directly affect I2V mode.")
     if args.control_path is not None and not WAN_CONFIGS[args.task].is_fun_control:
         raise ValueError("--control_path is provided, but the selected task does not support Fun-Control.")
-    if not args.control_path and WAN_CONFIGS[args.task].is_fun_control:
-        raise ValueError("The selected task requires Fun-Control (--control_path), but it was not provided.")
+    #if not args.control_path and WAN_CONFIGS[args.task].is_fun_control:
+    #    raise ValueError("The selected task requires Fun-Control (--control_path), but it was not provided.")
 
 
     return args
@@ -623,22 +623,6 @@ def prepare_t2v_inputs(
 
     # Fun-Control: encode control video to latent space
     y = None # Initialize y for standard T2V
-    if config.is_fun_control:
-        if vae is None:
-             raise ValueError("VAE is required for Fun-Control but was not provided.")
-        logger.info(f"Encoding control video to latent space for Fun-Control")
-        # C, F, H, W
-        control_video = load_control_video(args.control_path, frames, height, width).to(device) # Use specific Fun-Control loader
-        vae.to_device(device) # Ensure VAE is on device for encoding
-        with accelerator.autocast(), torch.no_grad():
-            control_latent = vae.encode([control_video])[0]
-        y = torch.concat([control_latent, torch.zeros_like(control_latent)], dim=0)  # add control video latent
-        vae.to_device("cpu") # Move VAE back to CPU
-        clean_memory_on_device(device)
-        logger.info(f"Fun-Control latent shape: {y.shape}")
-    else:
-        # Standard T2V doesn't use 'y'
-        pass
 
     # generate noise
     noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
@@ -707,7 +691,6 @@ def prepare_i2v_inputs(
     max_seq_len = math.ceil((lat_f + (1 if has_end_image else 0)) * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
     logger.info(f"I2V target resolution: {target_height}x{target_width}, latent shape: ({lat_f}, {lat_h}, {lat_w}), seq_len: {max_seq_len}")
 
-
     # set seed
     seed = args.seed # Seed should be set in generate()
     if not args.cpu_noise:
@@ -756,11 +739,12 @@ def prepare_i2v_inputs(
 
     # encode image to CLIP context
     logger.info(f"Encoding image to CLIP context")
-    # Resize original image tensor for CLIP visual model (expects B, C, F, H, W - use F=1)
-    clip_img_tensor = TF.resize(img_tensor, [224, 224]).unsqueeze(1) # Example resize, check CLIP requirements
+    
+    # Prepare image for CLIP in the format clip.visual expects
     with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-        # clip_context = clip.visual([img_tensor[:, None, :, :]]) # Original line assumed CHW input? Clip needs BCHW or BCFHW
-        clip_context = clip.visual(clip_img_tensor.to(clip.dtype)) # Pass BCFHW
+        # This is what works in fun_wan_generate_video.py
+        clip_context = clip.visual([img_tensor[:, None, :, :]])
+    
     logger.info(f"Encoding complete")
 
     # free CLIP model and clean memory
@@ -771,17 +755,18 @@ def prepare_i2v_inputs(
     logger.info(f"Encoding image to latent space")
     vae.to_device(device)
 
+    # CRITICAL FIX: following the exact pattern from fun_wan_generate_video.py
     # resize image to the calculated target resolution for VAE
     interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
     img_resized_np = cv2.resize(img_cv2, (target_width, target_height), interpolation=interpolation)
     img_resized = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-    img_resized = img_resized.unsqueeze(1)  # CFHW, F=1
+    img_resized = img_resized.unsqueeze(1)  # CFHW (add frame dimension)
 
     if has_end_image:
         interpolation_end = cv2.INTER_AREA if target_height < end_img_cv2.shape[0] else cv2.INTER_CUBIC
         end_img_resized_np = cv2.resize(end_img_cv2, (target_width, target_height), interpolation=interpolation_end)
         end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-        end_img_resized = end_img_resized.unsqueeze(1)  # CFHW, F=1
+        end_img_resized = end_img_resized.unsqueeze(1)  # CFHW (add frame dimension)
 
     # create mask for the first frame (and potentially last)
     msk = torch.zeros(4, lat_f + (1 if has_end_image else 0), lat_h, lat_w, device=device)
@@ -791,27 +776,40 @@ def prepare_i2v_inputs(
 
     # encode image(s) to latent space
     with accelerator.autocast(), torch.no_grad():
-        # The VAE encode expects [C, F, H, W] input in a list
-        # Here F=1 for single image encoding
-        y = vae.encode([img_resized[:, 0, :, :]])[0] # Encode first frame (squeeze F dim)
+        # CRITICAL FIX: add padding frames to match required video length
+        padding_frames = frames - 1  # first frame is the image
+        img_padded = torch.cat([img_resized, torch.zeros(3, padding_frames, target_height, target_width, device=device)], dim=1)
+        y = vae.encode([img_padded])[0] # Encode with padding
 
         if has_end_image:
-            y_end = vae.encode([end_img_resized[:, 0, :, :]])[0] # Encode end frame
-            # Need to construct the full latent sequence: [y_start, zeros..., y_end]
-            # y has shape [C, H, W], need [C, F, H, W]
-            y_full = torch.zeros(y.shape[0], lat_f, y.shape[1], y.shape[2], device=device, dtype=y.dtype)
-            y_full[:, 0] = y # Place start latent
-            y = torch.cat([y_full, y_end.unsqueeze(1)], dim=1) # Add end frame latent -> [C, F+1, H, W]
-        else:
-             # Just need [y_start, zeros...]
-             y_full = torch.zeros(y.shape[0], lat_f, y.shape[1], y.shape[2], device=device, dtype=y.dtype)
-             y_full[:, 0] = y # Place start latent
-             y = y_full
+            y_end = vae.encode([end_img_resized])[0] # Encode end frame
+            y = torch.cat([y, y_end], dim=1) # Add end frame latent
 
     # Concatenate mask and latent(s)
     y = torch.concat([msk, y]) # Shape [4+C, F(+1), H, W]
     logger.info(f"I2V conditioning 'y' shape: {y.shape}")
     logger.info(f"Encoding complete")
+
+    # Fun-Control: encode control video to latent space if needed
+    # In prepare_i2v_inputs function
+    if config.is_fun_control and args.control_path:
+        logger.info(f"Encoding control video to latent space for Fun-Control")
+        # Load and process control video (C, F, H, W format)
+        control_video = load_control_video(args.control_path, frames + (1 if has_end_image else 0), 
+                                          target_height, target_width).to(device)
+
+        with accelerator.autocast(), torch.no_grad():
+            control_latent = vae.encode([control_video])[0]
+
+        # DIRECTLY COPYING THE WORKING CODE:
+        y = y[msk.shape[0]:]  # remove mask because Fun-Control does not need it
+        if has_end_image:
+            y[:, 1:-1] = 0  # remove image latent except first and last frame
+        else:
+            y[:, 1:] = 0  # remove image latent except first frame
+        y = torch.concat([control_latent, y], dim=0)  # add control video latent
+
+        logger.info(f"Fun-Control combined latent shape: {y.shape}")
 
     # move VAE to CPU (or cache device if specified)
     vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
@@ -1044,7 +1042,6 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
 # --- End V2V Helper Functions ---
 
-# --- Fun-Control Helper Function ---
 def load_control_video(control_path: str, frames: int, height: int, width: int) -> torch.Tensor:
     """load control video to pixel space for Fun-Control model
 
@@ -1085,8 +1082,6 @@ def load_control_video(control_path: str, frames: int, height: int, width: int) 
     logger.info(f"Loaded Fun-Control video tensor shape: {video_tensor.shape}")
 
     return video_tensor
-# --- End Fun-Control Helper ---
-
 
 def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> Tuple[Any, torch.Tensor]:
     """setup scheduler for sampling
@@ -1224,14 +1219,16 @@ def run_sampling(
     logger.info(f"Starting sampling loop for {num_timesteps} steps.")
     for i, t in enumerate(tqdm(timesteps)):
         # Prepare input for the model (move latent to compute device)
-        # latent has shape [1, C, F, H, W], so we take the first element
-        latent_model_input = [latent[0].to(device)] # Remove batch dim here
+        # Latent should be [B, C, F, H, W] or [C, F, H, W]
+        # The model expects the latent input 'x' as a list: [tensor]
+        latent_on_device = latent.to(device)
+        latent_model_input_list = [latent_on_device] # <<< WRAP IN LIST
         timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
             # 1. Predict conditional noise estimate
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            # Move prediction to storage device if offloading
+            # Pass the list here
+            noise_pred_cond = model(latent_model_input_list, t=timestep, **arg_c)[0]
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
             # 2. Predict unconditional noise estimate (potentially with SLG)
@@ -1242,24 +1239,24 @@ def run_sampling(
                 uncond_input_args = arg_null
 
                 if apply_slg_step and args.slg_mode == "original":
-                    # Standard uncond prediction first
-                    noise_pred_uncond = model(latent_model_input, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
-                    # SLG prediction (skipping layers in uncond)
-                    skip_layer_out = model(latent_model_input, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                    # Standard uncond prediction first - Pass the list here
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
+                    # SLG prediction (skipping layers in uncond) - Pass the list here
+                    skip_layer_out = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
 
                     # Combine using SD3 formula: scaled = uncond + scale * (cond - uncond) + slg_scale * (cond - skip)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                 elif apply_slg_step and args.slg_mode == "uncond":
-                     # SLG prediction (skipping layers in uncond) replaces standard uncond
-                    noise_pred_uncond = model(latent_model_input, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                     # SLG prediction (skipping layers in uncond) replaces standard uncond - Pass the list here
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
                     # Combine: scaled = slg_uncond + scale * (cond - slg_uncond)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 else:
-                    # Regular CFG (no SLG or SLG not active this step)
-                    noise_pred_uncond = model(latent_model_input, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
+                    # Regular CFG (no SLG or SLG not active this step) - Pass the list here
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
                     # Combine: scaled = uncond + scale * (cond - uncond)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
@@ -1269,11 +1266,11 @@ def run_sampling(
             # 3. Compute previous sample state with the scheduler
             # Scheduler expects noise_pred [B, C, F, H, W] and latent [B, C, F, H, W]
             # Ensure latent is on the compute device for the step
-            latent_step_input = latent.to(device)
+            # latent_step_input = latent.to(device) # Already did this with latent_on_device
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device
                 t,
-                latent_step_input,
+                latent_on_device, # Pass the tensor directly to scheduler step
                 return_dict=False,
                 generator=seed_g # Pass generator
             )
