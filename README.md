@@ -53,6 +53,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+3/29/2025  
+    Added support for fun models! download dit from https://huggingface.co/alibaba-pai/Wan2.1-Fun-14B-Control and specify correct task type and dit location. I renamed it from diffusion_pytorch_model to Wan2.1-Fun-14B-control. Works in the normal WanX-i2v tab when you select the control option at the bottom of the page.  
 3/23/2025  
     Added Wanx cfg skip functionality to skip cfg guidance during inference for faster generations but less following of the prompt  
 3/22/2025  
