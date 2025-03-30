@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
     # Fun-Control argument (distinct from V2V)
     parser.add_argument(
+        "--control_strength",
+        type=float,
+        default=1.0,
+        help="Strength of control video influence for Fun-Control (1.0 = normal)",
+    )
+    parser.add_argument(
         "--control_path",
         type=str,
         default=None,
@@ -801,13 +807,21 @@ def prepare_i2v_inputs(
         with accelerator.autocast(), torch.no_grad():
             control_latent = vae.encode([control_video])[0]
 
-        # DIRECTLY COPYING THE WORKING CODE:
+        # Apply control strength scaling to control_latent
+        # This is the key change - scale the control latent according to strength parameter
+        control_strength = getattr(args, 'control_strength', 1.0)  # Default to 1.0 if not provided
+        logger.info(f"Applying control strength factor: {control_strength}")
+        if control_strength != 1.0:
+            # Scale the control latent - increasing strength means more influence 
+            control_latent = control_latent * control_strength
+
+        # Existing code continues...
         y = y[msk.shape[0]:]  # remove mask because Fun-Control does not need it
         if has_end_image:
             y[:, 1:-1] = 0  # remove image latent except first and last frame
         else:
             y[:, 1:] = 0  # remove image latent except first frame
-        y = torch.concat([control_latent, y], dim=0)  # add control video latent
+        y = torch.concat([control_latent, y], dim=0)
 
         logger.info(f"Fun-Control combined latent shape: {y.shape}")
 

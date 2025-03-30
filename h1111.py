@@ -1980,10 +1980,10 @@ def wanx_batch_handler(
         # but different seeds
         batch_size = int(batch_size)  # Ensure batch_size is treated as an integer
         input_file = None
-        control_video = None  # Add parameter for control video
+        control_video = None
+        control_strength = 1.0  # Default control strength
         
-        # Get the input image/video and control video from the remaining parameters if available
-        # The position depends on the number of LoRA parameters passed
+        # Get the input image/video, control video, and control strength from remaining parameters
         remaining_params = clean_lora_params[num_lora_weights*2:]  # After LoRA weights and multipliers
         
         if len(remaining_params) > 0 and remaining_params[0] is not None and remaining_params[0] != "None":
@@ -1994,6 +1994,14 @@ def wanx_batch_handler(
         if len(remaining_params) > 1 and remaining_params[1] is not None and remaining_params[1] != "None":
             control_video = remaining_params[1]
             print(f"Found control video in remaining params: {control_video}")
+            
+        # Get control strength if provided
+        if len(remaining_params) > 2 and remaining_params[2] is not None:
+            try:
+                control_strength = float(remaining_params[2])
+                print(f"Using control strength: {control_strength}")
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert control strength to float, using default 1.0")
         
         # If we still don't have an image path, this is a problem
         if not input_file and "i2v" in task:
@@ -2597,7 +2605,8 @@ def wanx_generate_video(
     enable_cfg_skip=False,
     cfg_skip_mode="none",
     cfg_apply_ratio=0.7,
-    control_video=None,  # New parameter for Fun-Control video
+    control_video=None,
+    control_strength=1.0,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
@@ -2705,6 +2714,7 @@ def wanx_generate_video(
     # Handle Fun-Control (control video path)
     if is_fun_control and control_video:
         command.extend(["--control_path", str(control_video)])
+        command.extend(["--control_strength", str(control_strength)])
 
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
@@ -3920,6 +3930,9 @@ with gr.Blocks(
                     with gr.Row():
                         wanx_use_fun_control = gr.Checkbox(label="Use Fun-Control Model", value=False)
                         wanx_control_video = gr.Video(label="Control Video for Fun-Control", visible=False, format="mp4")
+                        wanx_control_strength = gr.Slider(minimum=0.1, maximum=2.0, step=0.05, value=1.0, 
+                            label="Control Strength", visible=False,
+                            info="Adjust influence of control video (1.0 = normal)")
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -4466,9 +4479,9 @@ with gr.Blocks(
             return current_task
 
     wanx_use_fun_control.change(
-        fn=update_task_for_funcontrol,
-        inputs=[wanx_use_fun_control, wanx_task],
-        outputs=[wanx_task]
+        fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
+        inputs=[wanx_use_fun_control],
+        outputs=[wanx_control_video, wanx_control_strength]
     )
 
     # Make task change update checkbox state
@@ -6150,7 +6163,8 @@ with gr.Blocks(
             *wanx_lora_weights,
             *wanx_lora_multipliers,
             wanx_input,  # Input image
-            wanx_control_video  # Add control video
+            wanx_control_video,  # Control video
+            wanx_control_strength  # Add control strength parameter
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
         queue=True
