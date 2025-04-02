@@ -331,8 +331,9 @@ def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config)
     return ((16, lat_f, lat_h, lat_w), seq_len)
 
 
+# Modified function (replace the original)
 def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torch.dtype) -> WanVAE:
-    """load VAE model
+    """load VAE model with robust path handling
 
     Args:
         args: command line arguments
@@ -343,11 +344,45 @@ def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torc
     Returns:
         WanVAE: loaded VAE model
     """
-    vae_path = args.vae if args.vae is not None else os.path.join(args.ckpt_dir, config.vae_checkpoint)
+    vae_override_path = args.vae
+    vae_filename = config.vae_checkpoint # Get expected filename, e.g., "Wan2.1_VAE.pth"
+    # Assume models are in 'wan' dir relative to script if not otherwise specified
+    vae_base_dir = "wan"
 
-    logger.info(f"Loading VAE model from {vae_path}")
+    final_vae_path = None
+
+    # 1. Check if args.vae is a valid *existing file path*
+    if vae_override_path and isinstance(vae_override_path, str) and \
+       (vae_override_path.endswith(".pth") or vae_override_path.endswith(".safetensors")) and \
+       os.path.isfile(vae_override_path):
+        final_vae_path = vae_override_path
+        logger.info(f"Using VAE override path from --vae: {final_vae_path}")
+
+    # 2. If override is invalid or not provided, construct default path
+    if final_vae_path is None:
+        constructed_path = os.path.join(vae_base_dir, vae_filename)
+        if os.path.isfile(constructed_path):
+            final_vae_path = constructed_path
+            logger.info(f"Constructed default VAE path: {final_vae_path}")
+            if vae_override_path:
+                 logger.warning(f"Ignoring potentially invalid --vae argument: {vae_override_path}")
+        else:
+             # 3. Fallback using ckpt_dir if provided and default construction failed
+             if args.ckpt_dir:
+                 fallback_path = os.path.join(args.ckpt_dir, vae_filename)
+                 if os.path.isfile(fallback_path):
+                     final_vae_path = fallback_path
+                     logger.info(f"Using VAE path from --ckpt_dir fallback: {final_vae_path}")
+                 else:
+                     # If all attempts fail, raise error
+                     raise FileNotFoundError(f"Cannot find VAE. Checked override '{vae_override_path}', constructed '{constructed_path}', and fallback '{fallback_path}'")
+             else:
+                 raise FileNotFoundError(f"Cannot find VAE. Checked override '{vae_override_path}' and constructed '{constructed_path}'. No --ckpt_dir provided for fallback.")
+
+    # At this point, final_vae_path should be valid
+    logger.info(f"Loading VAE model from final path: {final_vae_path}")
     cache_device = torch.device("cpu") if args.vae_cache_cpu else None
-    vae = WanVAE(vae_path=vae_path, device=device, dtype=dtype, cache_device=cache_device)
+    vae = WanVAE(vae_path=final_vae_path, device=device, dtype=dtype, cache_device=cache_device)
     return vae
 
 
@@ -1532,7 +1567,7 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     else:
         # Need to load VAE if it wasn't used/stored (e.g., pure T2V or latent input mode)
         logger.info("Loading VAE for decoding...")
-        vae_dtype_decode = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else (torch.bfloat16 if str_to_dtype(args.dit).itemsize > 2 else torch.float16) # Simplified dtype detection
+        vae_dtype_decode = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else detect_wan_sd_dtype(args.dit)
         vae = load_vae(args, cfg, device, vae_dtype_decode)
         args._vae = vae # Store it in case needed again?
 
