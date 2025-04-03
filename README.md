@@ -9,6 +9,7 @@ https://github.com/kohya-ss/musubi-tuner
 
 It allows inference with these models:  
 Hunyuan-t2v  
+Hunyuan-i2v  
 Hunyuan-v2v  
 WanX-t2v  
 WanX-i2v  
@@ -22,7 +23,9 @@ Best quality will be obtained with only enabling block swapping and using the fp
 
 If you are using a lora that you didn't train with musubi you need to drag it to the convert lora tab and convert it to the default format. It should spit it out into the /lora folder.
 
-This about the speed I get generating a 960x544 97 frame 40 step video without fp8 using sage attention and skyreels on a 4090: 80%|████████  | 24/30 [11:01<02:45, 27.54s/it]
+This about the speed I get generating a 960x544 97 frame 40 step video without fp8 using sage attention and skyreels on a 4090: 80%|████████  | 24/30 [11:01<02:45, 27.54s/it]  
+
+If you need additional installation instructions or information create an issue and I will try to help. Also there are alot of settings notes on the musubi github linked above.  
 
 ## To Use Skyreels
 
@@ -54,7 +57,7 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 4/3/2025  
-    Add support for hunyuan i2v model.  
+    Add support for hunyuan i2v model. Download the clip vision from https://huggingface.co/maybleMyers/H1111_Hunyuan_i2v And download the official model from hunyuan's website and rename it to mp_rank_00_model_states_i2v.pt https://huggingface.co/tencent/HunyuanVideo-I2V/tree/main/hunyuan-video-i2v-720p/transformers  add both to your hunyuan folder.  
 3/29/2025  
     Added support for fun models! download dit from https://huggingface.co/alibaba-pai/Wan2.1-Fun-14B-Control and specify correct task type and dit location. I renamed it from diffusion_pytorch_model to Wan2.1-Fun-14B-control. Works in the normal WanX-i2v tab when you select the control option at the bottom of the page.  
 3/23/2025  
