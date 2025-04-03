@@ -30,6 +30,358 @@ stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
 
+def process_i2v_single_video(
+    prompt: str,
+    image_path: str,
+    width: int,
+    height: int,
+    batch_size: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    dit_folder: str,
+    model: str,
+    vae: str,
+    te1: str,
+    te2: str,
+    clip_vision_path: str,
+    save_path: str,
+    flow_shift: float,
+    cfg_scale: float, # embedded_cfg_scale
+    guidance_scale: float, # main CFG
+    output_type: str,
+    attn_mode: str,
+    block_swap: int,
+    exclude_single_blocks: bool,
+    use_split_attn: bool,
+    lora_folder: str,
+    vae_chunk_size: int,
+    vae_spatial_tile_min: int,
+    # --- Explicit LoRA args instead of *lora_params ---
+    lora1: str = "None",
+    lora2: str = "None",
+    lora3: str = "None",
+    lora4: str = "None",
+    lora1_multiplier: float = 1.0,
+    lora2_multiplier: float = 1.0,
+    lora3_multiplier: float = 1.0,
+    lora4_multiplier: float = 1.0,
+    # --- End LoRA args ---
+    negative_prompt: Optional[str] = None,
+    use_fp8: bool = False,
+    fp8_llm: bool = False
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate a single video using hv_i2v_generate_video.py"""
+    global stop_event
+
+    # ... (Keep existing argument validation and env setup) ...
+    if stop_event.is_set():
+        yield [], "", ""
+        return
+
+    # Argument validation
+    if not image_path or not os.path.exists(image_path):
+         yield [], "Error: Input image not found", f"Cannot find image: {image_path}"
+         return
+    # Check clip vision path only if needed (Hunyuan-I2V, not SkyReels-I2V based on script name)
+    is_hunyuan_i2v = "mp_rank_00_model_states_i2v" in model # Heuristic check
+    if is_hunyuan_i2v and (not clip_vision_path or not os.path.exists(clip_vision_path)):
+         yield [], "Error: CLIP Vision model not found", f"Cannot find file: {clip_vision_path}"
+         return
+
+    if os.path.isabs(model):
+        model_path = model
+    else:
+        model_path = os.path.normpath(os.path.join(dit_folder, model))
+
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    if seed == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+    else:
+        current_seed = seed
+
+    clear_cuda_cache()
+
+    command = [
+        sys.executable,
+        "hv_i2v_generate_video.py", # <<< Use the new script
+        "--dit", model_path,
+        "--vae", vae,
+        "--text_encoder1", te1,
+        "--text_encoder2", te2,
+        # Add clip vision path only if it's likely the Hunyuan I2V model
+        *(["--clip_vision_path", clip_vision_path] if is_hunyuan_i2v else []),
+        "--prompt", prompt,
+        "--video_size", str(height), str(width),
+        "--video_length", str(video_length),
+        "--fps", str(fps),
+        "--infer_steps", str(infer_steps),
+        "--save_path", save_path,
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift),
+        "--embedded_cfg_scale", str(cfg_scale),
+        "--guidance_scale", str(guidance_scale),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(block_swap),
+        "--image_path", image_path
+    ]
+
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+
+    if use_fp8:
+        command.append("--fp8")
+    if fp8_llm:
+        command.append("--fp8_llm")
+
+    if exclude_single_blocks:
+        command.append("--exclude_single_blocks")
+    if use_split_attn:
+        command.append("--split_attn")
+
+    if vae_chunk_size > 0:
+        command.extend(["--vae_chunk_size", str(vae_chunk_size)])
+    if vae_spatial_tile_min > 0:
+        command.extend(["--vae_spatial_tile_sample_min_size", str(vae_spatial_tile_min)])
+
+    # --- Updated LoRA handling using named arguments ---
+    lora_weights_list = [lora1, lora2, lora3, lora4]
+    lora_multipliers_list = [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]
+    valid_loras = []
+    for weight, mult in zip(lora_weights_list, lora_multipliers_list):
+        if weight and weight != "None":
+            lora_file_path = os.path.join(lora_folder, weight)
+            if os.path.exists(lora_file_path):
+                 valid_loras.append((lora_file_path, mult))
+            else:
+                print(f"Warning: LoRA file not found: {lora_file_path}")
+
+    if valid_loras:
+        weights = [weight for weight, _ in valid_loras]
+        multipliers = [str(mult) for _, mult in valid_loras]
+        command.extend(["--lora_weight"] + weights)
+        command.extend(["--lora_multiplier"] + multipliers)
+    # --- End Updated LoRA handling ---
+
+    # ... (Keep subprocess execution, output collection, and metadata saving logic) ...
+    command_str = [str(c) for c in command] # Ensure all args are strings
+    print(f"Running Command (I2V): {' '.join(command_str)}")
+
+    p = subprocess.Popen(
+        command_str, # Use stringified command
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    videos = []
+
+    while True:
+        if stop_event.is_set():
+            p.terminate()
+            p.wait()
+            yield [], "", "Generation stopped by user."
+            return
+
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None:
+                break
+            continue
+
+        print(line, end='') # Print progress to console
+        if '|' in line and '%' in line and '[' in line and ']' in line:
+            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+
+    p.stdout.close()
+    p.wait()
+
+    clear_cuda_cache()
+    time.sleep(0.5)
+
+    # Collect generated video
+    save_path_abs = os.path.abspath(save_path)
+    generated_video_path = None
+    if os.path.exists(save_path_abs):
+        all_videos_files = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        # Try to find the video matching the seed
+        matching_videos = [v for v in all_videos_files if f"_{current_seed}" in v]
+        if matching_videos:
+            generated_video_path = os.path.join(save_path_abs, matching_videos[0])
+
+    if generated_video_path:
+         # Collect parameters for metadata (adjust as needed for i2v specifics)
+        parameters = {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "video_length": video_length,
+            "fps": fps,
+            "infer_steps": infer_steps,
+            "seed": current_seed,
+            "model": model,
+            "vae": vae,
+            "te1": te1,
+            "te2": te2,
+            "clip_vision_path": clip_vision_path,
+            "save_path": save_path,
+            "flow_shift": flow_shift,
+            "embedded_cfg_scale": cfg_scale,
+            "guidance_scale": guidance_scale,
+            "output_type": output_type,
+            "attn_mode": attn_mode,
+            "block_swap": block_swap,
+            "lora_weights": list(lora_weights_list), # Save the list
+            "lora_multipliers": list(lora_multipliers_list), # Save the list
+            "input_image": image_path,
+            "negative_prompt": negative_prompt if negative_prompt else None,
+            "vae_chunk_size": vae_chunk_size,
+            "vae_spatial_tile_min": vae_spatial_tile_min,
+            "use_fp8_dit": use_fp8,
+            "use_fp8_llm": fp8_llm
+        }
+        add_metadata_to_video(generated_video_path, parameters)
+        videos.append((str(generated_video_path), f"Seed: {current_seed}"))
+        yield videos, f"Completed (seed: {current_seed})", ""
+    else:
+        yield [], f"Failed (seed: {current_seed})", "Could not find generated video file."
+
+
+def process_i2v_batch(
+    prompt: str,
+    image_path: str,
+    width: int,
+    height: int,
+    batch_size: int,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    seed: int,
+    dit_folder: str,
+    model: str,
+    vae: str,
+    te1: str,
+    te2: str,
+    clip_vision_path: str, # Added
+    save_path: str,
+    flow_shift: float,
+    cfg_scale: float, # embedded_cfg_scale
+    guidance_scale: float, # main CFG
+    output_type: str,
+    attn_mode: str,
+    block_swap: int,
+    exclude_single_blocks: bool,
+    use_split_attn: bool,
+    lora_folder: str,
+    vae_chunk_size: int, # Added
+    vae_spatial_tile_min: int, # Added
+    negative_prompt: Optional[str] = None, # Added
+    use_fp8: bool = False, # Added
+    fp8_llm: bool = False, # Added
+    *lora_params # Captures LoRA weights and multipliers
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Process a batch of videos using the new I2V script"""
+    global stop_event
+    stop_event.clear()
+
+    all_videos = []
+    progress_text = "Starting I2V generation..."
+    yield [], "Preparing...", progress_text
+
+    # Extract LoRA weights and multipliers once
+    num_lora_weights = 4
+    lora_weights_list = lora_params[:num_lora_weights]
+    lora_multipliers_list = lora_params[num_lora_weights:num_lora_weights*2]
+
+    for i in range(batch_size):
+        if stop_event.is_set():
+            yield all_videos, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1:
+            current_seed = seed + i
+
+        batch_text = f"Generating video {i + 1} of {batch_size} (I2V)"
+        yield all_videos.copy(), batch_text, progress_text
+
+        # Call the single video processing function
+        single_gen = process_i2v_single_video(
+            prompt=prompt,
+            image_path=image_path,
+            width=width,
+            height=height,
+            batch_size=batch_size,
+            video_length=video_length,
+            fps=fps,
+            infer_steps=infer_steps,
+            seed=current_seed,
+            dit_folder=dit_folder,
+            model=model,
+            vae=vae,
+            te1=te1,
+            te2=te2,
+            clip_vision_path=clip_vision_path,
+            save_path=save_path,
+            flow_shift=flow_shift,
+            cfg_scale=cfg_scale,
+            guidance_scale=guidance_scale,
+            output_type=output_type,
+            attn_mode=attn_mode,
+            block_swap=block_swap,
+            exclude_single_blocks=exclude_single_blocks,
+            use_split_attn=use_split_attn,
+            lora_folder=lora_folder,
+            vae_chunk_size=vae_chunk_size,
+            vae_spatial_tile_min=vae_spatial_tile_min,
+            # --- Pass LoRA params by keyword ---
+            lora1=lora_weights_list[0],
+            lora2=lora_weights_list[1],
+            lora3=lora_weights_list[2],
+            lora4=lora_weights_list[3],
+            lora1_multiplier=lora_multipliers_list[0],
+            lora2_multiplier=lora_multipliers_list[1],
+            lora3_multiplier=lora_multipliers_list[2],
+            lora4_multiplier=lora_multipliers_list[3],
+            # --- End LoRA keyword args ---
+            negative_prompt=negative_prompt,
+            use_fp8=use_fp8,
+            fp8_llm=fp8_llm
+        )
+
+        # Yield progress updates from the single generator
+        try:
+            for videos, status, progress in single_gen:
+                if videos:
+                    # Only add the latest video from this specific generation
+                    new_video = videos[-1]
+                    if new_video not in all_videos:
+                         all_videos.append(new_video)
+                yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+        except Exception as e:
+             yield all_videos.copy(), f"Error in batch {i+1}: {e}", ""
+             print(f"Error during single I2V generation: {e}") # Log error
+
+        # Optional small delay between batch items
+        time.sleep(0.1)
+
+    yield all_videos, "I2V Batch complete", ""
+
 def wanx_extend_video_wrapper(
     prompt, negative_prompt, input_image, base_video_path,
     width, height, video_length, fps, infer_steps, 
@@ -1804,6 +2156,7 @@ def wanx_batch_handler(
     input_folder_path,
     wanx_input_end,
     task,
+    dit_folder,
     dit_path,
     vae_path,
     t5_path,
@@ -1833,6 +2186,9 @@ def wanx_batch_handler(
     slg_layers = None if slg_layers == "None" else slg_layers
     slg_start = None if slg_start == "None" else slg_start
     slg_end = None if slg_end == "None" else slg_end
+    
+    # Construct full dit_path including folder
+    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
     
     # Clean up LoRA params to proper format
     clean_lora_params = []
@@ -1864,6 +2220,7 @@ def wanx_batch_handler(
     # Debug the parameters
     print(f"DEBUG - Cleaned LoRA weights: {lora_weights}")
     print(f"DEBUG - Cleaned LoRA multipliers: {lora_multipliers}")
+    print(f"DEBUG - Using full DiT path: {full_dit_path}")
     
     if use_random:
         # Random image from folder mode
@@ -1929,7 +2286,8 @@ def wanx_batch_handler(
                 current_seed,
                 wanx_input_end,
                 task,
-                dit_path,
+                dit_folder,
+                full_dit_path,  # Use full_dit_path here instead of dit_path
                 vae_path,
                 t5_path,
                 clip_path,
@@ -2053,7 +2411,8 @@ def wanx_batch_handler(
                     current_seed,
                     wanx_input_end,
                     task,
-                    dit_path,
+                    dit_folder,
+                    full_dit_path,  # Use full_dit_path here
                     vae_path,
                     t5_path,
                     clip_path,
@@ -2116,7 +2475,8 @@ def wanx_batch_handler(
                 seed,
                 wanx_input_end,
                 task,
-                dit_path,
+                dit_folder,
+                full_dit_path,  # Use full_dit_path here
                 vae_path,
                 t5_path,
                 clip_path,
@@ -3561,7 +3921,8 @@ with gr.Blocks(
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         #Image to Video Tab
-        with gr.Tab(label="h-basic-i2v") as i2v_tab:
+        with gr.Tab(label="Hunyuan-i2v") as i2v_tab: # Keep tab name consistent if needed elsewhere
+            # ... (Keep existing Rows for prompt, batch size, progress) ...
             with gr.Row():
                 with gr.Column(scale=4):
                     i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -3571,31 +3932,35 @@ with gr.Blocks(
                     i2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
 
                 with gr.Column(scale=2):
-                    i2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    i2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    i2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress_i2v") # Unique elem_id
+                    i2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text_i2v") # Unique elem_id
 
             with gr.Row():
                 i2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
                 i2v_stop_btn = gr.Button("Stop Generation", variant="stop")
 
+
             with gr.Row():
                 with gr.Column():
                     i2v_input = gr.Image(label="Input Image", type="filepath")
-                    i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
-                    # Scale slider as percentage 
-                    scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                    # REMOVED i2v_strength slider, as hv_i2v_generate_video.py doesn't seem to use it based on the sample command
+                    # i2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.75, label="Denoise Strength")
+                    scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale % (UI Only - affects W/H)") # Clarified UI only
                     original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
                     # Width and height inputs
                     with gr.Row():
-                        width = gr.Number(label="New Width", value=544, step=16)
+                        # Renamed width/height to avoid potential conflicts if they weren't already prefixed
+                        i2v_width = gr.Number(label="New Width", value=720, step=16) # Default from sample
                         calc_height_btn = gr.Button("→")
                         calc_width_btn = gr.Button("←")
-                        height = gr.Number(label="New Height", value=544, step=16)
-                    i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25)
-                    i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
-                    i2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30)
-                    i2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0)
-                    i2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg scale", value=7.0)
+                        i2v_height = gr.Number(label="New Height", value=720, step=16) # Default from sample
+                    i2v_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=49) # Default from sample
+                    i2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24) # Default from sample
+                    i2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30) # Default from sample
+                    i2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=17.0) # Default from sample
+                    i2v_cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="Embedded CFG Scale", value=7.0) # Default from sample
+                    i2v_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale (CFG)", value=1.0) # Default from sample (usually 1.0 for no CFG)
+
                 with gr.Column():
                     i2v_output = gr.Gallery(
                         label="Generated Videos (Click to select)",
@@ -3604,11 +3969,11 @@ with gr.Blocks(
                         object_fit="contain",
                         height="auto",
                         show_label=True,
-                        elem_id="gallery",
+                        elem_id="gallery_i2v", # Unique elem_id
                         allow_preview=True,
                         preview=True
                     )
-                    i2v_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
+                    i2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v") # Keep sending to original V2V
 
                     # Add LoRA section for Image2Video
                     i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
@@ -3617,43 +3982,47 @@ with gr.Blocks(
                     for i in range(4):
                         with gr.Column():
                             i2v_lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
+                                label=f"LoRA {i+1}",
+                                choices=get_lora_options(),
+                                value="None",
                                 allow_custom_value=True,
                                 interactive=True
                             ))
                             i2v_lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
+                                label=f"Multiplier",
+                                minimum=0.0,
+                                maximum=2.0,
+                                step=0.05,
                                 value=1.0
                             ))
 
             with gr.Row():
-                i2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)                
+                i2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
                 i2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
                 i2v_dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
                 i2v_model = gr.Dropdown(
                     label="DiT Model",
                     choices=get_dit_models("hunyuan"),
-                    value="mp_rank_00_model_states.pt",
+                    value="mp_rank_00_model_states_i2v.pt", # Default from sample
                     allow_custom_value=True,
                     interactive=True
                 )
-
-                i2v_vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
-                i2v_te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
-                i2v_te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
-                i2v_save_path = gr.Textbox(label="Save Path", value="outputs")
+                i2v_vae = gr.Textbox(label="VAE Path", value="hunyuan/pytorch_model.pt") # Default from sample
+                i2v_te1 = gr.Textbox(label="Text Encoder 1 Path", value="hunyuan/llava_llama3_fp16.safetensors") # Default from sample
+                i2v_te2 = gr.Textbox(label="Text Encoder 2 Path", value="hunyuan/clip_l.safetensors") # Default from sample
+                i2v_clip_vision_path = gr.Textbox(label="CLIP Vision Path", value="hunyuan/llava_llama3_vision.safetensors") # Default from sample
+                i2v_save_path = gr.Textbox(label="Save Path", value="outputs") # Default from sample
             with gr.Row():
                 i2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                i2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                i2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
-                i2v_use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
-                i2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+                i2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video") # Default from sample
+                i2v_use_split_attn = gr.Checkbox(label="Use Split Attention", value=False) # Not in sample, keep default False
+                i2v_use_fp8 = gr.Checkbox(label="Use FP8 DiT", value=False) # Not in sample, keep default False
+                i2v_fp8_llm = gr.Checkbox(label="Use FP8 LLM", value=False) # Not in sample, keep default False
+                i2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa") # Default from sample
+                i2v_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=30) # Default from sample
+                # Add VAE tiling options like sample command
+                i2v_vae_chunk_size = gr.Number(label="VAE Chunk Size", value=32, step=1, info="For CausalConv3d, set 0 to disable")
+                i2v_vae_spatial_tile_min = gr.Number(label="VAE Spatial Tile Min Size", value=128, step=16, info="Set 0 to disable spatial tiling")
 
         # Video to Video Tab
         with gr.Tab(id=2, label="Hunyuan v2v") as v2v_tab:
@@ -4007,7 +4376,14 @@ with gr.Blocks(
                     value="i2v-14B",
                     info="Select model type. *-FC options enable Fun-Control features"
                 )
-                wanx_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_i2v_720p_14B_fp16.safetensors")
+                wanx_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
+                wanx_dit_path = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("wan"),  # Use the existing function to get available models
+                    value="wan2.1_i2v_720p_14B_fp16.safetensors",
+                    allow_custom_value=True,
+                    interactive=True
+                )
                 wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_clip_path = gr.Textbox(label="CLIP Path", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
@@ -5329,26 +5705,26 @@ with gr.Blocks(
     i2v_input.change(
         fn=update_dimensions,
         inputs=[i2v_input],
-        outputs=[original_dims, width, height]
+        outputs=[original_dims, i2v_width, i2v_height] # Update correct components
     )
 
     scale_slider.change(
         fn=update_from_scale,
         inputs=[scale_slider, original_dims],
-        outputs=[width, height]
+        outputs=[i2v_width, i2v_height] # Update correct components
     )
 
     calc_width_btn.click(
         fn=calculate_width,
-        inputs=[height, original_dims],
-        outputs=[width]
+        inputs=[i2v_height, original_dims], # Update correct components
+        outputs=[i2v_width]
     )
 
     calc_height_btn.click(
         fn=calculate_height,
-        inputs=[width, original_dims],
-        outputs=[height]
-    )            
+        inputs=[i2v_width, original_dims], # Update correct components
+        outputs=[i2v_height]    
+    )
 
     # Function to get available DiT models
     def get_dit_models(dit_folder: str) -> List[str]:
@@ -5616,16 +5992,46 @@ with gr.Blocks(
                 flow_shift, cfg_scale, lora1, lora2, lora3, lora4, 
                 lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier)
 
-    # Generate button handler
+    # Generate button handler for h-basic-i2v
     i2v_generate_btn.click(
-        fn=process_batch,
+        fn=process_i2v_batch, # <<< Use the new batch function
         inputs=[
-            i2v_prompt, width, height,
-            i2v_batch_size, i2v_video_length, 
-            i2v_fps, i2v_infer_steps, i2v_seed, i2v_dit_folder, i2v_model, i2v_vae, i2v_te1, i2v_te2,
-            i2v_save_path, i2v_flow_shift, i2v_cfg_scale, i2v_output_type, i2v_attn_mode, 
-            i2v_block_swap, i2v_exclude_single_blocks, i2v_use_split_attn, i2v_lora_folder, 
-            *i2v_lora_weights, *i2v_lora_multipliers, i2v_input, i2v_strength, i2v_use_fp8
+            i2v_prompt,
+            i2v_input, # Image path
+            i2v_width,
+            i2v_height,
+            i2v_batch_size,
+            i2v_video_length,
+            i2v_fps,
+            i2v_infer_steps,
+            i2v_seed,
+            i2v_dit_folder,
+            i2v_model,
+            i2v_vae,
+            i2v_te1,
+            i2v_te2,
+            i2v_clip_vision_path,
+            i2v_save_path,
+            i2v_flow_shift,
+            i2v_cfg_scale, # embedded_cfg_scale
+            i2v_guidance_scale, # main CFG scale
+            i2v_output_type,
+            i2v_attn_mode,
+            i2v_block_swap,
+            i2v_exclude_single_blocks,
+            i2v_use_split_attn,
+            i2v_lora_folder,
+            i2v_vae_chunk_size,
+            i2v_vae_spatial_tile_min,
+            # --- Add negative prompt component if you have one ---
+            # i2v_negative_prompt, # Uncomment if you added this textbox
+            # --- If no negative prompt textbox, pass None or "": ---
+            gr.Textbox(value="", visible=False), # Placeholder if no UI element
+            # --- End negative prompt handling ---
+            i2v_use_fp8,
+            i2v_fp8_llm,
+            *i2v_lora_weights, # Pass LoRA weights components
+            *i2v_lora_multipliers # Pass LoRA multipliers components
         ],
         outputs=[i2v_output, i2v_batch_progress, i2v_progress_text],
         queue=True
@@ -5641,19 +6047,19 @@ with gr.Blocks(
     )
 
     i2v_send_to_v2v_btn.click(
-        fn=send_i2v_to_v2v,
+        fn=send_i2v_to_v2v, # Function definition needs careful review/update if args changed
         inputs=[
             i2v_output, i2v_prompt, i2v_selected_index,
-            width, height,
+            i2v_width, i2v_height, # <<< Use i2v width/height
             i2v_video_length, i2v_fps, i2v_infer_steps,
-            i2v_seed, i2v_flow_shift, i2v_cfg_scale
-        ] + i2v_lora_weights + i2v_lora_multipliers,
+            i2v_seed, i2v_flow_shift, i2v_cfg_scale # <<< Use i2v cfg_scale (embedded)
+        ] + i2v_lora_weights + i2v_lora_multipliers, # <<< Use i2v LoRAs
         outputs=[
             v2v_input, v2v_prompt,
-            v2v_width, v2v_height,
+            v2v_width, v2v_height, # Target V2V components
             v2v_video_length, v2v_fps, v2v_infer_steps,
-            v2v_seed, v2v_flow_shift, v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers
+            v2v_seed, v2v_flow_shift, v2v_cfg_scale # Target V2V components
+        ] + v2v_lora_weights + v2v_lora_multipliers # Target V2V LoRAs
     ).then(
         fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
@@ -5756,8 +6162,8 @@ with gr.Blocks(
     ).then(
         lambda params: [
             params.get("prompt", ""),
-            params.get("width", 544),
-            params.get("height", 544),
+            params.get("width", 544),              # Parameter mapping is fine here
+            params.get("height", 544),             # Parameter mapping is fine here
             params.get("batch_size", 1),
             params.get("video_length", 25),
             params.get("fps", 24),
@@ -5775,10 +6181,10 @@ with gr.Blocks(
             params.get("block_swap", "0"),
             *[params.get(f"lora{i+1}", "") for i in range(4)],
             *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
-        ] if params else [gr.update()]*26,
+        ] if params else [gr.update()]*26, # This lambda returns values based on param keys
         inputs=params_state,
-        outputs=[prompt, width, height, batch_size, video_length, fps, infer_steps, seed, 
-                 model, vae, te1, te2, save_path, flow_shift, cfg_scale, 
+        outputs=[prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps, seed, # <<< CORRECTED HERE: use t2v_width, t2v_height
+                 model, vae, te1, te2, save_path, flow_shift, cfg_scale,
                  output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
     )
     # Text to Video generation
@@ -6140,6 +6546,7 @@ with gr.Blocks(
             wanx_input_folder,
             wanx_input_end,
             wanx_task,
+            wanx_dit_folder,
             wanx_dit_path,
             wanx_vae_path,
             wanx_t5_path,
@@ -6175,14 +6582,19 @@ with gr.Blocks(
     )
     
     # Add refresh button handler for WanX-i2v tab
-    wanx_refresh_outputs = []
+    wanx_refresh_outputs = [wanx_dit_path]  # Add model dropdown to outputs
     for i in range(4):
         wanx_refresh_outputs.extend([wanx_lora_weights[i], wanx_lora_multipliers[i]])
-    
+
     wanx_refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[wanx_lora_folder] + wanx_lora_weights + wanx_lora_multipliers,
+        fn=update_dit_and_lora_dropdowns,  # This function already exists and handles both updates
+        inputs=[wanx_dit_folder, wanx_lora_folder, wanx_dit_path] + wanx_lora_weights + wanx_lora_multipliers,
         outputs=wanx_refresh_outputs
+    )
+    wanx_dit_folder.change(
+        fn=update_dit_dropdown,  # This function already exists for other tabs
+        inputs=[wanx_dit_folder],
+        outputs=[wanx_dit_path]
     )
     
     # Gallery selection handling
