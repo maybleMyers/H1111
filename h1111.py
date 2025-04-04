@@ -2284,9 +2284,9 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale, 
                 current_seed,
-                wanx_input_end,
+                wanx_input_end, # Pass the value from args/UI
                 task,
-                dit_folder,
+                # dit_folder, # Removed, use full_dit_path
                 full_dit_path,  # Use full_dit_path here instead of dit_path
                 vae_path,
                 t5_path,
@@ -2300,7 +2300,7 @@ def wanx_batch_handler(
                 fp8,
                 fp8_scaled,
                 fp8_t5,
-                lora_folder,
+                lora_folder, # Pass the lora_folder string
                 slg_layers,
                 slg_start,
                 slg_end,
@@ -2315,7 +2315,8 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                None  # No control video for random batch mode
+                None,  # No control video for random batch mode
+                1.0    # Default control strength for random batch mode
             ):
                 if videos:
                     all_videos.extend(videos)
@@ -2396,51 +2397,50 @@ def wanx_batch_handler(
                 batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
                 yield all_videos, batch_text, progress_text
                 
-                # Generate a single video with the current seed
                 for videos, status, progress in wanx_generate_video(
-                    prompt, 
-                    negative_prompt, 
-                    input_file, 
-                    width,
-                    height,
-                    video_length,
-                    fps,
-                    infer_steps,
-                    flow_shift,
-                    guidance_scale, 
-                    current_seed,
-                    wanx_input_end,
-                    task,
-                    dit_folder,
-                    full_dit_path,  # Use full_dit_path here
-                    vae_path,
-                    t5_path,
-                    clip_path,
-                    save_path,
-                    output_type,
-                    sample_solver,
-                    exclude_single_blocks,
-                    attn_mode,
-                    block_swap,
-                    fp8,
-                    fp8_scaled,
-                    fp8_t5,
-                    lora_folder,
-                    slg_layers,
-                    slg_start,
-                    slg_end,
-                    lora_weights[0],
-                    lora_weights[1],
-                    lora_weights[2], 
-                    lora_weights[3],
-                    lora_multipliers[0],
-                    lora_multipliers[1],
-                    lora_multipliers[2],
-                    lora_multipliers[3],
-                    enable_cfg_skip,
-                    cfg_skip_mode,
-                    cfg_apply_ratio,  
-                    control_video  # Pass control video for Fun-Control                 
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    input_image=input_file,
+                    width=width,
+                    height=height,
+                    video_length=video_length,
+                    fps=fps,
+                    infer_steps=infer_steps,
+                    flow_shift=flow_shift,
+                    guidance_scale=guidance_scale,
+                    seed=current_seed,
+                    wanx_input_end=wanx_input_end, # Pass end image correctly
+                    task=task,
+                    dit_path=full_dit_path, # Pass full path here
+                    vae_path=vae_path,
+                    t5_path=t5_path,
+                    clip_path=clip_path,
+                    save_path=save_path,
+                    output_type=output_type,
+                    sample_solver=sample_solver,
+                    exclude_single_blocks=exclude_single_blocks,
+                    attn_mode=attn_mode,
+                    block_swap=block_swap,
+                    fp8=fp8,
+                    fp8_scaled=fp8_scaled,
+                    fp8_t5=fp8_t5,
+                    lora_folder=lora_folder, # Pass LoRA folder correctly
+                    slg_layers=slg_layers,
+                    slg_start=slg_start,
+                    slg_end=slg_end,
+                    lora1=lora_weights[0],
+                    lora2=lora_weights[1],
+                    lora3=lora_weights[2],
+                    lora4=lora_weights[3],
+                    lora1_multiplier=lora_multipliers[0],
+                    lora2_multiplier=lora_multipliers[1],
+                    lora3_multiplier=lora_multipliers[2],
+                    lora4_multiplier=lora_multipliers[3],
+                    enable_cfg_skip=enable_cfg_skip,
+                    cfg_skip_mode=cfg_skip_mode,
+                    cfg_apply_ratio=cfg_apply_ratio,
+                    control_video=control_video, # Pass control video for Fun-Control
+                    control_strength=control_strength # Pass control strength
                 ):
                     if videos:
                         all_videos.extend(videos)
@@ -2473,9 +2473,9 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale,
                 seed,
-                wanx_input_end,
+                wanx_input_end, # Pass the value from args/UI
                 task,
-                dit_folder,
+                # dit_folder, # Removed, use full_dit_path
                 full_dit_path,  # Use full_dit_path here
                 vae_path,
                 t5_path,
@@ -2489,7 +2489,7 @@ def wanx_batch_handler(
                 fp8,
                 fp8_scaled,
                 fp8_t5, 
-                lora_folder,
+                lora_folder, # Pass the lora_folder string
                 slg_layers,
                 slg_start,
                 slg_end,
@@ -2504,7 +2504,8 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                control_video  # Pass control video for Fun-Control
+                control_video,  # Pass control video for Fun-Control                 
+                control_strength # Pass control strength
             )
 
 def process_single_video(
@@ -3140,6 +3141,10 @@ def wanx_generate_video(
         weight_str = str(weight)
 
         # Construct full path and verify file exists
+        if not isinstance(lora_folder, str):
+            print(f"Error: lora_folder is not a string: {lora_folder} (type: {type(lora_folder)})")
+            continue # Skip this LoRA if folder path is invalid
+
         full_path = os.path.join(lora_folder, weight_str)
         if not os.path.exists(full_path):
             print(f"LoRA file not found: {full_path}")
