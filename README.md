@@ -117,7 +117,6 @@ python -m venv env
 source env/bin/activate 
 pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 pip install flash-attn --no-build-isolation
 pip install sageattention==1.0.6
 might need python3.10-dev as well for sage attention to work
@@ -151,7 +150,6 @@ python -m venv env
 ./env/scripts/activate
 pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
-pip install ascii-magic matplotlib tensorboard wheel gradio==5.14.0 tiktoken ffmpeg ffmpeg-python
 
 ```
 
