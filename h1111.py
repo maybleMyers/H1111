@@ -535,7 +535,7 @@ def wanx_extend_video_wrapper(
                     slg_list.append(int(layer))
             if slg_list:  # Only add if we have valid layers
                 command.extend(["--slg_layers", ",".join(map(str, slg_list))])
-                
+
                 # Only add slg_start and slg_end if we have valid slg_layers
                 if slg_start is not None and float(slg_start) >= 0:
                     command.extend(["--slg_start", str(float(slg_start))])
@@ -815,18 +815,21 @@ def wanx_v2v_generate_video(
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
         try:
-            command.extend(["--slg_layers", ",".join(map(str, [int(x) for x in str(slg_layers).split(",")]))])
+            # Parse SLG layers
+            layer_list = [int(x) for x in str(slg_layers).split(",")]
+            if layer_list:  # Only proceed if we have valid layer values
+                command.extend(["--slg_layers", ",".join(map(str, layer_list))])
+                
+                # Only add slg_start and slg_end if we have valid slg_layers
+                try:
+                    if slg_start_float is not None and slg_start_float >= 0:
+                        command.extend(["--slg_start", str(slg_start_float)])
+                    if slg_end_float is not None and slg_end_float <= 1.0:
+                        command.extend(["--slg_end", str(slg_end_float)])
+                except ValueError as e:
+                    print(f"Invalid SLG timing values: {str(e)}")
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
-
-    # Handle SLG start/end timings
-    try:
-        if slg_start_float is not None and slg_start_float >= 0:
-            command.extend(["--slg_start", str(slg_start_float)])
-        if slg_end_float is not None and slg_end_float <= 1.0:
-            command.extend(["--slg_end", str(slg_end_float)])
-    except ValueError as e:
-        print(f"Invalid SLG timing values: {str(e)}")
     
     if negative_prompt:
         command.extend(["--negative_prompt", negative_prompt])
@@ -3109,14 +3112,6 @@ def wanx_generate_video(
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
 
-    # Handle SLG start/end timings
-    try:
-        if slg_start_float is not None and slg_start_float >= 0:
-            command.extend(["--slg_start", str(slg_start_float)])
-        if slg_end_float is not None and slg_end_float <= 1.0:
-            command.extend(["--slg_end", str(slg_end_float)])
-    except ValueError as e:
-        print(f"Invalid SLG timing values: {str(e)}")
     
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
