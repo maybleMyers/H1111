@@ -3623,12 +3623,12 @@ def process_batch_extension(
     prompt, negative_prompt, input_image, base_video,
     width, height, video_length, fps, infer_steps,
     flow_shift, guidance_scale, seed, batch_size,
-    task, dit_folder, dit_path, vae_path, t5_path, clip_path,  # FIXED: Added dit_folder parameter
+    task, dit_folder, dit_path, vae_path, t5_path, clip_path,
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
     slg_layers, slg_start, slg_end,
-    lora1, lora2, lora3, lora4, 
-    lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier
+    lora1="None", lora2="None", lora3="None", lora4="None",
+    lora1_multiplier=1.0, lora2_multiplier=1.0, lora3_multiplier=1.0, lora4_multiplier=1.0
 ):
     """Process a batch of video extensions one at a time"""
     global stop_event
@@ -3670,7 +3670,7 @@ def process_batch_extension(
             prompt, negative_prompt, input_image, base_video,
             width, height, video_length, fps, infer_steps,
             flow_shift, guidance_scale, current_seed,
-            task, dit_folder, dit_path, vae_path, t5_path, clip_path,  # Pass dit_folder
+            task, dit_folder, dit_path, vae_path, t5_path, clip_path,
             save_path, output_type, sample_solver, exclude_single_blocks,
             attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
             slg_layers, slg_start, slg_end,
@@ -5234,7 +5234,7 @@ with gr.Blocks(
             wanx_prompt, wanx_negative_prompt, wanx_input, wanx_trimmed_video_path,
             wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
             wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_task, wanx_dit_folder, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,  # Added wanx_dit_folder
+            wanx_task, wanx_dit_folder, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
             wanx_save_path, wanx_output_type, wanx_sample_solver, wanx_exclude_single_blocks,
             wanx_attn_mode, wanx_block_swap, wanx_fp8, wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
             wanx_slg_layers, wanx_slg_start, wanx_slg_end,
