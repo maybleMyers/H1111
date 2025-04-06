@@ -386,7 +386,7 @@ def wanx_extend_video_wrapper(
     prompt, negative_prompt, input_image, base_video_path,
     width, height, video_length, fps, infer_steps, 
     flow_shift, guidance_scale, seed, 
-    task, dit_path, vae_path, t5_path, clip_path,
+    task, dit_folder, dit_path, vae_path, t5_path, clip_path,
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
     slg_layers="", slg_start=0.0, slg_end=1.0,
@@ -400,7 +400,7 @@ def wanx_extend_video_wrapper(
     # All videos generated
     all_videos = []
     
-    # Debug print to understand what we're getting
+    # Debug prints to understand what we're getting
     print(f"DEBUG - Received parameters:")
     print(f"  task: {task}")
     print(f"  dit_path: {dit_path}")
@@ -410,67 +410,14 @@ def wanx_extend_video_wrapper(
     print(f"  sample_solver: {sample_solver}")
     print(f"  attn_mode: {attn_mode}")
     print(f"  block_swap: {block_swap}")
-    print(f"  enable_cfg_skip: {enable_cfg_skip}")
-    print(f"  cfg_skip_mode: {cfg_skip_mode}")
-    print(f"  cfg_apply_ratio: {cfg_apply_ratio}")
     
     # Get current seed
     current_seed = seed
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
     
-    # Correct known parameter issues
-    # 1. Fix task - ensure it's just the task name, not a path
-    corrected_task = "i2v-14B"
-    if isinstance(task, str) and not "/" in task and not "\\" in task:
-        corrected_task = task
-    
-    # 2. Fix file paths - use proper paths when necessary
-    corrected_dit_path = dit_path
-    if not isinstance(dit_path, str) or "mp_rank" in dit_path or not dit_path.endswith((".safetensors", ".pt")):
-        corrected_dit_path = "wan/wan2.1_i2v_480p_14B_bf16.safetensors"
-        
-    corrected_vae_path = vae_path
-    if not isinstance(vae_path, str) or not vae_path.endswith((".pth", ".safetensors")):
-        corrected_vae_path = "wan/Wan2.1_VAE.pth"
-        
-    corrected_t5_path = t5_path
-    if not isinstance(t5_path, str) or not "t5" in t5_path.lower():
-        corrected_t5_path = "wan/models_t5_umt5-xxl-enc-bf16.pth"
-        
-    corrected_clip_path = clip_path
-    if not isinstance(clip_path, str) or not "clip" in clip_path.lower():
-        corrected_clip_path = "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
-    
-    # 3. Fix attention mode - ensure it's a valid string
-    attn_modes = ["flash", "sdpa", "sageattn", "xformers", "torch"]
-    corrected_attn_mode = "flash"  # Use flash as default since it worked
-    if isinstance(attn_mode, str) and attn_mode in attn_modes:
-        corrected_attn_mode = attn_mode
-    
-    # 4. Fix sample solver - ensure it's a valid string
-    corrected_sample_solver = "unipc"
-    sample_solvers = ["unipc", "dpm++", "vanilla"]
-    if isinstance(sample_solver, str) and sample_solver in sample_solvers:
-        corrected_sample_solver = sample_solver
-    elif isinstance(output_type, str) and output_type in sample_solvers:
-        corrected_sample_solver = output_type
-        
-    # 5. Fix block swap - ensure it's an integer and keep the original value if it's reasonable
-    corrected_block_swap = 26  # Default to 26 which seems to work well
-    if isinstance(block_swap, (int, float)) and 0 <= int(block_swap) <= 39:
-        corrected_block_swap = int(block_swap)
-    
-    # 6. Fix output type - ensure it's a valid string
-    corrected_output_type = "video"
-    output_types = ["video", "images", "latent", "both"]
-    if isinstance(output_type, str) and output_type in output_types:
-        corrected_output_type = output_type
-    
-    # 7. Fix save path - preserve original if it looks valid
-    corrected_save_path = save_path
-    if not isinstance(save_path, str) or len(save_path) < 1:
-        corrected_save_path = "outputs"
+    # Construct full dit_path - Handle relative/absolute paths
+    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
     
     # Prepare environment
     env = os.environ.copy()
@@ -480,33 +427,53 @@ def wanx_extend_video_wrapper(
     # Clear CUDA cache
     clear_cuda_cache()
     
+    # Validate and fix parameters
+    # Fix output_type - must be one of: video, images, latent, both
+    valid_output_types = ["video", "images", "latent", "both"]
+    actual_output_type = "video" if output_type not in valid_output_types else output_type
+    
+    # Fix sample_solver - must be one of: unipc, dpm++, vanilla
+    valid_sample_solvers = ["unipc", "dpm++", "vanilla"]
+    actual_sample_solver = "unipc" if sample_solver not in valid_sample_solvers else sample_solver
+    
+    # Fix attn_mode - must be one of: sdpa, flash, sageattn, xformers, torch
+    valid_attn_modes = ["sdpa", "flash", "sageattn", "xformers", "torch"]
+    actual_attn_mode = "sdpa" if attn_mode not in valid_attn_modes else attn_mode
+    
+    # Fix block_swap - must be an integer
+    try:
+        actual_block_swap = int(block_swap)
+    except (ValueError, TypeError):
+        actual_block_swap = 0
+        
     # Build command array with explicit string conversions for EVERY parameter
     command = [
         sys.executable,
         "wan_generate_video.py",
-        "--task", corrected_task,
+        "--task", str(task),
         "--prompt", str(prompt),
         "--video_size", str(height), str(width),
         "--video_length", str(video_length),
         "--fps", str(fps),
         "--infer_steps", str(infer_steps),
-        "--save_path", corrected_save_path,
+        "--save_path", str(save_path),
         "--seed", str(current_seed),
         "--flow_shift", str(flow_shift),
         "--guidance_scale", str(guidance_scale),
-        "--output_type", corrected_output_type,
-        "--attn_mode", corrected_attn_mode,
-        "--blocks_to_swap", str(corrected_block_swap),
-        "--dit", corrected_dit_path,
-        "--vae", corrected_vae_path,
-        "--t5", corrected_t5_path,
-        "--sample_solver", corrected_sample_solver
+        "--output_type", actual_output_type,
+        "--sample_solver", actual_sample_solver,
+        "--attn_mode", actual_attn_mode,
+        "--blocks_to_swap", str(actual_block_swap),
+        # Correctly specify each path separately
+        "--dit", str(full_dit_path),
+        "--vae", str(vae_path),
+        "--t5", str(t5_path)
     ]
-    
+        
     # Add image path
     if input_image:
         command.extend(["--image_path", str(input_image)])
-        command.extend(["--clip", corrected_clip_path])
+        command.extend(["--clip", str(clip_path)])
     
     # Add negative prompt
     if negative_prompt:
@@ -548,7 +515,7 @@ def wanx_extend_video_wrapper(
     valid_loras = []
     if lora_folder and isinstance(lora_folder, str):
         for weight, mult in zip([lora1, lora2, lora3, lora4], 
-                               [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
+                              [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier]):
             # Skip None or empty values
             if not weight or str(weight).lower() == "none":
                 continue
@@ -613,7 +580,7 @@ def wanx_extend_video_wrapper(
     time.sleep(0.5)
     
     # Find generated video
-    save_path_abs = os.path.abspath(corrected_save_path)
+    save_path_abs = os.path.abspath(save_path)
     if os.path.exists(save_path_abs):
         all_videos = sorted(
             [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
@@ -634,7 +601,7 @@ def wanx_extend_video_wrapper(
                 "fps": fps,
                 "infer_steps": infer_steps,
                 "seed": current_seed,
-                "task": corrected_task,
+                "task": task,
                 "flow_shift": flow_shift,
                 "guidance_scale": guidance_scale,
                 "negative_prompt": negative_prompt if negative_prompt else None
@@ -656,13 +623,13 @@ def wanx_extend_video_wrapper(
             # Create unique output filename
             timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
             output_filename = f"extended_{timestamp}_seed{current_seed}_{Path(base_video_path).stem}.mp4"
-            output_path = os.path.join(corrected_save_path, output_filename)
+            output_path = os.path.join(save_path, output_filename)
             
             # Extract the path from the gallery item
             new_video_path = videos[0][0] if isinstance(videos[0], tuple) else videos[0]
             
             # Create a temporary file list for ffmpeg
-            list_file = os.path.join(corrected_save_path, f"temp_list_{current_seed}.txt")
+            list_file = os.path.join(save_path, f"temp_list_{current_seed}.txt")
             with open(list_file, "w") as f:
                 f.write(f"file '{os.path.abspath(base_video_path)}'\n")
                 f.write(f"file '{os.path.abspath(new_video_path)}'\n")
@@ -3656,7 +3623,7 @@ def process_batch_extension(
     prompt, negative_prompt, input_image, base_video,
     width, height, video_length, fps, infer_steps,
     flow_shift, guidance_scale, seed, batch_size,
-    task, dit_path, vae_path, t5_path, clip_path,
+    task, dit_folder, dit_path, vae_path, t5_path, clip_path,  # FIXED: Added dit_folder parameter
     save_path, output_type, sample_solver, exclude_single_blocks,
     attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
     slg_layers, slg_start, slg_end,
@@ -3698,12 +3665,12 @@ def process_batch_extension(
         batch_text = f"Processing video {i+1}/{batch_size} (seed: {current_seed})"
         yield all_extended_videos, batch_text, progress_text
         
-        # Use the direct wrapper
+        # Use the direct wrapper with correct parameter order
         for videos, status, progress in wanx_extend_video_wrapper(
             prompt, negative_prompt, input_image, base_video,
             width, height, video_length, fps, infer_steps,
             flow_shift, guidance_scale, current_seed,
-            task, dit_path, vae_path, t5_path, clip_path,
+            task, dit_folder, dit_path, vae_path, t5_path, clip_path,  # Pass dit_folder
             save_path, output_type, sample_solver, exclude_single_blocks,
             attn_mode, block_swap, fp8, fp8_scaled, fp8_t5, lora_folder,
             slg_layers, slg_start, slg_end,
@@ -5267,7 +5234,7 @@ with gr.Blocks(
             wanx_prompt, wanx_negative_prompt, wanx_input, wanx_trimmed_video_path,
             wanx_width, wanx_height, wanx_video_length, wanx_fps, wanx_infer_steps,
             wanx_flow_shift, wanx_guidance_scale, wanx_seed, wanx_batch_size,
-            wanx_task, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,
+            wanx_task, wanx_dit_folder, wanx_dit_path, wanx_vae_path, wanx_t5_path, wanx_clip_path,  # Added wanx_dit_folder
             wanx_save_path, wanx_output_type, wanx_sample_solver, wanx_exclude_single_blocks,
             wanx_attn_mode, wanx_block_swap, wanx_fp8, wanx_fp8_scaled, wanx_fp8_t5, wanx_lora_folder,
             wanx_slg_layers, wanx_slg_start, wanx_slg_end,
