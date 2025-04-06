@@ -527,14 +527,20 @@ def wanx_extend_video_wrapper(
     
     # Add SLG parameters
     try:
-        if slg_start is not None and float(slg_start) >= 0:
-            command.extend(["--slg_start", str(float(slg_start))])
-    except (ValueError, TypeError):
-        pass
-        
-    try:
-        if slg_end is not None and float(slg_end) <= 1.0:
-            command.extend(["--slg_end", str(float(slg_end))])
+        if slg_layers and str(slg_layers).strip() and str(slg_layers).lower() != "none":
+            slg_list = []
+            for layer in str(slg_layers).split(","):
+                layer = layer.strip()
+                if layer.isdigit():  # Only add if it's a valid integer
+                    slg_list.append(int(layer))
+            if slg_list:  # Only add if we have valid layers
+                command.extend(["--slg_layers", ",".join(map(str, slg_list))])
+                
+                # Only add slg_start and slg_end if we have valid slg_layers
+                if slg_start is not None and float(slg_start) >= 0:
+                    command.extend(["--slg_start", str(float(slg_start))])
+                if slg_end is not None and float(slg_end) <= 1.0:
+                    command.extend(["--slg_end", str(float(slg_end))])
     except (ValueError, TypeError):
         pass
     
@@ -3091,6 +3097,15 @@ def wanx_generate_video(
                     slg_list.append(int(layer))
             if slg_list:  # Only add if we have valid layers
                 command.extend(["--slg_layers", ",".join(map(str, slg_list))])
+
+                # Only add slg_start and slg_end if we have valid slg_layers
+                try:
+                    if slg_start_float is not None and slg_start_float >= 0:
+                        command.extend(["--slg_start", str(slg_start_float)])
+                    if slg_end_float is not None and slg_end_float <= 1.0:
+                        command.extend(["--slg_end", str(slg_end_float)])
+                except ValueError as e:
+                    print(f"Invalid SLG timing values: {str(e)}")
         except ValueError as e:
             print(f"Invalid SLG layers format: {slg_layers} - {str(e)}")
 
