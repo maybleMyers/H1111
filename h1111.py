@@ -717,6 +717,7 @@ def wanx_v2v_generate_video(
     strength,
     seed,
     task,
+    dit_folder,
     dit_path,
     vae_path,
     t5_path,
@@ -784,6 +785,9 @@ def wanx_v2v_generate_video(
     
     clear_cuda_cache()
 
+    # Construct full dit_path including folder - this is the fix
+    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
+
     command = [
         sys.executable,
         "wan_generate_video.py",
@@ -800,7 +804,7 @@ def wanx_v2v_generate_video(
         "--output_type", output_type,
         "--attn_mode", attn_mode,
         "--blocks_to_swap", str(block_swap),
-        "--dit", dit_path,
+        "--dit", full_dit_path,  # Use full_dit_path instead of dit_path
         "--vae", vae_path,
         "--t5", t5_path,
         "--sample_solver", sample_solver,
@@ -934,7 +938,7 @@ def wanx_v2v_generate_video(
                 "strength": strength,
                 "lora_weights": [lora1, lora2, lora3, lora4],
                 "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
-                "dit_path": dit_path,
+                "dit_path": full_dit_path,  # Store the full path in metadata
                 "vae_path": vae_path,
                 "t5_path": t5_path,
                 "negative_prompt": negative_prompt if negative_prompt else None,
@@ -961,7 +965,8 @@ def wanx_v2v_batch_handler(
     seed,
     batch_size,
     task,
-    dit_path,
+    dit_folder,  # folder path
+    dit_path,    # model filename
     vae_path,
     t5_path,
     save_path,
@@ -1026,7 +1031,8 @@ def wanx_v2v_batch_handler(
             strength,
             current_seed,
             task, 
-            dit_path, 
+            dit_folder,  # Pass folder path
+            dit_path,    # Pass model filename
             vae_path, 
             t5_path, 
             save_path, 
@@ -2197,8 +2203,7 @@ def wanx_batch_handler(
     slg_end = None if slg_end == "None" else slg_end
     
     # Construct full dit_path including folder
-    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
-    
+    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path    
     # Clean up LoRA params to proper format
     clean_lora_params = []
     for param in lora_params:
@@ -4530,7 +4535,13 @@ with gr.Blocks(
                     value="t2v-14B",
                     info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
                 )
-                wanx_t2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_fp16.safetensors")
+                wanx_t2v_dit_path = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("wan"),
+                    value="wan2.1_t2v_14B_fp16.safetensors",
+                    allow_custom_value=True,
+                    interactive=True
+                )
                 wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
@@ -4671,7 +4682,14 @@ with gr.Blocks(
                     value="t2v-14B",
                     info="Model size: t2v-1.3B is faster, t2v-14B has higher quality"
                 )
-                wanx_v2v_dit_path = gr.Textbox(label="DiT Model Path", value="wan/wan2.1_t2v_14B_fp16.safetensors")
+                wanx_v2v_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
+                wanx_v2v_dit_path = gr.Dropdown(
+                    label="DiT Model",
+                    choices=get_dit_models("wan"),
+                    value="wan2.1_t2v_14B_fp16.safetensors",
+                    allow_custom_value=True,
+                    interactive=True
+                )
                 wanx_v2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
                 wanx_v2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                 wanx_v2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
@@ -5026,6 +5044,7 @@ with gr.Blocks(
             wanx_v2v_seed,
             wanx_v2v_batch_size,
             wanx_v2v_task,
+            wanx_v2v_dit_folder,
             wanx_v2v_dit_path,
             wanx_v2v_vae_path,
             wanx_v2v_t5_path,
@@ -5101,7 +5120,7 @@ with gr.Blocks(
     )
 
     # Add refresh button handler for WanX-v2v tab
-    wanx_v2v_refresh_outputs = []
+    wanx_v2v_refresh_outputs = [wanx_v2v_dit_path]
     for i in range(4):
         wanx_v2v_refresh_outputs.extend([wanx_v2v_lora_weights[i], wanx_v2v_lora_multipliers[i]])
 
@@ -6609,9 +6628,21 @@ with gr.Blocks(
         outputs=wanx_refresh_outputs
     )
     wanx_dit_folder.change(
-        fn=update_dit_dropdown,  # This function already exists for other tabs
+        fn=update_dit_dropdown,
         inputs=[wanx_dit_folder],
         outputs=[wanx_dit_path]
+    )
+
+    wanx_dit_folder.change(
+        fn=update_dit_dropdown,
+        inputs=[wanx_dit_folder],
+        outputs=[wanx_t2v_dit_path]
+    )
+
+    wanx_dit_folder.change(
+        fn=update_dit_dropdown,
+        inputs=[wanx_dit_folder],
+        outputs=[wanx_v2v_dit_path]
     )
     
     # Gallery selection handling
@@ -6728,7 +6759,7 @@ with gr.Blocks(
     )
     
     # Add refresh button handler for WanX-t2v tab
-    wanx_t2v_refresh_outputs = []
+    wanx_t2v_refresh_outputs = [wanx_t2v_dit_path]
     for i in range(4):
         wanx_t2v_refresh_outputs.extend([wanx_t2v_lora_weights[i], wanx_t2v_lora_multipliers[i]])
     
