@@ -1196,7 +1196,6 @@ def run_sampling(
     device: torch.device,
     seed_g: torch.Generator,
     accelerator: Accelerator,
-    # is_i2v: bool = False, # No longer needed as logic is handled by inputs dict
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
@@ -1269,9 +1268,25 @@ def run_sampling(
     for i, t in enumerate(tqdm(timesteps)):
         # Prepare input for the model (move latent to compute device)
         # Latent should be [B, C, F, H, W] or [C, F, H, W]
-        # The model expects the latent input 'x' as a list: [tensor]
         latent_on_device = latent.to(device)
-        latent_model_input_list = [latent_on_device] # <<< WRAP IN LIST
+        
+        # FIX: Check if latent_on_device has too many dimensions and fix it
+        # The model expects input x as a list of tensors with shape [C, F, H, W]
+        if len(latent_on_device.shape) > 5:
+            # Remove extra dimensions (likely [1, 1, C, F, H, W] -> [1, C, F, H, W])
+            while len(latent_on_device.shape) > 5:
+                latent_on_device = latent_on_device.squeeze(0)
+            logger.info(f"Adjusted latent shape for model input: {latent_on_device.shape}")
+            
+        # The model expects the latent input 'x' as a list: [tensor]
+        # If batch dimension is present, we need to split the tensor into a list of tensors
+        if len(latent_on_device.shape) == 5:
+            # Has batch dimension [B, C, F, H, W]
+            latent_model_input_list = [latent_on_device[i] for i in range(latent_on_device.shape[0])]
+        else:
+            # No batch dimension [C, F, H, W]
+            latent_model_input_list = [latent_on_device]
+            
         timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
@@ -1314,12 +1329,21 @@ def run_sampling(
 
             # 3. Compute previous sample state with the scheduler
             # Scheduler expects noise_pred [B, C, F, H, W] and latent [B, C, F, H, W]
-            # Ensure latent is on the compute device for the step
-            # latent_step_input = latent.to(device) # Already did this with latent_on_device
+            # Ensure shapes match what scheduler expects
+            if len(noise_pred.shape) < 5:
+                # Add batch dimension if missing
+                noise_pred = noise_pred.unsqueeze(0)
+                
+            # Similarly, ensure latent_on_device has batch dimension
+            if len(latent_on_device.shape) < 5:
+                latent_on_device_batched = latent_on_device.unsqueeze(0)
+            else:
+                latent_on_device_batched = latent_on_device
+                
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device
                 t,
-                latent_on_device, # Pass the tensor directly to scheduler step
+                latent_on_device_batched, # Pass the tensor with batch dimension to scheduler step
                 return_dict=False,
                 generator=seed_g # Pass generator
             )
@@ -1331,7 +1355,6 @@ def run_sampling(
     # Return the final denoised latent (should be on storage device)
     logger.info("Sampling loop finished.")
     return latent
-
 
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     """main function for generation pipeline (T2V, I2V, V2V)

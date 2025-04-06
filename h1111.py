@@ -2284,9 +2284,9 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale, 
                 current_seed,
-                wanx_input_end, # Pass the value from args/UI
+                wanx_input_end,
                 task,
-                # dit_folder, # Removed, use full_dit_path
+                dit_folder,
                 full_dit_path,  # Use full_dit_path here instead of dit_path
                 vae_path,
                 t5_path,
@@ -2300,7 +2300,7 @@ def wanx_batch_handler(
                 fp8,
                 fp8_scaled,
                 fp8_t5,
-                lora_folder, # Pass the lora_folder string
+                lora_folder,
                 slg_layers,
                 slg_start,
                 slg_end,
@@ -2315,8 +2315,7 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                None,  # No control video for random batch mode
-                1.0    # Default control strength for random batch mode
+                None  # No control video for random batch mode
             ):
                 if videos:
                     all_videos.extend(videos)
@@ -2397,50 +2396,51 @@ def wanx_batch_handler(
                 batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
                 yield all_videos, batch_text, progress_text
                 
+                # Generate a single video with the current seed
                 for videos, status, progress in wanx_generate_video(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    input_image=input_file,
-                    width=width,
-                    height=height,
-                    video_length=video_length,
-                    fps=fps,
-                    infer_steps=infer_steps,
-                    flow_shift=flow_shift,
-                    guidance_scale=guidance_scale,
-                    seed=current_seed,
-                    wanx_input_end=wanx_input_end, # Pass end image correctly
-                    task=task,
-                    dit_path=full_dit_path, # Pass full path here
-                    vae_path=vae_path,
-                    t5_path=t5_path,
-                    clip_path=clip_path,
-                    save_path=save_path,
-                    output_type=output_type,
-                    sample_solver=sample_solver,
-                    exclude_single_blocks=exclude_single_blocks,
-                    attn_mode=attn_mode,
-                    block_swap=block_swap,
-                    fp8=fp8,
-                    fp8_scaled=fp8_scaled,
-                    fp8_t5=fp8_t5,
-                    lora_folder=lora_folder, # Pass LoRA folder correctly
-                    slg_layers=slg_layers,
-                    slg_start=slg_start,
-                    slg_end=slg_end,
-                    lora1=lora_weights[0],
-                    lora2=lora_weights[1],
-                    lora3=lora_weights[2],
-                    lora4=lora_weights[3],
-                    lora1_multiplier=lora_multipliers[0],
-                    lora2_multiplier=lora_multipliers[1],
-                    lora3_multiplier=lora_multipliers[2],
-                    lora4_multiplier=lora_multipliers[3],
-                    enable_cfg_skip=enable_cfg_skip,
-                    cfg_skip_mode=cfg_skip_mode,
-                    cfg_apply_ratio=cfg_apply_ratio,
-                    control_video=control_video, # Pass control video for Fun-Control
-                    control_strength=control_strength # Pass control strength
+                    prompt, 
+                    negative_prompt, 
+                    input_file, 
+                    width,
+                    height,
+                    video_length,
+                    fps,
+                    infer_steps,
+                    flow_shift,
+                    guidance_scale, 
+                    current_seed,
+                    wanx_input_end,
+                    task,
+                    dit_folder,
+                    full_dit_path,  # Use full_dit_path here
+                    vae_path,
+                    t5_path,
+                    clip_path,
+                    save_path,
+                    output_type,
+                    sample_solver,
+                    exclude_single_blocks,
+                    attn_mode,
+                    block_swap,
+                    fp8,
+                    fp8_scaled,
+                    fp8_t5,
+                    lora_folder,
+                    slg_layers,
+                    slg_start,
+                    slg_end,
+                    lora_weights[0],
+                    lora_weights[1],
+                    lora_weights[2], 
+                    lora_weights[3],
+                    lora_multipliers[0],
+                    lora_multipliers[1],
+                    lora_multipliers[2],
+                    lora_multipliers[3],
+                    enable_cfg_skip,
+                    cfg_skip_mode,
+                    cfg_apply_ratio,  
+                    control_video  # Pass control video for Fun-Control                 
                 ):
                     if videos:
                         all_videos.extend(videos)
@@ -2473,9 +2473,9 @@ def wanx_batch_handler(
                 flow_shift,
                 guidance_scale,
                 seed,
-                wanx_input_end, # Pass the value from args/UI
+                wanx_input_end,
                 task,
-                # dit_folder, # Removed, use full_dit_path
+                dit_folder,
                 full_dit_path,  # Use full_dit_path here
                 vae_path,
                 t5_path,
@@ -2489,7 +2489,7 @@ def wanx_batch_handler(
                 fp8,
                 fp8_scaled,
                 fp8_t5, 
-                lora_folder, # Pass the lora_folder string
+                lora_folder,
                 slg_layers,
                 slg_start,
                 slg_end,
@@ -2504,8 +2504,7 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                control_video,  # Pass control video for Fun-Control                 
-                control_strength # Pass control strength
+                control_video  # Pass control video for Fun-Control
             )
 
 def process_single_video(
@@ -2938,6 +2937,7 @@ def wanx_generate_video(
     seed,
     wanx_input_end,
     task,
+    dit_folder,
     dit_path,
     vae_path,
     t5_path,
@@ -2971,33 +2971,14 @@ def wanx_generate_video(
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
-
     
-    # Debug LoRA parameters
+    # Fix 1: Ensure lora_folder is a string
+    lora_folder = str(lora_folder) if lora_folder else "lora"
+    
+    # Debug prints
     print(f"DEBUG - LoRA params: {lora1}, {lora2}, {lora3}, {lora4}")
     print(f"DEBUG - LoRA multipliers: {lora1_multiplier}, {lora2_multiplier}, {lora3_multiplier}, {lora4_multiplier}")
     print(f"DEBUG - LoRA folder: {lora_folder}")
-
-    
-    # Check if this is a Fun-Control task
-    is_fun_control = "-FC" in task and control_video is not None
-    if is_fun_control:
-        print(f"DEBUG - Using Fun-Control mode with control video: {control_video}")
-            # Verify control video is provided
-        if not control_video:
-            yield [], "Error: No control video provided", "Fun-Control requires a control video"
-            return
-        
-        # Verify needed files exist
-        for path_name, path in [
-            ("DIT", dit_path),
-            ("VAE", vae_path),
-            ("T5", t5_path),
-            ("CLIP", clip_path)
-        ]:
-            if not os.path.exists(path):
-                yield [], f"Error: {path_name} model not found", f"Model file doesn't exist: {path}"
-                return
     
     # Convert values safely to float or None
     try:
@@ -3018,6 +2999,26 @@ def wanx_generate_video(
         yield [], "", ""
         return
 
+    # Check if this is a Fun-Control task
+    is_fun_control = "-FC" in task and control_video is not None
+    if is_fun_control:
+        print(f"DEBUG - Using Fun-Control mode with control video: {control_video}")
+        # Verify control video is provided
+        if not control_video:
+            yield [], "Error: No control video provided", "Fun-Control requires a control video"
+            return
+        
+        # Verify needed files exist
+        for path_name, path in [
+            ("DIT", dit_path),
+            ("VAE", vae_path),
+            ("T5", t5_path),
+            ("CLIP", clip_path)
+        ]:
+            if not os.path.exists(path):
+                yield [], f"Error: {path_name} model not found", f"Model file doesn't exist: {path}"
+                return
+    
     # Get current seed or use provided seed
     current_seed = seed
     if seed == -1:
@@ -3040,35 +3041,37 @@ def wanx_generate_video(
     
     clear_cuda_cache()
 
+    # Fix 2: Create command array with all string values
     command = [
         sys.executable,
         "wan_generate_video.py",
-        "--task", task,
-        "--prompt", prompt,
+        "--task", str(task),
+        "--prompt", str(prompt),
         "--video_size", str(height), str(width),
         "--video_length", str(video_length),
         "--fps", str(fps),
         "--infer_steps", str(infer_steps),
-        "--save_path", save_path,
+        "--save_path", str(save_path),
         "--seed", str(current_seed),
         "--flow_shift", str(flow_shift),
         "--guidance_scale", str(guidance_scale),
-        "--output_type", output_type,
-        "--attn_mode", attn_mode,
+        "--output_type", str(output_type),
+        "--attn_mode", str(attn_mode),
         "--blocks_to_swap", str(block_swap),
-        "--dit", dit_path,
-        "--vae", vae_path,
-        "--t5", t5_path,
-        "--sample_solver", sample_solver
+        "--dit", str(dit_path),
+        "--vae", str(vae_path),
+        "--t5", str(t5_path),
+        "--sample_solver", str(sample_solver)
     ]
     
+    # Fix 3: Only add boolean flags if they're True
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
-            "--cfg_skip_mode", cfg_skip_mode,
+            "--cfg_skip_mode", str(cfg_skip_mode),
             "--cfg_apply_ratio", str(cfg_apply_ratio)
         ])
         
-    if wanx_input_end and wanx_input_end != "none" and os.path.exists(wanx_input_end):
+    if wanx_input_end and wanx_input_end != "none" and os.path.exists(str(wanx_input_end)):
         command.extend(["--end_image_path", str(wanx_input_end)])
         command.extend(["--trim_tail_frames", "3"])
         
@@ -3078,7 +3081,7 @@ def wanx_generate_video(
         command.extend(["--control_strength", str(control_strength)])
 
     # Handle SLG parameters
-    if slg_layers and str(slg_layers).strip() and slg_layers.lower() != "none":
+    if slg_layers and str(slg_layers).strip() and str(slg_layers).lower() != "none":
         try:
             # Make sure slg_layers is parsed as a list of integers
             slg_list = []
@@ -3102,19 +3105,20 @@ def wanx_generate_video(
     
     # Add image path only for i2v task and if input image is provided
     if "i2v" in task and input_image:
-        command.extend(["--image_path", input_image])
-        command.extend(["--clip", clip_path])  # CLIP is needed for i2v and Fun-Control
+        command.extend(["--image_path", str(input_image)])
+        command.extend(["--clip", str(clip_path)])  # CLIP is needed for i2v and Fun-Control
     
     # Add video path for v2v task
     if "v2v" in task and input_image:
-        command.extend(["--video_path", input_image])
+        command.extend(["--video_path", str(input_image)])
         # Add strength parameter for video-to-video
         if isinstance(guidance_scale, (int, float)) and guidance_scale > 0:
             command.extend(["--strength", str(guidance_scale)])
     
     if negative_prompt:
-        command.extend(["--negative_prompt", negative_prompt])
+        command.extend(["--negative_prompt", str(negative_prompt)])
     
+    # Add boolean flags correctly
     if fp8:
         command.append("--fp8")
     
@@ -3141,16 +3145,12 @@ def wanx_generate_video(
         weight_str = str(weight)
 
         # Construct full path and verify file exists
-        if not isinstance(lora_folder, str):
-            print(f"Error: lora_folder is not a string: {lora_folder} (type: {type(lora_folder)})")
-            continue # Skip this LoRA if folder path is invalid
-
         full_path = os.path.join(lora_folder, weight_str)
         if not os.path.exists(full_path):
             print(f"LoRA file not found: {full_path}")
             continue
 
-            # Add valid LoRA to the list
+        # Add valid LoRA to the list
         valid_loras.append((full_path, mult))
 
     # Only add LoRA parameters if we have valid LoRAs
@@ -3160,8 +3160,10 @@ def wanx_generate_video(
         command.extend(["--lora_weight"] + weights)
         command.extend(["--lora_multiplier"] + multipliers)
     
-    str_command = [str(arg) for arg in command]
-    print(f"Running: {' '.join(str_command)}")
+    # Make sure every item in command is a string
+    command = [str(item) for item in command]
+    
+    print(f"Running: {' '.join(command)}")
 
     p = subprocess.Popen(
         command,
@@ -6687,15 +6689,16 @@ with gr.Blocks(
             wanx_t2v_input_folder,    # The input folder textbox
             wanx_t2v_input_end,       # The end frame parameter
             wanx_t2v_task,
-            wanx_t2v_dit_path,
+            wanx_dit_folder,      # Changed: dit_folder before dit_path
+            wanx_t2v_dit_path,        # Changed: actual model path
             wanx_t2v_vae_path,
             wanx_t2v_t5_path,
             wanx_t2v_clip_path,
             wanx_t2v_save_path,
-            wanx_t2v_output_type,
-            wanx_t2v_sample_solver,
+            wanx_t2v_output_type,     # Changed: corrected output_type
+            wanx_t2v_sample_solver,   # Changed: corrected sample_solver
             wanx_t2v_exclude_single_blocks,
-            wanx_t2v_attn_mode,
+            wanx_t2v_attn_mode,       # Changed: corrected attn_mode
             wanx_t2v_block_swap,
             wanx_t2v_fp8,
             wanx_t2v_fp8_scaled,
