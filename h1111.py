@@ -488,9 +488,6 @@ def wanx_extend_video_wrapper(
     
     if fp8_t5:
         command.append("--fp8_t5")
-        
-    if exclude_single_blocks:
-        command.append("--exclude_single_blocks")
     
     # Add SLG parameters
     try:
@@ -6729,7 +6726,7 @@ with gr.Blocks(
     wanx_t2v_refresh_outputs = [wanx_t2v_dit_path]  # This is one output
     for i in range(4):
         wanx_t2v_refresh_outputs.extend([wanx_t2v_lora_weights[i], wanx_t2v_lora_multipliers[i]])  # This adds 8 more outputs
-    
+
     wanx_t2v_refresh_btn.click(
         fn=update_dit_and_lora_dropdowns,  # Change to this function instead
         inputs=[wanx_dit_folder, wanx_t2v_lora_folder, wanx_t2v_dit_path] + wanx_t2v_lora_weights + wanx_t2v_lora_multipliers,
