@@ -5087,15 +5087,15 @@ with gr.Blocks(
     )
 
     # Add refresh button handler for WanX-v2v tab
-    wanx_v2v_refresh_outputs = [wanx_v2v_dit_path]
+    wanx_v2v_refresh_outputs = [wanx_v2v_dit_path]  # This is one output
     for i in range(4):
-        wanx_v2v_refresh_outputs.extend([wanx_v2v_lora_weights[i], wanx_v2v_lora_multipliers[i]])
+        wanx_v2v_refresh_outputs.extend([wanx_v2v_lora_weights[i], wanx_v2v_lora_multipliers[i]])  # This adds 8 more outputs
 
     wanx_v2v_refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[wanx_v2v_lora_folder] + wanx_v2v_lora_weights + wanx_v2v_lora_multipliers,
+        fn=update_dit_and_lora_dropdowns,  # We need to use this function instead
+        inputs=[wanx_v2v_dit_folder, wanx_v2v_lora_folder, wanx_v2v_dit_path] + wanx_v2v_lora_weights + wanx_v2v_lora_multipliers,
         outputs=wanx_v2v_refresh_outputs
-    ) 
+    )
 
     # Add function to send videos from Video Info tab to WanX-v2v
     def send_to_wanx_v2v(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
@@ -6726,13 +6726,13 @@ with gr.Blocks(
     )
     
     # Add refresh button handler for WanX-t2v tab
-    wanx_t2v_refresh_outputs = [wanx_t2v_dit_path]
+    wanx_t2v_refresh_outputs = [wanx_t2v_dit_path]  # This is one output
     for i in range(4):
-        wanx_t2v_refresh_outputs.extend([wanx_t2v_lora_weights[i], wanx_t2v_lora_multipliers[i]])
+        wanx_t2v_refresh_outputs.extend([wanx_t2v_lora_weights[i], wanx_t2v_lora_multipliers[i]])  # This adds 8 more outputs
     
     wanx_t2v_refresh_btn.click(
-        fn=update_lora_dropdowns,
-        inputs=[wanx_t2v_lora_folder] + wanx_t2v_lora_weights + wanx_t2v_lora_multipliers,
+        fn=update_dit_and_lora_dropdowns,  # Change to this function instead
+        inputs=[wanx_dit_folder, wanx_t2v_lora_folder, wanx_t2v_dit_path] + wanx_t2v_lora_weights + wanx_t2v_lora_multipliers,
         outputs=wanx_t2v_refresh_outputs
     )
 
