@@ -403,6 +403,7 @@ def wanx_extend_video_wrapper(
     # Debug prints to understand what we're getting
     print(f"DEBUG - Received parameters:")
     print(f"  task: {task}")
+    print(f"  dit_folder: {dit_folder}")
     print(f"  dit_path: {dit_path}")
     print(f"  vae_path: {vae_path}")
     print(f"  t5_path: {t5_path}")
@@ -416,8 +417,12 @@ def wanx_extend_video_wrapper(
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
     
-    # Construct full dit_path - Handle relative/absolute paths
+    # FIX: Handle both relative and absolute paths correctly
+    # If dit_path is not an absolute path, then combine with dit_folder
     full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
+    
+    # Ensure other paths are also correctly handled - do not combine with dit_path
+    # These should be either absolute paths or paths relative to the current working directory
     
     # Prepare environment
     env = os.environ.copy()
@@ -464,7 +469,7 @@ def wanx_extend_video_wrapper(
         "--sample_solver", actual_sample_solver,
         "--attn_mode", actual_attn_mode,
         "--blocks_to_swap", str(actual_block_swap),
-        # Correctly specify each path separately
+        # Correctly specify each path separately - FIX: use full_dit_path
         "--dit", str(full_dit_path),
         "--vae", str(vae_path),
         "--t5", str(t5_path)
