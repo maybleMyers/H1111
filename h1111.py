@@ -417,13 +417,6 @@ def wanx_extend_video_wrapper(
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
     
-    # FIX: Handle both relative and absolute paths correctly
-    # If dit_path is not an absolute path, then combine with dit_folder
-    full_dit_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
-    
-    # Ensure other paths are also correctly handled - do not combine with dit_path
-    # These should be either absolute paths or paths relative to the current working directory
-    
     # Prepare environment
     env = os.environ.copy()
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
@@ -468,12 +461,19 @@ def wanx_extend_video_wrapper(
         "--output_type", actual_output_type,
         "--sample_solver", actual_sample_solver,
         "--attn_mode", actual_attn_mode,
-        "--blocks_to_swap", str(actual_block_swap),
-        # Correctly specify each path separately - FIX: use full_dit_path
-        "--dit", str(full_dit_path),
-        "--vae", str(vae_path),
-        "--t5", str(t5_path)
+        "--blocks_to_swap", str(actual_block_swap)
     ]
+    
+    # CRITICAL FIX: Correctly handle model paths - ensure dit_path gets the folder
+    # but other paths don't have the folder prepended twice
+    if not os.path.isabs(dit_path):
+        command.extend(["--dit", os.path.join(dit_folder, dit_path)])
+    else:
+        command.extend(["--dit", dit_path])
+        
+    # Add other model paths directly - let wan_generate_video.py handle relative paths
+    command.extend(["--vae", vae_path])
+    command.extend(["--t5", t5_path])
         
     # Add image path
     if input_image:
