@@ -381,7 +381,6 @@ def process_i2v_batch(
         time.sleep(0.1)
 
     yield all_videos, "I2V Batch complete", ""
-
 def wanx_extend_video_wrapper(
     prompt, negative_prompt, input_image, base_video_path,
     width, height, video_length, fps, infer_steps, 
@@ -416,6 +415,30 @@ def wanx_extend_video_wrapper(
     current_seed = seed
     if seed == -1:
         current_seed = random.randint(0, 2**32 - 1)
+    
+    # CRITICAL FIX: Check if parameters are swapped and fix them
+    # When extending, the dit_folder might actually contain the model filename,
+    # and dit_path might contain the VAE path
+    
+    # First, check if dit_path looks like a VAE path (contains "VAE" or ends with .pth)
+    if dit_path and (("VAE" in dit_path) or dit_path.endswith(".pth")):
+        # Parameters are likely swapped
+        print("WARNING: Parameters appear to be swapped. Fixing...")
+        
+        # Save the original dit_folder as the actual model path
+        actual_model_path = dit_folder
+        
+        # Use a default dit_folder if needed
+        dit_folder = "wan"
+        
+        # For clarity, print what we're doing
+        print(f"  Using model path: {actual_model_path}")
+        print(f"  Using dit_folder: {dit_folder}")
+        print(f"  Using vae_path: {vae_path}")
+        print(f"  Using t5_path: {t5_path}")
+    else:
+        # Parameters seem correct, combine normally
+        actual_model_path = os.path.join(dit_folder, dit_path) if not os.path.isabs(dit_path) else dit_path
     
     # Prepare environment
     env = os.environ.copy()
@@ -461,24 +484,19 @@ def wanx_extend_video_wrapper(
         "--output_type", actual_output_type,
         "--sample_solver", actual_sample_solver,
         "--attn_mode", actual_attn_mode,
-        "--blocks_to_swap", str(actual_block_swap)
+        "--blocks_to_swap", str(actual_block_swap),
+        # Use the corrected model path
+        "--dit", str(actual_model_path),
+        "--vae", str(vae_path),
+        "--t5", str(t5_path)
     ]
-    
-    # CRITICAL FIX: Correctly handle model paths - ensure dit_path gets the folder
-    # but other paths don't have the folder prepended twice
-    if not os.path.isabs(dit_path):
-        command.extend(["--dit", os.path.join(dit_folder, dit_path)])
-    else:
-        command.extend(["--dit", dit_path])
         
-    # Add other model paths directly - let wan_generate_video.py handle relative paths
-    command.extend(["--vae", vae_path])
-    command.extend(["--t5", t5_path])
-        
-    # Add image path
+    # Add image path and clip model path if needed
     if input_image:
         command.extend(["--image_path", str(input_image)])
-        command.extend(["--clip", str(clip_path)])
+        # Only add clip if it's not the output path (another potential swap)
+        if clip_path and clip_path != "outputs" and "output" not in clip_path:
+            command.extend(["--clip", str(clip_path)])
     
     # Add negative prompt
     if negative_prompt:
