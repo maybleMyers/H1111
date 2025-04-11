@@ -4402,12 +4402,12 @@ with gr.Blocks(
                         wanx_height = gr.Number(label="Height", value=480, interactive=True)
                         wanx_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
 
-                    wanx_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                    wanx_video_length = gr.Slider(minimum=1, maximum=401, step=4, label="Video Length in Frames", value=81)
                     wanx_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wanx_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
                     wanx_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=3.0, 
                                             info="Recommended: 3.0 for 480p, 5.0 for others")
-                    wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Guidance Scale", value=5.0)
 
                 with gr.Column():
                     wanx_output = gr.Gallery(
