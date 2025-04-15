@@ -2226,7 +2226,7 @@ def wanx_batch_handler(
     enable_cfg_skip: bool,
     cfg_skip_mode: str,
     cfg_apply_ratio: float,
-    *lora_params
+    *lora_params,   # <-- DO NOT ADD NAMED ARGS AFTER THIS!
 ):
     """Handle both folder-based batch processing and regular processing for all WanX tabs"""
     global stop_event
@@ -2251,37 +2251,39 @@ def wanx_batch_handler(
     num_lora_weights = 4
     lora_weights = clean_lora_params[:num_lora_weights]
     lora_multipliers = []
-    
-    # Convert multipliers to float
     for mult in clean_lora_params[num_lora_weights:num_lora_weights*2]:
         try:
             lora_multipliers.append(float(mult))
         except (ValueError, TypeError):
-            lora_multipliers.append(1.0)  # Default multiplier
-    
-    # Fill with defaults if not enough provided
+            lora_multipliers.append(1.0)
     while len(lora_weights) < 4:
         lora_weights.append("None")
     while len(lora_multipliers) < 4:
         lora_multipliers.append(1.0)
-        
-    # Debug the parameters
-    print(f"DEBUG - Cleaned LoRA weights: {lora_weights}")
-    print(f"DEBUG - Cleaned LoRA multipliers: {lora_multipliers}")
-    print(f"DEBUG - Using full DiT path: {full_dit_path}")
-    
-    if use_random:
-        # Random image from folder mode
-        stop_event.clear()
 
+    # Now extract trailing params: input_file, control_video, control_strength, control_start, control_end
+    remaining_params = clean_lora_params[num_lora_weights*2:]
+    input_file = remaining_params[0] if len(remaining_params) > 0 else None
+    control_video = remaining_params[1] if len(remaining_params) > 1 else None
+    try:
+        control_strength = float(remaining_params[2]) if len(remaining_params) > 2 else 1.0
+    except Exception:
+        control_strength = 1.0
+    try:
+        control_start = float(remaining_params[3]) if len(remaining_params) > 3 else 0.0
+    except Exception:
+        control_start = 0.0
+    try:
+        control_end = float(remaining_params[4]) if len(remaining_params) > 4 else 1.0
+    except Exception:
+        control_end = 1.0
+
+    if use_random:
+        stop_event.clear()
         all_videos = []
         progress_text = "Starting generation..."
         yield [], "Preparing...", progress_text
-
-        # Ensure batch_size is treated as an integer
         batch_size = int(batch_size)
-        
-        # Process each item in the batch separately
         for i in range(batch_size):
             if stop_event.is_set():
                 yield all_videos, "Generation stopped by user", ""
@@ -2290,36 +2292,31 @@ def wanx_batch_handler(
             batch_text = f"Generating video {i + 1} of {batch_size}"
             yield all_videos.copy(), batch_text, progress_text
 
-            # Get random image from folder
             random_image, status = get_random_image_from_folder(input_folder_path)
             if random_image is None:
                 yield all_videos, f"Error in batch {i+1}: {status}", ""
                 continue
 
-            # Resize image
             resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, width, height)
             if resized_image is None:
                 yield all_videos, f"Error resizing image in batch {i+1}: {size_info}", ""
                 continue
 
-            # Use the dimensions returned from the resize function
-            local_width, local_height = width, height  # Default fallback
+            local_width, local_height = width, height
             if isinstance(size_info, tuple):
                 local_width, local_height = size_info
-                progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height} (maintaining aspect ratio)"
+                progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height}"
             else:
                 progress_text = f"Using image: {os.path.basename(random_image)}"
             
             yield all_videos.copy(), batch_text, progress_text
 
-            # Calculate seed for this batch item
             current_seed = seed
             if seed == -1:
                 current_seed = random.randint(0, 2**32 - 1)
             elif batch_size > 1:
                 current_seed = seed + i
 
-            # Generate video for this image - one at a time
             for videos, status, progress in wanx_generate_video(
                 prompt, 
                 negative_prompt, 
@@ -2335,7 +2332,7 @@ def wanx_batch_handler(
                 wanx_input_end,
                 task,
                 dit_folder,
-                full_dit_path,  # Use full_dit_path here instead of dit_path
+                full_dit_path,  
                 vae_path,
                 t5_path,
                 clip_path,
@@ -2363,88 +2360,51 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                None  # No control video for random batch mode
+                None,                # control_video
+                1.0,                 # control_strength
+                0.0,                 # control_start
+                1.0,                 # control_end
             ):
                 if videos:
                     all_videos.extend(videos)
                 yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
 
-            # Clean up temporary file
             try:
                 if os.path.exists(resized_image):
                     os.remove(resized_image)
             except:
                 pass
-            
-            # Clear CUDA cache between generations
+
             clear_cuda_cache()
             time.sleep(0.5)
-
         yield all_videos, "Batch complete", ""
     else:
-        # For non-random mode, if batch_size > 1, we process multiple times with the same input image
-        # but different seeds
-        batch_size = int(batch_size)  # Ensure batch_size is treated as an integer
-        input_file = None
-        control_video = None
-        control_strength = 1.0  # Default control strength
-        
-        # Get the input image/video, control video, and control strength from remaining parameters
-        remaining_params = clean_lora_params[num_lora_weights*2:]  # After LoRA weights and multipliers
-        
-        if len(remaining_params) > 0 and remaining_params[0] is not None and remaining_params[0] != "None":
-            input_file = remaining_params[0]
-            print(f"Found input file in remaining params: {input_file}")
-        
-        # Get control video if provided (for Fun-Control)
-        if len(remaining_params) > 1 and remaining_params[1] is not None and remaining_params[1] != "None":
-            control_video = remaining_params[1]
-            print(f"Found control video in remaining params: {control_video}")
-            
-        # Get control strength if provided
-        if len(remaining_params) > 2 and remaining_params[2] is not None:
-            try:
-                control_strength = float(remaining_params[2])
-                print(f"Using control strength: {control_strength}")
-            except (ValueError, TypeError):
-                print(f"Warning: Could not convert control strength to float, using default 1.0")
-        
-        # If we still don't have an image path, this is a problem
+        batch_size = int(batch_size)
         if not input_file and "i2v" in task:
-            print("No image path found in extra_args")
-            print(f"Full lora_params: {lora_params}")
             yield [], "Error: No input image provided", "An input image is required for I2V models"
             return
-            
-        # Check for Fun-Control requirements
         if "-FC" in task and not control_video:
             yield [], "Error: No control video provided", "A control video is required for Fun-Control models"
             return
-        
+
         if batch_size > 1:
             stop_event.clear()
-            
             all_videos = []
             progress_text = "Starting generation..."
             yield [], "Preparing...", progress_text
             
-            # Process each batch item
             for i in range(batch_size):
                 if stop_event.is_set():
                     yield all_videos, "Generation stopped by user", ""
                     return
-                
-                # Calculate seed for this batch item
+
                 current_seed = seed
                 if seed == -1:
                     current_seed = random.randint(0, 2**32 - 1)
                 elif batch_size > 1:
                     current_seed = seed + i
-                
                 batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
                 yield all_videos, batch_text, progress_text
-                
-                # Generate a single video with the current seed
                 for videos, status, progress in wanx_generate_video(
                     prompt, 
                     negative_prompt, 
@@ -2460,7 +2420,7 @@ def wanx_batch_handler(
                     wanx_input_end,
                     task,
                     dit_folder,
-                    full_dit_path,  # Use full_dit_path here
+                    full_dit_path, 
                     vae_path,
                     t5_path,
                     clip_path,
@@ -2487,28 +2447,20 @@ def wanx_batch_handler(
                     lora_multipliers[3],
                     enable_cfg_skip,
                     cfg_skip_mode,
-                    cfg_apply_ratio,  
-                    control_video  # Pass control video for Fun-Control                 
+                    cfg_apply_ratio,
+                    control_video,
+                    control_strength,
+                    control_start,
+                    control_end,
                 ):
                     if videos:
                         all_videos.extend(videos)
                     yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
-                
-                # Clear CUDA cache between generations
                 clear_cuda_cache()
                 time.sleep(0.5)
-            
             yield all_videos, "Batch complete", ""
         else:
-            # Single image/video, single generation
             stop_event.clear()
-            
-            # Debug the input file and control video
-            print(f"Processing single video with input file: {input_file}")
-            if control_video:
-                print(f"Using control video: {control_video}")
-            
-            # Call wanx_generate_video directly with the input file and control video
             yield from wanx_generate_video(
                 prompt, 
                 negative_prompt,
@@ -2524,7 +2476,7 @@ def wanx_batch_handler(
                 wanx_input_end,
                 task,
                 dit_folder,
-                full_dit_path,  # Use full_dit_path here
+                full_dit_path,
                 vae_path,
                 t5_path,
                 clip_path,
@@ -2552,7 +2504,10 @@ def wanx_batch_handler(
                 enable_cfg_skip,
                 cfg_skip_mode,
                 cfg_apply_ratio,
-                control_video  # Pass control video for Fun-Control
+                control_video,
+                control_strength,
+                control_start,
+                control_end,
             )
 
 def process_single_video(
@@ -3016,6 +2971,8 @@ def wanx_generate_video(
     cfg_apply_ratio=0.7,
     control_video=None,
     control_strength=1.0,
+    control_start=0.0,
+    control_end=1.0,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
@@ -3126,7 +3083,9 @@ def wanx_generate_video(
     # Handle Fun-Control (control video path)
     if is_fun_control and control_video:
         command.extend(["--control_path", str(control_video)])
-        command.extend(["--control_strength", str(control_strength)])
+        command.extend(["--control_weight", str(control_strength)])
+        command.extend(["--control_start", str(control_start)])
+        command.extend(["--control_end", str(control_end)])
 
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and str(slg_layers).lower() != "none":
@@ -4391,6 +4350,24 @@ with gr.Blocks(
                         wanx_control_strength = gr.Slider(minimum=0.1, maximum=2.0, step=0.05, value=1.0, 
                             label="Control Strength", visible=False,
                             info="Adjust influence of control video (1.0 = normal)")
+                        wanx_control_start = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            step=0.01,
+                            value=0.0,
+                            label="Control Start (Fun-Control fade-in)",
+                            visible=False,
+                            info="When (0-1) in the timeline control influence is full after fade-in"
+                        )
+                        wanx_control_end = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            step=0.01,
+                            value=1.0,
+                            label="Control End (Fun-Control fade-out start)",
+                            visible=False,
+                            info="When (0-1) in the timeline control starts to fade out"
+                        )
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -4957,9 +4934,9 @@ with gr.Blocks(
             return current_task
 
     wanx_use_fun_control.change(
-        fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
+        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=x), gr.update(visible=x)),
         inputs=[wanx_use_fun_control],
-        outputs=[wanx_control_video, wanx_control_strength]
+        outputs=[wanx_control_video, wanx_control_strength, wanx_control_start, wanx_control_end]
     )
 
     # Make task change update checkbox state
@@ -6741,7 +6718,9 @@ with gr.Blocks(
             *wanx_lora_multipliers,
             wanx_input,  # Input image
             wanx_control_video,  # Control video
-            wanx_control_strength  # Add control strength parameter
+            wanx_control_strength,
+            wanx_control_start,
+            wanx_control_end,
         ],
         outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
         queue=True

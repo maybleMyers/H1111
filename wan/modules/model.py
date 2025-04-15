@@ -738,8 +738,15 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            print('WanModel concat debug:')
+            for i, (u, v) in enumerate(zip(x, y)):
+                print(f"x[{i}]: {u.shape}, y[{i}]: {v.shape}, y[{i}].dim(): {v.dim()}")
+            x = [
+                torch.cat([u, v], dim=0)
+                for u, v in zip(x, y)
+            ]
             y = None
+        
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]

@@ -1,4 +1,4 @@
-# --- START OF FILE wan_generate_video.py ---
+# --- START OF FILE wanFUN_generate_video.py ---
 
 import argparse
 from datetime import datetime
@@ -108,18 +108,36 @@ def parse_args() -> argparse.Namespace:
     # I2V arguments
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
     parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
-    # Fun-Control argument (distinct from V2V)
+    # Fun-Control arguments (NEW/MODIFIED)
     parser.add_argument(
-        "--control_strength",
-        type=float,
-        default=1.0,
-        help="Strength of control video influence for Fun-Control (1.0 = normal)",
-    )
-    parser.add_argument(
-        "--control_path",
+        "--control_path", # Keep this argument name
         type=str,
         default=None,
-        help="path to control video for inference with controlnet (Fun-Control model only). video file or directory with images",
+        help="path to control video for inference with Fun-Control model. video file or directory with images",
+    )
+    parser.add_argument(
+        "--control_start",
+        type=float,
+        default=0.0,
+        help="Start point (0.0-1.0) in the timeline where control influence is full (after fade-in)",
+    )
+    parser.add_argument(
+        "--control_end",
+        type=float,
+        default=1.0,
+        help="End point (0.0-1.0) in the timeline where control influence starts to fade out",
+    )
+    parser.add_argument(
+        "--control_falloff_percentage", # NEW name
+        type=float,
+        default=0.3,
+        help="Falloff percentage (0.0-0.49) for smooth transitions at start/end of control influence region",
+    )
+    parser.add_argument(
+        "--control_weight", # NEW name
+        type=float,
+        default=1.0,
+        help="Overall weight/strength of control video influence for Fun-Control (0.0 to high values)",
     )
     parser.add_argument("--trim_tail_frames", type=int, default=0, help="trim tail N frames from the video before saving")
     parser.add_argument(
@@ -204,20 +222,321 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--video_path and --image_path cannot be used together.")
     if args.video_path is not None and args.control_path is not None:
         raise ValueError("--video_path (standard V2V) and --control_path (Fun-Control) cannot be used together.")
-    #if args.image_path is not None and args.control_path is not None:
-    #    raise ValueError("--image_path (I2V) and --control_path (Fun-Control) cannot be used together.")
-    #if args.video_path is not None and "i2v" in args.task:
-    #     logger.warning("--video_path is provided, but task is set to i2v. Task type does not directly affect V2V mode.")
     if args.image_path is not None and "t2v" in args.task:
          logger.warning("--image_path is provided, but task is set to t2v. Task type does not directly affect I2V mode.")
     if args.control_path is not None and not WAN_CONFIGS[args.task].is_fun_control:
         raise ValueError("--control_path is provided, but the selected task does not support Fun-Control.")
-    #if not args.control_path and WAN_CONFIGS[args.task].is_fun_control:
-    #    raise ValueError("The selected task requires Fun-Control (--control_path), but it was not provided.")
-
+    if not (0.0 <= args.control_falloff_percentage <= 0.49):
+        raise ValueError("--control_falloff_percentage must be between 0.0 and 0.49")
 
     return args
 
+def create_funcontrol_conditioning_latent(
+    args: argparse.Namespace,
+    config,
+    vae: WanVAE,
+    device: torch.device,
+    lat_f: int,
+    lat_h: int,
+    lat_w: int,
+    pixel_height: int, # Actual pixel height for resizing
+    pixel_width: int   # Actual pixel width for resizing
+) -> Optional[torch.Tensor]:
+    """
+    Creates the conditioning latent tensor 'y' for FunControl models,
+    replicating the logic from WanWeightedControlToVideo node.
+
+    Args:
+        args: Command line arguments.
+        config: Model configuration.
+        vae: Loaded VAE model instance.
+        device: Target computation device.
+        lat_f: Number of latent frames.
+        lat_h: Latent height.
+        lat_w: Latent width.
+        pixel_height: Target pixel height for image/video processing.
+        pixel_width: Target pixel width for image/video processing.
+
+    Returns:
+        torch.Tensor: The final conditioning latent 'y' [1, 32, lat_f, lat_h, lat_w],
+                      or None if VAE is missing when required.
+    """
+    logger.info("Creating FunControl conditioning latent 'y'...")
+    if vae is None:
+         # Should not happen if called correctly, but check anyway
+         logger.error("VAE is required to create FunControl conditioning latent but was not provided.")
+         return None
+
+    batch_size = 1 # Hardcoded for script execution
+    total_latent_frames = lat_f
+    vae_dtype = vae.dtype # Use VAE's dtype for encoding
+
+    # Initialize the two parts of the concat latent
+    # Control part (first 16 channels) - will be filled later
+    control_latent_part = torch.zeros([batch_size, 16, total_latent_frames, lat_h, lat_w],
+                                    device=device, dtype=vae_dtype).contiguous()
+    # Image guidance part (last 16 channels)
+    image_guidance_latent = torch.zeros([batch_size, 16, total_latent_frames, lat_h, lat_w],
+                                      device=device, dtype=vae_dtype).contiguous()
+
+    # --- Image Guidance Processing (Start/End Images) ---
+    timeline_mask = torch.zeros([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
+    has_start_image = args.image_path is not None
+    has_end_image = args.end_image_path is not None
+
+    # Process start image if provided
+    start_latent = None
+    if has_start_image:
+        logger.info(f"Processing start image: {args.image_path}")
+        try:
+            img = Image.open(args.image_path).convert("RGB")
+            img_np = np.array(img)
+            # Resize to target pixel dimensions
+            interpolation = cv2.INTER_AREA if pixel_height < img_np.shape[0] else cv2.INTER_CUBIC
+            img_resized_np = cv2.resize(img_np, (pixel_width, pixel_height), interpolation=interpolation)
+            # Convert to tensor CFHW, range [-1, 1]
+            img_tensor = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)
+            img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
+
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
+                # vae.encode expects a list, returns a list. Take first element.
+                # Result shape [C', F', H', W'] - needs batch dim for processing here
+                start_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
+
+            # Calculate influence and falloff
+            start_frames_influence = min(start_latent.shape[2], total_latent_frames) # Usually 1
+            if start_frames_influence > 0:
+                 # Use falloff_percentage for smooth transition *away* from start image
+                 falloff_len_frames = max(1, int(total_latent_frames * args.control_falloff_percentage))
+                 start_influence_mask = torch.ones([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
+
+                 # Apply falloff starting *after* the first frame
+                 if total_latent_frames > 1 + falloff_len_frames:
+                     # Falloff from frame 1 to 1+falloff_len_frames
+                     t = torch.linspace(0, 1, falloff_len_frames, device=device)
+                     falloff = 0.5 + 0.5 * torch.cos(t * math.pi) # 1 -> 0
+                     start_influence_mask[0, 0, 1:1+falloff_len_frames] = falloff
+                     # Set influence to 0 after falloff
+                     start_influence_mask[0, 0, 1+falloff_len_frames:] = 0.0
+                 elif total_latent_frames > 1:
+                     # Shorter falloff if video is too short
+                     t = torch.linspace(0, 1, total_latent_frames - 1, device=device)
+                     falloff = 0.5 + 0.5 * torch.cos(t * math.pi) # 1 -> 0
+                     start_influence_mask[0, 0, 1:] = falloff
+
+                 # Place start latent in the image guidance part, weighted by mask
+                 # Since start_latent is only frame 0, we just place it there.
+                 # The mask influences how other elements (like end image) blend *in*.
+                 image_guidance_latent[:, :, 0:1, :, :] = start_latent[:, :, 0:1, :, :] # Take first frame
+
+                 # Update the main timeline mask
+                 timeline_mask = torch.max(timeline_mask, start_influence_mask) # Start image dominates beginning
+                 logger.info(f"Start image processed. Latent shape: {start_latent.shape}")
+
+        except Exception as e:
+            logger.error(f"Error processing start image: {e}")
+            # Continue without start image guidance
+
+    # Process end image if provided
+    end_latent = None
+    if has_end_image:
+        logger.info(f"Processing end image: {args.end_image_path}")
+        try:
+            img = Image.open(args.end_image_path).convert("RGB")
+            img_np = np.array(img)
+            # Resize to target pixel dimensions
+            interpolation = cv2.INTER_AREA if pixel_height < img_np.shape[0] else cv2.INTER_CUBIC
+            img_resized_np = cv2.resize(img_np, (pixel_width, pixel_height), interpolation=interpolation)
+            # Convert to tensor CFHW, range [-1, 1]
+            img_tensor = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)
+            img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
+
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
+                end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
+
+            # Calculate end image influence transition (S-curve / cubic)
+            end_influence_mask = torch.zeros([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
+            falloff_len_frames = max(1, int(total_latent_frames * args.control_falloff_percentage))
+
+            # Determine when the end image influence should start ramping up
+            # More sophisticated start point based on control_end if control video exists
+            if args.control_path and args.control_end < 1.0:
+                 # Start fade-in just before control video fades out significantly
+                 influence_start_frame = max(0, int(total_latent_frames * args.control_end) - falloff_len_frames // 2)
+            else:
+                 # Default: start influence around 60% mark if no control or control runs full length
+                 influence_start_frame = max(0, int(total_latent_frames * 0.6))
+
+            # Ensure start frame isn't too close to the beginning if start image exists
+            if has_start_image:
+                influence_start_frame = max(influence_start_frame, 1 + falloff_len_frames) # Ensure it starts after start_img falloff
+
+            transition_length = total_latent_frames - influence_start_frame
+            if transition_length > 0:
+                 logger.info(f"End image influence transition: frames {influence_start_frame} to {total_latent_frames-1}")
+                 curve_positions = torch.linspace(0, 1, transition_length, device=device)
+                 for i, pos in enumerate(curve_positions):
+                     idx = influence_start_frame + i
+                     if idx < total_latent_frames:
+                         # Cubic ease-in-out curve (smoother than cosine)
+                         if pos < 0.5: influence = 4 * pos * pos * pos
+                         else: p = pos - 1; influence = 1 + 4 * p * p * p
+                         # Ensure full influence near the end
+                         if idx >= total_latent_frames - 3: influence = 1.0
+                         end_influence_mask[0, 0, idx] = influence
+
+                 # Blending logic (similar to base_nodes)
+                 blend_start_frame = influence_start_frame
+                 blend_length = total_latent_frames - blend_start_frame
+                 if blend_length > 0:
+                     # Create reference end latent (just the single frame repeated conceptually)
+                     # Blend existing content with end latent based on influence weight
+                     for i in range(blend_length):
+                         idx = blend_start_frame + i
+                         if idx < total_latent_frames:
+                             weight = end_influence_mask[0, 0, idx].item()
+                             if weight > 0:
+                                 # Blend: (1-w)*current + w*end_latent
+                                 image_guidance_latent[:, :, idx] = (
+                                     (1.0 - weight) * image_guidance_latent[:, :, idx] +
+                                     weight * end_latent[:, :, 0] # Use the single frame end_latent
+                                 )
+
+                 # Ensure final frames are exactly the end image latent
+                 last_frames_exact = min(3, total_latent_frames) # Ensure at least last 3 frames are end image
+                 if last_frames_exact > 0:
+                     end_offset = total_latent_frames - last_frames_exact
+                     if end_offset >= 0:
+                         image_guidance_latent[:, :, end_offset:] = end_latent[:, :, 0:1].repeat(1, 1, last_frames_exact, 1, 1)
+
+                 # Update the main timeline mask
+                 timeline_mask = torch.max(timeline_mask, end_influence_mask)
+                 logger.info(f"End image processed. Latent shape: {end_latent.shape}")
+
+        except Exception as e:
+            logger.error(f"Error processing end image: {e}")
+            # Continue without end image guidance
+
+    # --- Control Video Processing ---
+    control_video_latent = None
+    if args.control_path:
+        logger.info(f"Processing control video: {args.control_path}")
+        try:
+            # Load control video frames (use helper from hv_generate_video for consistency)
+            # Use args.video_length for the number of frames
+            if os.path.isfile(args.control_path):
+                video_frames_np = hv_load_video(args.control_path, 0, args.video_length, bucket_reso=(pixel_width, pixel_height))
+            elif os.path.isdir(args.control_path):
+                video_frames_np = hv_load_images(args.control_path, args.video_length, bucket_reso=(pixel_width, pixel_height))
+            else:
+                 raise FileNotFoundError(f"Control path not found: {args.control_path}")
+
+            if not video_frames_np:
+                raise ValueError("No frames loaded from control path.")
+
+            num_control_frames_loaded = len(video_frames_np)
+            if num_control_frames_loaded < args.video_length:
+                 logger.warning(f"Control video loaded {num_control_frames_loaded} frames, less than target {args.video_length}. Padding with last frame.")
+                 # Pad with the last frame
+                 last_frame = video_frames_np[-1]
+                 padding = [last_frame] * (args.video_length - num_control_frames_loaded)
+                 video_frames_np.extend(padding)
+
+            # Stack and convert to tensor: F, H, W, C -> B, C, F, H, W, range [-1, 1]
+            video_frames_np = np.stack(video_frames_np[:args.video_length], axis=0) # Ensure correct length
+            control_tensor = torch.from_numpy(video_frames_np).permute(0, 3, 1, 2).float() / 127.5 - 1.0 # F,C,H,W
+            control_tensor = control_tensor.permute(1, 0, 2, 3) # C,F,H,W
+            control_tensor = control_tensor.unsqueeze(0).to(device) # B,C,F,H,W
+
+            # Encode control video
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
+                # vae.encode expects list of [C, F, H, W], returns list of [C', F', H', W']
+                control_video_latent = vae.encode([control_tensor[0]])[0].unsqueeze(0).to(device).contiguous() # [1, 16, lat_f, lat_h, lat_w]
+
+            # Calculate weighted control mask (replicating base_nodes logic)
+            control_frames_latent = control_video_latent.shape[2] # Should match total_latent_frames
+            control_mask = torch.zeros([1, 1, control_frames_latent], device=device, dtype=torch.float32).contiguous()
+
+            start_frame_idx = max(0, min(control_frames_latent - 1, int(control_frames_latent * args.control_start)))
+            end_frame_idx = max(start_frame_idx + 1, min(control_frames_latent, int(control_frames_latent * args.control_end)))
+            falloff_len_frames = max(2, int(control_frames_latent * args.control_falloff_percentage))
+
+            # Main active region
+            if start_frame_idx < end_frame_idx:
+                control_mask[:, :, start_frame_idx:end_frame_idx] = 1.0
+
+            # Fall-on at the start
+            if start_frame_idx > 0:
+                fallon_start = max(0, start_frame_idx - falloff_len_frames)
+                fallon_len = start_frame_idx - fallon_start
+                if fallon_len > 0:
+                    t = torch.linspace(0, 1, fallon_len, device=device)
+                    smooth_t = 0.5 - 0.5 * torch.cos(t * math.pi) # 0 -> 1
+                    control_mask[:, :, fallon_start:start_frame_idx] = smooth_t.reshape(1, 1, -1)
+
+            # Fall-off at the end (interacting with end_image influence)
+            if end_frame_idx < control_frames_latent:
+                falloff_start = end_frame_idx
+                falloff_end = min(control_frames_latent, falloff_start + falloff_len_frames)
+                falloff_actual_len = falloff_end - falloff_start
+                if falloff_actual_len > 0:
+                    # Check for end image influence in this region
+                    if has_end_image:
+                        for i in range(falloff_start, falloff_end):
+                            # Calculate original falloff (1 -> 0)
+                            fade_pos = (i - falloff_start) / falloff_actual_len
+                            original_falloff = 0.5 + 0.5 * math.cos(fade_pos * math.pi)
+                            # Get end image influence (already calculated in timeline_mask)
+                            end_influence_here = timeline_mask[0, 0, i].item()
+                            # Adjust control falloff: decrease faster if end image is taking over
+                            # Use a factor (e.g., 0.8) to control how much end image preempts control
+                            adjusted_falloff = original_falloff * (1.0 - (end_influence_here * 0.8))
+                            control_mask[0, 0, i] = adjusted_falloff
+                        logger.info("Applied end-image interaction to control falloff.")
+                    else:
+                        # Standard falloff if no end image
+                        t = torch.linspace(0, 1, falloff_actual_len, device=device)
+                        smooth_t = 0.5 + 0.5 * torch.cos(t * math.pi) # 1 -> 0
+                        control_mask[:, :, falloff_start:falloff_end] = smooth_t.reshape(1, 1, -1)
+
+            # Apply final control weight
+            control_mask = control_mask * args.control_weight
+
+            # Expand mask and apply to control latent
+            control_mask_expanded = control_mask.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) # [1, 1, 1, F, 1, 1] ? -> needs [1, 1, F, 1, 1]
+            control_mask_expanded = control_mask.unsqueeze(-1).unsqueeze(-1) # Shape: [1, 1, F, 1, 1]
+
+            # Apply weighting to the control_video_latent
+            weighted_control_latent = control_video_latent * control_mask_expanded # [1, 16, F, H, W]
+
+            # Place into the first 16 channels of the final latent
+            control_latent_part = weighted_control_latent
+
+            # Log mask pattern
+            mask_pattern = "".join(["#" if v > 0.8*args.control_weight else "+" if v > 0.4*args.control_weight else "." if v > 0.1*args.control_weight else " "
+                                   for v in control_mask[0, 0, :].tolist()])
+            logger.info(f"Control mask pattern (weight={args.control_weight:.2f}): |{mask_pattern}|")
+            logger.info(f"Control video processed. Latent shape: {control_video_latent.shape}")
+
+        except Exception as e:
+            logger.error(f"Error processing control video: {e}")
+            # Continue without control video guidance (control_latent_part remains zeros)
+
+    # --- Final Assembly ---
+    # Concatenate the control part and the image guidance part
+    final_y = torch.cat([control_latent_part, image_guidance_latent], dim=1) # Concat along channel dim: [1, 16+16, F, H, W]
+    final_y = final_y.contiguous()
+
+    logger.info(f"FunControl conditioning latent 'y' created. Final shape: {final_y.shape}")
+
+    # Optional: Clean up intermediate tensors explicitly if memory is tight
+    del start_latent, end_latent, control_video_latent, control_latent_part, image_guidance_latent
+    del timeline_mask, control_mask
+    if 'control_tensor' in locals(): del control_tensor
+    if 'img_tensor' in locals(): del img_tensor
+    clean_memory_on_device(device) # Be cautious with frequent cache clearing
+
+    return final_y
 
 def get_task_defaults(task: str, size: Optional[Tuple[int, int]] = None) -> Tuple[int, float, int, bool]:
     """Return default values for each task
@@ -629,8 +948,8 @@ def prepare_t2v_inputs(
     # calculate dimensions and sequence length
     height, width = args.video_size
     frames = args.video_length # Should be set by now
-    (_, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
-    target_shape = (16, lat_f, lat_h, lat_w)
+    (ch, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
+    target_shape = (ch, lat_f, lat_h, lat_w) # Should be (16, lat_f, lat_h, lat_w) for base latent
 
     # configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
@@ -662,27 +981,67 @@ def prepare_t2v_inputs(
     del text_encoder
     clean_memory_on_device(device)
 
-    # Fun-Control: encode control video to latent space
-    y = None # Initialize y for standard T2V
+    # Initialize 'y' (conditioning latent) to None
+    y = None
 
-    # generate noise
+    # Handle Fun-Control T2V case
+    if config.is_fun_control:
+        logger.info("Preparing inputs for Fun-Control T2V.")
+        if vae is None:
+            raise ValueError("VAE is required for Fun-Control T2V input preparation.")
+
+        # Calculate pixel dimensions needed for encoding helper
+        pixel_height = lat_h * config.vae_stride[1]
+        pixel_width = lat_w * config.vae_stride[2]
+
+        # Create the conditioning latent 'y'
+        # This function handles control video encoding (if path provided)
+        # and creates the [1, 32, F, H, W] tensor.
+        # If no control path, it creates the control part as zeros.
+        # Since this is T2V, image_path and end_image_path are None in args,
+        # so the image guidance part will also be zeros.
+        vae.to_device(device) # Ensure VAE is on device
+        y = create_funcontrol_conditioning_latent(
+            args, config, vae, device, lat_f, lat_h, lat_w, pixel_height, pixel_width
+        )
+        # Move VAE back after use
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+        clean_memory_on_device(device)
+
+        if y is None:
+            raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
+
+    # generate noise (base latent noise, shape [16, F, H, W])
     noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
     noise = noise.to(device)
 
     # prepare model input arguments
     arg_c = {"context": context, "seq_len": seq_len}
     arg_null = {"context": context_null, "seq_len": seq_len}
-    if y is not None: # Add 'y' only if Fun-Control generated it
-        arg_c["y"] = [y]
+
+    # Add 'y' ONLY if it was created (i.e., for Fun-Control)
+    if y is not None:
+        arg_c["y"] = [y] # Model expects y as a list
         arg_null["y"] = [y]
+        logger.info(f"Added FunControl conditioning 'y' (shape: {y.shape}) to model inputs.")
+    elif config.is_fun_control:
+        # This case should technically be handled by y being zeros, but double-check
+         logger.warning("FunControl task but 'y' tensor was not generated. Model might error.")
+         # Create a zero tensor as fallback if y generation failed somehow?
+         # y = torch.zeros([1, 32, lat_f, lat_h, lat_w], device=device, dtype=noise.dtype)
+         # arg_c["y"] = [y]
+         # arg_null["y"] = [y]
+
 
     return noise, context, context_null, (arg_c, arg_null)
 
-
+# ========================================================================= #
+# START OF MODIFIED FUNCTION prepare_i2v_inputs
+# ========================================================================= #
 def prepare_i2v_inputs(
     args: argparse.Namespace, config, accelerator: Accelerator, device: torch.device, vae: WanVAE
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
-    """Prepare inputs for I2V
+    """Prepare inputs for I2V (including Fun-Control I2V variation)
 
     Args:
         args: command line arguments
@@ -694,192 +1053,276 @@ def prepare_i2v_inputs(
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
             (noise, context, context_null, y, (arg_c, arg_null))
+            'y' is the conditioning latent ([1, 32, F, H, W] for FunControl,
+             [1, C+4, F, H, W] for standard I2V with mask).
     """
     if vae is None:
         raise ValueError("VAE must be provided for I2V input preparation.")
 
-    # get video dimensions
-    height, width = args.video_size
-    frames = args.video_length # Should be set by now
-    max_area = width * height
+    # --- Prepare Conditioning Latent 'y' ---
+    # This check MUST come first to decide the entire logic path
+    if config.is_fun_control:
+        # --- FunControl I2V Path ---
+        logger.info("Preparing inputs for Fun-Control I2V.")
 
-    # load image
-    img = Image.open(args.image_path).convert("RGB")
+        # Calculate dimensions (FunControl might use different aspect logic)
+        height, width = args.video_size
+        frames = args.video_length # Should be set by now
+        (_, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
+        pixel_height = lat_h * config.vae_stride[1]
+        pixel_width = lat_w * config.vae_stride[2]
+        noise_channels = 16 # FunControl DiT denoises 16 channels
 
-    # convert to numpy
-    img_cv2 = np.array(img)  # PIL to numpy
+        logger.info(f"FunControl I2V target pixel resolution: {pixel_height}x{pixel_width}, latent shape: ({lat_f}, {lat_h}, {lat_w}), seq_len: {seq_len}")
 
-    # convert to tensor (-1 to 1)
-    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+        # set seed
+        seed = args.seed
+        if not args.cpu_noise:
+            seed_g = torch.Generator(device=device)
+            seed_g.manual_seed(seed)
+        else:
+            seed_g = torch.manual_seed(seed)
 
-    # end frame image
-    if args.end_image_path is not None:
-        end_img = Image.open(args.end_image_path).convert("RGB")
-        end_img_cv2 = np.array(end_img)  # PIL to numpy
-    else:
-        end_img = None
-        end_img_cv2 = None
-    has_end_image = end_img is not None
+        # generate noise (for the part being denoised by the DiT)
+        noise = torch.randn(
+            noise_channels, lat_f, lat_h, lat_w,
+            dtype=torch.float32, generator=seed_g,
+            device=device if not args.cpu_noise else "cpu",
+        )
+        noise = noise.to(device)
 
-    # calculate latent dimensions: keep aspect ratio
-    img_height, img_width = img_tensor.shape[1:]
-    aspect_ratio = img_height / img_width
-    lat_h = round(np.sqrt(max_area * aspect_ratio) // config.vae_stride[1] // config.patch_size[1] * config.patch_size[1])
-    lat_w = round(np.sqrt(max_area / aspect_ratio) // config.vae_stride[2] // config.patch_size[2] * config.patch_size[2])
-    target_height = lat_h * config.vae_stride[1]
-    target_width = lat_w * config.vae_stride[2]
-    lat_f = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
-    max_seq_len = math.ceil((lat_f + (1 if has_end_image else 0)) * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
-    logger.info(f"I2V target resolution: {target_height}x{target_width}, latent shape: ({lat_f}, {lat_h}, {lat_w}), seq_len: {max_seq_len}")
+        # configure negative prompt
+        n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-    # set seed
-    seed = args.seed # Seed should be set in generate()
-    if not args.cpu_noise:
-        seed_g = torch.Generator(device=device)
-        seed_g.manual_seed(seed)
-    else:
-        # ComfyUI compatible noise
-        seed_g = torch.manual_seed(seed)
-
-    # generate noise
-    noise = torch.randn(
-        16, # Channel dim for latent
-        lat_f + (1 if has_end_image else 0),
-        lat_h,
-        lat_w,
-        dtype=torch.float32,
-        generator=seed_g,
-        device=device if not args.cpu_noise else "cpu",
-    )
-    noise = noise.to(device)
-
-    # configure negative prompt
-    n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
-
-    # load text encoder
-    text_encoder = load_text_encoder(args, config, device)
-    text_encoder.model.to(device)
-
-    # encode prompt
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+        # load text encoder & encode prompts
+        text_encoder = load_text_encoder(args, config, device)
+        text_encoder.model.to(device)
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                    context = text_encoder([args.prompt], device)
+                    context_null = text_encoder([n_prompt], device)
+            else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
+        del text_encoder
+        clean_memory_on_device(device)
+
+        # load CLIP model & encode image
+        clip = load_clip_model(args, config, device)
+        clip.model.to(device)
+        if not args.image_path:
+             raise ValueError("--image_path is required for FunControl I2V mode.")
+        img_clip = Image.open(args.image_path).convert("RGB")
+        img_tensor_clip = TF.to_tensor(img_clip).sub_(0.5).div_(0.5).to(device) # CHW, [-1, 1]
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+            clip_context = clip.visual([img_tensor_clip.unsqueeze(1)]) # Add Frame dim
+        del clip, img_clip, img_tensor_clip
+        clean_memory_on_device(device)
+
+        # Use the FunControl helper function to create the 32-channel 'y'
+        vae.to_device(device) # Ensure VAE is on compute device
+        y = create_funcontrol_conditioning_latent(
+            args, config, vae, device, lat_f, lat_h, lat_w, pixel_height, pixel_width
+        )
+        if y is None:
+            raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu") # Move VAE back
+        clean_memory_on_device(device)
+
+        # Prepare Model Input Arguments for FunControl
+        y_for_model = y[0] # Shape becomes [32, F, H, W]
+        arg_c = {
+            "context": context,
+            "clip_fea": clip_context,
+            "seq_len": seq_len,
+            "y": [y_for_model], # Pass the 4D tensor in the list
+        }
+        arg_null = {
+            "context": context_null,
+            "clip_fea": clip_context,
+            "seq_len": seq_len,
+            "y": [y_for_model], # Pass the 4D tensor in the list
+        }
+    
+
+        # Return noise, context, context_null, y (for potential debugging), (arg_c, arg_null)
+        return noise, context, context_null, y, (arg_c, arg_null)
+
+    else:
+        # --- Standard I2V Path (Logic copied/adapted from original wan_generate_video.py) ---
+        logger.info("Preparing inputs for standard I2V.")
+
+        # get video dimensions
+        height, width = args.video_size
+        frames = args.video_length # Should be set by now
+        max_area = width * height
+
+        # load image
+        if not args.image_path:
+            raise ValueError("--image_path is required for standard I2V mode.")
+        img = Image.open(args.image_path).convert("RGB")
+        img_cv2 = np.array(img)  # PIL to numpy
+        img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device) # For CLIP
+
+        # end frame image
+        end_img = None
+        end_img_cv2 = None
+        if args.end_image_path is not None:
+            end_img = Image.open(args.end_image_path).convert("RGB")
+            end_img_cv2 = np.array(end_img)  # PIL to numpy
+        has_end_image = end_img is not None
+
+        # calculate latent dimensions: keep aspect ratio (Original Method)
+        img_height, img_width = img.size[::-1] # PIL size is W,H
+        aspect_ratio = img_height / img_width
+        lat_h = round(np.sqrt(max_area * aspect_ratio) / config.vae_stride[1] / config.patch_size[1]) * config.patch_size[1]
+        lat_w = round(np.sqrt(max_area / aspect_ratio) / config.vae_stride[2] / config.patch_size[2]) * config.patch_size[2]
+        target_height = lat_h * config.vae_stride[1]
+        target_width = lat_w * config.vae_stride[2]
+
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #1: Frame Dimension ---
+        lat_f_base = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
+        lat_f_effective = lat_f_base + (1 if has_end_image else 0) # Adjust frame dim if end image exists
+
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #2: Sequence Length ---
+        max_seq_len = math.ceil(lat_f_effective * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
+
+        logger.info(f"Standard I2V target pixel resolution: {target_height}x{target_width}, latent shape: ({lat_f_effective}, {lat_h}, {lat_w}), seq_len: {max_seq_len}")
+
+        # set seed
+        seed = args.seed
+        if not args.cpu_noise:
+            seed_g = torch.Generator(device=device)
+            seed_g.manual_seed(seed)
         else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
+            seed_g = torch.manual_seed(seed)
 
-    # free text encoder and clean memory
-    del text_encoder
-    clean_memory_on_device(device)
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #3: Noise Shape ---
+        noise = torch.randn(
+            16, # Channel dim for latent
+            lat_f_effective, # Use adjusted frame dim
+            lat_h, lat_w,
+            dtype=torch.float32, generator=seed_g,
+            device=device if not args.cpu_noise else "cpu",
+        )
+        noise = noise.to(device)
 
-    # load CLIP model
-    clip = load_clip_model(args, config, device)
-    clip.model.to(device)
+        # configure negative prompt
+        n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-    # encode image to CLIP context
-    logger.info(f"Encoding image to CLIP context")
-    
-    # Prepare image for CLIP in the format clip.visual expects
-    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-        # This is what works in fun_wan_generate_video.py
-        clip_context = clip.visual([img_tensor[:, None, :, :]])
-    
-    logger.info(f"Encoding complete")
+        # load text encoder & encode prompts
+        text_encoder = load_text_encoder(args, config, device)
+        text_encoder.model.to(device)
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                    context = text_encoder([args.prompt], device)
+                    context_null = text_encoder([n_prompt], device)
+            else:
+                context = text_encoder([args.prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        del text_encoder
+        clean_memory_on_device(device)
 
-    # free CLIP model and clean memory
-    del clip
-    clean_memory_on_device(device)
+        # load CLIP model & encode image
+        clip = load_clip_model(args, config, device)
+        clip.model.to(device)
+        logger.info(f"Encoding image to CLIP context")
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+            # Use the [-1, 1] tensor directly if clip.visual expects that format
+            # clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Original had [img_tensor[:, None, :, :]] which adds frame dim
+            # Use unsqueeze(1) which seems more consistent with other parts
+            clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Add Frame dim
+        logger.info(f"CLIP Encoding complete")
+        del clip
+        clean_memory_on_device(device)
 
-    # encode image to latent space with VAE
-    logger.info(f"Encoding image to latent space")
-    vae.to_device(device)
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #4: VAE Encoding and 'y' construction ---
+        logger.info(f"Encoding image(s) to latent space (Standard I2V method)")
+        vae.to_device(device)
 
-    # CRITICAL FIX: following the exact pattern from fun_wan_generate_video.py
-    # resize image to the calculated target resolution for VAE
-    interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
-    img_resized_np = cv2.resize(img_cv2, (target_width, target_height), interpolation=interpolation)
-    img_resized = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-    img_resized = img_resized.unsqueeze(1)  # CFHW (add frame dimension)
+        # Resize image(s) for VAE
+        interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
+        img_resized_np = cv2.resize(img_cv2, (target_width, target_height), interpolation=interpolation)
+        img_resized = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)  # [-1, 1], CHW
+        img_resized = img_resized.unsqueeze(1)  # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-    if has_end_image:
-        interpolation_end = cv2.INTER_AREA if target_height < end_img_cv2.shape[0] else cv2.INTER_CUBIC
-        end_img_resized_np = cv2.resize(end_img_cv2, (target_width, target_height), interpolation=interpolation_end)
-        end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-        end_img_resized = end_img_resized.unsqueeze(1)  # CFHW (add frame dimension)
+        end_img_resized = None
+        if has_end_image and end_img_cv2 is not None:
+            interpolation_end = cv2.INTER_AREA if target_height < end_img_cv2.shape[0] else cv2.INTER_CUBIC
+            end_img_resized_np = cv2.resize(end_img_cv2, (target_width, target_height), interpolation=interpolation_end)
+            end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device) # [-1, 1], CHW
+            end_img_resized = end_img_resized.unsqueeze(1) # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-    # create mask for the first frame (and potentially last)
-    msk = torch.zeros(4, lat_f + (1 if has_end_image else 0), lat_h, lat_w, device=device)
-    msk[:, 0] = 1
-    if has_end_image:
-        msk[:, -1] = 1
-
-    # encode image(s) to latent space
-    with accelerator.autocast(), torch.no_grad():
-        # CRITICAL FIX: add padding frames to match required video length
-        padding_frames = frames - 1  # first frame is the image
-        img_padded = torch.cat([img_resized, torch.zeros(3, padding_frames, target_height, target_width, device=device)], dim=1)
-        y = vae.encode([img_padded])[0] # Encode with padding
-
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #5: Mask Shape ---
+        msk = torch.zeros(4, lat_f_effective, lat_h, lat_w, device=device, dtype=vae.dtype) # Use adjusted frame dim
+        msk[:, 0] = 1 # Mask first frame
         if has_end_image:
-            y_end = vae.encode([end_img_resized])[0] # Encode end frame
-            y = torch.cat([y, y_end], dim=1) # Add end frame latent
+            msk[:, -1] = 1 # Mask last frame (the lat_f+1'th frame)
 
-    # Concatenate mask and latent(s)
-    y = torch.concat([msk, y]) # Shape [4+C, F(+1), H, W]
-    logger.info(f"I2V conditioning 'y' shape: {y.shape}")
-    logger.info(f"Encoding complete")
-
-    # Fun-Control: encode control video to latent space if needed
-    # In prepare_i2v_inputs function
-    if config.is_fun_control and args.control_path:
-        logger.info(f"Encoding control video to latent space for Fun-Control")
-        # Load and process control video (C, F, H, W format)
-        control_video = load_control_video(args.control_path, frames + (1 if has_end_image else 0), 
-                                          target_height, target_width).to(device)
-
+        # Encode image(s) using VAE (Padded Method)
         with accelerator.autocast(), torch.no_grad():
-            control_latent = vae.encode([control_video])[0]
+            # Pad the *start* image tensor temporally before encoding
+            # Calculate padding needed to reach base frame count (before adding end frame)
+            padding_frames_needed = frames - 1 # Number of frames to generate *after* the first
+            if padding_frames_needed < 0: padding_frames_needed = 0
 
-        # Apply control strength scaling to control_latent
-        # This is the key change - scale the control latent according to strength parameter
-        control_strength = getattr(args, 'control_strength', 1.0)  # Default to 1.0 if not provided
-        logger.info(f"Applying control strength factor: {control_strength}")
-        if control_strength != 1.0:
-            # Scale the control latent - increasing strength means more influence 
-            control_latent = control_latent * control_strength
+            img_padded = img_resized # Start with [C, 1, H, W]
+            if padding_frames_needed > 0:
+                 # Create padding tensor [C, padding_frames_needed, H, W]
+                 padding_tensor = torch.zeros(
+                     img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                     device=device, dtype=img_resized.dtype
+                 )
+                 # Concatenate along frame dimension (dim=1)
+                 img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+                 # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
 
-        # Existing code continues...
-        y = y[msk.shape[0]:]  # remove mask because Fun-Control does not need it
-        if has_end_image:
-            y[:, 1:-1] = 0  # remove image latent except first and last frame
-        else:
-            y[:, 1:] = 0  # remove image latent except first frame
-        y = torch.concat([control_latent, y], dim=0)
+            # Encode the padded start image tensor. VAE output matches latent frame count.
+            # vae.encode expects [C, F, H, W]
+            y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
 
-        logger.info(f"Fun-Control combined latent shape: {y.shape}")
+            if has_end_image and end_img_resized is not None:
+                 # Encode the single end frame
+                 y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
+                 # Concatenate along frame dimension (dim=1)
+                 y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
+            else:
+                 y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
 
-    # move VAE to CPU (or cache device if specified)
-    vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
-    clean_memory_on_device(device)
+        # Concatenate mask and the combined latent
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
+        y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
+        # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
 
-    # prepare model input arguments
-    arg_c = {
-        "context": [context[0]],
-        "clip_fea": clip_context,
-        "seq_len": max_seq_len,
-        "y": [y], # y contains mask and image latent(s)
-    }
+        logger.info(f"Standard I2V conditioning 'y' constructed. Shape: {y.shape}")
+        logger.info(f"Image encoding complete")
 
-    arg_null = {
-        "context": context_null,
-        "clip_fea": clip_context,
-        "seq_len": max_seq_len,
-        "y": [y], # y contains mask and image latent(s)
-    }
+        # Move VAE back
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+        clean_memory_on_device(device)
 
-    return noise, context, context_null, y, (arg_c, arg_null)
+        # Prepare model input arguments for Standard I2V
+        arg_c = {
+            "context": context, # Model expects batch dim? Assuming yes.
+            "clip_fea": clip_context,
+            "seq_len": max_seq_len, # Use original seq len calculation
+            "y": [y], # Use the 'original method' y
+        }
+        arg_null = {
+            "context": context_null,
+            "clip_fea": clip_context,
+            "seq_len": max_seq_len,
+            "y": [y], # Use the 'original method' y
+        }
+
+        # Return noise, context, context_null, y (for debugging), (arg_c, arg_null)
+        return noise, context, context_null, y, (arg_c, arg_null)
+# ========================================================================= #
+# END OF MODIFIED FUNCTION prepare_i2v_inputs
+# ========================================================================= #
+
 
 # --- V2V Helper Functions ---
 
@@ -1091,19 +1534,25 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
 # --- End V2V Helper Functions ---
 
-def load_control_video(control_path: str, frames: int, height: int, width: int) -> torch.Tensor:
-    """load control video to pixel space for Fun-Control model
+def load_control_video(control_path: str, frames: int, height: int, width: int, args=None) -> torch.Tensor:
+    """Load control video to pixel space for Fun-Control model with enhanced control.
 
     Args:
         control_path: path to control video
         frames: number of frames in the video
         height: height of the video
         width: width of the video
+        args: command line arguments (optional, for logging)
 
     Returns:
         torch.Tensor: control video tensor, CFHW, range [-1, 1]
     """
-    logger.info(f"Load control video for Fun-Control from {control_path}")
+    logger = logging.getLogger(__name__)
+    msg = f"Load control video for Fun-Control from {control_path}"
+    if args:
+        # Use the correct argument names from wanFUN_generate_video.py
+        msg += f" (weight={args.control_weight}, start={args.control_start}, end={args.control_end})"
+    logger.info(msg)
 
     # Use the original helper from hv_generate_video for consistency
     if os.path.isfile(control_path):
@@ -1269,7 +1718,7 @@ def run_sampling(
         # Prepare input for the model (move latent to compute device)
         # Latent should be [B, C, F, H, W] or [C, F, H, W]
         latent_on_device = latent.to(device)
-        
+
         # FIX: Check if latent_on_device has too many dimensions and fix it
         # The model expects input x as a list of tensors with shape [C, F, H, W]
         if len(latent_on_device.shape) > 5:
@@ -1277,7 +1726,7 @@ def run_sampling(
             while len(latent_on_device.shape) > 5:
                 latent_on_device = latent_on_device.squeeze(0)
             logger.info(f"Adjusted latent shape for model input: {latent_on_device.shape}")
-            
+
         # The model expects the latent input 'x' as a list: [tensor]
         # If batch dimension is present, we need to split the tensor into a list of tensors
         if len(latent_on_device.shape) == 5:
@@ -1286,7 +1735,7 @@ def run_sampling(
         else:
             # No batch dimension [C, F, H, W]
             latent_model_input_list = [latent_on_device]
-            
+
         timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
@@ -1333,13 +1782,13 @@ def run_sampling(
             if len(noise_pred.shape) < 5:
                 # Add batch dimension if missing
                 noise_pred = noise_pred.unsqueeze(0)
-                
+
             # Similarly, ensure latent_on_device has batch dimension
             if len(latent_on_device.shape) < 5:
                 latent_on_device_batched = latent_on_device.unsqueeze(0)
             else:
                 latent_on_device_batched = latent_on_device
-                
+
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device
                 t,
@@ -1376,7 +1825,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
-    elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control")
+    elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
     else: logger.info(f"Running Text-to-Video (T2V) inference")
 
     # --- Data Types ---
@@ -1409,7 +1858,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Load VAE (if needed for input processing) ---
     vae = None
-    needs_vae_early = is_i2v or is_v2v or is_fun_control
+    # VAE is needed early for V2V, I2V (both types), and FunControl T2V
+    needs_vae_early = is_v2v or is_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
     if needs_vae_early:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
@@ -1422,10 +1872,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     video_latents = None # For V2V mixing
 
     if is_v2v:
+        # Standard V2V path (mutually exclusive with FunControl)
         # 1. Load and prepare video
-        # Use args.video_size as the target resolution
-        # If args.video_length is None, load_video determines actual length
-        # If args.video_length is set, load_video loads that many frames
         video_frames_np, actual_frames_loaded = load_video(
             args.video_path,
             start_frame=0,
@@ -1441,6 +1889,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             args.video_length = actual_frames_loaded
             # Re-check height/width/length now that length is known
             height, width, video_length = check_inputs(args)
+            args.video_size = [height, width] # Update args
         else:
             video_length = args.video_length # Use the specified length
 
@@ -1458,23 +1907,29 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         noise, context, context_null, inputs = prepare_v2v_inputs(args, cfg, accelerator, device, video_latents)
 
     elif is_i2v:
-        # Prepare I2V inputs (requires VAE)
+        # I2V path (handles both standard and FunControl internally based on config)
+        if args.video_length is None:
+             raise ValueError("video_length must be specified for I2V mode.")
         noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_i2v_inputs moves VAE to CPU/cache after use
 
-    elif is_fun_control or is_t2v:
-        # Check if video_length was determined by V2V loading
+    elif is_fun_control: # Pure FunControl T2V (no image input)
         if args.video_length is None:
-             raise ValueError("video_length must be specified for T2V/Fun-Control or derived during V2V loading.")
-        # Prepare T2V inputs (Fun-Control variation passes VAE)
-        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae if is_fun_control else None)
+             raise ValueError("video_length must be specified for Fun-Control T2V mode.")
+        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_t2v_inputs moves VAE to CPU/cache if it used it
 
+    elif is_t2v: # Standard T2V
+        if args.video_length is None:
+             raise ValueError("video_length must be specified for standard T2V mode.")
+        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
+
+
     # At this point, VAE should be on CPU/cache unless still needed for decoding
-    # If VAE wasn't loaded early (pure T2V), vae is still None
+    # If VAE wasn't loaded early (standard T2V), vae is still None
 
     # --- Load DiT Model ---
-    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag
+    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag (for potential internal use)
 
     # --- Merge LoRA ---
     if args.lora_weight is not None and len(args.lora_weight) > 0:
@@ -1519,6 +1974,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
         # Ensure video_latents are on the same device and dtype as noise for mixing
         video_latents = video_latents.to(device=noise.device, dtype=noise.dtype)
+
+        # V2V expects noise and latents to have the same shape B,C,F,H,W
+        # Check if shapes match before mixing
+        if noise.shape != video_latents.shape:
+            logger.error(f"Noise shape {noise.shape} does not match video latent shape {video_latents.shape} for V2V mixing. Cannot proceed.")
+            # Potentially resize/pad noise or error out. For now, error out.
+            raise ValueError("Shape mismatch between noise and video latents in V2V.")
+
         latent = noise * mix_ratio + video_latents * (1.0 - mix_ratio)
 
         # Use only the required subset of timesteps
@@ -1590,7 +2053,15 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     else:
         # Need to load VAE if it wasn't used/stored (e.g., pure T2V or latent input mode)
         logger.info("Loading VAE for decoding...")
-        vae_dtype_decode = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else detect_wan_sd_dtype(args.dit)
+        # Attempt to detect DiT dtype even if DiT wasn't loaded (e.g., latent mode)
+        # Fallback to bfloat16 if DiT path isn't available
+        try:
+            dit_dtype_ref = detect_wan_sd_dtype(args.dit) if args.dit else torch.bfloat16
+        except: # Handle cases where DiT path is invalid or missing in latent mode
+            dit_dtype_ref = torch.bfloat16
+            logger.warning("Could not detect DiT dtype for VAE decoding, defaulting to bfloat16.")
+
+        vae_dtype_decode = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else (torch.bfloat16 if dit_dtype_ref == torch.bfloat16 else torch.float16)
         vae = load_vae(args, cfg, device, vae_dtype_decode)
         args._vae = vae # Store it in case needed again?
 
@@ -1671,6 +2142,18 @@ def save_output(
 
         metadata = {}
         if not args.no_metadata:
+            # Try to get model paths robustly for metadata
+            cfg = WAN_CONFIGS.get(args.task) # Get config if task exists
+            dit_path_meta = "N/A"
+            if args.dit: dit_path_meta = args.dit
+            elif cfg and cfg.dit_checkpoint and args.ckpt_dir: dit_path_meta = os.path.join(args.ckpt_dir, cfg.dit_checkpoint)
+            elif cfg and cfg.dit_checkpoint: dit_path_meta = cfg.dit_checkpoint # Use relative path if no ckpt_dir
+
+            vae_path_meta = "N/A"
+            if args.vae: vae_path_meta = args.vae
+            elif cfg and cfg.vae_checkpoint and args.ckpt_dir: vae_path_meta = os.path.join(args.ckpt_dir, cfg.vae_checkpoint)
+            elif cfg and cfg.vae_checkpoint: vae_path_meta = cfg.vae_checkpoint # Use relative path if no ckpt_dir
+
             metadata = {
                 "prompt": f"{args.prompt}",
                 "negative_prompt": f"{args.negative_prompt or ''}",
@@ -1682,15 +2165,20 @@ def save_output(
                 "guidance_scale": f"{args.guidance_scale}",
                 "flow_shift": f"{args.flow_shift}",
                 "task": f"{args.task}",
-                "dit_model": f"{args.dit or os.path.join(args.ckpt_dir, WAN_CONFIGS[args.task].dit_checkpoint) if args.ckpt_dir else 'N/A'}",
-                "vae_model": f"{args.vae or os.path.join(args.ckpt_dir, WAN_CONFIGS[args.task].vae_checkpoint) if args.ckpt_dir else 'N/A'}",
+                "dit_model": f"{dit_path_meta}",
+                "vae_model": f"{vae_path_meta}",
                 # Add V2V/I2V specific info
                 "mode": "V2V" if args.video_path else ("I2V" if args.image_path else ("FunControl" if args.control_path else "T2V")),
             }
             if args.video_path: metadata["v2v_strength"] = f"{args.strength}"
             if args.image_path: metadata["i2v_image"] = f"{os.path.basename(args.image_path)}"
             if args.end_image_path: metadata["i2v_end_image"] = f"{os.path.basename(args.end_image_path)}"
-            if args.control_path: metadata["funcontrol_video"] = f"{os.path.basename(args.control_path)}"
+            if args.control_path:
+                 metadata["funcontrol_video"] = f"{os.path.basename(args.control_path)}"
+                 metadata["funcontrol_weight"] = f"{args.control_weight}"
+                 metadata["funcontrol_start"] = f"{args.control_start}"
+                 metadata["funcontrol_end"] = f"{args.control_end}"
+                 metadata["funcontrol_falloff"] = f"{args.control_falloff_percentage}"
             # Add LoRA info if used
             if args.lora_weight:
                 metadata["lora_weights"] = ", ".join([os.path.basename(p) for p in args.lora_weight])
@@ -1761,12 +2249,21 @@ def main():
         args.video_size = [height, width] # Ensure args reflect checked dimensions
         args.video_length = video_length # May still be None for V2V
 
-        mode_str = "V2V" if args.video_path else ("I2V" if args.image_path else ("FunControl" if args.control_path else "T2V"))
-        logger.info(f"Mode: {mode_str}")
+        # Determine specific mode string
+        mode_str = "Unknown"
+        if args.video_path: mode_str = "V2V"
+        elif args.image_path and args.control_path: mode_str = "FunControl-I2V" # FunControl overrides if control_path is present
+        elif args.control_path: mode_str = "FunControl-T2V"
+        elif args.image_path: mode_str = "I2V"
+        else: mode_str = "T2V"
+
+        logger.info(f"Mode: {mode_str} (Task: {args.task})")
         logger.info(
             f"Initial settings: video size: {height}x{width}@{video_length or 'auto'} (HxW@F), fps: {args.fps}, "
             f"infer_steps: {args.infer_steps}, guidance: {args.guidance_scale}, flow_shift: {args.flow_shift}"
         )
+        if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
+        if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
 
         # Core generation pipeline
         generated_latent = generate(args) # Returns [B, C, F, H, W] or None
@@ -1780,13 +2277,15 @@ def main():
              return
 
         # Update dimensions based on the *actual* generated latent
-        _, _, video_length, height, width = generated_latent.shape
+        # Latent shape might differ slightly from input request depending on VAE/model strides
+        _, lat_c, lat_f, lat_h, lat_w = generated_latent.shape
         # Convert latent dimensions back to pixel dimensions for metadata/logging
-        pixel_height = height * cfg.vae_stride[1]
-        pixel_width = width * cfg.vae_stride[2]
-        pixel_frames = (video_length - 1) * cfg.vae_stride[0] + 1
+        pixel_height = lat_h * cfg.vae_stride[1]
+        pixel_width = lat_w * cfg.vae_stride[2]
+        pixel_frames = (lat_f - 1) * cfg.vae_stride[0] + 1
         logger.info(f"Generation complete. Latent shape: {generated_latent.shape} -> Pixel Video: {pixel_height}x{pixel_width}@{pixel_frames}")
-        height, width, video_length = pixel_height, pixel_width, pixel_frames # Update for saving
+        # Use these derived pixel dimensions for saving metadata
+        height, width, video_length = pixel_height, pixel_width, pixel_frames
 
 
     else:
@@ -1804,10 +2303,10 @@ def main():
         original_base_names.append(os.path.splitext(os.path.basename(latent_path))[0])
         loaded_latent = None
         metadata = {}
-        seed = args.seed if args.seed is not None else 0 # Default seed
+        seed = args.seed if args.seed is not None else random.randint(0, 2**32-1) # Default seed if none in metadata
 
         try:
-            if os.path.splitext(latent_path)[1] != ".safetensors":
+            if os.path.splitext(latent_path)[1].lower() != ".safetensors":
                 logger.warning("Loading non-safetensors latent file. Metadata might be missing.")
                 loaded_latent = torch.load(latent_path, map_location="cpu")
                 # Attempt to handle different save formats (dict vs raw tensor)
@@ -1822,6 +2321,9 @@ def main():
                               loaded_latent = loaded_latent[first_key]
                          else:
                               raise ValueError("Could not find latent tensor in loaded dictionary.")
+                elif not isinstance(loaded_latent, torch.Tensor):
+                     raise ValueError(f"Loaded file content is not a tensor or expected dictionary format: {type(loaded_latent)}")
+
 
             else:
                 # Load latent tensor
@@ -1831,20 +2333,30 @@ def main():
                     metadata = f.metadata() or {}
                 logger.info(f"Loaded metadata: {metadata}")
 
-                # Restore args from metadata if available
-                if "seeds" in metadata: seed = int(metadata["seeds"])
-                if "prompt" in metadata: args.prompt = metadata["prompt"] # Overwrite prompt for context
-                if "negative_prompt" in metadata: args.negative_prompt = metadata["negative_prompt"]
-                if "height" in metadata and "width" in metadata:
-                    height = int(metadata["height"]); width = int(metadata["width"])
-                    args.video_size = [height, width]
-                if "video_length" in metadata:
-                    video_length = int(metadata["video_length"])
-                    args.video_length = video_length
-                if "guidance_scale" in metadata: args.guidance_scale = float(metadata["guidance_scale"])
-                if "infer_steps" in metadata: args.infer_steps = int(metadata["infer_steps"])
-                if "flow_shift" in metadata: args.flow_shift = float(metadata["flow_shift"])
-                # Could restore more args if needed
+                # Restore args from metadata if available AND not overridden by command line
+                # Command line args take precedence if provided
+                if args.seed is None and "seeds" in metadata: seed = int(metadata["seeds"])
+                if "prompt" in metadata: args.prompt = args.prompt or metadata["prompt"] # Keep command line if provided
+                if "negative_prompt" in metadata: args.negative_prompt = args.negative_prompt or metadata["negative_prompt"]
+                # We need height/width/length to decode, so always load if available
+                if "height" in metadata: height = int(metadata["height"])
+                if "width" in metadata: width = int(metadata["width"])
+                if "video_length" in metadata: video_length = int(metadata["video_length"])
+                # Restore other relevant args if not set by user
+                if args.guidance_scale == 5.0 and "guidance_scale" in metadata: args.guidance_scale = float(metadata["guidance_scale"]) # Assuming 5.0 is default
+                if args.infer_steps is None and "infer_steps" in metadata: args.infer_steps = int(metadata["infer_steps"])
+                if args.flow_shift is None and "flow_shift" in metadata: args.flow_shift = float(metadata["flow_shift"])
+                if "task" in metadata: args.task = args.task or metadata["task"] # Restore task if not specified
+                # FunControl specific args
+                if "funcontrol_weight" in metadata: args.control_weight = args.control_weight or float(metadata["funcontrol_weight"])
+                if "funcontrol_start" in metadata: args.control_start = args.control_start or float(metadata["funcontrol_start"])
+                if "funcontrol_end" in metadata: args.control_end = args.control_end or float(metadata["funcontrol_end"])
+                if "funcontrol_falloff" in metadata: args.control_falloff_percentage = args.control_falloff_percentage or float(metadata["funcontrol_falloff"])
+                # V2V specific args
+                if "v2v_strength" in metadata: args.strength = args.strength or float(metadata["v2v_strength"])
+
+                # Update config based on restored task
+                cfg = WAN_CONFIGS[args.task]
 
             seeds.append(seed)
             latents_list.append(loaded_latent)
@@ -1861,21 +2373,27 @@ def main():
         # Stack latents (currently just one) - ensure batch dimension
         generated_latent = torch.stack(latents_list, dim=0) # [B, C, F, H, W]
         if len(generated_latent.shape) != 5:
-             raise ValueError(f"Loaded latent has incorrect shape: {generated_latent.shape}. Expected 5 dimensions.")
+             # Maybe saved without batch dim? Try adding it.
+             if len(generated_latent.shape) == 4:
+                 logger.warning(f"Loaded latent has 4 dimensions {generated_latent.shape}. Adding batch dimension.")
+                 generated_latent = generated_latent.unsqueeze(0)
+             else:
+                 raise ValueError(f"Loaded latent has incorrect shape: {generated_latent.shape}. Expected 4 or 5 dimensions.")
 
         # Set seed from metadata (or default)
         args.seed = seeds[0]
 
-        # Infer pixel dimensions from latent shape and config if not in metadata
+        # Infer pixel dimensions from latent shape and config if not available in metadata
+        _, _, lat_f, lat_h, lat_w = generated_latent.shape # Get dimensions from loaded latent
         if height is None or width is None or video_length is None:
              logger.warning("Dimensions not found in metadata, inferring from latent shape.")
-             _, _, lat_f, lat_h, lat_w = generated_latent.shape
              height = lat_h * cfg.vae_stride[1]
              width = lat_w * cfg.vae_stride[2]
              video_length = (lat_f - 1) * cfg.vae_stride[0] + 1
              logger.info(f"Inferred pixel dimensions: {height}x{width}@{video_length}")
-             args.video_size = [height, width]
-             args.video_length = video_length
+        # Store final dimensions in args for consistency
+        args.video_size = [height, width]
+        args.video_length = video_length
 
     # --- Decode and Save ---
     if generated_latent is not None:
@@ -1897,4 +2415,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# --- END OF FILE wan_generate_video.py ---
+# --- END OF FILE wanFUN_generate_video.py ---
