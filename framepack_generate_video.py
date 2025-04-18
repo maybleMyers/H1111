@@ -706,19 +706,25 @@ def generate_video(args, models):
 
             # --- Save Intermediate Video ---
             current_num_pixel_frames = history_pixels.shape[2]
-            # Keep the filename generation that includes width/height
             output_filename = output_dir / f'{job_id}_section{i+1}_frames{current_num_pixel_frames}_{width}x{height}.mp4'
             print(f"  Saving intermediate video ({current_num_pixel_frames} frames) to: {output_filename}")
-            
+
             try:
-                # Use the original saving function
-                save_bcthw_as_mp4(history_pixels, str(output_filename), fps=fps)
+                # Ensure history_pixels is float32 and fps is integer
+                history_pixels_float32 = history_pixels.float()
+                fps_int = int(fps)
+                print(f"  Attempting to save with dtype: {history_pixels_float32.dtype}, fps: {fps_int}")
+
+                # Use the original saving function with corrected types
+                save_bcthw_as_mp4(history_pixels_float32, str(output_filename), fps=fps_int)
                 print(f"  Saved video using save_bcthw_as_mp4")
+
             except Exception as e:
                 print(f"  Error saving video using save_bcthw_as_mp4: {e}")
-                # Optional: Add minimal fallback like saving the first frame if needed
+                # Fallback image saving (already handles denormalization and uint8 conversion)
                 try:
-                    first_frame = history_pixels[0, :, 0].permute(1, 2, 0).cpu().numpy()
+                    # Use the float32 tensor for consistency in fallback
+                    first_frame = history_pixels_float32[0, :, 0].permute(1, 2, 0).cpu().numpy()
                     first_frame = (first_frame * 0.5 + 0.5) * 255 # Denormalize
                     first_frame = first_frame.astype(np.uint8)
                     frame_path = str(output_filename).replace('.mp4', '_first_frame.png')
@@ -726,8 +732,8 @@ def generate_video(args, models):
                     print(f"  Saved first frame as image to {frame_path} due to video saving error.")
                 except Exception as frame_err:
                     print(f"  Could not save first frame either: {frame_err}")
-            
-            final_video_path = str(output_filename) # Update the path to the latest complete video
+
+            final_video_path = str(output_filename)
 
             section_end_time = time.time()
             print(f"--- Section {i+1} finished in {section_end_time - section_start_time:.2f} seconds ---")
