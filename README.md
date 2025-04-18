@@ -55,6 +55,9 @@ Download the T5 `models_t5_umt5-xxl-enc-bf16.pth`, vae `Wan2.1_VAE.pth` and CLIP
 Download the DiT weights from the following page: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models  
 ie : wan2.1_i2v_720p_14B_fp16.safetensors  
 
+For the fun control option in WanX-i2v I recommend the fp16 weights here: https://huggingface.co/maybleMyers/wan_files_for_h1111/tree/main  
+Wan2.1-Fun-14B-Control_fp16.safetensors  
+
 git pull to update the installation
 pip install -r requirements.txt
 
