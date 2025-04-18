@@ -30,7 +30,11 @@ If you need additional installation instructions or information create an issue 
 Install as normal, then install the frame pack requirements in requirementsFP.txt.  
 pip install -r requirementsFP.txt  
 
-It should automatically download the files for you on first run.
+It should automatically download the files for you on first run.  
+
+If you have already downloaded the model you can set the locations in the gui and it might work. You will also probably have to set the env variables ie:  
+    export HF_HOME="/............./h111/hf_download"   (for linux)
+    $env:HF_HOME="C:\........\hf_download"   (for windoze)
 
 ## To Use Skyreels
 
