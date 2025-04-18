@@ -19,13 +19,18 @@ SkyReels-t2v
 
 If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
 
-Best quality will be obtained with only enabling block swapping and using the fp16 model with sdpa attention. You can speed things up with cfg skip, fp8 scaled, slg skip is small speedup, sage attention is fastest but all speedups come with quality degradations. You can use the video to video like you would img2img in Automatic1111 to increase quality possibly.  
+Best quality will be obtained with only enabling block swapping and using the fp16 model with sdpa attention. You can speed things up with cfg skip, fp8 scaled, slg skip is small speedup, sage attention is fastest but all speedups come with quality degradations. I designed this to try to focus on quality over speed.
 
 If you are using a lora that you didn't train with musubi you need to drag it to the convert lora tab and convert it to the default format. It should spit it out into the /lora folder.
 
-This about the speed I get generating a 960x544 97 frame 40 step video without fp8 using sage attention and skyreels on a 4090: 80%|████████  | 24/30 [11:01<02:45, 27.54s/it]  
-
 If you need additional installation instructions or information create an issue and I will try to help. Also there are alot of settings notes on the musubi github linked above.  
+
+## To Use FramePack
+
+Install as normal, then install the frame pack requirements in requirementsFP.txt.  
+pip install -r requirementsFP.txt  
+
+It should automatically download the files for you on first run.
 
 ## To Use Skyreels
 
@@ -56,6 +61,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+4/18/2025  
+    Add initial support for FramePack. https://github.com/lllyasviel/FramePack  
 4/15/2025  
     Add much improved functionality for the wan fun control model. Added strength imrpovements and dropoff code to choose when to apply the control video. Thanks wordbrew.  
 4/3/2025  

@@ -1,0 +1,14 @@
+accelerate
+diffusers
+transformers
+sentencepiece
+pillow
+av
+numpy
+scipy
+requests
+torchsde
+
+einops
+opencv-contrib-python
+safetensors

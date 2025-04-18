@@ -30,6 +30,294 @@ stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
 
+def process_framepack_video(
+    prompt: str,
+    negative_prompt: str,
+    input_image: str,
+    transformer_path: str,
+    vae_path: str,
+    text_encoder_path: str,
+    text_encoder_2_path: str,
+    image_encoder_path: str,
+    hf_home: str,
+    save_path: str,
+    target_resolution: Optional[int], # Can be None now if width/height provided
+    framepack_width: Optional[int],   # <<< New Argument
+    framepack_height: Optional[int],  # <<< New Argument
+    seed: int,
+    total_second_length: float,
+    fps: int,
+    steps: int, # Fixed value usually
+    distilled_guidance_scale: float,
+    cfg: float, # Fixed value usually
+    rs: float, # Fixed value usually
+    latent_window_size: int, # Fixed value usually
+    high_vram: bool,
+    low_vram: bool,
+    gpu_memory_preservation: float,
+    use_teacache: bool,
+    device: Optional[str],
+    batch_size: int, # For batch processing loop
+    # LoRA params (placeholders for UI, not used by backend script yet)
+    lora_folder: str,
+    lora1: str = "None",
+    lora2: str = "None",
+    lora3: str = "None",
+    lora4: str = "None",
+    lora1_multiplier: float = 1.0,
+    lora2_multiplier: float = 1.0,
+    lora3_multiplier: float = 1.0,
+    lora4_multiplier: float = 1.0,
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate video using framepack_generate_video.py"""
+    global stop_event
+
+    if stop_event.is_set():
+        yield [], "", "Generation stopped."
+        return
+
+    # --- Argument Validation ---
+    if not prompt:
+        yield [], "Error: Prompt is required.", ""
+        return
+    if not input_image or not os.path.exists(input_image):
+        yield [], "Error: Input image not found.", f"Cannot find image: {input_image}"
+        return
+    if not save_path:
+        yield [], "Error: Save path is required.", ""
+        return
+
+    # --- Resolution Validation (UI level check) ---
+    use_explicit_dims = framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0
+    use_target_res = target_resolution is not None and target_resolution > 0
+
+    if not use_explicit_dims and not use_target_res:
+        yield [], "Error: Resolution required. Please provide Target Resolution OR both Width and Height.", ""
+        return
+
+    all_videos = []
+    progress_text = "Starting FramePack generation..."
+    status_text = "Preparing..."
+    yield all_videos, status_text, progress_text
+
+    for i in range(batch_size):
+        if stop_event.is_set():
+            yield all_videos, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1:
+            current_seed = seed + i
+
+        status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
+        yield all_videos.copy(), status_text, progress_text
+
+        # --- Prepare Environment and Command ---
+        env = os.environ.copy()
+        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+        env["PYTHONIOENCODING"] = "utf-8"
+        if hf_home:
+            env["HF_HOME"] = os.path.abspath(hf_home)
+
+        clear_cuda_cache()
+
+        command = [
+            sys.executable,
+            "framepack_generate_video.py",
+            "--prompt", prompt,
+            "--input_image", input_image,
+            "--save_path", save_path,
+            "--seed", str(current_seed),
+            "--total_second_length", str(total_second_length),
+            "--fps", str(fps),
+            "--steps", str(steps),
+            "--gs", str(distilled_guidance_scale), # Alias --gs
+            "--cfg", str(cfg),
+            "--rs", str(rs),
+            "--latent_window_size", str(latent_window_size),
+            # -- Resolution handled below --
+            "--gpu_memory_preservation", str(gpu_memory_preservation),
+        ]
+
+        # --- Resolution Handling ---
+        if use_explicit_dims:
+            print(f"Using explicit dimensions for command: {framepack_width}x{framepack_height}")
+            command.extend(["--width", str(framepack_width)])
+            command.extend(["--height", str(framepack_height)])
+        elif use_target_res:
+            print(f"Using target resolution for command: {target_resolution}")
+            command.extend(["--target_resolution", str(target_resolution)])
+        # Backend script handles the case where neither is valid (already checked above)
+
+        # Add optional text/model paths if provided
+        if transformer_path: command.extend(["--transformer_path", transformer_path])
+        if vae_path: command.extend(["--vae_path", vae_path])
+        if text_encoder_path: command.extend(["--text_encoder_path", text_encoder_path])
+        if text_encoder_2_path: command.extend(["--text_encoder_2_path", text_encoder_2_path])
+        if image_encoder_path: command.extend(["--image_encoder_path", image_encoder_path])
+        if hf_home: command.extend(["--hf_home", hf_home])
+        if negative_prompt: command.extend(["--negative_prompt", negative_prompt])
+        if device: command.extend(["--device", device])
+
+        # Handle boolean flags
+        if high_vram: command.append("--high_vram")
+        if low_vram: command.append("--low_vram")
+        if not use_teacache: command.append("--no_teacache")
+
+        command_str = [str(c) for c in command]
+        print(f"Running FramePack Command: {' '.join(command_str)}")
+
+        # --- Execute Subprocess ---
+        p = subprocess.Popen(
+            command_str,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1
+        )
+
+        current_video_path = None
+        while True:
+            if stop_event.is_set():
+                p.terminate()
+                p.wait()
+                yield all_videos.copy(), "Generation stopped by user.", ""
+                return
+
+            line = p.stdout.readline()
+            if not line:
+                if p.poll() is not None:
+                    break
+                continue
+
+            print(line, end='') # Print progress to console
+            progress_text = line.strip()
+            if "Sampling" in line and "%|" in line:
+                match = re.search(r'\s*(\d+)%\|', line)
+                if match:
+                    percent = match.group(1)
+                    progress_text = f"Sampling {percent}%"
+                yield all_videos.copy(), status_text, progress_text
+            elif "Decoding generated latents" in line:
+                 progress_text = "Decoding..."
+                 yield all_videos.copy(), status_text, progress_text
+            elif line.startswith("ACTUAL_FINAL_PATH:"):
+                current_video_path = line.split("ACTUAL_FINAL_PATH:")[-1].strip()
+                progress_text = f"Final video path received: {os.path.basename(current_video_path)}"
+                yield all_videos.copy(), status_text, progress_text
+            elif line.startswith("Video generation finished in"):
+                 status_text = f"Finishing (Seed: {current_seed})"
+                 progress_text = line.strip()
+                 yield all_videos.copy(), status_text, progress_text
+
+        p.stdout.close()
+        rc = p.wait()
+
+        clear_cuda_cache()
+        time.sleep(0.5)
+
+        # --- Collect Output ---
+        if rc == 0 and current_video_path and os.path.exists(current_video_path):
+            parameters = {
+                "prompt": prompt, "negative_prompt": negative_prompt, "input_image": os.path.basename(input_image),
+                "transformer_path": transformer_path, "vae_path": vae_path,
+                "text_encoder_path": text_encoder_path, "text_encoder_2_path": text_encoder_2_path,
+                "image_encoder_path": image_encoder_path, "hf_home": hf_home,
+                "save_path": save_path,
+                # Add resolution parameters used
+                "target_resolution": target_resolution if not use_explicit_dims else None,
+                "framepack_width": framepack_width if use_explicit_dims else None,
+                "framepack_height": framepack_height if use_explicit_dims else None,
+                "seed": current_seed,
+                "total_second_length": total_second_length, "fps": fps, "steps": steps,
+                "distilled_guidance_scale": distilled_guidance_scale, "cfg": cfg, "rs": rs,
+                "latent_window_size": latent_window_size, "high_vram": high_vram, "low_vram": low_vram,
+                "gpu_memory_preservation": gpu_memory_preservation, "use_teacache": use_teacache,
+                "device": device,
+                "lora_weights": [lora1, lora2, lora3, lora4],
+                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+            }
+            add_metadata_to_video(current_video_path, parameters)
+
+            video_item = (str(current_video_path), f"Seed: {current_seed}")
+            all_videos.append(video_item)
+
+            status_text = f"Completed (Seed: {current_seed})"
+            progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
+            yield all_videos.copy(), status_text, progress_text
+        elif rc != 0:
+            status_text = f"Failed (Seed: {current_seed})"
+            progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
+            yield all_videos.copy(), status_text, progress_text
+        else:
+            status_text = f"Failed (Seed: {current_seed})"
+            progress_text = "Could not find generated video file. Check console logs."
+            yield all_videos.copy(), status_text, progress_text
+
+    # Final yield after loop
+    yield all_videos, "FramePack Batch complete", ""
+
+def update_framepack_image_dimensions(image):
+    """Update FramePack dimensions from uploaded image"""
+    if image is None:
+        return "", gr.update(value=None), gr.update(value=None), gr.update(value=100) # Reset scale too
+    try:
+        img = Image.open(image)
+        w, h = img.size
+        # Ensure divisibility by 16
+        w = (w // 16) * 16
+        h = (h // 16) * 16
+        # Use None for width/height initially if target_res is preferred
+        return f"{w}x{h}", gr.update(value=None), gr.update(value=None), gr.update(value=100) # Return None for w/h initially
+    except Exception as e:
+        print(f"Error reading image dimensions: {e}")
+        return "", gr.update(value=None), gr.update(value=None), gr.update(value=100)
+
+def calculate_framepack_width(height, original_dims):
+    """Calculate FramePack width based on height maintaining aspect ratio"""
+    if not original_dims or height is None:
+        return gr.update()
+    try:
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        if orig_h == 0: return gr.update() # Avoid division by zero
+        aspect_ratio = orig_w / orig_h
+        new_width = math.floor((height * aspect_ratio) / 16) * 16
+        return gr.update(value=max(16, new_width)) # Ensure minimum size
+    except Exception:
+        return gr.update()
+
+def calculate_framepack_height(width, original_dims):
+    """Calculate FramePack height based on width maintaining aspect ratio"""
+    if not original_dims or width is None:
+        return gr.update()
+    try:
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        if orig_w == 0: return gr.update() # Avoid division by zero
+        aspect_ratio = orig_w / orig_h
+        new_height = math.floor((width / aspect_ratio) / 16) * 16
+        return gr.update(value=max(16, new_height)) # Ensure minimum size
+    except Exception:
+        return gr.update()
+
+def update_framepack_from_scale(scale, original_dims):
+    """Update FramePack dimensions based on scale percentage"""
+    if not original_dims:
+        return gr.update(), gr.update()
+    try:
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        scale_factor = scale / 100.0
+        new_w = math.floor((orig_w * scale_factor) / 16) * 16
+        new_h = math.floor((orig_h * scale_factor) / 16) * 16
+        # Clear target resolution if using scale slider for explicit dims
+        return gr.update(value=max(16, new_w)), gr.update(value=max(16, new_h)), gr.update(value=None)
+    except Exception:
+        return gr.update(), gr.update(), gr.update()
+
 def process_i2v_single_video(
     prompt: str,
     image_path: str,
@@ -3847,6 +4135,8 @@ with gr.Blocks(
     wanx_trimmed_video_path = gr.State(value=None) 
     wanx_v2v_selected_index = gr.State(value=None)
     wanx_t2v_selected_index = gr.State(value=None)
+    framepack_selected_index = gr.State(value=None)
+    framepack_original_dims = gr.State(value="")
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -3880,6 +4170,118 @@ with gr.Blocks(
     """)
         
     with gr.Tabs() as tabs:
+
+        #FRAME PACK TAB
+        with gr.Tab(id=10, label="FramePack") as framepack_tab: # Set id=0
+            # Top Row: Prompt, Batch, Progress
+            with gr.Row():
+                with gr.Column(scale=4):                    
+                    framepack_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="cinematic video of a cat wizard casting a spell", lines=3)
+                    framepack_negative_prompt = gr.Textbox(scale=3, label="Negative Prompt", value="", lines=3)
+                with gr.Column(scale=1):
+                    framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False) # <<< ADDED Token Counter
+                    framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    framepack_progress_text = gr.Textbox(label="Progress", interactive=False, value="", lines=1)
+
+            # Second Row: Generate/Stop Buttons
+            with gr.Row():
+                framepack_generate_btn = gr.Button("Generate FramePack Video", elem_classes="green-btn")
+                framepack_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            # Third Row: Main Content (Input/Params Left, Output/LoRA Right)
+            with gr.Row():
+                # --- Left Column ---
+                with gr.Column():
+                    framepack_input_image = gr.Image(label="Input Image", type="filepath")
+                    gr.Markdown("### Resolution Options (Choose One)")
+                    framepack_target_resolution = gr.Number(
+                        label="Option 1: Target Resolution (Longer Side)",
+                        value=640,
+                        minimum=256,
+                        maximum=1280,
+                        step=16,
+                        info="Target for longer side. Uses automatic aspect ratio (bucketing). Final size divisible by 32.",
+                        interactive=True
+                    )
+                    with gr.Accordion("Option 2: Explicit Resolution (Overrides Option 1)", open=False):
+                         framepack_scale_slider = gr.Slider( # <<< Added Scale Slider
+                             minimum=1, maximum=200, value=100, step=1, label="Scale % (UI Only)"
+                         )
+                         with gr.Row():
+                             framepack_width = gr.Number(
+                                 label="Width", value=None, minimum=64, step=16,
+                                 info="Must be divisible by 16.", interactive=True
+                             )
+                             framepack_calc_height_btn = gr.Button("→") # <<< Added Calc Button
+                             framepack_calc_width_btn = gr.Button("←")  # <<< Added Calc Button
+                             framepack_height = gr.Number(
+                                 label="Height", value=None, minimum=64, step=16,
+                                 info="Must be divisible by 16.", interactive=True
+                             )
+                    framepack_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=1, label="Total Video Length (seconds)", value=5.0)
+                    framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
+                    framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                    framepack_gs = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Distilled Guidance Scale (gs)", value=10.0)
+
+                # --- Right Column ---
+                with gr.Column():
+                    framepack_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[1],
+                        object_fit="contain", height="auto", show_label=True,
+                        elem_id="gallery_framepack", allow_preview=True, preview=True
+                    )
+                    # Optional Button:
+                    # framepack_send_to_v2v_btn = gr.Button("Send Selected to V2V (Placeholder)")
+
+                    # LoRA Section (Placeholder)
+                    with gr.Group(): # Group LoRA controls visually
+                        with gr.Row():
+                            framepack_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                            framepack_lora_folder = gr.Textbox(label="LoRa IS NOT IMPLEMENTED YET", value="lora", scale=4)
+                        framepack_lora_weights = []
+                        framepack_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                framepack_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=True, interactive=True, scale=2
+                                ))
+                                framepack_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1
+                                ))
+
+            # --- Accordions Below Main Content ---
+            with gr.Accordion("Fixed Generation Parameters (Changing Not Recommended)", open=True):
+                 with gr.Row():
+                    framepack_steps = gr.Slider(minimum=10, maximum=50, step=1, label="Steps", value=25, interactive=True)
+                    framepack_cfg = gr.Slider(minimum=1.0, maximum=10.0, step=0.1, label="CFG Scale", value=1.0, interactive=True)
+                    framepack_rs = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="CFG Rescale (rs)", value=0.0, interactive=True)
+                    framepack_latent_window_size = gr.Number(label="Latent Window Size", value=9, interactive=True)
+
+            with gr.Accordion("Advanced / Model Paths", open=True):
+                 with gr.Row():
+                    framepack_transformer_path = gr.Textbox(label="Transformer Path", value="lllyasviel/FramePackI2V_HY")
+                    framepack_vae_path = gr.Textbox(label="VAE Path", value="hunyuanvideo-community/HunyuanVideo")
+                 with gr.Row():
+                    framepack_text_encoder_path = gr.Textbox(label="Text Encoder 1 (Llama) Path", value="hunyuanvideo-community/HunyuanVideo")
+                    framepack_text_encoder_2_path = gr.Textbox(label="Text Encoder 2 (CLIP) Path", value="hunyuanvideo-community/HunyuanVideo")
+                 with gr.Row():
+                    framepack_image_encoder_path = gr.Textbox(label="Image Encoder (SigLIP) Path", value="lllyasviel/flux_redux_bfl")
+                    framepack_hf_home = gr.Textbox(label="HuggingFace Cache Dir", value="./hf_download")
+                    framepack_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Accordion("Performance / Memory", open=True):
+                with gr.Row():
+                    framepack_high_vram = gr.Checkbox(label="Force High VRAM Mode", value=False)
+                    framepack_low_vram = gr.Checkbox(label="Force Low VRAM Mode", value=False)
+                    framepack_use_teacache = gr.Checkbox(label="Use TeaCache Optimization", value=False)
+                with gr.Row():
+                    framepack_gpu_memory_preservation = gr.Number(label="GPU Memory Preservation (GB, Low VRAM)", value=6.0, minimum=0.0)
+                    framepack_device = gr.Textbox(label="Device Override (optional)", placeholder="e.g., cuda:0, cpu")
+
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
@@ -4913,6 +5315,98 @@ with gr.Blocks(
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
     #Event handlers etc
+    # Connect FramePack Generate button
+    framepack_prompt.change(fn=count_prompt_tokens, inputs=framepack_prompt, outputs=framepack_token_counter)
+    framepack_generate_btn.click(
+        fn=process_framepack_video,
+        inputs=[
+            framepack_prompt,
+            framepack_negative_prompt,
+            framepack_input_image,
+            framepack_transformer_path,
+            framepack_vae_path,
+            framepack_text_encoder_path,
+            framepack_text_encoder_2_path,
+            framepack_image_encoder_path,
+            framepack_hf_home,
+            framepack_save_path,
+            framepack_target_resolution,
+            framepack_width,              # <<< Added
+            framepack_height,             # <<< Added
+            framepack_seed,
+            framepack_total_second_length,
+            framepack_fps,
+            framepack_steps,
+            framepack_gs,
+            framepack_cfg,
+            framepack_rs,
+            framepack_latent_window_size,
+            framepack_high_vram,
+            framepack_low_vram,
+            framepack_gpu_memory_preservation,
+            framepack_use_teacache,
+            framepack_device,
+            framepack_batch_size,
+            framepack_lora_folder,
+            *framepack_lora_weights,
+            *framepack_lora_multipliers
+        ],
+        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text],
+        queue=True
+    )
+
+    framepack_input_image.change(
+        fn=update_framepack_image_dimensions,
+        inputs=[framepack_input_image],
+        outputs=[framepack_original_dims, framepack_width, framepack_height, framepack_scale_slider]
+    )
+
+    framepack_scale_slider.change(
+        fn=update_framepack_from_scale,
+        inputs=[framepack_scale_slider, framepack_original_dims],
+        outputs=[framepack_width, framepack_height, framepack_target_resolution] # Also clear target res
+    )
+
+    framepack_calc_width_btn.click(
+        fn=calculate_framepack_width,
+        inputs=[framepack_height, framepack_original_dims],
+        outputs=[framepack_width]
+    ).then(
+        fn=lambda: gr.update(value=None), # Clear target res when explicitly calculating
+        outputs=framepack_target_resolution
+    )
+
+    framepack_calc_height_btn.click(
+        fn=calculate_framepack_height,
+        inputs=[framepack_width, framepack_original_dims],
+        outputs=[framepack_height]
+    ).then(
+        fn=lambda: gr.update(value=None), # Clear target res when explicitly calculating
+        outputs=framepack_target_resolution
+    )
+
+    # Connect FramePack Stop button
+    framepack_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Connect FramePack Gallery selection
+    def handle_framepack_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    framepack_output.select(
+        fn=handle_framepack_gallery_select,
+        outputs=framepack_selected_index
+    )
+
+    # Connect FramePack LoRA Refresh button (Placeholder functionality)
+    framepack_refresh_outputs = []
+    for i in range(4):
+        framepack_refresh_outputs.extend([framepack_lora_weights[i], framepack_lora_multipliers[i]])
+
+    framepack_refresh_btn.click(
+        fn=update_lora_dropdowns, # Reuse existing function
+        inputs=[framepack_lora_folder] + framepack_lora_weights + framepack_lora_multipliers,
+        outputs=framepack_refresh_outputs
+    )
 
     def toggle_fun_control(use_fun_control):
         """Toggle control video visibility and update task suffix"""
