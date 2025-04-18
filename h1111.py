@@ -71,6 +71,7 @@ def process_framepack_video(
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video using framepack_generate_video.py"""
     global stop_event
+    stop_event.clear()
 
     if stop_event.is_set():
         yield [], "", "Generation stopped."
