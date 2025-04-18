@@ -8,6 +8,7 @@ This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
 
 It allows inference with these models:  
+FramePack  
 Hunyuan-t2v  
 Hunyuan-i2v  
 Hunyuan-v2v  
@@ -33,7 +34,7 @@ pip install -r requirementsFP.txt
 It should automatically download the files for you on first run.  
 
 If you have already downloaded the model you can set the locations in the gui and it might work. You will also probably have to set the env variables ie:  
-    export HF_HOME="/............./h111/hf_download"   (for linux)
+    export HF_HOME="/............./h111/hf_download"   (for linux)  
     $env:HF_HOME="C:\........\hf_download"   (for windoze)
 
 ## To Use Skyreels
