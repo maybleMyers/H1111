@@ -1,7 +1,3 @@
-# --- START OF MODIFIED FILE framepack_generate_video.py ---
-
-# START OF FILE framepack_generate_video.py
-
 import argparse
 import os
 import sys
@@ -18,6 +14,12 @@ import torch
 import av # For saving video
 from PIL import Image
 from tqdm import tqdm
+import cv2
+import subprocess
+import torchvision
+import tempfile
+import shutil
+
 
 # --- Dependencies from diffusers_helper ---
 # Ensure this library is installed or in the PYTHONPATH
@@ -200,6 +202,83 @@ def load_models(args):
         "transformer": transformer,
         "device": device
     }
+
+def save_video_with_fallback(video_tensor, output_path, fps=30):
+    """
+    Save a video tensor to a file with multiple fallback options to handle platform differences.
+    
+    Args:
+        video_tensor: A tensor of shape [B, C, T, H, W]
+        output_path: Output file path
+        fps: Frames per second
+    """
+    try:
+        # First attempt: Try torchvision's writer directly
+        import torchvision
+        video_tensor = video_tensor.permute(0, 2, 3, 4, 1)  # [B, T, H, W, C]
+        video_tensor = video_tensor.squeeze(0)  # [T, H, W, C]
+        video_tensor = (video_tensor * 255).to(torch.uint8)
+        try:
+            torchvision.io.write_video(output_path, video_tensor, fps=fps, video_codec='h264', options={'crf': '0'})
+            print(f"Successfully saved video using torchvision.io.write_video to {output_path}")
+            return True
+        except TypeError as e:
+            print(f"Torchvision writer failed with TypeError: {e}, trying alternative method...")
+            
+        # Second attempt: Try using PIL and moviepy
+        try:
+
+            # Create a temporary directory for storing frames
+            temp_dir = tempfile.mkdtemp()
+            try:
+                # Save each frame as a PNG file
+                frames = []
+                for i in range(video_tensor.shape[0]):
+                    frame = video_tensor[i].cpu().numpy()
+                    img = Image.fromarray(frame)
+                    frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
+                    img.save(frame_path)
+                    frames.append(frame_path)
+                
+                # Create a video from the frames
+                clip = ImageSequenceClip(frames, fps=fps)
+                clip.write_videofile(output_path, codec="libx264", fps=fps)
+                print(f"Successfully saved video using moviepy to {output_path}")
+                return True
+            finally:
+                # Clean up the temporary directory
+                shutil.rmtree(temp_dir)
+                
+        except ImportError:
+            print("Moviepy not available, trying next method...")
+        
+        # Third attempt: Try using OpenCV
+        try:
+            import cv2
+            import numpy as np
+            
+            video_tensor = video_tensor.cpu().numpy()
+            height, width = video_tensor.shape[1], video_tensor.shape[2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or use 'avc1' or other codecs
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            
+            for i in range(video_tensor.shape[0]):
+                # Convert RGB to BGR for OpenCV
+                frame = cv2.cvtColor(video_tensor[i], cv2.COLOR_RGB2BGR)
+                out.write(frame)
+            
+            out.release()
+            print(f"Successfully saved video using OpenCV to {output_path}")
+            return True
+            
+        except ImportError:
+            print("OpenCV not available, no more fallback methods...")
+            
+        return False
+        
+    except Exception as e:
+        print(f"All video saving methods failed with error: {e}")
+        return False
 
 def adjust_to_multiple(value, multiple):
     """Rounds down value to the nearest multiple."""
@@ -626,12 +705,90 @@ def generate_video(args, models):
             print(f"  Decoding and merging finished in {decode_end_time - decode_start_time:.2f} seconds.")
 
             # --- Save Intermediate Video ---
-            # Save after each section to see progress and ensure the final one is kept
             current_num_pixel_frames = history_pixels.shape[2]
             output_filename = output_dir / f'{job_id}_section{i+1}_frames{current_num_pixel_frames}_{width}x{height}.mp4'
             print(f"  Saving intermediate video ({current_num_pixel_frames} frames) to: {output_filename}")
-            save_bcthw_as_mp4(history_pixels, str(output_filename), fps=fps)
-            final_video_path = str(output_filename) # Update the path to the latest complete video
+
+            # Cross-platform video saving with fallbacks
+            try:
+                # First try with standard torchvision approach
+                video_tensor = history_pixels.permute(0, 2, 3, 4, 1).squeeze(0)  # [T, H, W, C]
+                video_tensor = (video_tensor * 0.5 + 0.5) * 255  # Normalize to 0-255 range
+                video_tensor = video_tensor.to(torch.uint8).cpu()
+
+                try:
+                    # Standard torchvision approach - may fail on some platforms
+                    torchvision.io.write_video(str(output_filename), video_tensor, fps=fps)
+                    print(f"  Saved video using torchvision.io")
+                except (TypeError, RuntimeError) as e:
+                    print(f"  Torchvision saving failed with {type(e).__name__}: {e}, trying OpenCV...")
+
+                    # Fall back to OpenCV with FFmpeg-compatible format
+                    video_np = video_tensor.numpy()
+                    height, width = video_np.shape[1], video_np.shape[2]
+
+                    # Try to use h264 codec via FFmpeg if available
+                    temp_dir = tempfile.mkdtemp()
+                    try:
+                        # Save frames as images
+                        frame_paths = []
+                        for i in range(video_np.shape[0]):
+                            frame = cv2.cvtColor(video_np[i], cv2.COLOR_RGB2BGR)
+                            frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
+                            cv2.imwrite(frame_path, frame)
+                            frame_paths.append(frame_path)
+
+                        # Use FFmpeg directly for better compatibility
+                        ffmpeg_cmd = [
+                            "ffmpeg", "-y",
+                            "-framerate", str(fps),
+                            "-i", os.path.join(temp_dir, "frame_%04d.png"),
+                            "-c:v", "libx264", 
+                            "-profile:v", "high",
+                            "-pix_fmt", "yuv420p",  # This is crucial for compatibility
+                            "-crf", "23",  # Good quality
+                            "-movflags", "+faststart",  # For web compatibility
+                            str(output_filename)
+                        ]
+
+                        try:
+                            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                            print(f"  Saved video using FFmpeg")
+                        except (subprocess.SubprocessError, FileNotFoundError):
+                            # If FFmpeg fails or isn't available, try OpenCV's VideoWriter
+                            print(f"  FFmpeg failed, using OpenCV directly...")
+                            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
+                            out = cv2.VideoWriter(str(output_filename), fourcc, fps, (width, height))
+
+                            if not out.isOpened():
+                                # If avc1 fails, try mp4v as last resort
+                                print(f"  OpenCV with H.264 codec failed, falling back to mp4v...")
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                out = cv2.VideoWriter(str(output_filename), fourcc, fps, (width, height))
+
+                            for i in range(video_np.shape[0]):
+                                frame = cv2.cvtColor(video_np[i], cv2.COLOR_RGB2BGR)
+                                out.write(frame)
+
+                            out.release()
+                            print(f"  Saved video using OpenCV")
+                    finally:
+                        # Clean up the temporary directory
+                        shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"  Error saving video: {e}")
+                # If video saving completely fails, at least save a reference frame as an image
+                try:
+                    first_frame = history_pixels[0, :, 0].permute(1, 2, 0).cpu().numpy()
+                    first_frame = (first_frame * 0.5 + 0.5) * 255  # Denormalize to 0-255 range
+                    first_frame = first_frame.astype(np.uint8)
+                    frame_path = str(output_filename).replace('.mp4', '_first_frame.png')
+                    Image.fromarray(first_frame).save(frame_path)
+                    print(f"  Saved first frame as image to {frame_path}")
+                except Exception as frame_err:
+                    print(f"  Could not save first frame either: {frame_err}")
+
+            final_video_path = str(output_filename)  # Update the path to the latest complete video
 
             section_end_time = time.time()
             print(f"--- Section {i+1} finished in {section_end_time - section_start_time:.2f} seconds ---")
@@ -688,5 +845,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# --- END OF MODIFIED FILE framepack_generate_video.py ---

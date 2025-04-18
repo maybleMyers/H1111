@@ -4197,12 +4197,12 @@ with gr.Blocks(
                     framepack_input_image = gr.Image(label="Input Image", type="filepath")
                     gr.Markdown("### Resolution Options (Choose One)")
                     framepack_target_resolution = gr.Number(
-                        label="Option 1: Target Resolution (Longer Side)",
+                        label="Option 1: Target Resolution ",
                         value=640,
                         minimum=256,
                         maximum=1280,
                         step=16,
-                        info="Target for longer side. Uses automatic aspect ratio (bucketing). Final size divisible by 32.",
+                        info="Target bucket size. Uses automatic aspect ratio (bucketing). Final size divisible by 32.",
                         interactive=True
                     )
                     with gr.Accordion("Option 2: Explicit Resolution (Overrides Option 1)", open=False):
