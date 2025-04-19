@@ -41,24 +41,23 @@ def process_framepack_video(
     image_encoder_path: str,
     hf_home: str,
     save_path: str,
-    target_resolution: Optional[int], # Can be None now if width/height provided
-    framepack_width: Optional[int],   # <<< New Argument
-    framepack_height: Optional[int],  # <<< New Argument
+    target_resolution: Optional[int],
+    framepack_width: Optional[int],
+    framepack_height: Optional[int],
     seed: int,
-    total_second_length: float,
+    total_second_length: float, # Need this for total sections calculation
     fps: int,
-    steps: int, # Fixed value usually
+    steps: int,
     distilled_guidance_scale: float,
-    cfg: float, # Fixed value usually
-    rs: float, # Fixed value usually
-    latent_window_size: int, # Fixed value usually
+    cfg: float,
+    rs: float,
+    latent_window_size: int, # Need this for total sections calculation
     high_vram: bool,
     low_vram: bool,
     gpu_memory_preservation: float,
     use_teacache: bool,
     device: Optional[str],
-    batch_size: int, # For batch processing loop
-    # LoRA params (placeholders for UI, not used by backend script yet)
+    batch_size: int,
     lora_folder: str,
     lora1: str = "None",
     lora2: str = "None",
@@ -68,24 +67,24 @@ def process_framepack_video(
     lora2_multiplier: float = 1.0,
     lora3_multiplier: float = 1.0,
     lora4_multiplier: float = 1.0,
-) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+) -> Generator[Tuple[List[Tuple[str, str]], str, str, List[Tuple[str, str]]], None, None]:
     """Generate video using framepack_generate_video.py"""
     global stop_event
     stop_event.clear()
 
     if stop_event.is_set():
-        yield [], "", "Generation stopped."
+        yield [], "", "", []
         return
 
     # --- Argument Validation ---
     if not prompt:
-        yield [], "Error: Prompt is required.", ""
+        yield [], "Error: Prompt is required.", "", []
         return
     if not input_image or not os.path.exists(input_image):
-        yield [], "Error: Input image not found.", f"Cannot find image: {input_image}"
+        yield [], "Error: Input image not found.", f"Cannot find image: {input_image}", []
         return
     if not save_path:
-        yield [], "Error: Save path is required.", ""
+        yield [], "Error: Save path is required.", "", []
         return
 
     # --- Resolution Validation (UI level check) ---
@@ -93,17 +92,26 @@ def process_framepack_video(
     use_target_res = target_resolution is not None and target_resolution > 0
 
     if not use_explicit_dims and not use_target_res:
-        yield [], "Error: Resolution required. Please provide Target Resolution OR both Width and Height.", ""
+        yield [], "Error: Resolution required. Please provide Target Resolution OR both Width and Height.", "", []
         return
 
+    # --- Calculate Total Sections (Replicate subprocess script logic) ---
+    # Assumes internal 30fps for calculation, output fps is separate
+    total_sections_float = (total_second_length * 30) / (latent_window_size * 4)
+    total_sections = int(max(round(total_sections_float), 1))
+    print(f"Calculated total_sections for UI display: {total_sections}")
+    # --- End Calculate Total Sections ---
+
+
     all_videos = []
-    progress_text = "Starting FramePack generation..."
-    status_text = "Preparing..."
-    yield all_videos, status_text, progress_text
+    progress_text = f"Starting FramePack generation batch ({total_sections} sections per video)..." # Update initial text
+    status_text = "Preparing batch..."
+
+    yield all_videos, status_text, progress_text, [] # Initial yield
 
     for i in range(batch_size):
         if stop_event.is_set():
-            yield all_videos, "Generation stopped by user.", ""
+            yield all_videos, "Generation stopped by user.", "", []
             return
 
         current_seed = seed
@@ -113,7 +121,10 @@ def process_framepack_video(
             current_seed = seed + i
 
         status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
-        yield all_videos.copy(), status_text, progress_text
+        progress_text = f"Section 1/{total_sections}: Preparing for subprocess..." # Update initial progress for each item
+        # Clear progress videos at the start of each batch item to avoid showing videos from previous iterations
+        progress_videos = []
+        yield all_videos.copy(), status_text, progress_text, progress_videos
 
         # --- Prepare Environment and Command ---
         env = os.environ.copy()
@@ -182,39 +193,94 @@ def process_framepack_video(
             bufsize=1
         )
 
-        current_video_path = None
+        current_video_path = None # Path to the final video of the current batch item
+
+
+        # Monitor subprocess output
         while True:
             if stop_event.is_set():
-                p.terminate()
-                p.wait()
-                yield all_videos.copy(), "Generation stopped by user.", ""
+                p.terminate() # Send terminate signal
+                p.wait() # Wait for process to exit
+                # Clear progress gallery on stop
+                yield all_videos.copy(), "Generation stopped by user.", "", []
                 return
 
             line = p.stdout.readline()
             if not line:
+                # If no output line, check if process has finished
                 if p.poll() is not None:
-                    break
+                    break # Process has ended
+                # Otherwise, wait a bit before trying to read again
+                time.sleep(0.01) # Small sleep to prevent tight loop
                 continue
 
-            print(line, end='') # Print progress to console
-            progress_text = line.strip()
+            # Process the line
+            # print(f"SUBPROCESS: {line.strip()}") # Print progress to console with identifier
+
+            # --- Look for Sampling progress line and extract info ---
+            # Pattern: "SUBPROCESS: --- Starting Section X/Y ... ---" followed by "SUBPROCESS:   Section X Sampling: [TQDM BAR]"
+            # We need the line containing "Section X Sampling: " and the TQDM bar.
+            # Use regex to capture the Section number and the part after "Sampling: "
             if "Sampling" in line and "%|" in line:
-                match = re.search(r'\s*(\d+)%\|', line)
+                # Capture 'X' from "Section X Sampling: " and the full TQDM bar part
+                match = re.search(r'Section (\d+) Sampling: (.*)$', line)
                 if match:
-                    percent = match.group(1)
-                    progress_text = f"Sampling {percent}%"
-                yield all_videos.copy(), status_text, progress_text
+                    section_number = match.group(1)
+                    tqdm_bar_part = match.group(2).strip() # Get the rest of the line (TQDM bar)
+                    # Construct the new progress text including section/total and the full TQDM bar
+                    progress_text = f"S{section_number}/{total_sections} {tqdm_bar_part}"
+                    # print(f"DEBUG: Progress text updated to: {progress_text}") # Optional debug print
+
+            # --- Keep other existing progress indicators ---
             elif "Decoding generated latents" in line:
                  progress_text = "Decoding..."
-                 yield all_videos.copy(), status_text, progress_text
+
+            # Look for the line indicating intermediate video saving
+            elif "Saving intermediate video" in line:
+                # Extract the path using regex
+                path_match = re.search(r'Saving intermediate video .* to: (.+\.mp4)', line)
+                if path_match:
+                    intermediate_path = path_match.group(1)
+
+                    # Give the file system a moment to write the file
+                    time.sleep(0.1)
+
+                    # Check if file exists
+                    if os.path.exists(intermediate_path):
+                        # --- CRITICAL CHANGE: Replace the list with *only* the new video ---
+                        frames_match = re.search(r'frames(\d+)', intermediate_path)
+                        frames_count = frames_match.group(1) if frames_match else "?"
+                        section_match = re.search(r'section(\d+)', intermediate_path)
+                        section_number = section_match.group(1) if section_match else "?"
+
+                        caption = f"Section {section_number} ({frames_count} frames)"
+                        # Replace the entire list with just the latest video
+                        progress_videos = [(intermediate_path, caption)]
+                        # No sorting needed anymore as it's always a single item
+
+                        # Update the progress gallery in the UI
+                        progress_text = f"Generated section {section_number} ({frames_count} frames)"
+                        print(f"Updating intermediate gallery with latest video: {intermediate_path}")
+
+            # Removed the directory scanning logic as it was causing duplicates/showing older videos
+            # and the explicit print line is a more reliable trigger.
+
+            # Look for the line indicating the final output path
             elif line.startswith("ACTUAL_FINAL_PATH:"):
                 current_video_path = line.split("ACTUAL_FINAL_PATH:")[-1].strip()
                 progress_text = f"Final video path received: {os.path.basename(current_video_path)}"
-                yield all_videos.copy(), status_text, progress_text
+                print(progress_text)
+
+            # Look for the line indicating generation finished
             elif line.startswith("Video generation finished in"):
                  status_text = f"Finishing (Seed: {current_seed})"
                  progress_text = line.strip()
-                 yield all_videos.copy(), status_text, progress_text
+                 print(progress_text)
+
+            # Yield progress updates (this yield is now inside the while loop)
+            # The progress_text variable holds the latest message determined by the elif chain
+            yield all_videos.copy(), status_text, progress_text, progress_videos
+
 
         p.stdout.close()
         rc = p.wait()
@@ -223,6 +289,7 @@ def process_framepack_video(
         time.sleep(0.5)
 
         # --- Collect Output ---
+        # This block executes after the while loop finishes for one batch item
         if rc == 0 and current_video_path and os.path.exists(current_video_path):
             parameters = {
                 "prompt": prompt, "negative_prompt": negative_prompt, "input_image": os.path.basename(input_image),
@@ -250,18 +317,22 @@ def process_framepack_video(
 
             status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
-            yield all_videos.copy(), status_text, progress_text
+            progress_videos = [] # Clear intermediate gallery on successful completion
+            yield all_videos.copy(), status_text, progress_text, progress_videos
         elif rc != 0:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
-            yield all_videos.copy(), status_text, progress_text
+            progress_videos = [] # Clear intermediate gallery on failure
+            yield all_videos.copy(), status_text, progress_text, progress_videos
         else:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = "Could not find generated video file. Check console logs."
-            yield all_videos.copy(), status_text, progress_text
+            progress_videos = [] # Clear intermediate gallery on failure
+            yield all_videos.copy(), status_text, progress_text, progress_videos
 
-    # Final yield after loop
-    yield all_videos, "FramePack Batch complete", ""
+
+    # Final yield after batch loop completes
+    yield all_videos, "FramePack Batch complete", "", []
 
 def update_framepack_image_dimensions(image):
     """Update FramePack dimensions from uploaded image"""
@@ -4234,6 +4305,12 @@ with gr.Blocks(
                         object_fit="contain", height="auto", show_label=True,
                         elem_id="gallery_framepack", allow_preview=True, preview=True
                     )
+                    framepack_progress_gallery = gr.Gallery(
+                        label="Generation Progress (Intermediate Videos)",
+                        columns=[1], rows=[1],
+                        object_fit="contain", height="auto", show_label=True,
+                        elem_id="gallery_framepack_progress", allow_preview=True, preview=True
+                    )
                     # Optional Button:
                     # framepack_send_to_v2v_btn = gr.Button("Send Selected to V2V (Placeholder)")
 
@@ -5332,8 +5409,8 @@ with gr.Blocks(
             framepack_hf_home,
             framepack_save_path,
             framepack_target_resolution,
-            framepack_width,              # <<< Added
-            framepack_height,             # <<< Added
+            framepack_width,
+            framepack_height,
             framepack_seed,
             framepack_total_second_length,
             framepack_fps,
@@ -5352,7 +5429,7 @@ with gr.Blocks(
             *framepack_lora_weights,
             *framepack_lora_multipliers
         ],
-        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text],
+        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text, framepack_progress_gallery],
         queue=True
     )
 
