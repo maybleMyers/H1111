@@ -4334,7 +4334,7 @@ with gr.Blocks(
                             interactive=True
                         )
                         framepack_end_frame_weight = gr.Slider(
-                            minimum=0.0, maximum=1.0, step=0.05, value=0.6,
+                            minimum=0.0, maximum=1.0, step=0.05, value=0.5,
                             label="Global End Frame Weight", # Clarified global
                             info="Influence strength for 'half' and 'progressive' modes",
                             interactive=True
