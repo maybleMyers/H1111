@@ -33,13 +33,16 @@ pip install -r requirementsFP.txt
 
 It should automatically download the files for you on first run.  
 
-Keyframes sections are highly experimental and a Work in Progress.  
+Keyframes sections are highly experimental and a Work in Progress, do not use an ending image when using keyframes.    
 
 If you have already downloaded the model you can set the locations in the gui and it might work. You will also probably have to set the env variables ie:  
     export HF_HOME="/............./h111/hf_download"   (for linux)  
     $env:HF_HOME="C:\........\hf_download"   (for windoze)
 
 ## To Use Skyreels
+
+I do not have support for the V2 DF model but you can use the new I2V model from https://huggingface.co/maybleMyers/wan_files_for_h1111 in the WanX-i2v tab  
+Download SkyReels-V2-I2V-14B-540P-FP16.safetensors and put it in the wan subfolder.  
 
 To use the Skyreels models, first download Kijai's awesome models:
 
