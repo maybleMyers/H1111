@@ -4324,13 +4324,13 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath") # Clarified label
-                    with gr.Accordion("Optional End Frame Control", open=True):
+                    with gr.Accordion("Optional End Frame Control (Use an end frame or section keyframes, not both.)", open=True):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1) # Clarified label
                         framepack_end_frame_influence = gr.Dropdown(
                             label="Global End Frame Influence Mode", # Clarified global
                             choices=["last", "half", "progressive", "bookend"],
                             value="last", # Changed default to 'last'
-                            info="How the global end frame affects generation (overridden by sections)",
+                            info="How the global end frame affects generation",
                             interactive=True
                         )
                         framepack_end_frame_weight = gr.Slider(
