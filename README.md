@@ -33,6 +33,8 @@ pip install -r requirementsFP.txt
 
 It should automatically download the files for you on first run.  
 
+Keyframes sections are highly experimental and a Work in Progress.  
+
 If you have already downloaded the model you can set the locations in the gui and it might work. You will also probably have to set the env variables ie:  
     export HF_HOME="/............./h111/hf_download"   (for linux)  
     $env:HF_HOME="C:\........\hf_download"   (for windoze)
