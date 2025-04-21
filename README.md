@@ -43,6 +43,7 @@ If you have already downloaded the model you can set the locations in the gui an
 
 I do not have support for the V2 DF model but you can use the new I2V model from https://huggingface.co/maybleMyers/wan_files_for_h1111 in the WanX-i2v tab  
 Download SkyReels-V2-I2V-14B-540P-FP16.safetensors and put it in the wan subfolder.  
+Added initial support for the V2 1.3 model. Use it in the WanX-i2v tab. Download dit from official skyreels repo or kijais.  
 
 To use the Skyreels models, first download Kijai's awesome models:
 
@@ -74,6 +75,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+4/20/2024  
+    Some Skyreels V2 support. They are going to release 18 models so I am dieing?  
 4/18/2025  
     Add initial support for FramePack. https://github.com/lllyasviel/FramePack  
 4/15/2025  
