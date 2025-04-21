@@ -4324,7 +4324,7 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath") # Clarified label
-                    with gr.Accordion("Optional End Frame Control (Use an end frame or section keyframes, not both.)", open=True):
+                    with gr.Accordion("(wip not working yet) Optional End Frame Control (Use an end frame or section keyframes, not both.)", open=True):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1) # Clarified label
                         framepack_end_frame_influence = gr.Dropdown(
                             label="Global End Frame Influence Mode", # Clarified global
@@ -4335,7 +4335,7 @@ with gr.Blocks(
                         )
                         framepack_end_frame_weight = gr.Slider(
                             minimum=0.0, maximum=1.0, step=0.05, value=0.5,
-                            label="Global End Frame Weight", # Clarified global
+                            label="(wip not working yet) Global End Frame Weight", # Clarified global
                             info="Influence strength for 'half' and 'progressive' modes",
                             interactive=True
                         )
