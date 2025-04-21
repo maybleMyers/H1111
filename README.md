@@ -33,6 +33,8 @@ pip install -r requirementsFP.txt
 
 It should automatically download the files for you on first run.  
 
+How to use the global end frame: 'last' (uses end frame for initial context only, no latent blending), 'half' (blends start/end conditioning latents for second half of video), 'progressive' (gradually blends conditioning latents from end to start), 'bookend' (uses end frame conditioning latent ONLY for first generated section IF no section keyframe set, no blending otherwise). All modes use start image embedding.  
+
 Keyframes sections are highly experimental and a Work in Progress, do not use an ending image when using keyframes.    
 
 If you have already downloaded the model you can set the locations in the gui and it might work. You will also probably have to set the env variables ie:  
@@ -75,7 +77,9 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
-4/20/2024  
+4/21/2025  
+    Updated framepack backend script to use end frame weights differently.  
+4/20/2025  
     Some Skyreels V2 support. They are going to release 18 models so I am dieing?  
 4/18/2025  
     Add initial support for FramePack. https://github.com/lllyasviel/FramePack  
