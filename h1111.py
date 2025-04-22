@@ -114,25 +114,25 @@ def process_framepack_video(
 
     # --- Argument Validation ---
     if not prompt:
-        yield [], "Error: Prompt is required.", "", []
+        yield [], "Error: Prompt is required.", ""
         return
     if not input_image or not os.path.exists(input_image):
-        yield [], "Error: Input image not found.", f"Cannot find image: {input_image}", []
+        yield [], "Error: Input image not found.", f"Cannot find image: {input_image}"
         return
     if not save_path:
-        yield [], "Error: Save path is required.", "", []
+        yield [], "Error: Save path is required.", ""
         return
     if input_end_frame and not os.path.exists(input_end_frame):
-        yield [], "Error: End frame image not found.", f"Cannot find end frame image: {input_end_frame}", []
+        yield [], "Error: End frame image not found.", f"Cannot find end frame image: {input_end_frame}"
         return
     if not text_encoder_path or not os.path.exists(text_encoder_path):
-         yield [], "Error: Text Encoder 1 path is required and not found.", "", []
+         yield [], "Error: Text Encoder 1 path is required and not found.", ""
          return
     if not text_encoder_2_path or not os.path.exists(text_encoder_2_path):
-        yield [], "Error: Text Encoder 2 path is required and not found.", "", []
+        yield [], "Error: Text Encoder 2 path is required and not found.", ""
         return
     if not image_encoder_path or not os.path.exists(image_encoder_path):
-        yield [], "Error: Image Encoder path is required and not found.", "", []
+        yield [], "Error: Image Encoder path is required and not found.", ""
         return
 
     # --- Resolution Calculation ---
@@ -140,7 +140,7 @@ def process_framepack_video(
     # Prioritize explicit width/height if valid
     if framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0:
         if framepack_width % 8 != 0 or framepack_height % 8 != 0:
-             yield [], "Error: Explicit Width and Height must be divisible by 8.", "", []
+             yield [], "Error: Explicit Width and Height must be divisible by 8.", ""
              return
         final_height = int(framepack_height)
         final_width = int(framepack_width)
@@ -149,11 +149,11 @@ def process_framepack_video(
     elif target_resolution is not None and target_resolution > 0:
          final_height, final_width = calculate_target_dims(target_resolution, original_dims_str)
          if final_height is None or final_width is None:
-              yield [], "Error: Could not calculate dimensions from Target Resolution and Input Image.", "", []
+              yield [], "Error: Could not calculate dimensions from Target Resolution and Input Image.", ""
               return
          print(f"Using target resolution {target_resolution}, calculated dimensions: H={final_height}, W={final_width}")
     else:
-        yield [], "Error: Resolution required. Please provide Target Resolution OR both Width and Height.", "", []
+        yield [], "Error: Resolution required. Please provide Target Resolution OR both Width and Height.", ""
         return
 
     all_videos = []
@@ -163,7 +163,7 @@ def process_framepack_video(
     progress_text = f"Starting FramePack generation batch ({total_sections} estimated sections per video)..."
     status_text = "Preparing batch..."
     # Removed progress_videos yield as intermediate saving is not supported by backend
-    yield all_videos, status_text, progress_text, [] # Empty list for progress gallery
+    yield all_videos, status_text, progress_text
 
     lora_weights_list = [lora1_w, lora2_w, lora3_w, lora4_w]
     lora_multipliers_list = [lora1_m, lora2_m, lora3_m, lora4_m]
@@ -181,7 +181,7 @@ def process_framepack_video(
 
     for i in range(batch_size):
         if stop_event.is_set():
-            yield all_videos, "Generation stopped by user.", "", []
+            yield all_videos, "Generation stopped by user.", ""
             return
 
         current_seed = seed
@@ -192,7 +192,7 @@ def process_framepack_video(
 
         status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
         progress_text = f"Item {i+1}/{batch_size}: Preparing subprocess..."
-        yield all_videos.copy(), status_text, progress_text, [] # Empty progress gallery
+        yield all_videos.copy(), status_text, progress_text
 
         # --- Prepare Environment and Command ---
         env = os.environ.copy()
@@ -291,7 +291,7 @@ def process_framepack_video(
             if stop_event.is_set():
                 p.terminate()
                 p.wait()
-                yield all_videos.copy(), "Generation stopped by user.", "", []
+                yield all_videos.copy(), "Generation stopped by user.", ""
                 return
 
             line = p.stdout.readline()
@@ -318,7 +318,7 @@ def process_framepack_video(
                  status_text = f"Item {i+1}/{batch_size}: Error Detected (Check Console)"
                  progress_text = line # Show error line
 
-            yield all_videos.copy(), status_text, progress_text, [] # Empty progress gallery
+            yield all_videos.copy(), status_text, progress_text
 
         p.stdout.close()
         rc = p.wait()
@@ -372,17 +372,17 @@ def process_framepack_video(
 
             status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
-            yield all_videos.copy(), status_text, progress_text, [] # Empty progress gallery
+            yield all_videos.copy(), status_text, progress_text
         elif rc != 0:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = f"Subprocess failed with exit code {rc}. Check console logs for errors."
-            yield all_videos.copy(), status_text, progress_text, []
+            yield all_videos.copy(), status_text, progress_text
         else:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = "Subprocess finished, but could not find generated video file. Check console logs."
-            yield all_videos.copy(), status_text, progress_text, []
+            yield all_videos.copy(), status_text, progress_text
 
-    yield all_videos, "FramePack Batch complete", "", []
+    yield all_videos, "FramePack Batch complete", ""
 
 
 def update_framepack_image_dimensions(image):
@@ -5534,7 +5534,7 @@ with gr.Blocks(
             *framepack_lora_weights,
             *framepack_lora_multipliers
         ],
-        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text, gr.Gallery(visible=False)], # Pass dummy output for removed gallery
+        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text], 
         queue=True
     )
 
