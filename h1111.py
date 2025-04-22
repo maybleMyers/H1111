@@ -334,9 +334,29 @@ def process_framepack_video(
                 current_video_path = line.split("Video saved to:")[-1].strip()
                 progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
                 print(progress_text)
+                
+                # Add the video to the gallery immediately when it's saved
+                if os.path.exists(current_video_path):
+                    video_filename = os.path.basename(current_video_path)
+                    all_videos.append((current_video_path, video_filename))
             elif "ERROR" in line or "Traceback" in line:
                  status_text = f"Item {i+1}/{batch_size}: Error Detected (Check Console)"
                  progress_text = line # Show error line
+            
+            # Extract progress percentage from tqdm output and update progress
+            if "%|" in line and "it/s]" in line:
+                try:
+                    # Extract percentage from tqdm output like: 50%|█████     | 18/36 [01:31<01:30,  5.05s/it]
+                    percentage_match = re.search(r'(\d+)%\|', line)
+                    if percentage_match:
+                        percentage = int(percentage_match.group(1))
+                        # Update progress text with percentage
+                        if "Generating Latents" in progress_text:
+                            progress_text = f"Item {i+1}/{batch_size} | Generating Latents... {percentage}%"
+                        elif "Decoding Video" in progress_text:
+                            progress_text = f"Item {i+1}/{batch_size} | Decoding Video... {percentage}%"
+                except Exception as e:
+                    print(f"Error parsing progress: {e}")
 
             yield all_videos.copy(), status_text, progress_text
 
@@ -387,10 +407,10 @@ def process_framepack_video(
             }
             add_metadata_to_video(current_video_path, parameters)
 
-            # Add the generated video to the gallery and yield
-            all_videos.append((current_video_path, os.path.basename(current_video_path)))
-            status_text = "Generation complete"
-            progress_text = f"Generated video: {os.path.basename(current_video_path)}"
+            video_item = (str(current_video_path), f"Seed: {current_seed}")
+            all_videos.append(video_item)
+
+            status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
             yield all_videos.copy(), status_text, progress_text
         elif rc != 0:
