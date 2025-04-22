@@ -162,8 +162,28 @@ def process_framepack_video(
     total_sections = int(max(round(total_sections_float), 1))
     progress_text = f"Starting FramePack generation batch ({total_sections} estimated sections per video)..."
     status_text = "Preparing batch..."
-    # Removed progress_videos yield as intermediate saving is not supported by backend
+    # Initial yield with empty list
     yield all_videos, status_text, progress_text
+    
+    # After generation completes, check the outputs directory for the newest video
+    save_path_abs = os.path.abspath(save_path)
+    if os.path.exists(save_path_abs):
+        # Find all MP4 files and sort by modification time (newest first)
+        video_files = sorted(
+            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
+            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
+            reverse=True
+        )
+        
+        if video_files:
+            # Get the most recently created video file
+            latest_video = video_files[0]
+            video_path = os.path.join(save_path_abs, latest_video)
+            # Add the video to the gallery list with its filename as the label
+            all_videos.append((video_path, latest_video))
+            status_text = "Generation complete"
+            progress_text = f"Generated video: {latest_video}"
+            yield all_videos, status_text, progress_text
 
     lora_weights_list = [lora1_w, lora2_w, lora3_w, lora4_w]
     lora_multipliers_list = [lora1_m, lora2_m, lora3_m, lora4_m]
