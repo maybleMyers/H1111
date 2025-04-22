@@ -8,7 +8,6 @@ import math
 import os
 import re
 from typing import Dict, List, Optional, Type, Union
-from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
 import numpy as np
 import torch
@@ -296,7 +295,7 @@ class LoRAInfModule(LoRAModule):
         return self.default_forward(x)
 
 
-def create_network_hunyuan_video(
+def create_arch_network(
     multiplier: float,
     network_dim: Optional[int],
     network_alpha: Optional[float],
@@ -344,6 +343,7 @@ def create_network(
     neuron_dropout: Optional[float] = None,
     **kwargs,
 ):
+    """ architecture independent network creation """
     if network_dim is None:
         network_dim = 4  # default
     if network_alpha is None:
@@ -860,7 +860,7 @@ class LoRANetwork(torch.nn.Module):
         return keys_scaled, sum(norms) / len(norms), max(norms)
 
 
-def create_network_from_weights_hunyuan_video(
+def create_arch_network_from_weights(
     multiplier: float,
     weights_sd: Dict[str, torch.Tensor],
     text_encoders: Optional[List[nn.Module]] = None,
@@ -910,59 +910,4 @@ def create_network_from_weights(
         modules_alpha=modules_alpha,
         module_class=module_class,
     )
-    return network
-
-def create_network_from_weights_wan(
-    multiplier: float,
-    weights_sd: Dict[str, torch.Tensor],
-    transformer=None,
-    for_inference: bool = False,
-    **kwargs,
-) -> LoRANetwork:
-    """Create a LoRA network for Wan models from weights.
-    
-    This function creates a LoRA network for Wan models, similar to
-    create_network_from_weights_hunyuan_video but adapted for Wan model architecture.
-    
-    Args:
-        multiplier: The multiplier for LoRA weights
-        weights_sd: The state dict containing LoRA weights
-        transformer: The transformer model to apply LoRA to
-        for_inference: Whether the network is for inference
-    
-    Returns:
-        A LoRANetwork instance configured for the Wan model
-    """
-    # Define target modules for Wan models
-    WAN_TARGET_REPLACE_MODULES = ["LayerType", "WanModel", "SelfAttention", "MLP", "Attention"]
-    
-    # Get dim/alpha mapping
-    modules_dim = {}
-    modules_alpha = {}
-    for key, value in weights_sd.items():
-        if "." not in key:
-            continue
-
-        lora_name = key.split(".")[0]
-        if "alpha" in key:
-            modules_alpha[lora_name] = value
-        elif "lora_down" in key:
-            dim = value.shape[0]
-            modules_dim[lora_name] = dim
-            # logger.info(f"Found module: {lora_name}, dim: {dim}")
-
-    module_class = LoRAInfModule if for_inference else LoRAModule
-
-    # Create network for Wan model with extracted dimensions
-    network = LoRANetwork(
-        WAN_TARGET_REPLACE_MODULES,
-        "lora_wan",
-        [],  # text_encoders - not used for Wan
-        transformer,  # passes the Wan model as unet parameter
-        multiplier=multiplier,
-        modules_dim=modules_dim,
-        modules_alpha=modules_alpha,
-        module_class=module_class,
-    )
-    
     return network
