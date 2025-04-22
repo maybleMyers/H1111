@@ -387,10 +387,10 @@ def process_framepack_video(
             }
             add_metadata_to_video(current_video_path, parameters)
 
-            video_item = (str(current_video_path), f"Seed: {current_seed}")
-            all_videos.append(video_item)
-
-            status_text = f"Completed (Seed: {current_seed})"
+            # Add the generated video to the gallery and yield
+            all_videos.append((current_video_path, os.path.basename(current_video_path)))
+            status_text = "Generation complete"
+            progress_text = f"Generated video: {os.path.basename(current_video_path)}"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
             yield all_videos.copy(), status_text, progress_text
         elif rc != 0:
