@@ -158,34 +158,15 @@ def process_framepack_video(
 
     all_videos = []
     # Calculate total sections for display (doesn't affect backend)
-    # Note: This estimation might not be perfectly accurate if backend behavior changes
-    total_sections_float = (total_second_length * fps) / (latent_window_size * 4) # Use fps instead of hardcoded 30
+    # Use the actual fps passed as an argument
+    total_sections_float = (total_second_length * fps) / (latent_window_size * 4)
     total_sections = int(max(round(total_sections_float), 1))
     progress_text = f"Starting FramePack generation batch ({total_sections} estimated sections per video)..."
     status_text = "Preparing batch..."
     # Initial yield with empty list and preparing status
     yield all_videos, status_text, progress_text
-    
-    # After generation completes, check the outputs directory for the newest video
-    save_path_abs = os.path.abspath(save_path)
-    if os.path.exists(save_path_abs):
-        # Find all MP4 files and sort by modification time (newest first)
-        video_files = sorted(
-            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
-            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
-            reverse=True
-        )
-        
-        if video_files:
-            # Get the most recently created video file
-            latest_video = video_files[0]
-            video_path = os.path.join(save_path_abs, latest_video)
-            # Add the video to the gallery list with its filename as the label
-            all_videos.append((video_path, latest_video))
-            status_text = "Generation complete"
-            progress_text = f"Generated video: {latest_video}"
-            yield all_videos, status_text, progress_text
 
+    # --- LoRA Setup ---
     lora_weights_list = [lora1_w, lora2_w, lora3_w, lora4_w]
     lora_multipliers_list = [lora1_m, lora2_m, lora3_m, lora4_m]
     valid_loras_paths = []
@@ -200,6 +181,7 @@ def process_framepack_video(
                  else:
                      print(f"Warning: LoRA file not found: {lora_path}")
 
+    # --- Batch Loop ---
     for i in range(batch_size):
         if stop_event.is_set():
             yield all_videos, "Generation stopped by user.", ""
@@ -211,9 +193,11 @@ def process_framepack_video(
         elif batch_size > 1:
             current_seed = seed + i
 
+        # Reset status/progress for the new item
         status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
         progress_text = f"Item {i+1}/{batch_size}: Preparing subprocess..."
-        yield all_videos.copy(), status_text, progress_text
+        current_video_path = None # <<< Reset confirmed video path for each item
+        yield all_videos.copy(), status_text, progress_text # Yield status before starting subprocess
 
         # --- Prepare Environment and Command ---
         env = os.environ.copy()
@@ -307,7 +291,6 @@ def process_framepack_video(
 
         # --- Monitor subprocess output ---
         current_phase = "Preparing" # Track generation phase
-        current_video_path = None # Reset for each item
 
         while True:
             if stop_event.is_set():
@@ -339,27 +322,33 @@ def process_framepack_video(
                  progress_text = f"Item {i+1}/{batch_size} | {current_phase}..."
 
             # --- Update Gallery Immediately on Save ---
-            elif line.startswith("Video saved to:"):
+            elif line.startswith("INFO:__main__:Video saved to:"): # Match the exact log message
                 # Extract path as soon as it's printed
-                found_video_path = line.split("Video saved to:")[-1].strip()
-                progress_text = f"Video saved to: {os.path.basename(found_video_path)}"
-                print(f"Detected saved video: {found_video_path}") # Debug print
+                # Use regex for robustness
+                match = re.search(r"Video saved to:\s*(.*\.mp4)", line)
+                if match:
+                    found_video_path = match.group(1).strip()
+                    progress_text = f"Video saved to: {os.path.basename(found_video_path)}"
+                    print(f"Detected saved video: {found_video_path}") # Debug print
 
-                # Check if the file exists and add to gallery
-                if os.path.exists(found_video_path):
-                    video_filename = os.path.basename(found_video_path)
-                    # Use seed in label for clarity
-                    new_item = (found_video_path, f"Seed: {current_seed}")
-                    # Prevent adding duplicates in case the line appears multiple times
-                    if not all_videos or all_videos[-1][0] != found_video_path:
-                        all_videos.append(new_item)
-                        print(f"Added video to gallery: {new_item}")
-                        # Store the confirmed path for metadata saving later
-                        current_video_path = found_video_path
+                    # Check if the file exists and add to gallery
+                    if os.path.exists(found_video_path):
+                        video_filename = os.path.basename(found_video_path)
+                        # Use seed in label for clarity
+                        new_item = (found_video_path, f"Seed: {current_seed}")
+                        # Prevent adding duplicates in case the line appears multiple times
+                        if not all_videos or all_videos[-1][0] != found_video_path:
+                            all_videos.append(new_item)
+                            print(f"Added video to gallery: {new_item}")
+                            # Store the confirmed path for metadata saving later
+                            current_video_path = found_video_path
+                        else:
+                             print(f"Video path {found_video_path} already in gallery.")
                     else:
-                         print(f"Video path {found_video_path} already in gallery.")
+                        print(f"Warning: Video path detected '{found_video_path}' but file not found.")
                 else:
-                    print(f"Warning: Video path detected '{found_video_path}' but file not found.")
+                    print(f"Warning: Could not parse video path from line: {line}")
+
 
             # --- Handle Errors ---
             elif "ERROR" in line or "Traceback" in line:
@@ -372,7 +361,8 @@ def process_framepack_video(
             if "%|" in line and "it/s]" in line and current_phase != "Error":
                 try:
                     percentage_match = re.search(r'(\d+)%\|', line)
-                    steps_match = re.search(r'(\d+)/(\d+)\s+\[', line) # Optional: get steps
+                    # Match steps like '18/36 [' or '18 / 36 ['
+                    steps_match = re.search(r'(\d+)\s*/\s*(\d+)\s+\[', line)
                     if percentage_match:
                         percentage = int(percentage_match.group(1))
                         base_progress = f"Item {i+1}/{batch_size} | {current_phase}"
@@ -387,6 +377,7 @@ def process_framepack_video(
             # <<< Yield updated state within the loop >>>
             yield all_videos.copy(), status_text, progress_text
 
+        # --- Subprocess Finished ---
         p.stdout.close()
         rc = p.wait()
 
@@ -394,6 +385,7 @@ def process_framepack_video(
         time.sleep(0.1) # Small delay
 
         # --- Collect Output and Save Metadata ---
+        # Check if video was found and exists
         if rc == 0 and current_video_path and os.path.exists(current_video_path):
             # Video should already be in all_videos from the loop.
             # Just add metadata now.
@@ -434,8 +426,13 @@ def process_framepack_video(
                 "lora_weights": [os.path.basename(p) for p in valid_loras_paths],
                 "lora_multipliers": [float(m) for m in valid_loras_mults],
             }
-            add_metadata_to_video(current_video_path, parameters)
-            
+            try:
+                add_metadata_to_video(current_video_path, parameters)
+                print(f"Added metadata to {current_video_path}")
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_path}: {meta_err}")
+
+
             # Update status for the completed item
             status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
@@ -445,17 +442,15 @@ def process_framepack_video(
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
             yield all_videos.copy(), status_text, progress_text
-        else: # rc == 0 but video not found or confirmed
+        else: # rc == 0 but video not found or confirmed during loop
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = "Subprocess finished, but could not confirm generated video file. Check logs."
             yield all_videos.copy(), status_text, progress_text
-            
+
         # Short delay between batch items might be helpful for UI responsiveness
         time.sleep(0.2)
 
     # --- Final Yield After Batch Loop ---
-    yield all_videos, "FramePack Batch complete", ""
-
     yield all_videos, "FramePack Batch complete", ""
 
 
