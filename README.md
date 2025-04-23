@@ -23,3 +23,5 @@ model.safetensors
 pytorch_model.pt  
 
 Lora might work? It is too different of a model for them to work well.  Use a lot of block swap this is a different back end than the official repo.   
+
+Put loras in a /lora subfolder. Unsure of formats that work, no lora I have tried has a big effect tho  
