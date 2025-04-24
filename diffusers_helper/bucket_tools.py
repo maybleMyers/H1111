@@ -5,7 +5,7 @@ import math
 # NOTE: It's generally recommended that width and height are divisible by 16 or even 32
 # for optimal compatibility with VAEs and model architectures.
 # This implementation uses a divisibility factor of 32 for all new buckets.
-DIVISIBILITY_FACTOR = 32
+DIVISIBILITY_FACTOR = 32 # <--- Using 32 for generated buckets
 
 # --- Helper Function to Generate Bucket Pairs ---
 
@@ -76,7 +76,7 @@ def generate_bucket_pairs(target_res, step=32, num_steps_half=6, max_ratio=2.5):
 # --- Bucket Options ---
 
 bucket_options = {
-    # Original 640 bucket (divisible by 16) - DO NOT MODIFY
+    # Original 640 bucket (divisible by 32) - KEEP AS IS FOR COMPATIBILITY
     640: [
         (416, 960), (448, 864), (480, 832), (512, 768), (544, 704),
         (576, 672), (608, 640), (640, 608), (672, 576), (704, 544),
@@ -87,14 +87,14 @@ bucket_options = {
 }
 
 # Define the range of new bucket resolutions (step of 32)
-new_bucket_keys = range(672, 960 + 1, DIVISIBILITY_FACTOR)
+new_bucket_keys = range(128, 960 + 1, DIVISIBILITY_FACTOR)
 
 # Generate pairs for each new bucket key
 for key in new_bucket_keys:
     bucket_options[key] = generate_bucket_pairs(
         target_res=key,
         step=DIVISIBILITY_FACTOR,
-        num_steps_half=7, # Generates a decent range of aspect ratios
+        num_steps_half=4, # Generates a decent range of aspect ratios
         max_ratio=2.7   # Allow slightly more elongated aspect ratios
     )
 
@@ -103,13 +103,13 @@ for key in new_bucket_keys:
 # Ensure HD resolutions are explicitly included in the 960 bucket
 # (May already be generated, but adding ensures they exist and handles rounding edge cases)
 if 960 in bucket_options:
-    hd_pairs = {(720, 1280), (1280, 720)} # Use a set for easy addition
-    # Check divisibility just in case (should be fine since 720/1280 are div by 32)
+    hd_pairs = {(704, 1280), (1280, 704)} # Use a set for easy addition
+    # Check divisibility just in case (should be fine since 704/1280 are div by 32)
     hd_pairs_filtered = {
         (h, w) for h, w in hd_pairs
         if h % DIVISIBILITY_FACTOR == 0 and w % DIVISIBILITY_FACTOR == 0
     }
-    
+
     existing_pairs = set(bucket_options[960])
     updated_pairs = existing_pairs.union(hd_pairs_filtered)
     bucket_options[960] = sorted(list(updated_pairs))
@@ -131,54 +131,60 @@ def find_nearest_bucket(h, w, resolution=640):
 
     Returns:
         tuple[int, int]: The best matching (height, width) bucket dimensions,
-                         or None if the resolution key doesn't exist.
+                         or None if resolution key is invalid or no buckets exist.
     """
+    # Ensure resolution is an integer
+    try:
+        resolution = int(resolution)
+    except (TypeError, ValueError):
+        print(f"Error: Invalid resolution value '{resolution}'. Must be an integer.")
+        resolution = 640 # Default fallback
+        print(f"Warning: Defaulting to resolution {resolution}.")
+
     if resolution not in bucket_options:
-        print(f"Error: Resolution key '{resolution}' not found in bucket_options.")
-        # Fallback strategy: Find the closest available key? Or just return None?
-        # Let's try finding the closest key as a fallback.
         available_keys = sorted(bucket_options.keys())
         if not available_keys:
             print("Error: No buckets defined.")
-            return None
+            return None # Cannot proceed
+
+        # Find the numerically closest key
         closest_key = min(available_keys, key=lambda k: abs(k - resolution))
-        print(f"Warning: Falling back to closest available resolution key: {closest_key}")
+        print(f"Warning: Resolution key '{resolution}' not found. Using closest key: {closest_key}")
         resolution = closest_key
-        # return None # Or raise an error depending on desired behavior
+
+    if not bucket_options[resolution]:
+         print(f"Error: No bucket options available for resolution {resolution}.")
+         return None # Cannot proceed
 
     min_metric = float('inf')
     best_bucket = None
 
     # Aspect ratio of the input image
-    target_aspect_ratio = w / h if h > 0 else float('inf')
+    if h <= 0: # Avoid division by zero or invalid aspect ratio
+        print("Warning: Invalid input height (<=0). Using aspect ratio 1.0 for bucket selection.")
+        target_aspect_ratio = 1.0
+    else:
+        target_aspect_ratio = w / h
 
     for (bucket_h, bucket_w) in bucket_options[resolution]:
-        # Calculate aspect ratio difference (more robust than the original metric)
-        bucket_aspect_ratio = bucket_w / bucket_h if bucket_h > 0 else float('inf')
+        # Calculate aspect ratio difference
+        if bucket_h <= 0: continue # Skip invalid buckets
+        bucket_aspect_ratio = bucket_w / bucket_h
         metric = abs(target_aspect_ratio - bucket_aspect_ratio)
 
-        # Optional: Add a penalty for area difference if aspect ratios are very close
-        # target_area = h * w
-        # bucket_area = bucket_h * bucket_w
-        # area_difference = abs(target_area - bucket_area) / target_area if target_area > 0 else 0
-        # metric += area_difference * 0.1 # Small penalty for area difference
+        # Optional: Add a small penalty for area difference to break ties
+        target_area = h * w
+        bucket_area = bucket_h * bucket_w
+        area_diff_penalty = abs(target_area - bucket_area) / (target_area + 1e-6) * 0.01 # Small penalty
+        metric += area_diff_penalty
 
         if metric < min_metric:
             min_metric = metric
             best_bucket = (bucket_h, bucket_w)
-        # If metrics are identical, maybe prefer the one with closer area? (Less important)
-        # elif metric == min_metric:
-        #     current_best_area = best_bucket[0] * best_bucket[1]
-        #     new_bucket_area = bucket_h * bucket_w
-        #     if abs(target_area - new_bucket_area) < abs(target_area - current_best_area):
-        #          best_bucket = (bucket_h, bucket_w)
 
-
-    if best_bucket is None and bucket_options[resolution]:
-        # If somehow no best bucket was found (e.g., input h=0), return the first option
+    if best_bucket is None:
+        # Fallback if something went wrong, e.g., all buckets invalid
+        print(f"Warning: Could not find best bucket for resolution {resolution}. Using first available.")
         best_bucket = bucket_options[resolution][0]
-    elif best_bucket is None:
-         print(f"Error: No bucket options available for resolution {resolution}.")
-         return None # Or raise error
 
     return best_bucket

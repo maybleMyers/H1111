@@ -761,10 +761,10 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     # This is needed for tracking progress for progressive blending
     latent_paddings = list(latent_paddings)
 
-    for latent_padding in latent_paddings:
+    for section_idx, latent_padding in enumerate(latent_paddings):
         is_last_section = latent_padding == 0
         latent_padding_size = latent_padding * latent_window_size
-
+        logger.info(f"PROGRESS:{section_idx + 1}/{len(latent_paddings)}")
         # For endframe support: Track if this is the first generation step
         is_first_generation_step = (latent_padding == latent_paddings[0])
         current_section_index = latent_paddings.index(latent_padding)
