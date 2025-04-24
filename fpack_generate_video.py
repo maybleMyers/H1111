@@ -36,13 +36,10 @@ except:
     pass
 
 from utils.device_utils import clean_memory_on_device
-from hv_generate_video import save_images_grid, save_videos_grid, synchronize_device
-from wan_generate_video import merge_lora_weights
+from base_hv_generate_video import save_images_grid, save_videos_grid, synchronize_device
+from base_wan_generate_video import merge_lora_weights
 from frame_pack.framepack_utils import load_vae, load_text_encoder1, load_text_encoder2, load_image_encoders
 from dataset.image_video_dataset import load_video
-from utils.safetensors_utils import mem_eff_save_file, load_safetensors
-from types import ModuleType, SimpleNamespace
-from diffusers_helper.load_lora import load_lora
 
 import logging
 
@@ -84,7 +81,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     # inference
-    parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="prompt for generation. If `;;;` is used, it will be split into sections. Example: `section_index:prompt` or "
+        "`section_index:prompt;;;section_index:prompt;;;...`, section_index can be `0` or `-1` or `0-2`, `-1` means last section, `0-2` means from 0 to 2 (inclusive).",
+    )
     parser.add_argument(
         "--negative_prompt",
         type=str,
@@ -113,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_rescale", type=float, default=0.0, help="CFG Re-scale, default is 0.0. Should not change.")
     # parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference")
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
-    # parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
+    parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
     # parser.add_argument(
     #     "--control_path",
     #     type=str,
@@ -169,13 +172,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
 
-    # For endframe support
-    parser.add_argument("--end_image_path", type=str, default=None, help="Path to the optional end frame image (video end)")
-    parser.add_argument("--end_frame_weight", type=float, default=0.3, help="End frame influence weight (0.0-1.0) for blending modes")
-    parser.add_argument("--end_frame_influence", type=str, default="last",
-                        choices=["last", "half", "progressive", "bookend"],
-                        help="How to use the global end frame")
-
     args = parser.parse_args()
 
     # Validate arguments
@@ -187,77 +183,6 @@ def parse_args() -> argparse.Namespace:
 
     return args
 
-def merge_lora_weights(
-    lora_module,
-    transformer,
-    args,
-    device,
-):
-    """Integrate both LoRA loading methods into the existing function
-    
-    Args:
-        lora_module: Module containing LoRA implementation
-        transformer: transformer model
-        args: command line arguments
-        device: device to use
-    """
-    # Check if we have a single LoRA weight (use load_lora method)
-    if len(args.lora_weight) == 1 and args.lora_multiplier == 1.0:
-        # This appears to be a single LoRA file path, use the load_lora style
-        lora_path = args.lora_weight[0]
-        lora_dir, lora_name = os.path.split(lora_path)
-        
-        # Check if this is likely a diffusers format
-        is_diffusers = False
-        if hasattr(args, 'lycoris') and not args.lycoris:
-            # If not lycoris and it's a directory or safetensors file,
-            # assume it might be diffusers format
-            if os.path.isdir(lora_path) or lora_path.endswith('.safetensors'):
-                is_diffusers = True
-        
-        logger.info(f"Loading LoRA using direct method: {lora_path}")
-        try:
-            return load_lora(transformer, lora_dir, lora_name, is_diffusers)
-        except ImportError:
-            logger.warning("diffusers_helper.load_lora not available, falling back to standard method")
-            # Continue with standard method if import fails
-    
-    # Original implementation for multiple LoRA weights with multipliers
-    weights = []
-    weight_path = None
-    
-    for lora_weight, lora_multiplier in zip(
-        args.lora_weight if isinstance(args.lora_weight, list) else [args.lora_weight],
-        args.lora_multiplier if isinstance(args.lora_multiplier, list) else [args.lora_multiplier]
-    ):
-        weight_path = lora_weight
-        
-        # The rest of the original function implementation...
-        # [Keep all the existing logic for loading and merging weights]
-        
-    # Return the transformed model
-    return transformer
-
-def mix_latents(latent_a, latent_b, weight_b):
-    """Mix two latents with the specified weight for latent_b."""
-    if latent_a is None: return latent_b
-    if latent_b is None: return latent_a
-
-    target_device = latent_a.device
-    target_dtype = latent_a.dtype
-    if latent_b.device != target_device:
-        latent_b = latent_b.to(target_device)
-    if latent_b.dtype != target_dtype:
-        latent_b = latent_b.to(dtype=target_dtype)
-
-    weight_b = max(0.0, min(1.0, weight_b))
-
-    if weight_b == 0.0:
-        return latent_a
-    elif weight_b == 1.0:
-        return latent_b
-    else:
-        return (1.0 - weight_b) * latent_a + weight_b * latent_b
 
 def parse_prompt_line(line: str) -> Dict[str, Any]:
     """Parse a prompt line into a dictionary of argument overrides
@@ -499,7 +424,7 @@ def prepare_i2v_inputs(
     vae: AutoencoderKLCausal3D,
     encoded_context: Optional[Dict] = None,
     encoded_context_n: Optional[Dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
     """Prepare inputs for I2V
 
     Args:
@@ -510,37 +435,28 @@ def prepare_i2v_inputs(
         encoded_context: Pre-encoded text context
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
-            (height, width, video_seconds, start_latent, end_frame_latent, (arg_c, arg_null))
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+            (noise, context, context_null, y, (arg_c, arg_null))
     """
-    # prepare image
-    img = Image.open(args.image_path).convert("RGB")
-
-    img_np = np.array(img)  # PIL to numpy, HWC
 
     height, width, video_seconds = check_inputs(args)
-    # height, width = find_nearest_bucket(H, W, resolution=640)
-    img_np = image_video_dataset.resize_image_to_bucket(img_np, (width, height))
-    # img_np = resize_and_center_crop(img_np, target_width=width, target_height=height)
-    img_tensor = torch.from_numpy(img_np).float() / 127.5 - 1.0  # -1 to 1.0, HWC
-    img_tensor = img_tensor.permute(2, 0, 1)[None, :, None]  # HWC -> CHW -> NCFHW, N=1, C=3, F=1
 
-    # For endframe support: process end frame image if provided
-    end_frame_latent = None
-    if hasattr(args, 'end_image_path') and args.end_image_path and os.path.exists(args.end_image_path):
-        logger.info(f"Processing end frame image: {args.end_image_path}")
-        end_img = Image.open(args.end_image_path).convert("RGB")
-        end_img_np = np.array(end_img)
-        end_img_np = image_video_dataset.resize_image_to_bucket(end_img_np, (width, height))
-        end_img_tensor = torch.from_numpy(end_img_np).float() / 127.5 - 1.0
-        end_img_tensor = end_img_tensor.permute(2, 0, 1)[None, :, None]
-        
-        # VAE encoding for end frame
-        vae.to(device)
-        end_frame_latent = hunyuan.vae_encode(end_img_tensor.to(device=device, dtype=vae.dtype), vae)
-        logger.info(f"End frame latent encoded with shape: {end_frame_latent.shape}")
-        # Keep on CPU as float32 for later use
-        end_frame_latent = end_frame_latent.cpu().float()
+    # prepare image
+    def preprocess_image(image_path: str):
+        image = Image.open(image_path).convert("RGB")
+
+        image_np = np.array(image)  # PIL to numpy, HWC
+
+        image_np = image_video_dataset.resize_image_to_bucket(image_np, (width, height))
+        image_tensor = torch.from_numpy(image_np).float() / 127.5 - 1.0  # -1 to 1.0, HWC
+        image_tensor = image_tensor.permute(2, 0, 1)[None, :, None]  # HWC -> CHW -> NCFHW, N=1, C=3, F=1
+        return image_tensor, image_np
+
+    img_tensor, img_np = preprocess_image(args.image_path)
+    if args.end_image_path is not None:
+        end_img_tensor, end_img_np = preprocess_image(args.end_image_path)
+    else:
+        end_img_tensor, end_img_np = None, None
 
     # configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else ""
@@ -551,21 +467,69 @@ def prepare_i2v_inputs(
         tokenizer2, text_encoder2 = load_text_encoder2(args)
         text_encoder2.to(device)
 
+        # parse section prompts
+        section_prompts = {}
+        if ";;;" in args.prompt:
+            section_prompt_strs = args.prompt.split(";;;")
+            for section_prompt_str in section_prompt_strs:
+                if ":" not in section_prompt_str:
+                    start = end = 0
+                    prompt_str = section_prompt_str.strip()
+                else:
+                    index_str, prompt_str = section_prompt_str.split(":", 1)
+                    index_str = index_str.strip()
+                    prompt_str = prompt_str.strip()
+
+                    m = re.match(r"^(-?\d+)(-\d+)?$", index_str)
+                    if m:
+                        start = int(m.group(1))
+                        end = int(m.group(2)[1:]) if m.group(2) is not None else start
+                    else:
+                        start = end = 0
+                        prompt_str = section_prompt_str.strip()
+                for i in range(start, end + 1):
+                    section_prompts[i] = prompt_str
+        else:
+            section_prompts[0] = args.prompt
+
+        # assert 0 in section_prompts, "Section prompts must contain section 0"
+        if 0 not in section_prompts:
+            # use smallest section index. prefer positive index over negative index
+            # if all section indices are negative, use the smallest negative index
+            indices = list(section_prompts.keys())
+            if all(i < 0 for i in indices):
+                section_index = min(indices)
+            else:
+                section_index = min(i for i in indices if i >= 0)
+            section_prompts[0] = section_prompts[section_index]
+        print(section_prompts)
+
         logger.info(f"Encoding prompt")
+        llama_vecs = {}
+        llama_attention_masks = {}
+        clip_l_poolers = {}
         with torch.autocast(device_type=device.type, dtype=text_encoder1.dtype), torch.no_grad():
-            llama_vec, clip_l_pooler = hunyuan.encode_prompt_conds(
-                args.prompt, text_encoder1, text_encoder2, tokenizer1, tokenizer2
-            )
+            for index, prompt in section_prompts.items():
+                llama_vec, clip_l_pooler = hunyuan.encode_prompt_conds(prompt, text_encoder1, text_encoder2, tokenizer1, tokenizer2)
+                llama_vec = llama_vec.cpu()
+                clip_l_pooler = clip_l_pooler.cpu()
+
+                llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+
+                llama_vecs[index] = llama_vec
+                llama_attention_masks[index] = llama_attention_mask
+                clip_l_poolers[index] = clip_l_pooler
 
         if args.guidance_scale == 1.0:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vecs[0]), torch.zeros_like(clip_l_poolers[0])
         else:
             with torch.autocast(device_type=device.type, dtype=text_encoder1.dtype), torch.no_grad():
                 llama_vec_n, clip_l_pooler_n = hunyuan.encode_prompt_conds(
                     n_prompt, text_encoder1, text_encoder2, tokenizer1, tokenizer2
                 )
+                llama_vec_n = llama_vec_n.cpu()
+                clip_l_pooler_n = clip_l_pooler_n.cpu()
 
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # free text encoder and clean memory
@@ -579,16 +543,23 @@ def prepare_i2v_inputs(
         # encode image with image encoder
         with torch.no_grad():
             image_encoder_output = hf_clip_vision_encode(img_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.cpu()
+
+        if end_img_np is not None:
+            with torch.no_grad():
+                end_image_encoder_output = hf_clip_vision_encode(end_img_np, feature_extractor, image_encoder)
+            end_image_encoder_last_hidden_state = end_image_encoder_output.last_hidden_state.cpu()
+        else:
+            end_image_encoder_last_hidden_state = None
 
         # free image encoder and clean memory
         del image_encoder, feature_extractor
         clean_memory_on_device(device)
     else:
         # Use pre-encoded context
-        llama_vec = encoded_context["llama_vec"]
-        llama_attention_mask = encoded_context["llama_attention_mask"]
-        clip_l_pooler = encoded_context["clip_l_pooler"]
+        llama_vecs = encoded_context["llama_vecs"]
+        llama_attention_masks = encoded_context["llama_attention_masks"]
+        clip_l_poolers = encoded_context["clip_l_poolers"]
         llama_vec_n = encoded_context_n["llama_vec"]
         llama_attention_mask_n = encoded_context_n["llama_attention_mask"]
         clip_l_pooler_n = encoded_context_n["clip_l_pooler"]
@@ -606,26 +577,40 @@ def prepare_i2v_inputs(
     # VAE encoding
     logger.info(f"Encoding image to latent space")
     vae.to(device)
-    start_latent = hunyuan.vae_encode(img_tensor, vae)
+    start_latent = hunyuan.vae_encode(img_tensor, vae).cpu()
+    if end_img_tensor is not None:
+        end_latent = hunyuan.vae_encode(end_img_tensor, vae).cpu()
+    else:
+        end_latent = None
     vae.to("cpu")  # move VAE to CPU to save memory
     clean_memory_on_device(device)
 
     # prepare model input arguments
-    arg_c = {
-        "llama_vec": llama_vec,
-        "llama_attention_mask": llama_attention_mask,
-        "clip_l_pooler": clip_l_pooler,
-        "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
-    }
+    arg_c = {}
+    for index in llama_vecs.keys():
+        llama_vec = llama_vecs[index]
+        llama_attention_mask = llama_attention_masks[index]
+        clip_l_pooler = clip_l_poolers[index]
+        arg_c_i = {
+            "llama_vec": llama_vec,
+            "llama_attention_mask": llama_attention_mask,
+            "clip_l_pooler": clip_l_pooler,
+            "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
+            "end_image_encoder_last_hidden_state": end_image_encoder_last_hidden_state,
+            "prompt": section_prompts[index],  # for debugging
+        }
+        arg_c[index] = arg_c_i
 
     arg_null = {
         "llama_vec": llama_vec_n,
         "llama_attention_mask": llama_attention_mask_n,
         "clip_l_pooler": clip_l_pooler_n,
         "image_encoder_last_hidden_state": image_encoder_last_hidden_state,
+        "end_image_encoder_last_hidden_state": end_image_encoder_last_hidden_state,
     }
 
-    return height, width, video_seconds, start_latent, end_frame_latent, arg_c, arg_null
+    return height, width, video_seconds, start_latent, end_latent, arg_c, arg_null
+
 
 # def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> Tuple[Any, torch.Tensor]:
 #     """setup scheduler for sampling
@@ -697,16 +682,13 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         n_prompt = args.negative_prompt if args.negative_prompt else ""
         encoded_context_n = shared_models.get("encoded_contexts", {}).get(n_prompt)
 
-        # For endframe support: added end_frame_latent to return values from prepare_i2v_inputs
-        height, width, video_seconds, start_latent, end_frame_latent, context, context_null = prepare_i2v_inputs(
+        height, width, video_seconds, start_latent, end_latent, context, context_null = prepare_i2v_inputs(
             args, device, vae, encoded_context, encoded_context_n
         )
     else:
         # prepare inputs without shared models
         vae = load_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, device)
-        
-        # For endframe support: added end_frame_latent to return values from prepare_i2v_inputs 
-        height, width, video_seconds, start_latent, end_frame_latent, context, context_null = prepare_i2v_inputs(args, device, vae)
+        height, width, video_seconds, start_latent, end_latent, context, context_null = prepare_i2v_inputs(args, device, vae)
 
         # load DiT model
         model = load_dit_model(args, device)
@@ -737,13 +719,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         f"infer_steps: {args.infer_steps}, frames per generation: {num_frames}"
     )
 
-    # For endframe support: Initialize history_latents and potentially set first slot to end frame latent
     history_latents = torch.zeros((1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32)
-    # If end_frame is provided, initialize context buffer's first slot with it
-    if hasattr(args, 'end_image_path') and args.end_image_path and end_frame_latent is not None:
-        history_latents[:, :, 0:1, :, :] = end_frame_latent.cpu().float()
-        logger.info("Initialized context buffer's first slot with end frame latent.")
-    
     # history_pixels = None
     total_generated_latent_frames = 0
 
@@ -757,19 +733,21 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         # 4 sections: 3, 2, 1, 0. 50 sections: 3, 2, 2, ... 2, 1, 0
         latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-    # For endframe support: Convert latent_paddings to a list if it's not already
-    # This is needed for tracking progress for progressive blending
-    latent_paddings = list(latent_paddings)
+    for section_index_reverse, latent_padding in enumerate(latent_paddings):
+        section_index = total_latent_sections - 1 - section_index_reverse
 
-    for section_idx, latent_padding in enumerate(latent_paddings):
         is_last_section = latent_padding == 0
+        is_first_section = section_index_reverse == 0
         latent_padding_size = latent_padding * latent_window_size
-        logger.info(f"PROGRESS:{section_idx + 1}/{len(latent_paddings)}")
-        # For endframe support: Track if this is the first generation step
-        is_first_generation_step = (latent_padding == latent_paddings[0])
-        current_section_index = latent_paddings.index(latent_padding)
 
         logger.info(f"latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}")
+
+        reference_start_latent = start_latent
+        apply_end_image = args.end_image_path is not None and is_first_section
+        if apply_end_image:
+            latent_padding_size = 0
+            reference_start_latent = end_latent
+            logger.info(f"Apply experimental end image, latent_padding_size = {latent_padding_size}")
 
         # sum([1, 3, 9, 1, 2, 16]) = 32
         indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
@@ -783,34 +761,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         ) = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
         clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-        # For endframe support: Implement blending for the conditioning latent based on the influence mode
-        base_conditioning_latent = start_latent  # Default to start latent
-        
-        # Apply 'bookend' override for first step
-        if hasattr(args, 'end_frame_influence') and args.end_frame_influence == "bookend" and is_first_generation_step and end_frame_latent is not None:
-            base_conditioning_latent = end_frame_latent
-            logger.info("Applying 'bookend': Using end frame latent for first generation step.")
-        
-        # Determine end frame blend weight based on influence mode
-        current_end_frame_weight = 0.0
-        if hasattr(args, 'end_frame_influence') and end_frame_latent is not None:
-            if args.end_frame_influence == 'progressive':
-                progress = current_section_index / max(1, len(latent_paddings) - 1)
-                current_end_frame_weight = getattr(args, 'end_frame_weight', 0.3) * (1.0 - progress)
-            elif args.end_frame_influence == 'half':
-                if current_section_index < len(latent_paddings) / 2:
-                    current_end_frame_weight = getattr(args, 'end_frame_weight', 0.3)
-        
-        # Apply blending if needed using the mix_latents helper function
-        if current_end_frame_weight > 1e-4 and end_frame_latent is not None:
-            logger.info(f"Blending conditioning latent: Base weight={1.0-current_end_frame_weight:.3f}, End weight={current_end_frame_weight:.3f}")
-            clean_latents_pre = mix_latents(base_conditioning_latent, end_frame_latent, current_end_frame_weight)
-        else:
-            clean_latents_pre = start_latent.to(history_latents)
-        
-        # Previous code without blending:
-        # clean_latents_pre = start_latent.to(history_latents)
-        
+        clean_latents_pre = reference_start_latent.to(history_latents)
         clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, : 1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
         clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
@@ -819,13 +770,31 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         # else:
         #     transformer.initialize_teacache(enable_teacache=False)
 
-        llama_vec = context["llama_vec"].to(device, dtype=torch.bfloat16)
-        llama_attention_mask = context["llama_attention_mask"].to(device)
-        clip_l_pooler = context["clip_l_pooler"].to(device, dtype=torch.bfloat16)
+        section_index_from_last = -(section_index_reverse + 1)  # -1, -2 ...
+        if section_index_from_last in context:
+            prompt_index = section_index_from_last
+        elif section_index in context:
+            prompt_index = section_index
+        else:
+            prompt_index = 0
+        context_for_index = context[prompt_index]
+        # if args.section_prompts is not None:
+        logger.info(f"Section {section_index}: {context_for_index['prompt']}")
+
+        llama_vec = context_for_index["llama_vec"].to(device, dtype=torch.bfloat16)
+        llama_attention_mask = context_for_index["llama_attention_mask"].to(device)
+        clip_l_pooler = context_for_index["clip_l_pooler"].to(device, dtype=torch.bfloat16)
+
+        if not apply_end_image:
+            image_encoder_last_hidden_state = context_for_index["image_encoder_last_hidden_state"].to(device, dtype=torch.bfloat16)
+        else:
+            image_encoder_last_hidden_state = context_for_index["end_image_encoder_last_hidden_state"].to(
+                device, dtype=torch.bfloat16
+            )
+
         llama_vec_n = context_null["llama_vec"].to(device, dtype=torch.bfloat16)
         llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
         clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=torch.bfloat16)
-        image_encoder_last_hidden_state = context["image_encoder_last_hidden_state"].to(device, dtype=torch.bfloat16)
 
         generated_latents = sample_hunyuan(
             transformer=model,
