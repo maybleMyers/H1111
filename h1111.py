@@ -5744,6 +5744,7 @@ with gr.Blocks(
                 metadata_output = gr.JSON(label="Generation Parameters")
 
             with gr.Row():
+                send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
                 send_to_t2v_btn = gr.Button("Send to Text2Video", variant="primary")
                 send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
@@ -5876,6 +5877,99 @@ with gr.Blocks(
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
     #Event handlers etc
+
+    #send to framepack
+    # <<< Function to switch to FramePack Tab >>>
+    def change_to_framepack_tab():
+        return gr.Tabs(selected=10) # FramePack tab has id=10
+
+    # <<< Function to handle parameter sending specifically for FramePack >>>
+    def handle_send_to_framepack_tab(metadata: dict) -> Tuple[str, dict, str]: # Added str return type for state value
+        """Prepare parameters specifically for the FramePack tab."""
+        if not metadata:
+            # Return default/empty values for status, params, and original_dims state
+            return "No parameters to send", {}, ""
+
+        # Extract the value intended for the state here
+        original_dims_value = metadata.get("original_dims_str", "")
+
+        # Return status message, the full metadata for params_state, and the specific value for framepack_original_dims state
+        return "Parameters ready for FramePack", metadata, original_dims_value
+
+    # <<< Connect the Send to FramePack button >>>
+    send_to_framepack_btn.click(
+        fn=handle_send_to_framepack_tab,
+        inputs=[metadata_output],
+        # Update the state directly in this first step
+        outputs=[status, params_state, framepack_original_dims] # Add framepack_original_dims here
+    ).then(
+        # This lambda now only prepares updates for UI components
+        lambda params: [
+            params.get("prompt", "cinematic video of a cat wizard casting a spell"), # Default prompt
+            params.get("negative_prompt", ""),
+            # Handle resolution: Prioritize explicit W/H if valid, else use target_res, else default
+            gr_update(value=int(params["video_width"])) if params.get("video_width") and int(params.get("video_width", 0)) % 32 == 0 else gr_update(value=None),
+            gr_update(value=int(params["video_height"])) if params.get("video_height") and int(params.get("video_height", 0)) % 32 == 0 else gr_update(value=None),
+            gr_update(value=int(params.get("target_resolution"))) if not (params.get("video_width") and int(params.get("video_width", 0)) % 32 == 0) and params.get("target_resolution") else gr_update(value=640),
+            # REMOVED original_dims_str from here - state is updated in the previous step
+            params.get("video_seconds", 5.0),
+            params.get("fps", 30),
+            params.get("seed", -1),
+            params.get("infer_steps", 25),
+            params.get("embedded_cfg_scale", 10.0), # Distilled Guidance
+            params.get("guidance_scale", 1.0),      # CFG
+            params.get("guidance_rescale", 0.0),    # RS
+            params.get("sample_solver", "unipc"),
+            # LoRAs - Get lists safely, defaulting to ["None"]*4 and [1.0]*4
+            *(params.get("lora_weights", ["None"]*4)[:4]), # Ensure exactly 4 items
+            *(params.get("lora_multipliers", [1.0]*4)[:4]), # Ensure exactly 4 items
+            # Performance/Memory
+            params.get("fp8", False),
+            params.get("fp8_scaled", False),
+            params.get("fp8_llm", False),
+            params.get("blocks_to_swap", 26),
+            params.get("bulk_decode", False),
+            params.get("attn_mode", "sdpa"),
+            params.get("vae_chunk_size", 32),
+            params.get("vae_spatial_tile_sample_min_size", 128),
+            params.get("device", "")
+        ] if params else [gr.update()]*30, # IMPORTANT: Count is now 30 (31 - 1 state)
+        inputs=params_state, # Read parameters from state
+        outputs=[
+            # Map to FramePack components (UI only)
+            framepack_prompt,
+            framepack_negative_prompt,
+            framepack_width, # Will be updated or set to None
+            framepack_height, # Will be updated or set to None
+            framepack_target_resolution, # Will be updated or set to None/default
+            # REMOVED framepack_original_dims from this list
+            framepack_total_second_length,
+            framepack_fps,
+            framepack_seed,
+            framepack_steps,
+            framepack_distilled_guidance_scale,
+            framepack_guidance_scale,
+            framepack_guidance_rescale,
+            framepack_sample_solver,
+            # LoRAs (unpacking the lists)
+            *framepack_lora_weights,
+            *framepack_lora_multipliers,
+             # Performance/Memory
+            framepack_fp8,
+            framepack_fp8_scaled,
+            framepack_fp8_llm,
+            framepack_blocks_to_swap,
+            framepack_bulk_decode,
+            framepack_attn_mode,
+            framepack_vae_chunk_size,
+            framepack_vae_spatial_tile_sample_min_size,
+            framepack_device
+        ] # IMPORTANT: List length is now 30
+    ).then(
+        fn=change_to_framepack_tab, # Switch to the FramePack tab
+        inputs=None,
+        outputs=[tabs]
+    )
     # Connect FramePack Generate button
     def update_framepack_image_dimensions(image):
         """Update FramePack dimensions from uploaded image, store raw dims, set default target res"""
@@ -5977,15 +6071,28 @@ with gr.Blocks(
         outputs=framepack_selected_index
     )
 
+    def refresh_lora_dropdowns_simple(lora_folder: str) -> List[gr.update]:
+        """Refreshes LoRA choices, always defaulting the selection to 'None'."""
+        new_choices = get_lora_options(lora_folder)
+        results = []
+        print(f"Refreshing LoRA dropdowns. Found choices: {new_choices}") # Debug print
+        for i in range(4): # Update all 4 slots
+            results.extend([
+                gr.update(choices=new_choices, value="None"), # Always reset value to None
+                gr.update(value=1.0) # Reset multiplier
+            ])
+        return results
+    
     # FramePack LoRA Refresh Button Handler
     framepack_lora_refresh_outputs = []
     for i in range(len(framepack_lora_weights)):
         framepack_lora_refresh_outputs.extend([framepack_lora_weights[i], framepack_lora_multipliers[i]])
 
+    # <<< Modify this click handler >>>
     framepack_refresh_lora_btn.click(
-        fn=update_lora_dropdowns, # Use the generic LoRA update function
-        inputs=[framepack_lora_folder] + framepack_lora_weights + framepack_lora_multipliers,
-        outputs=framepack_lora_refresh_outputs
+        fn=refresh_lora_dropdowns_simple, # Use the new simplified function
+        inputs=[framepack_lora_folder],   # Only needs the folder path as input
+        outputs=framepack_lora_refresh_outputs # Still outputs updates to all 8 components
     )
 
     # FramePack Model Refresh Button Handler
