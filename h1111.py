@@ -313,11 +313,16 @@ def process_framepack_video(
                 match = re.search(r"Video saved to:\s*(.*\.mp4)", line)
                 if match:
                     found_video_path = match.group(1).strip()
+                    current_video_path = found_video_path  # Assign the found path here
+                    if os.path.exists(current_video_path): # Check if it actually exists before adding
+                        all_videos.append((current_video_path, f"Seed: {current_seed}")) # Add to the list immediately
+                        print(f"Video path found and added to gallery list: {current_video_path}") # Optional: Log confirmation
+                    else:
+                         print(f"Warning: Parsed video path does not exist: {current_video_path}")
                     status_text = f"Video {i+1}/{batch_size} Saved (Seed: {current_seed})" # Final status update
                     progress_text = f"Saved: {os.path.basename(found_video_path)}"
                     current_phase = "Saved"
                     phase_changed = True
-                    # ... (rest of file saving logic) ...
                 else: print(f"Warning: Could not parse path from: {line}")
             elif "ERROR" in line or "Traceback" in line:
                  status_text = f"Item {i+1}/{batch_size}: Error Detected (Check Console)"
