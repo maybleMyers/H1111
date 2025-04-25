@@ -5580,83 +5580,96 @@ with gr.Blocks(
         # Return status message, the full metadata for params_state, and the specific value for framepack_original_dims state
         return "Parameters ready for FramePack", metadata, original_dims_value
 
-    # <<< Connect the Send to FramePack button >>>
     send_to_framepack_btn.click(
-        fn=handle_send_to_framepack_tab,
-        inputs=[metadata_output],
-        outputs=[status, params_state, framepack_original_dims] # Add framepack_original_dims here
-    ).then(
-        # This lambda now only prepares updates for UI components
-        lambda params: [
-            params.get("prompt", "cinematic video of a cat wizard casting a spell"),
-            params.get("negative_prompt", ""),
-            # Handle resolution: Prioritize explicit W/H if valid, else use target_res, else default
-            gr_update(value=int(params["video_width"])) if params.get("video_width") and int(params.get("video_width", 0)) % 32 == 0 else gr_update(value=None),
-            gr_update(value=int(params["video_height"])) if params.get("video_height") and int(params.get("video_height", 0)) % 32 == 0 else gr_update(value=None),
-            gr_update(value=int(params.get("target_resolution"))) if not (params.get("video_width") and int(params.get("video_width", 0)) % 32 == 0) and params.get("target_resolution") else gr_update(value=640),
-            params.get("video_seconds", 5.0),
-            params.get("fps", 30),
-            params.get("seed", -1),
-            params.get("infer_steps", 25),
-            params.get("embedded_cfg_scale", 10.0), # Distilled Guidance
-            params.get("guidance_scale", 1.0),      # CFG
-            params.get("guidance_rescale", 0.0),    # RS
-            params.get("sample_solver", "unipc"),
-            # LoRAs - Get lists safely, defaulting to ["None"]*4 and [1.0]*4
-            *(params.get("lora_weights", ["None"]*4)[:4]), # Ensure exactly 4 items
-            *(params.get("lora_multipliers", [1.0]*4)[:4]), # Ensure exactly 4 items
-            # Performance/Memory
-            params.get("fp8", False),
-            params.get("fp8_scaled", False),
-            params.get("fp8_llm", False),
-            params.get("blocks_to_swap", 26),
-            params.get("bulk_decode", False),
-            params.get("attn_mode", "sdpa"),
-            params.get("vae_chunk_size", 32),
-            params.get("vae_spatial_tile_sample_min_size", 128),
-            params.get("device", ""),
-            # <<< ADDED: End Frame Blending Params >>>
-            params.get("end_frame_influence", "none"),
-            params.get("end_frame_weight", 0.0)
-        ] if params else [gr.update()]*(28 + 2), # IMPORTANT: Count is now 30 (28 + 2 new params)
-        inputs=params_state, # Read parameters from state
-        outputs=[
-            # Map to FramePack components (UI only)
-            framepack_prompt,
-            framepack_negative_prompt,
-            framepack_width, # Will be updated or set to None
-            framepack_height, # Will be updated or set to None
-            framepack_target_resolution, # Will be updated or set to None/default
-            framepack_total_second_length,
-            framepack_fps,
-            framepack_seed,
-            framepack_steps,
-            framepack_distilled_guidance_scale,
-            framepack_guidance_scale,
-            framepack_guidance_rescale,
-            framepack_sample_solver,
-            # LoRAs (unpacking the lists)
-            *framepack_lora_weights,
-            *framepack_lora_multipliers,
-             # Performance/Memory
-            framepack_fp8,
-            framepack_fp8_scaled,
-            framepack_fp8_llm,
-            framepack_blocks_to_swap,
-            framepack_bulk_decode,
-            framepack_attn_mode,
-            framepack_vae_chunk_size,
-            framepack_vae_spatial_tile_sample_min_size,
-            framepack_device,
-            # <<< ADDED: Map to new UI components >>>
-            framepack_end_frame_influence,
-            framepack_end_frame_weight
-        ] 
-    ).then(
-        fn=change_to_framepack_tab, # Switch to the FramePack tab
-        inputs=None,
-        outputs=[tabs]
-    )
+            fn=handle_send_to_framepack_tab,
+            inputs=[metadata_output],
+            outputs=[status, params_state, framepack_original_dims] # Add framepack_original_dims here
+        ).then(
+            # This lambda now prepares updates for UI components (32 items)
+            lambda params: (
+                # Prepare the full list of 32 update values first
+                (
+                    # Fetch LoRA lists from params, default to empty lists if not found
+                    (weights_from_meta := params.get("lora_weights", [])),
+                    (mults_from_meta := params.get("lora_multipliers", [])),
+                    # Create explicitly padded lists ensuring 4 elements
+                    (padded_weights := (weights_from_meta + ["None"] * 4)[:4]),
+                    (padded_mults := ([float(m) for m in mults_from_meta] + [1.0] * 4)[:4]), # Ensure multipliers are floats
+    
+                    # Build the list of update values
+                    [
+                        params.get("prompt", "cinematic video of a cat wizard casting a spell"),
+                        params.get("negative_prompt", ""),
+                        # Handle resolution: Prioritize explicit W/H if valid (divisible by 8), else use target_res, else default
+                        gr_update(value=int(params["video_width"])) if params.get("video_width") and int(params.get("video_width", 0)) > 0 and int(params.get("video_width", 0)) % 8 == 0 else gr_update(value=None),
+                        gr_update(value=int(params["video_height"])) if params.get("video_height") and int(params.get("video_height", 0)) > 0 and int(params.get("video_height", 0)) % 8 == 0 else gr_update(value=None),
+                        # Use target resolution only if explicit width/height are *not* validly provided from metadata
+                        gr_update(value=int(params.get("target_resolution"))) if not (params.get("video_width") and int(params.get("video_width", 0)) > 0 and int(params.get("video_width", 0)) % 8 == 0) and params.get("target_resolution") else gr_update(value=640),
+                        params.get("video_seconds", 5.0),
+                        params.get("fps", 30),
+                        params.get("seed", -1),
+                        params.get("infer_steps", 25),
+                        params.get("embedded_cfg_scale", 10.0), # Distilled Guidance
+                        params.get("guidance_scale", 1.0),      # CFG
+                        params.get("guidance_rescale", 0.0),    # RS
+                        params.get("sample_solver", "unipc"),
+                        # Unpack the *padded* lists
+                        *padded_weights, # 4 items
+                        *padded_mults,   # 4 items
+                        # Performance/Memory
+                        params.get("fp8", False),
+                        params.get("fp8_scaled", False),
+                        params.get("fp8_llm", False),
+                        params.get("blocks_to_swap", 26),
+                        params.get("bulk_decode", False),
+                        params.get("attn_mode", "sdpa"),
+                        params.get("vae_chunk_size", 32),
+                        params.get("vae_spatial_tile_sample_min_size", 128),
+                        params.get("device", ""),
+                        # End Frame Blending Params - Use UI defaults
+                        params.get("end_frame_influence", "last"),
+                        params.get("end_frame_weight", 0.5)
+                    ]
+                )[-1] # Return the list of values we just built
+            ) if params else [gr.update()] * 32, # CORRECTED fallback count to 32
+            inputs=params_state, # Read parameters from state
+            outputs=[
+                # Map to FramePack components (UI only - 32 components)
+                framepack_prompt,
+                framepack_negative_prompt,
+                framepack_width, # Will be updated or set to None
+                framepack_height, # Will be updated or set to None
+                framepack_target_resolution, # Will be updated or set to None/default
+                framepack_total_second_length,
+                framepack_fps,
+                framepack_seed,
+                framepack_steps,
+                framepack_distilled_guidance_scale,
+                framepack_guidance_scale,
+                framepack_guidance_rescale,
+                framepack_sample_solver,
+                # LoRAs (unpacking the lists - 8 components total)
+                *framepack_lora_weights, # 4 components
+                *framepack_lora_multipliers, # 4 components
+                 # Performance/Memory
+                framepack_fp8,
+                framepack_fp8_scaled,
+                framepack_fp8_llm,
+                framepack_blocks_to_swap,
+                framepack_bulk_decode,
+                framepack_attn_mode,
+                framepack_vae_chunk_size,
+                framepack_vae_spatial_tile_sample_min_size,
+                framepack_device,
+                # Map to new UI components
+                framepack_end_frame_influence,
+                framepack_end_frame_weight
+            ]
+        ).then(
+            fn=change_to_framepack_tab, # Switch to the FramePack tab
+            inputs=None,
+            outputs=[tabs]
+        )
     # Connect FramePack Generate button
     def update_framepack_image_dimensions(image):
         """Update FramePack dimensions from uploaded image, store raw dims, set default target res"""
