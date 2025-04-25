@@ -48,9 +48,11 @@ model.safetensors
 
 pytorch_model.pt  
 
-Lora might work? It is too different of a model for them to work well.  Use a lot of block swap this is a different back end than the official repo.   
+Lora trained with musubi tuner's framepack training confirmed to work great. Normal lora trained for hunyuan kinda suck. Use a lot of block swap this is a different back end than the official repo.   
 
-Put loras in a /lora subfolder. Unsure of formats that work, no lora I have tried has a big effect tho  
+Put loras in a /lora subfolder, if not trained with musubi you need to convert them.  
+
+If you use last for endframe and put the end frame weight to 0 it will use a different first/last non weighted end frame script.  
 
 ## To Use Skyreels
 
@@ -84,6 +86,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+4/25/2025  
+    Framepack backend updates for better LoRa support for LoRa's trained with musubi tuner. Also better weighting options.  
 4/24/2025  
     Update FramePack backend to musubi backend instead of original. Offers much improved speed and some quality improvements.  
     Add support for torch 2.7.0 + cuda 12.8  
