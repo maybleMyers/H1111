@@ -301,9 +301,10 @@ def process_framepack_video(
             env=env, text=True, encoding='utf-8', errors='replace', bufsize=1
         )
         current_phase = "Preparing"
-        # Initialize display_section_num for this batch item
-        display_section_num = 1 # Start display at 1
-        total_sections_num = max(1, total_sections) # Use calculated sections for display
+        # --- State variables for tracking actual progress ---
+        actual_total_sections = None # Will store the dynamically detected total
+        display_section_num = 1 # Initialize display at 1, will be updated
+        # --- End State variables ---
 
         while True:
             if stop_event.is_set():
@@ -333,18 +334,30 @@ def process_framepack_video(
             current_section_log_match = re.search(r"INFO:__main__:Section (\d+):", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
 
+            # --- Determine current total sections ---
+            current_total_sections = actual_total_sections if actual_total_sections is not None else total_sections_estimate
+
             if current_section_log_match:
                 # Extract the backend's section number (counts down from N-1 to 0)
                 backend_section_num = int(current_section_log_match.group(1))
-                # Calculate the display section number (counts up from 1 to N)
-                display_section_num = max(1, total_sections_num - backend_section_num)
+
+                # --- Dynamically determine total sections from first log ---
+                if actual_total_sections is None:
+                    actual_total_sections = backend_section_num + 1
+                    current_total_sections = actual_total_sections # Update current_total immediately
+                    print(f"Detected actual total sections from backend: {actual_total_sections}")
+                # --- End dynamic determination ---
+
+                # Calculate the display section number (counts up from 1 to N) using the current total
+                display_section_num = max(1, current_total_sections - backend_section_num)
 
                 # Update phase and progress text immediately when a new section starts
-                if current_phase != f"Generating Section {display_section_num}":
-                    current_phase = f"Generating Section {display_section_num}"
+                new_phase = f"Generating Section {display_section_num}"
+                if current_phase != new_phase:
+                    current_phase = new_phase
                     phase_changed = True
 
-                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{total_sections_num} | Preparing..."
+                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{current_total_sections} | Preparing..."
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             # Then check for TQDM progress
@@ -355,11 +368,12 @@ def process_framepack_video(
                  time_elapsed = tqdm_match.group(4)
                  time_remaining = tqdm_match.group(5)
 
-                 # Use the most recently parsed display_section_num
-                 section_str = f"Section {display_section_num}/{total_sections_num}"
+                 # Use the most recently calculated display_section_num and current_total_sections
+                 section_str = f"Section {display_section_num}/{current_total_sections}"
 
-                 if current_phase != f"Generating Section {display_section_num}":
-                     current_phase = f"Generating Section {display_section_num}"
+                 new_phase = f"Generating Section {display_section_num}"
+                 if current_phase != new_phase and not current_section_log_match: # Only update phase if not already updated by section log
+                     current_phase = new_phase
                      phase_changed = True
 
                  # Update progress text with TQDM info and the current section
@@ -384,10 +398,10 @@ def process_framepack_video(
                         all_videos.append((current_video_path, f"Seed: {current_seed}"))
                         print(f"Video path found and added to gallery list: {current_video_path}")
                     else:
-                         print(f"Warning: Parsed video path does not exist: {current_video_path}")
+                         print(f"Warning: Parsed video path does not exist: {found_video_path}") # Use found_video_path
 
                     status_text = f"Video {i+1}/{batch_size} Saved (Seed: {current_seed})"
-                    progress_text = f"Saved: {os.path.basename(found_video_path)}"
+                    progress_text = f"Saved: {os.path.basename(found_video_path)}" # Use found_video_path
                     current_phase = "Saved"
                     phase_changed = True
                 else:
@@ -400,11 +414,12 @@ def process_framepack_video(
                     current_phase = "Error"
                     phase_changed = True
 
-            # Update status_text if phase changed for other reasons
-            elif phase_changed and current_phase not in ["Saved", "Error", "Generating Latents"]:
+            # Update status_text if phase changed for other reasons (and not a specific end state)
+            elif phase_changed and current_phase not in ["Saved", "Error"]:
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             # --- YIELD ---
+            # Ensure the latest status and progress are yielded after processing each line
             yield all_videos.copy(), status_text, progress_text
 
         # --- Subprocess Finished ---
