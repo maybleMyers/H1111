@@ -174,9 +174,9 @@ def process_framepack_video(
     # --- Batch Loop (Simulated for UI) ---
     all_videos = []
     # Calculate total sections for display (doesn't affect backend's internal logic)
-    total_sections_float = (total_second_length * fps) / (latent_window_size * 4) # Use fixed latent_window_size
-    total_sections = int(max(round(total_sections_float), 1))
-    progress_text = f"Starting FramePack generation batch ({total_sections} estimated sections per video)..."
+    total_sections_estimate_float = (total_second_length * fps) / (latent_window_size * 4) # Use fixed latent_window_size
+    total_sections_estimate = int(max(round(total_sections_estimate_float), 1))
+    progress_text = f"Starting FramePack generation batch ({total_sections_estimate} estimated sections per video)..."
     status_text = "Preparing batch..."
     yield all_videos, status_text, progress_text
 
