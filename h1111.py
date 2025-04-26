@@ -291,9 +291,6 @@ def process_framepack_video(
         if input_end_frame and os.path.exists(input_end_frame):
              command.extend(["--end_image_path", input_end_frame])
              # Conditionally add influence mode and weight if relevant
-             if end_frame_influence != "none" and end_frame_weight > 0.0:
-                command.extend(["--end_frame_influence", str(end_frame_influence)])
-                command.extend(["--end_frame_weight", str(end_frame_weight)])
 
         # Boolean Flags
         if fp8: command.append("--fp8")
