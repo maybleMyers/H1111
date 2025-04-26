@@ -114,23 +114,24 @@ def process_framepack_video(
     section_prompts_parts = []
     section_images_parts = []
 
-    for idx, sec_prompt, sec_image in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images):
-        # Convert index value safely, check if it's not None before using int()
-        current_idx = None
-        if idx is not None:
-            try:
-                current_idx = int(idx)
-            except (ValueError, TypeError):
-                print(f"Warning: Could not convert section index '{idx}' to int. Skipping.")
-                continue # Skip this entry if the index is invalid
+    index_pattern = re.compile(r"^\d+(-\d+)?$")
 
-        # Check prompt and index validity
-        if sec_prompt and sec_prompt.strip() and current_idx is not None and current_idx >= 0:
-            section_prompts_parts.append(f"{current_idx}:{sec_prompt.strip()}")
+    for idx_str, sec_prompt, sec_image in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images):
+        # Validate the index string format
+        if not idx_str or not isinstance(idx_str, str) or not index_pattern.match(idx_str.strip()):
+             if idx_str and idx_str.strip(): # Only warn if there was actual input
+                 print(f"Warning: Invalid section index/range format '{idx_str}'. Skipping.")
+             continue # Skip this entry if the index format is invalid
 
-        # Check image path and index validity
-        if sec_image and os.path.exists(sec_image) and current_idx is not None and current_idx >= 0:
-             section_images_parts.append(f"{current_idx}:{sec_image}")
+        current_idx_str = idx_str.strip() # Use the validated string directly
+
+        # Check prompt validity (index string is already validated)
+        if sec_prompt and sec_prompt.strip():
+            section_prompts_parts.append(f"{current_idx_str}:{sec_prompt.strip()}") # <<< Uses string index/range
+
+        # Check image path validity (index string is already validated)
+        if sec_image and os.path.exists(sec_image):
+             section_images_parts.append(f"{current_idx_str}:{sec_image}")
     # --- End Section Control String Preparation ---
 
     final_prompt_arg = prompt # Default to base prompt
@@ -4477,13 +4478,13 @@ with gr.Blocks(
                             choices=["last", "half", "progressive", "bookend"],
                             value="last",
                             info="How the end frame affects generation (if provided)",
-                            interactive=True
+                            visible=False
                         )
                         framepack_end_frame_weight = gr.Slider(
                             minimum=0.0, maximum=1.0, step=0.05, value=0.5, # Default changed from 0.3
                             label="End Frame Weight",
                             info="Influence strength of the end frame (if provided)",
-                            interactive=True
+                            visible=False
                         )
 
                     gr.Markdown("### Resolution Options (Choose One)")
@@ -4560,7 +4561,7 @@ with gr.Blocks(
                             gr.Markdown("**--- Control Slot 1 ---**")
                             with gr.Row():
                                  
-                                framepack_sec_1 = gr.Number(label="Start Index", value=0, precision=0, interactive=True)
+                                framepack_sec_1 = gr.Textbox(label="Index/Range", value="0", placeholder="e.g., 0 or 0-1", interactive=True)
                             framepack_sec_prompt_1 = gr.Textbox(label="Prompt Override", lines=2, placeholder="Overrides base prompt for these sections")
                             framepack_sec_image_1 = gr.Image(label="Start Image Override", type="filepath", scale=1)
                     with gr.Column(scale=1):
@@ -4568,7 +4569,7 @@ with gr.Blocks(
                             gr.Markdown("**--- Control Slot 2 ---**")
                             with gr.Row():
                                  
-                                 framepack_sec_2 = gr.Number(label="Start Index", value=1, precision=0, interactive=True)
+                                framepack_sec_2 = gr.Textbox(label="Index/Range", value="1", placeholder="e.g., 2 or 2-3", interactive=True)
                             framepack_sec_prompt_2 = gr.Textbox(label="Prompt Override", lines=2)
                             framepack_sec_image_2 = gr.Image(label="Start Image Override", type="filepath", scale=1)
                 with gr.Row():
@@ -4577,14 +4578,14 @@ with gr.Blocks(
                             gr.Markdown("**--- Control Slot 3 ---**")
                             with gr.Row():
                                 
-                                framepack_sec_3 = gr.Number(label="Start Index", value=2, precision=0, interactive=True)
+                                framepack_sec_3 = gr.Textbox(label="Index/Range", value="2", placeholder="e.g., 4 or 4-5", interactive=True)
                             framepack_sec_prompt_3 = gr.Textbox(label="Prompt Override", lines=2)
                             framepack_sec_image_3 = gr.Image(label="Start Image Override", type="filepath", scale=1)
                     with gr.Column(scale=1):
                          with gr.Group():
                             gr.Markdown("**--- Control Slot 4 ---**")
                             with gr.Row():
-                                framepack_sec_4 = gr.Number(label="Start Index", value=3, precision=0, interactive=True)
+                                framepack_sec_4 = gr.Textbox(label="Index/Range", value="3", placeholder="e.g., 6 or 6-7", interactive=True)
                             framepack_sec_prompt_4 = gr.Textbox(label="Prompt Override", lines=2)
                             framepack_sec_image_4 = gr.Image(label="Start Image Override", type="filepath", scale=1)
 
