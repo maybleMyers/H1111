@@ -54,20 +54,13 @@ Put loras in a /lora subfolder, if not trained with musubi you need to convert t
 
 If you use last for endframe and put the end frame weight to 0 it will use a different first/last non weighted end frame script.  
 
-## To Use Skyreels
+## To Use the new Skyreels-V2 models
 
-To use the Skyreels models, first download Kijai's awesome models:
+I have provided these 2 at https://huggingface.co/maybleMyers/wan_files_for_h1111  
+ SkyReels-V2-I2V-14B-720P-FP16.safetensors  
+ SkyReels-V2-I2V-14B-540P-FP16.safetensors  
 
-https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_i2v_bf16.safetensors?download=true  
-And  
-https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy/resolve/main/skyreels_hunyuan_t2v_bf16.safetensors?download=true  
-
-Place the models inside the hunyuan folder inside of H1111 and select them at the bottom of the page by clicking DIT model
-
-Use the i2v model for image to video.  
-Use the t2v model for video to video and text to video.
-
-Most of the lora's for hunyuan will work with skyreels also.
+You can just drop them into the wan folder and use them in the WanX-i2v tab. Skyreels-V2 is a fine tune from Wan2.1.  
 
 ## To Use WanX
 
@@ -86,6 +79,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+4/26/2025  
+    Add SkyReels-V2-I2V-14B-720P-FP16.safetensors to supported models.  
 4/25/2025  
     Framepack backend updates for better LoRa support for LoRa's trained with musubi tuner. Also better weighting options.  
 4/24/2025  
