@@ -75,7 +75,9 @@ def process_framepack_video(
     save_path: str, # Argument being checked
     # --- LoRA Params ---
     lora_folder: str,
-    *lora_params: Any
+    # --- CORRECTED: Use *args to capture variable inputs ---
+    *args: Any
+    # --- End Corrected ---
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video using fpack_generate_video.py"""
     global stop_event
@@ -87,46 +89,63 @@ def process_framepack_video(
         save_path = "outputs"
     # --- End Fallback ---
 
-    # Separate LoRA weights and multipliers from *lora_params
-    num_loras = 4 # Assuming 4 LoRA slots
-    lora_weights_list = list(lora_params[:num_loras])
-    lora_multipliers_list = list(lora_params[num_loras : num_loras * 2])
+    # --- CORRECTED: Reconstruct lists from *args ---
+    num_section_controls = 4
+    num_loras = 4
+    # Calculate slice indices based on the number of components for each group
+    secs_end = num_section_controls
+    prompts_end = secs_end + num_section_controls
+    images_end = prompts_end + num_section_controls
+    lora_weights_end = images_end + num_loras
+    lora_mults_end = lora_weights_end + num_loras
 
-    # --- Argument Validation ---
-    if not prompt:
-        yield [], "Error: Prompt is required.", ""
-        return
-    if not input_image or not os.path.exists(input_image):
-        yield [], "Error: Input start image not found.", f"Cannot find image: {input_image}"
-        return
+    # Slice the args tuple to get the values for each group
+    framepack_secs = args[0:secs_end]
+    framepack_sec_prompts = args[secs_end:prompts_end]
+    framepack_sec_images = args[prompts_end:images_end]
+    lora_weights_list = list(args[images_end:lora_weights_end]) # Convert tuple slice to list
+    lora_multipliers_list = list(args[lora_weights_end:lora_mults_end]) # Convert tuple slice to list
 
-    # --- Explicit Save Path Check AFTER Fallback ---
-    if not save_path: # Check the potentially corrected save_path variable
-        yield [], "Error: Save path is required.", ""
-        return
-    # --- End Save Path Check ---
-
-    if input_end_frame and not os.path.exists(input_end_frame):
-        yield [], "Error: End frame image not found.", f"Cannot find end frame image: {input_end_frame}"
+    if not input_image and not any(img for img in framepack_sec_images if img): # Need start image OR section images
+        yield [], "Error: Input start image or at least one section image override is required.", ""
         return
 
-    # --- Check Required Model Paths (excluding Save Path) ---
-    # Removed Save Path from this check, it's handled above
-    required_paths = {
-        "Text Encoder 1": text_encoder_path,
-        "Text Encoder 2": text_encoder_2_path,
-        "Image Encoder": image_encoder_path,
-        "Start Image": input_image
-    }
-    for name, path in required_paths.items():
-        if not path:
-             yield [], f"Error: {name} path is required.", ""
-             return
-        # Basic existence check (can be directory or file depending on model)
-        # We only need to check existence for model paths here.
-        if name != "Start Image" and not os.path.exists(path):
-             yield [], f"Error: {name} path not found.", f"Cannot find: {path}"
-             return
+    # --- Prepare Section Control Strings ---
+    section_prompts_parts = []
+    section_images_parts = []
+
+    for idx, sec_prompt, sec_image in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images):
+        # Convert index value safely, check if it's not None before using int()
+        current_idx = None
+        if idx is not None:
+            try:
+                current_idx = int(idx)
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert section index '{idx}' to int. Skipping.")
+                continue # Skip this entry if the index is invalid
+
+        # Check prompt and index validity
+        if sec_prompt and sec_prompt.strip() and current_idx is not None and current_idx >= 0:
+            section_prompts_parts.append(f"{current_idx}:{sec_prompt.strip()}")
+
+        # Check image path and index validity
+        if sec_image and os.path.exists(sec_image) and current_idx is not None and current_idx >= 0:
+             section_images_parts.append(f"{current_idx}:{sec_image}")
+    # --- End Section Control String Preparation ---
+
+    final_prompt_arg = prompt # Default to base prompt
+    if section_prompts_parts:
+        final_prompt_arg = ";;;".join(section_prompts_parts)
+        print(f"Using section prompt overrides: {final_prompt_arg}")
+
+    # Determine the image path argument based on section image overrides
+    final_image_path_arg = None # Initialize to None
+    if section_images_parts:
+        final_image_path_arg = ";;;".join(section_images_parts)
+        print(f"Using section image overrides for --image_path: {final_image_path_arg}")
+    elif input_image: # Only use base input_image if no section overrides are present
+        final_image_path_arg = input_image
+        print(f"Using base input image for --image_path: {final_image_path_arg}")
 
     # --- Resolution Calculation ---
     final_height, final_width = None, None
@@ -184,6 +203,7 @@ def process_framepack_video(
     valid_loras_paths = []
     valid_loras_mults = []
     if lora_folder and os.path.exists(lora_folder):
+        # Use the lora_weights_list and lora_multipliers_list reconstructed from *args
         for weight_name, mult in zip(lora_weights_list, lora_multipliers_list):
             if weight_name and weight_name != "None":
                  # Handle potential full paths or just filenames from dropdown
@@ -194,6 +214,7 @@ def process_framepack_video(
 
                  if os.path.exists(lora_path):
                      valid_loras_paths.append(lora_path)
+                     # Ensure multiplier is converted to string for command line
                      valid_loras_mults.append(str(mult))
                  else:
                      print(f"Warning: LoRA file not found: {lora_path}")
@@ -231,11 +252,16 @@ def process_framepack_video(
             "--text_encoder1", text_encoder_path,
             "--text_encoder2", text_encoder_2_path,
             "--image_encoder", image_encoder_path,
-            "--image_path", input_image, # Start image
-            "--save_path", save_path, # Use the potentially corrected save_path
+            # --- MODIFIED: Image Path Handling ---
+            # Add --image_path only if we determined a valid path (base or section overrides)
+            *(["--image_path", final_image_path_arg] if final_image_path_arg else []),
+            # --- End Modified ---
+            "--save_path", save_path,
             # Core Params
-            "--prompt", prompt,
-            "--video_size", str(final_height), str(final_width), # Pass calculated H, W
+            # --- MODIFIED: Prompt Handling ---
+            "--prompt", final_prompt_arg,
+            # --- End Modified ---
+            "--video_size", str(final_height), str(final_width),
             "--video_seconds", str(total_second_length),
             "--fps", str(fps),
             "--infer_steps", str(steps),
@@ -431,7 +457,15 @@ def process_framepack_video(
             # Create metadata dictionary matching backend arguments
             parameters = {
                 "prompt": prompt, "negative_prompt": negative_prompt,
-                "input_image": os.path.basename(input_image),
+                "input_image": os.path.basename(input_image) if input_image else None,
+                 # --- ADDED: Metadata for Section Control ---
+                "section_controls": [
+                     {"index": s, "prompt_override": p, "image_override": os.path.basename(i) if i else None}
+                     for s, p, i in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images)
+                     if (p and p.strip()) or i # Only record if prompt or image was set
+                 ],
+                "final_prompt_arg": final_prompt_arg, # Store the actual argument passed
+                "final_image_path_arg": final_image_path_arg, # Store the actual argument passed
                 "input_end_frame": os.path.basename(input_end_frame) if input_end_frame else None,
                 # Model Paths
                 "transformer_path": transformer_path,
@@ -4514,6 +4548,51 @@ with gr.Blocks(
                             framepack_latent_window_size = gr.Number(label="Latent Window Size", value=9, interactive=True, info="Default 9")
                             framepack_sample_solver = gr.Dropdown(label="Sample Solver", choices=["unipc", "dpm++", "vanilla"], value="unipc", interactive=True)
 
+            with gr.Accordion("Advanced Section Control (Optional)", open=False):
+                gr.Markdown(
+                    "Define specific prompts and starting images for different sections of the video. "
+                    "For the index you can input a range or a single index. A 5 second default video has 4 sections. The first section is 0 and the last is 3"
+                )
+                # --- Define section controls explicitly ---
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        with gr.Group():
+                            gr.Markdown("**--- Control Slot 1 ---**")
+                            with gr.Row():
+                                 
+                                framepack_sec_1 = gr.Number(label="Start Index", value=0, precision=0, interactive=True)
+                            framepack_sec_prompt_1 = gr.Textbox(label="Prompt Override", lines=2, placeholder="Overrides base prompt for these sections")
+                            framepack_sec_image_1 = gr.Image(label="Start Image Override", type="filepath", scale=1)
+                    with gr.Column(scale=1):
+                        with gr.Group():
+                            gr.Markdown("**--- Control Slot 2 ---**")
+                            with gr.Row():
+                                 
+                                 framepack_sec_2 = gr.Number(label="Start Index", value=1, precision=0, interactive=True)
+                            framepack_sec_prompt_2 = gr.Textbox(label="Prompt Override", lines=2)
+                            framepack_sec_image_2 = gr.Image(label="Start Image Override", type="filepath", scale=1)
+                with gr.Row():
+                    with gr.Column(scale=1):
+                         with gr.Group():
+                            gr.Markdown("**--- Control Slot 3 ---**")
+                            with gr.Row():
+                                
+                                framepack_sec_3 = gr.Number(label="Start Index", value=2, precision=0, interactive=True)
+                            framepack_sec_prompt_3 = gr.Textbox(label="Prompt Override", lines=2)
+                            framepack_sec_image_3 = gr.Image(label="Start Image Override", type="filepath", scale=1)
+                    with gr.Column(scale=1):
+                         with gr.Group():
+                            gr.Markdown("**--- Control Slot 4 ---**")
+                            with gr.Row():
+                                framepack_sec_4 = gr.Number(label="Start Index", value=3, precision=0, interactive=True)
+                            framepack_sec_prompt_4 = gr.Textbox(label="Prompt Override", lines=2)
+                            framepack_sec_image_4 = gr.Image(label="Start Image Override", type="filepath", scale=1)
+
+                # Group section control components for easier passing to functions (remains the same)
+                framepack_secs = [framepack_sec_1, framepack_sec_2, framepack_sec_3, framepack_sec_4]
+                framepack_sec_prompts = [framepack_sec_prompt_1, framepack_sec_prompt_2, framepack_sec_prompt_3, framepack_sec_prompt_4]
+                framepack_sec_images = [framepack_sec_image_1, framepack_sec_image_2, framepack_sec_image_3, framepack_sec_image_4]                            
+
             # Performance/Memory Accordion - Updated
             with gr.Accordion("Performance / Memory", open=True):
                 with gr.Row():
@@ -5767,7 +5846,7 @@ with gr.Blocks(
             # --- End Frame Args ---
             framepack_input_end_frame, framepack_end_frame_influence, framepack_end_frame_weight,
             # --- Model Paths ---
-            framepack_transformer_path, # Textbox value
+            framepack_transformer_path,
             framepack_vae_path,
             framepack_text_encoder_path,
             framepack_text_encoder_2_path,
@@ -5784,8 +5863,16 @@ with gr.Blocks(
             framepack_device,
             # --- Batching & Saving ---
             framepack_batch_size,
-            framepack_save_path, # Textbox value
-            framepack_lora_folder, *framepack_lora_weights, *framepack_lora_multipliers
+            framepack_save_path,
+            # --- LoRA Params ---
+            framepack_lora_folder,
+            # --- ADDED: Section Control Inputs ---
+            *framepack_secs,         # List of gr.Number components
+            *framepack_sec_prompts,  # List of gr.Textbox components
+            *framepack_sec_images,   # List of gr.Image components
+            # --- End Added Inputs ---
+            *framepack_lora_weights,
+            *framepack_lora_multipliers
         ],
         outputs=[framepack_output, framepack_batch_progress, framepack_progress_text],
         queue=True
