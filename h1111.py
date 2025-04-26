@@ -4511,7 +4511,7 @@ with gr.Blocks(
                             framepack_guidance_scale = gr.Slider(minimum=1.0, maximum=10.0, step=0.1, label="Guidance Scale (CFG)", value=1.0, interactive=True, info="Default 1.0 (no CFG), backend recommends not changing.")
                         with gr.Row():
                             framepack_guidance_rescale = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="CFG Rescale (rs)", value=0.0, interactive=True, info="Default 0.0, backend recommends not changing.")
-                            framepack_latent_window_size = gr.Number(label="Latent Window Size", value=9, interactive=False, info="Default 9 (fixed)")
+                            framepack_latent_window_size = gr.Number(label="Latent Window Size", value=9, interactive=True, info="Default 9")
                             framepack_sample_solver = gr.Dropdown(label="Sample Solver", choices=["unipc", "dpm++", "vanilla"], value="unipc", interactive=True)
 
             # Performance/Memory Accordion - Updated
