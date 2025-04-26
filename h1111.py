@@ -481,8 +481,8 @@ def process_framepack_video(
                 "guidance_scale": cfg, "guidance_rescale": rs, "sample_solver": sample_solver,
                 "latent_window_size": latent_window_size,
                  # --- Add End Frame Blending Params to Metadata ---
-                "end_frame_influence": end_frame_influence if input_end_frame else "none",
-                "end_frame_weight": end_frame_weight if input_end_frame else 0.0,
+                #"end_frame_influence": end_frame_influence if input_end_frame else "none",
+                #"end_frame_weight": end_frame_weight if input_end_frame else 0.0,
                 # --- End Metadata Addition ---
                 # Performance/Memory
                 "fp8": fp8,
