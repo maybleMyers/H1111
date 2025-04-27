@@ -4450,7 +4450,7 @@ with gr.Blocks(
                     framepack_prompt = gr.Textbox(
                         scale=3, label="Prompt (Supports sections: index:prompt;;;index:prompt)",
                         value="cinematic video of a cat wizard casting a spell", lines=3,
-                        info="Use '0:prompt;;;-1:prompt' or '0-2:prompt;;;3:prompt'. Index -1 is last section."
+                        info="Use '0:prompt;;;-1:prompt' or '0-2:prompt;;;3:prompt'. Index total sections -1 is last section."
                     )
                     framepack_negative_prompt = gr.Textbox(scale=3, label="Negative Prompt", value="", lines=3)
                 with gr.Column(scale=1):
