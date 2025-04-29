@@ -2785,6 +2785,8 @@ def wanx_batch_handler(
     enable_cfg_skip: bool,
     cfg_skip_mode: str,
     cfg_apply_ratio: float,
+    enable_preview: bool,
+    preview_steps: int,
     *lora_params,   # <-- DO NOT ADD NAMED ARGS AFTER THIS!
 ):
     """Handle both folder-based batch processing and regular processing for all WanX tabs"""
@@ -2837,236 +2839,147 @@ def wanx_batch_handler(
     except Exception:
         control_end = 1.0
 
+    yield [], [], "Preparing batch...", "" # Clear main and preview galleries
+
     if use_random:
         stop_event.clear()
         all_videos = []
+        all_previews = [] # Keep track of previews from the last successful item? Or clear each time? Let's clear.
         progress_text = "Starting generation..."
-        yield [], "Preparing...", progress_text
+        yield [], [], "Preparing...", progress_text # Clear galleries again just in case
         batch_size = int(batch_size)
         for i in range(batch_size):
             if stop_event.is_set():
-                yield all_videos, "Generation stopped by user", ""
+                yield all_videos, [], "Generation stopped by user", "" # Yield empty previews on stop
                 return
 
-            batch_text = f"Generating video {i + 1} of {batch_size}"
-            yield all_videos.copy(), batch_text, progress_text
+            # --- Clear previews for this item ---
+            current_previews_for_item = []
+            yield all_videos.copy(), current_previews_for_item, f"Generating video {i + 1} of {batch_size}", progress_text # Yield cleared previews
 
+            # ... (Keep existing random image logic) ...
             random_image, status = get_random_image_from_folder(input_folder_path)
             if random_image is None:
-                yield all_videos, f"Error in batch {i+1}: {status}", ""
+                yield all_videos, current_previews_for_item, f"Error in batch {i+1}: {status}", ""
                 continue
 
             resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, width, height)
             if resized_image is None:
-                yield all_videos, f"Error resizing image in batch {i+1}: {size_info}", ""
+                yield all_videos, current_previews_for_item, f"Error resizing image in batch {i+1}: {size_info}", ""
                 continue
 
             local_width, local_height = width, height
-            if isinstance(size_info, tuple):
-                local_width, local_height = size_info
-                progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height}"
-            else:
-                progress_text = f"Using image: {os.path.basename(random_image)}"
-            
-            yield all_videos.copy(), batch_text, progress_text
+            if isinstance(size_info, tuple): local_width, local_height = size_info
+            progress_text = f"Using image: {os.path.basename(random_image)} - Resized to {local_width}x{local_height}"
+            yield all_videos.copy(), current_previews_for_item, f"Generating video {i + 1} of {batch_size}", progress_text
 
             current_seed = seed
-            if seed == -1:
-                current_seed = random.randint(0, 2**32 - 1)
-            elif batch_size > 1:
-                current_seed = seed + i
+            if seed == -1: current_seed = random.randint(0, 2**32 - 1)
+            elif batch_size > 1: current_seed = seed + i
 
-            for videos, status, progress in wanx_generate_video(
-                prompt, 
-                negative_prompt, 
-                resized_image, 
-                local_width,
-                local_height,
-                video_length,
-                fps,
-                infer_steps,
-                flow_shift,
-                guidance_scale, 
-                current_seed,
-                wanx_input_end,
-                task,
-                dit_folder,
-                full_dit_path,  
-                vae_path,
-                t5_path,
-                clip_path,
-                save_path,
-                output_type,
-                sample_solver,
-                exclude_single_blocks,
-                attn_mode,
-                block_swap,
-                fp8,
-                fp8_scaled,
-                fp8_t5,
-                lora_folder,
-                slg_layers,
-                slg_start,
-                slg_end,
-                lora_weights[0],
-                lora_weights[1],
-                lora_weights[2], 
-                lora_weights[3],
-                lora_multipliers[0],
-                lora_multipliers[1],
-                lora_multipliers[2],
-                lora_multipliers[3],
-                enable_cfg_skip,
-                cfg_skip_mode,
-                cfg_apply_ratio,
-                None,                # control_video
-                1.0,                 # control_strength
-                0.0,                 # control_start
-                1.0,                 # control_end
+            # --- Modified call to wanx_generate_video ---
+            # Note: wanx_input_end is likely None here unless logic changes
+            for videos_update, previews_update, status, progress in wanx_generate_video(
+                prompt, negative_prompt, resized_image, local_width, local_height,
+                video_length, fps, infer_steps, flow_shift, guidance_scale, current_seed,
+                wanx_input_end, # Pass the argument
+                task, dit_folder, full_dit_path, vae_path, t5_path, clip_path, save_path,
+                output_type, sample_solver, exclude_single_blocks, attn_mode, block_swap,
+                fp8, fp8_scaled, fp8_t5, lora_folder,
+                slg_layers, slg_start, slg_end,
+                lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+                lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3],
+                enable_cfg_skip, cfg_skip_mode, cfg_apply_ratio,
+                None, 1.0, 0.0, 1.0, # Placeholders for control video args in random mode
+                # --- Pass preview args ---
+                enable_preview=enable_preview,
+                preview_steps=preview_steps
             ):
-                if videos:
-                    all_videos.extend(videos)
-                yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+                if videos_update: all_videos = videos_update # Update main gallery list
+                current_previews_for_item = previews_update # Update previews for *this* item
+                yield all_videos.copy(), current_previews_for_item, f"Batch {i+1}/{batch_size}: {status}", progress
 
             try:
-                if os.path.exists(resized_image):
-                    os.remove(resized_image)
-            except:
-                pass
-
+                if os.path.exists(resized_image): os.remove(resized_image)
+            except: pass
             clear_cuda_cache()
             time.sleep(0.5)
-        yield all_videos, "Batch complete", ""
+        yield all_videos, [], "Batch complete", "" # Yield empty previews at the end
     else:
+        # ... (Keep existing checks for non-random mode: input file, control video) ...
         batch_size = int(batch_size)
         if not input_file and "i2v" in task:
-            yield [], "Error: No input image provided", "An input image is required for I2V models"
+            yield [], [], "Error: No input image provided", "An input image is required for I2V models"
             return
         if "-FC" in task and not control_video:
-            yield [], "Error: No control video provided", "A control video is required for Fun-Control models"
+            yield [], [], "Error: No control video provided", "A control video is required for Fun-Control models"
             return
 
         if batch_size > 1:
             stop_event.clear()
             all_videos = []
+            all_previews = [] # Clear previews at start of batch
             progress_text = "Starting generation..."
-            yield [], "Preparing...", progress_text
-            
+            yield [], [], "Preparing...", progress_text # Clear galleries
+
             for i in range(batch_size):
                 if stop_event.is_set():
-                    yield all_videos, "Generation stopped by user", ""
+                    yield all_videos, [], "Generation stopped by user", "" # Yield empty previews
                     return
 
+                # --- Clear previews for this item ---
+                current_previews_for_item = []
+                yield all_videos.copy(), current_previews_for_item, f"Generating video {i+1}/{batch_size}", progress_text
+
                 current_seed = seed
-                if seed == -1:
-                    current_seed = random.randint(0, 2**32 - 1)
-                elif batch_size > 1:
-                    current_seed = seed + i
+                if seed == -1: current_seed = random.randint(0, 2**32 - 1)
+                elif batch_size > 1: current_seed = seed + i
                 batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
-                yield all_videos, batch_text, progress_text
-                for videos, status, progress in wanx_generate_video(
-                    prompt, 
-                    negative_prompt, 
-                    input_file, 
-                    width,
-                    height,
-                    video_length,
-                    fps,
-                    infer_steps,
-                    flow_shift,
-                    guidance_scale, 
-                    current_seed,
-                    wanx_input_end,
-                    task,
-                    dit_folder,
-                    full_dit_path, 
-                    vae_path,
-                    t5_path,
-                    clip_path,
-                    save_path,
-                    output_type,
-                    sample_solver,
-                    exclude_single_blocks,
-                    attn_mode,
-                    block_swap,
-                    fp8,
-                    fp8_scaled,
-                    fp8_t5,
-                    lora_folder,
-                    slg_layers,
-                    slg_start,
-                    slg_end,
-                    lora_weights[0],
-                    lora_weights[1],
-                    lora_weights[2], 
-                    lora_weights[3],
-                    lora_multipliers[0],
-                    lora_multipliers[1],
-                    lora_multipliers[2],
-                    lora_multipliers[3],
-                    enable_cfg_skip,
-                    cfg_skip_mode,
-                    cfg_apply_ratio,
-                    control_video,
-                    control_strength,
-                    control_start,
-                    control_end,
+                yield all_videos.copy(), current_previews_for_item, batch_text, progress_text # Update status
+
+                # --- Modified call to wanx_generate_video ---
+                for videos_update, previews_update, status, progress in wanx_generate_video(
+                    prompt, negative_prompt, input_file, width, height,
+                    video_length, fps, infer_steps, flow_shift, guidance_scale, current_seed,
+                    wanx_input_end, # Pass the argument
+                    task, dit_folder, full_dit_path, vae_path, t5_path, clip_path, save_path,
+                    output_type, sample_solver, exclude_single_blocks, attn_mode, block_swap,
+                    fp8, fp8_scaled, fp8_t5, lora_folder,
+                    slg_layers, slg_start, slg_end,
+                    lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+                    lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3],
+                    enable_cfg_skip, cfg_skip_mode, cfg_apply_ratio,
+                    control_video, control_strength, control_start, control_end,
+                    # --- Pass preview args ---
+                    enable_preview=enable_preview,
+                    preview_steps=preview_steps
                 ):
-                    if videos:
-                        all_videos.extend(videos)
-                    yield all_videos.copy(), f"Batch {i+1}/{batch_size}: {status}", progress
+                    if videos_update: all_videos = videos_update # Update main gallery
+                    current_previews_for_item = previews_update # Update previews for *this* item
+                    yield all_videos.copy(), current_previews_for_item, f"Batch {i+1}/{batch_size}: {status}", progress
+                # --- End modified call ---
                 clear_cuda_cache()
                 time.sleep(0.5)
-            yield all_videos, "Batch complete", ""
-        else:
+            yield all_videos, [], "Batch complete", "" # Yield empty previews at the end
+        else: # Single generation (batch_size = 1)
             stop_event.clear()
+            # --- Modified call to wanx_generate_video (yield from) ---
+            # Add preview args directly
             yield from wanx_generate_video(
-                prompt, 
-                negative_prompt,
-                input_file,
-                width,
-                height,
-                video_length,
-                fps,
-                infer_steps,
-                flow_shift,
-                guidance_scale,
-                seed,
-                wanx_input_end,
-                task,
-                dit_folder,
-                full_dit_path,
-                vae_path,
-                t5_path,
-                clip_path,
-                save_path,
-                output_type,
-                sample_solver,
-                exclude_single_blocks,
-                attn_mode,
-                block_swap,
-                fp8,
-                fp8_scaled,
-                fp8_t5, 
-                lora_folder,
-                slg_layers,
-                slg_start,
-                slg_end,
-                lora_weights[0],
-                lora_weights[1],
-                lora_weights[2], 
-                lora_weights[3],
-                lora_multipliers[0],
-                lora_multipliers[1],
-                lora_multipliers[2],
-                lora_multipliers[3],
-                enable_cfg_skip,
-                cfg_skip_mode,
-                cfg_apply_ratio,
-                control_video,
-                control_strength,
-                control_start,
-                control_end,
+                prompt, negative_prompt, input_file, width, height,
+                video_length, fps, infer_steps, flow_shift, guidance_scale, seed,
+                wanx_input_end, # Pass the argument
+                task, dit_folder, full_dit_path, vae_path, t5_path, clip_path, save_path,
+                output_type, sample_solver, exclude_single_blocks, attn_mode, block_swap,
+                fp8, fp8_scaled, fp8_t5, lora_folder,
+                slg_layers, slg_start, slg_end,
+                lora_weights[0], lora_weights[1], lora_weights[2], lora_weights[3],
+                lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3],
+                enable_cfg_skip, cfg_skip_mode, cfg_apply_ratio,
+                control_video, control_strength, control_start, control_end,
+                # --- Pass preview args ---
+                enable_preview=enable_preview,
+                preview_steps=preview_steps
             )
 
 def process_single_video(
@@ -3485,6 +3398,10 @@ def handle_wanx_gallery_select(evt: gr.SelectData, gallery) -> tuple:
     
     return evt.index, video_path
 
+def get_step_from_preview_path(path):
+    match = re.search(r"step_(\d+)_", os.path.basename(path))
+    return int(match.group(1)) if match else -1
+
 def wanx_generate_video(
     prompt, 
     negative_prompt,
@@ -3532,9 +3449,14 @@ def wanx_generate_video(
     control_strength=1.0,
     control_start=0.0,
     control_end=1.0,
+    enable_preview: bool = False,
+    preview_steps: int = 5
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
+
+    current_previews = []
+    yield [], current_previews, "Preparing...", "" # Yield empty previews
     
     # Fix 1: Ensure lora_folder is a string
     lora_folder = str(lora_folder) if lora_folder else "lora"
@@ -3560,7 +3482,7 @@ def wanx_generate_video(
     print(f"slg_start_float: {slg_start_float}, slg_end_float: {slg_end_float}")
     
     if stop_event.is_set():
-        yield [], "", ""
+        yield [], [], "", "" # Yield empty previews
         return
 
     # Check if this is a Fun-Control task
@@ -3629,6 +3551,10 @@ def wanx_generate_video(
     ]
     
     # Fix 3: Only add boolean flags if they're True
+    if enable_preview and preview_steps > 0:
+        command.extend(["--preview", str(preview_steps)])
+        print(f"DEBUG - Enabling preview every {preview_steps} steps.")
+
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
             "--cfg_skip_mode", str(cfg_skip_mode),
@@ -3744,6 +3670,9 @@ def wanx_generate_video(
     )
 
     videos = []
+    # current_previews list initialized at the start
+    preview_dir = os.path.join(save_path, "previews")
+    processed_preview_files = set() # Keep track of previews already yielded
     
     while True:
         if stop_event.is_set():
@@ -3759,60 +3688,98 @@ def wanx_generate_video(
             continue
             
         print(line, end='')
+        status_text = f"Processing (seed: {current_seed})" # Default status
+        progress_text_update = line.strip() # Default progress is the current line
+
         if '|' in line and '%' in line and '[' in line and ']' in line:
-            yield videos.copy(), f"Processing (seed: {current_seed})", line.strip()
+            status_text = f"Processing (seed: {current_seed})"
+            progress_text_update = line.strip()
+        elif "ERROR" in line.upper() or "TRACEBACK" in line.upper():
+            status_text = f"Error (seed: {current_seed})"
+            progress_text_update = line # Show error line
+        # Add any other status parsing if needed
+
+        # --- ADDED: Check for new previews ---
+        if enable_preview:
+            if os.path.exists(preview_dir):
+                # Find all preview files (png or mp4)
+                found_files = glob.glob(os.path.join(preview_dir, f"latent_preview_step_*.png"))
+                found_files.extend(glob.glob(os.path.join(preview_dir, f"latent_preview_step_*.mp4")))
+
+                new_previews_found = False
+                for f_path in found_files:
+                    if f_path not in processed_preview_files:
+                        current_previews.append(f_path)
+                        processed_preview_files.add(f_path)
+                        new_previews_found = True
+                
+                if new_previews_found:
+                    # Sort previews by step number
+                    current_previews.sort(key=get_step_from_preview_path)
+                    print(f"DEBUG - Found {len(current_previews)} previews. Latest: {os.path.basename(current_previews[-1]) if current_previews else 'None'}")
+
+
+       # Yield final videos, current previews, status, progress
+        yield videos.copy(), current_previews.copy(), status_text, progress_text_update
+
 
     p.stdout.close()
-    p.wait()
+    rc = p.wait() 
 
     clear_cuda_cache()
     time.sleep(0.5)
 
-    # Collect generated video
-    save_path_abs = os.path.abspath(save_path)
-    if os.path.exists(save_path_abs):
-        all_videos = sorted(
-            [f for f in os.listdir(save_path_abs) if f.endswith('.mp4')],
-            key=lambda x: os.path.getmtime(os.path.join(save_path_abs, x)),
-            reverse=True
-        )
-        matching_videos = [v for v in all_videos if f"_{current_seed}" in v]
-        if matching_videos:
-            video_path = os.path.join(save_path_abs, matching_videos[0])
-            
-            # Collect parameters for metadata
-            parameters = {
-                "prompt": prompt,
-                "width": width,
-                "height": height,
-                "video_length": video_length,
-                "fps": fps,
-                "infer_steps": infer_steps,
-                "seed": current_seed,
-                "task": task,
-                "flow_shift": flow_shift,
-                "guidance_scale": guidance_scale,
-                "output_type": output_type,
-                "attn_mode": attn_mode,
-                "block_swap": block_swap,
-                "input_image": input_image if "i2v" in task else None,
-                "input_video": input_image if "v2v" in task else None,
-                "control_video": control_video if "-FC" in task else None,  # Add Fun-Control info
-                "lora_weights": [lora1, lora2, lora3, lora4],
-                "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
-                "dit_path": dit_path,
-                "vae_path": vae_path,
-                "t5_path": t5_path,
-                "clip_path": clip_path if "i2v" in task or "-FC" in task else None,  # CLIP is used for both i2v and Fun-Control
-                "negative_prompt": negative_prompt if negative_prompt else None,
-                "sample_solver": sample_solver,
-                "is_fun_control": "-FC" in task  # Clear flag for Fun-Control
-            }
-            
-            add_metadata_to_video(video_path, parameters)
-            videos.append((str(video_path), f"Seed: {current_seed}"))
+    # --- Collect final generated video ---
+    generated_video_path = None
+    if rc == 0: # Only look for video if process succeeded
+        save_path_abs = os.path.abspath(save_path)
+        if os.path.exists(save_path_abs):
+            # Find the most recent mp4 containing the seed
+            all_mp4_files = glob.glob(os.path.join(save_path_abs, f"*_{current_seed}*.mp4"))
+            # Exclude files in the 'previews' subdirectory
+            all_mp4_files = [f for f in all_mp4_files if "previews" not in os.path.dirname(f)]
 
-    yield videos, f"Completed (seed: {current_seed})", ""
+            if all_mp4_files:
+                # Find the *absolute* most recent one, as multiple might match seed in edge cases
+                generated_video_path = max(all_mp4_files, key=os.path.getmtime)
+                print(f"Found newly generated video: {generated_video_path}")
+
+                # Add metadata (assuming add_metadata_to_video exists and works)
+                parameters = {
+                    "prompt": prompt, "negative_prompt": negative_prompt,
+                    "input_image": input_image if "i2v" in task else None,
+                    "width": width, "height": height, "video_length": video_length, "fps": fps,
+                    "infer_steps": infer_steps, "flow_shift": flow_shift, "guidance_scale": guidance_scale,
+                    "seed": current_seed, "task": task, "dit_path": dit_path,
+                    "vae_path": vae_path, "t5_path": t5_path, "clip_path": clip_path if "i2v" in task or is_fun_control else None,
+                    "save_path": save_path, "output_type": output_type, "sample_solver": sample_solver,
+                    "exclude_single_blocks": exclude_single_blocks, "attn_mode": attn_mode,
+                    "block_swap": block_swap, "fp8": fp8, "fp8_scaled": fp8_scaled, "fp8_t5": fp8_t5,
+                    "lora_weights": [lora1, lora2, lora3, lora4],
+                    "lora_multipliers": [lora1_multiplier, lora2_multiplier, lora3_multiplier, lora4_multiplier],
+                    "slg_layers": slg_layers, "slg_start": slg_start, "slg_end": slg_end,
+                    "enable_cfg_skip": enable_cfg_skip, "cfg_skip_mode": cfg_skip_mode, "cfg_apply_ratio": cfg_apply_ratio,
+                    "control_video": control_video if is_fun_control else None,
+                    "control_strength": control_strength if is_fun_control else None,
+                    "control_start": control_start if is_fun_control else None,
+                    "control_end": control_end if is_fun_control else None,
+                }
+                try:
+                     add_metadata_to_video(generated_video_path, parameters)
+                except NameError:
+                     print("Warning: add_metadata_to_video function not found. Skipping metadata.")
+                except Exception as meta_err:
+                     print(f"Warning: Failed to add metadata: {meta_err}")
+
+                # Append to the final video list
+                videos.append((str(generated_video_path), f"Seed: {current_seed}"))
+            else:
+                 print(f"Subprocess finished successfully (rc=0), but could not find generated video for seed {current_seed} in {save_path_abs}")
+
+    # --- Final Yield ---
+    final_status = f"Completed (seed: {current_seed})" if rc == 0 and generated_video_path else f"Failed (seed: {current_seed}, rc={rc})"
+    final_progress = f"Video saved: {os.path.basename(generated_video_path)}" if rc == 0 and generated_video_path else f"Subprocess failed with exit code {rc}"
+    yield videos, current_previews, final_status, final_progress
 
 def send_wanx_to_v2v(
     gallery: list,
@@ -5139,6 +5106,14 @@ with gr.Blocks(
                         allow_preview=True,
                         preview=True
                     )
+                    with gr.Accordion("Latent Preview (During Generation)", open=False):
+                        wanx_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        wanx_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps", info="Generates previews during the sampling loop.")
+                        wanx_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_preview_gallery"
+                        )                    
                     wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
                     wanx_i2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
                     wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
@@ -5288,6 +5263,14 @@ with gr.Blocks(
                         allow_preview=True,
                         preview=True
                     )
+                    with gr.Accordion("Latent Preview (During Generation)", open=False):
+                        wanx_t2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        wanx_t2v_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                        label="Preview Every N Steps", info="Generates previews during the sampling loop.")
+                        wanx_t2v_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_t2v_preview_gallery"
+                        )                    
                     wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan v2v")
                     wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
@@ -7677,7 +7660,7 @@ with gr.Blocks(
         fn=wanx_batch_handler,
         inputs=[
             wanx_use_random_folder,
-            wanx_prompt, 
+            wanx_prompt,
             wanx_negative_prompt,
             wanx_width,
             wanx_height,
@@ -7689,7 +7672,7 @@ with gr.Blocks(
             wanx_seed,
             wanx_batch_size,
             wanx_input_folder,
-            wanx_input_end,
+            wanx_input_end, # Make sure this is passed
             wanx_task,
             wanx_dit_folder,
             wanx_dit_path,
@@ -7712,15 +7695,24 @@ with gr.Blocks(
             wanx_enable_cfg_skip,
             wanx_cfg_skip_mode,
             wanx_cfg_apply_ratio,
+            # --- ADDED PREVIEW INPUTS ---
+            wanx_enable_preview,
+            wanx_preview_steps,
+            # --- END ADDED ---
             *wanx_lora_weights,
             *wanx_lora_multipliers,
-            wanx_input,  # Input image
-            wanx_control_video,  # Control video
+            wanx_input,              # Input image (used as input_file in handler)
+            wanx_control_video,      # Control video
             wanx_control_strength,
             wanx_control_start,
             wanx_control_end,
         ],
-        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text],
+        outputs=[
+            wanx_output,          # Main video gallery
+            wanx_preview_output,  # ADDED: Preview gallery
+            wanx_batch_progress,  # Status text
+            wanx_progress_text    # Progress text
+        ], # Now 4 outputs
         queue=True
     ).then(
         fn=lambda batch_size: 0 if batch_size == 1 else None,
@@ -7822,51 +7814,71 @@ with gr.Blocks(
         outputs=[wanx_t2v_clip_path]
     )
 
-    # Generate button handler for T2V
+        # Generate button handler for T2V
     wanx_t2v_generate_btn.click(
         fn=wanx_batch_handler,
         inputs=[
-            wanx_t2v_use_random_folder,  # First parameter - the checkbox
-            wanx_t2v_prompt, 
-            wanx_t2v_negative_prompt,
-            wanx_t2v_width,
-            wanx_t2v_height,
-            wanx_t2v_video_length,
-            wanx_t2v_fps,
-            wanx_t2v_infer_steps,
-            wanx_t2v_flow_shift,
-            wanx_t2v_guidance_scale,
-            wanx_t2v_seed,
-            wanx_t2v_batch_size,
-            wanx_t2v_input_folder,    # The input folder textbox
-            wanx_t2v_input_end,       # The end frame parameter
-            wanx_t2v_task,
-            wanx_dit_folder,      # Changed: dit_folder before dit_path
-            wanx_t2v_dit_path,        # Changed: actual model path
-            wanx_t2v_vae_path,
-            wanx_t2v_t5_path,
-            wanx_t2v_clip_path,
-            wanx_t2v_save_path,
-            wanx_t2v_output_type,     # Changed: corrected output_type
-            wanx_t2v_sample_solver,   # Changed: corrected sample_solver
-            wanx_t2v_exclude_single_blocks,
-            wanx_t2v_attn_mode,       # Changed: corrected attn_mode
-            wanx_t2v_block_swap,
-            wanx_t2v_fp8,
-            wanx_t2v_fp8_scaled,
-            wanx_t2v_fp8_t5, 
-            wanx_t2v_lora_folder,
-            wanx_t2v_slg_layers,
-            wanx_t2v_slg_start,
-            wanx_t2v_slg_end,
-            wanx_t2v_enable_cfg_skip,
-            wanx_t2v_cfg_skip_mode,
-            wanx_t2v_cfg_apply_ratio,
-            *wanx_t2v_lora_weights,
-            *wanx_t2v_lora_multipliers
+            wanx_t2v_use_random_folder, # use_random
+            wanx_t2v_prompt,            # prompt
+            wanx_t2v_negative_prompt,   # negative_prompt
+            wanx_t2v_width,             # width
+            wanx_t2v_height,            # height
+            wanx_t2v_video_length,      # video_length
+            wanx_t2v_fps,               # fps
+            wanx_t2v_infer_steps,       # infer_steps
+            wanx_t2v_flow_shift,        # flow_shift
+            wanx_t2v_guidance_scale,    # guidance_scale
+            wanx_t2v_seed,              # seed
+            wanx_t2v_batch_size,        # batch_size
+            wanx_t2v_input_folder,      # input_folder_path
+            wanx_t2v_input_end,         # wanx_input_end
+            wanx_t2v_task,              # task
+            wanx_dit_folder,            # dit_folder (shared)
+            wanx_t2v_dit_path,          # dit_path
+            wanx_t2v_vae_path,          # vae_path
+            wanx_t2v_t5_path,           # t5_path
+            wanx_t2v_clip_path,         # clip_path (often None for t2v)
+            wanx_t2v_save_path,         # save_path
+            wanx_t2v_output_type,       # output_type
+            wanx_t2v_sample_solver,     # sample_solver
+            wanx_t2v_exclude_single_blocks, # exclude_single_blocks
+            wanx_t2v_attn_mode,         # attn_mode
+            wanx_t2v_block_swap,        # block_swap
+            wanx_t2v_fp8,               # fp8
+            wanx_t2v_fp8_scaled,        # fp8_scaled
+            wanx_t2v_fp8_t5,            # fp8_t5
+            wanx_t2v_lora_folder,       # lora_folder
+            wanx_t2v_slg_layers,        # slg_layers
+            wanx_t2v_slg_start,         # slg_start
+            wanx_t2v_slg_end,           # slg_end
+            wanx_t2v_enable_cfg_skip,   # enable_cfg_skip
+            wanx_t2v_cfg_skip_mode,     # cfg_skip_mode
+            wanx_t2v_cfg_apply_ratio,   # cfg_apply_ratio
+            # --- ADDED PREVIEW INPUTS ---
+            wanx_t2v_enable_preview,
+            wanx_t2v_preview_steps,
+            # --- END ADDED ---
+            *wanx_t2v_lora_weights,     # *lora_params (weights)
+            *wanx_t2v_lora_multipliers, # *lora_params (multipliers)
+            # --- ADDED Placeholders for trailing args expected by wanx_batch_handler ---
+            gr.File(value=None, visible=False), # Placeholder for input_file (None for T2V)
+            gr.Video(value=None, visible=False), # Placeholder for control_video (None for T2V)
+            gr.Number(value=1.0, visible=False), # Placeholder for control_strength
+            gr.Number(value=0.0, visible=False), # Placeholder for control_start
+            gr.Number(value=1.0, visible=False), # Placeholder for control_end
+            # --- END Placeholders ---
         ],
-        outputs=[wanx_t2v_output, wanx_t2v_batch_progress, wanx_t2v_progress_text],
+        outputs=[
+            wanx_t2v_output,         # Main video gallery
+            wanx_t2v_preview_output, # ADDED: Preview gallery
+            wanx_t2v_batch_progress, # Status text
+            wanx_t2v_progress_text   # Progress text
+        ], # Now 4 outputs
         queue=True
+    ).then(
+        fn=lambda batch_size: 0 if batch_size == 1 else None,
+        inputs=[wanx_t2v_batch_size],
+        outputs=wanx_t2v_selected_index
     )
     
     # Add refresh button handler for WanX-t2v tab
