@@ -88,7 +88,8 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 4/29/2025  
-     Wan2.1-Fun-V1.1-14B-InP-FP16.safetensors is available at https://huggingface.co/maybleMyers/wan_files_for_h1111  
+    Add initial preview support to the wanX-i2v tab. If you want to use them use the preview branch.  
+    Wan2.1-Fun-V1.1-14B-InP-FP16.safetensors is available at https://huggingface.co/maybleMyers/wan_files_for_h1111  
 4/26/2025  
     Add SkyReels-V2-I2V-14B-720P-FP16.safetensors to supported models.  
     Added alot better options for Framepack including working sectional images, Thanks to kohya!  
