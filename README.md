@@ -87,6 +87,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+4/30/2025  
+    Previews for framepack in the preview branch. You will need to reinstall requirements and requirementsFP.txt (pip install -r requirements.txt)  
 4/29/2025  
     Add initial preview support to the wanX-i2v tab based. If you want to use them use the preview branch. Thanks to Sarania (https://github.com/Sarania/musubi-tuner)   
     Wan2.1-Fun-V1.1-14B-InP-FP16.safetensors is available at https://huggingface.co/maybleMyers/wan_files_for_h1111  
@@ -130,7 +132,7 @@ I have tested the 14B i2v and t2v models so far to be working
 3/1/2025  
     Added support for Skyreels Video to Video and Text to Video.   
 2/23/2025  
-    Added initial support for skyreels using musubi's skyreel implementation. (thanks  sdbds && Kijai :D)
+    Added initial support for skyreels-V1 using musubi's skyreel implementation. (thanks  sdbds)
 download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and add them to your hunyuan folder
 skyreels_hunyuan_i2v_bf16.safetensors
 skyreels_hunyuan_t2v_bf16.safetensors
