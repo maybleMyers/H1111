@@ -24,12 +24,31 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 from diffusers_helper.bucket_tools import find_nearest_bucket
+import time
 
 
 # Add global stop event
 stop_event = threading.Event()
 
 logger = logging.getLogger(__name__)
+
+def set_random_seed():
+    """Returns -1 to set the seed input to random."""
+    return -1
+
+def get_step_from_preview_path(path): # Helper function
+    # Extracts step number from preview filenames like latent_preview_step_005.mp4
+    # or for framepack: latent_preview_section_002.mp4 (assuming sections for framepack)
+    # Let's adjust for potential FramePack naming convention (using 'section' instead of 'step')
+    base = os.path.basename(path)
+    match_step = re.search(r"step_(\d+)", base)
+    if match_step:
+        return int(match_step.group(1))
+    match_section = re.search(r"section_(\d+)", base) # Check for FramePack section naming
+    if match_section:
+        # Maybe treat sections differently? Or just return the number? Let's return number.
+        return int(match_section.group(1))
+    return -1 # Default if no number found
 
 def process_framepack_video(
     # --- Standard initial args ---
@@ -75,10 +94,12 @@ def process_framepack_video(
     save_path: str, # Argument being checked
     # --- LoRA Params ---
     lora_folder: str,
+    enable_preview: bool,
+    preview_every_n_sections: int,
     # --- CORRECTED: Use *args to capture variable inputs ---
     *args: Any
     # --- End Corrected ---
-) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]: # Modified return type for preview path
     """Generate video using fpack_generate_video.py"""
     global stop_event
     stop_event.clear()
@@ -106,8 +127,9 @@ def process_framepack_video(
     lora_weights_list = list(args[images_end:lora_weights_end]) # Convert tuple slice to list
     lora_multipliers_list = list(args[lora_weights_end:lora_mults_end]) # Convert tuple slice to list
 
-    if not input_image and not any(img for img in framepack_sec_images if img): # Need start image OR section images
-        yield [], "Error: Input start image or at least one section image override is required.", ""
+    if not input_image and not any(img for img in framepack_sec_images if img):
+        # Yield empty preview path on error
+        yield [], None, "Error: Input start image or at least one section image override is required.", ""
         return
 
     # --- Prepare Section Control Strings ---
@@ -198,7 +220,7 @@ def process_framepack_video(
     total_sections_estimate = int(max(round(total_sections_estimate_float), 1))
     progress_text = f"Starting FramePack generation batch ({total_sections_estimate} estimated sections per video)..."
     status_text = "Preparing batch..."
-    yield all_videos, status_text, progress_text
+    yield all_videos, None, status_text, progress_text
 
     # --- LoRA Setup ---
     valid_loras_paths = []
@@ -219,101 +241,72 @@ def process_framepack_video(
                      valid_loras_mults.append(str(mult))
                  else:
                      print(f"Warning: LoRA file not found: {lora_path}")
+    # Define preview file path base name (backend script creates .mp4 or .png)
+    preview_base_path = os.path.join(save_path, "latent_preview")
+    preview_mp4_path = preview_base_path + ".mp4"
+    preview_png_path = preview_base_path + ".png"
 
     # --- Loop for UI Batching ---
     for i in range(batch_size):
         if stop_event.is_set():
-            yield all_videos, "Generation stopped by user.", ""
+            yield all_videos, None, "Generation stopped by user.", ""
             return
 
         current_seed = seed
-        if seed == -1:
-            current_seed = random.randint(0, 2**32 - 1)
-        elif batch_size > 1:
-            current_seed = seed + i
+        if seed == -1: current_seed = random.randint(0, 2**32 - 1)
+        elif batch_size > 1: current_seed = seed + i
 
         status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
         progress_text = f"Item {i+1}/{batch_size}: Preparing subprocess..."
         current_video_path = None
-        # Initial yield for the new item starting
-        yield all_videos.copy(), status_text, progress_text
+        # --- Reset preview state for this batch item ---
+        current_preview_yield_path = None
+        last_preview_mtime = 0
+        # --- End Reset ---
+        # Initial yield for the new item starting (with empty preview)
+        yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
 
         # --- Prepare Environment and Command ---
         env = os.environ.copy()
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         env["PYTHONIOENCODING"] = "utf-8"
-
         clear_cuda_cache()
 
         # --- Command Construction for fpack_generate_video.py ---
         command = [
-            sys.executable,
-            "fpack_generate_video.py",
-            # Required Paths
-            "--text_encoder1", text_encoder_path,
-            "--text_encoder2", text_encoder_2_path,
+            sys.executable, "fpack_generate_video.py",
+            "--text_encoder1", text_encoder_path, "--text_encoder2", text_encoder_2_path,
             "--image_encoder", image_encoder_path,
-            # --- MODIFIED: Image Path Handling ---
-            # Add --image_path only if we determined a valid path (base or section overrides)
             *(["--image_path", final_image_path_arg] if final_image_path_arg else []),
-            # --- End Modified ---
-            "--save_path", save_path,
-            # Core Params
-            # --- MODIFIED: Prompt Handling ---
-            "--prompt", final_prompt_arg,
-            # --- End Modified ---
+            "--save_path", save_path, "--prompt", final_prompt_arg,
             "--video_size", str(final_height), str(final_width),
-            "--video_seconds", str(total_second_length),
-            "--fps", str(fps),
-            "--infer_steps", str(steps),
-            "--seed", str(current_seed),
+            "--video_seconds", str(total_second_length), "--fps", str(fps),
+            "--infer_steps", str(steps), "--seed", str(current_seed),
             "--embedded_cfg_scale", str(distilled_guidance_scale),
-            "--guidance_scale", str(cfg),
-            "--guidance_rescale", str(rs),
-            "--latent_window_size", str(latent_window_size), # Pass fixed value
-            "--sample_solver", sample_solver,
-            # Fixed/Defaulted options
-            "--output_type", "video",
-            "--attn_mode", attn_mode
+            "--guidance_scale", str(cfg), "--guidance_rescale", str(rs),
+            "--latent_window_size", str(latent_window_size),
+            "--sample_solver", sample_solver, "--output_type", "video", "--attn_mode", attn_mode
         ]
-
-        if transformer_path and transformer_path.strip() and os.path.exists(transformer_path): # Check existence
-            command.extend(["--dit", transformer_path.strip()])
-
-        if vae_path and vae_path.strip() and os.path.exists(vae_path):
-             command.extend(["--vae", vae_path.strip()])
-
-        # Optional Negative Prompt
-        if negative_prompt and negative_prompt.strip():
-            command.extend(["--negative_prompt", negative_prompt.strip()])
-
-        # Optional End Frame and Blending Logic
-        if input_end_frame and os.path.exists(input_end_frame):
-             command.extend(["--end_image_path", input_end_frame])
-             # Conditionally add influence mode and weight if relevant
-
-        # Boolean Flags
+        if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
+        if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
+        if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
+        if input_end_frame and os.path.exists(input_end_frame): command.extend(["--end_image_path", input_end_frame])
         if fp8: command.append("--fp8")
-        if fp8 and fp8_scaled: command.append("--fp8_scaled") # Check fp8 is also enabled
+        if fp8 and fp8_scaled: command.append("--fp8_scaled")
         if fp8_llm: command.append("--fp8_llm")
         if bulk_decode: command.append("--bulk_decode")
-
-        # Performance/Memory Options
-        if blocks_to_swap > 0:
-            command.extend(["--blocks_to_swap", str(blocks_to_swap)])
-        if vae_chunk_size is not None and vae_chunk_size > 0:
-             command.extend(["--vae_chunk_size", str(vae_chunk_size)])
-        if vae_spatial_tile_sample_min_size is not None and vae_spatial_tile_sample_min_size > 0:
-             command.extend(["--vae_spatial_tile_sample_min_size", str(vae_spatial_tile_sample_min_size)])
-
-        # Optional Device Override
-        if device and device.strip():
-            command.extend(["--device", device.strip()])
-
-        # Add LoRAs
+        if blocks_to_swap > 0: command.extend(["--blocks_to_swap", str(blocks_to_swap)])
+        if vae_chunk_size is not None and vae_chunk_size > 0: command.extend(["--vae_chunk_size", str(vae_chunk_size)])
+        if vae_spatial_tile_sample_min_size is not None and vae_spatial_tile_sample_min_size > 0: command.extend(["--vae_spatial_tile_sample_min_size", str(vae_spatial_tile_sample_min_size)])
+        if device and device.strip(): command.extend(["--device", device.strip()])
         if valid_loras_paths:
             command.extend(["--lora_weight"] + valid_loras_paths)
             command.extend(["--lora_multiplier"] + valid_loras_mults)
+
+        # --- ADDED: Add preview argument if enabled ---
+        if enable_preview and preview_every_n_sections > 0:
+            command.extend(["--preview_latent_every", str(preview_every_n_sections)])
+            print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections.")
 
         # Ensure all command parts are strings
         command_str = [str(c) for c in command]
@@ -442,9 +435,31 @@ def process_framepack_video(
             elif phase_changed and current_phase not in ["Saved", "Error"]:
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
+            preview_updated = False
+            current_mtime = 0
+            found_preview_path = None
+
+            if enable_preview:
+                # Check MP4 first, then PNG
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    found_preview_path = preview_mp4_path
+                elif os.path.exists(preview_png_path):
+                    current_mtime = os.path.getmtime(preview_png_path)
+                    found_preview_path = preview_png_path
+
+                if found_preview_path and current_mtime > last_preview_mtime:
+                    print(f"DEBUG: Preview file updated: {found_preview_path} (mtime: {current_mtime})")
+                    # --- FIX: Yield the clean path ---
+                    current_preview_yield_path = found_preview_path # REMOVED the cache buster
+                    # --- END FIX ---
+                    last_preview_mtime = current_mtime
+                    preview_updated = True
+            # --- End Preview Check ---
+
             # --- YIELD ---
-            # Ensure the latest status and progress are yielded after processing each line
-            yield all_videos.copy(), status_text, progress_text
+            # Yield progress and potentially updated clean preview path
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
 
         # --- Subprocess Finished ---
         p.stdout.close(); rc = p.wait()
@@ -505,21 +520,21 @@ def process_framepack_video(
 
             status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
-            yield all_videos.copy(), status_text, progress_text
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
         elif rc != 0:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
-            yield all_videos.copy(), status_text, progress_text
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
             # Don't add to all_videos if failed
         else: # rc == 0 but current_video_path is not set or doesn't exist
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = "Subprocess finished, but could not confirm generated video file. Check logs."
-            yield all_videos.copy(), status_text, progress_text
+    yield all_videos, current_preview_yield_path, "FramePack Batch complete", ""
 
-        time.sleep(0.2) # Small delay between batch items
+    time.sleep(0.2) # Small delay between batch items
 
     # --- Final Yield ---
-    yield all_videos, "FramePack Batch complete", ""
+    yield all_videos, current_preview_yield_path, "FramePack Batch complete", ""
 
 def calculate_framepack_width(height, original_dims):
     """Calculate FramePack width based on height maintaining aspect ratio (divisible by 32)"""
@@ -4381,16 +4396,25 @@ with gr.Blocks(
 
         function updateTitle(text) {
             if (text && text.trim()) {
-                const progressMatch = text.match(/(\d+)%.*\[.*<(\d+:\d+),/);
-                if (progressMatch) {
-                    const percentage = progressMatch[1];
-                    const timeRemaining = progressMatch[2];
+                // Regex for the FramePack format: "Item ... (...)% | ... Remaining: HH:MM"
+                // Captures: 1. Percentage (digits inside parens)
+                //           2. Remaining Time (HH:MM after "Remaining: ")
+                const framepackMatch = text.match(/.*?\((\d+)%\).*?Remaining:\s*(\d{2}:\d{2})/); // <--- NEW REGEX
+                if (framepackMatch) {
+                    const percentage = framepackMatch[1];     // Group 1: Percentage
+                    const timeRemaining = framepackMatch[2]; // Group 2: Remaining Time
                     document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
+                } else {
+                   // Optional: Fallback or reset if no match? You could add the old regex here if needed.
+                   // const originalMatch = text.match(/(\d+)%.*\[.*<(\d+:\d+),/);
+                   // if (originalMatch) { ... }
+                   // else { document.title = 'H1111'; /* Reset title if nothing matches */ }
                 }
             }
         }
 
         setTimeout(() => {
+            // QuerySelectorAll should still work fine even with the new regex logic
             const progressElements = document.querySelectorAll('textarea.scroll-hide');
             progressElements.forEach(element => {
                 if (element) {
@@ -4425,7 +4449,7 @@ with gr.Blocks(
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
-                    framepack_progress_text = gr.Textbox(label="Progress", interactive=False, value="", lines=1)
+                    framepack_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
             with gr.Row():
                 framepack_generate_btn = gr.Button("Generate FramePack Video", elem_classes="green-btn")
                 framepack_stop_btn = gr.Button("Stop Generation", variant="stop")
@@ -4475,7 +4499,9 @@ with gr.Blocks(
                              )
                     framepack_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Total Video Length (seconds)", value=5.0)
                     framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
-                    framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                    with gr.Row():
+                        framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        framepack_random_seed =gr.Button("🎲️")
                     framepack_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Steps", value=25, interactive=True) # Moved here
 
                 # --- Right Column ---
@@ -4486,8 +4512,19 @@ with gr.Blocks(
                         object_fit="contain", height="auto", show_label=True,
                         elem_id="gallery_framepack", allow_preview=True, preview=True
                     )
-                    # Removed progress gallery as intermediate saving is not supported by backend
-                    # LoRA Section - Now Interactive
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        with gr.Row():
+                            framepack_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                            framepack_preview_every_n_sections = gr.Slider(
+                                minimum=1, maximum=50, step=1, value=1,
+                                label="Preview Every N Sections",
+                                info="Generates previews during the sampling loop."
+                            )
+                        framepack_preview_output = gr.Video( # Changed from Gallery to Video
+                             label="Latest Preview", height=300,
+                             interactive=False, # Not interactive for display
+                             elem_id="framepack_preview_video"
+                        )
                     with gr.Group():
                         with gr.Row():
                             framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
@@ -5822,43 +5859,52 @@ with gr.Blocks(
     framepack_generate_btn.click(
         fn=process_framepack_video,
         inputs=[
-            # --- Standard initial args ---
+            # Standard args
             framepack_prompt, framepack_negative_prompt, framepack_input_image,
-            # --- End Frame Args ---
+            # End Frame args
             framepack_input_end_frame, framepack_end_frame_influence, framepack_end_frame_weight,
-            # --- Model Paths ---
-            framepack_transformer_path,
-            framepack_vae_path,
-            framepack_text_encoder_path,
-            framepack_text_encoder_2_path,
-            framepack_image_encoder_path,
-            # --- Core Generation Params ---
+            # Model Paths
+            framepack_transformer_path, framepack_vae_path, framepack_text_encoder_path,
+            framepack_text_encoder_2_path, framepack_image_encoder_path,
+            # Core Params
             framepack_target_resolution, framepack_width, framepack_height, framepack_original_dims,
             framepack_total_second_length, framepack_fps, framepack_seed, framepack_steps,
             framepack_distilled_guidance_scale, framepack_guidance_scale, framepack_guidance_rescale,
             framepack_sample_solver, framepack_latent_window_size,
-            # --- Performance/Memory ---
+            # Performance/Memory
             framepack_fp8, framepack_fp8_scaled, framepack_fp8_llm,
             framepack_blocks_to_swap, framepack_bulk_decode, framepack_attn_mode,
             framepack_vae_chunk_size, framepack_vae_spatial_tile_sample_min_size,
             framepack_device,
-            # --- Batching & Saving ---
-            framepack_batch_size,
-            framepack_save_path,
-            # --- LoRA Params ---
+            # Batching & Saving
+            framepack_batch_size, framepack_save_path,
+            # LoRA Params
             framepack_lora_folder,
-            # --- ADDED: Section Control Inputs ---
-            *framepack_secs,         # List of gr.Number components
-            *framepack_sec_prompts,  # List of gr.Textbox components
-            *framepack_sec_images,   # List of gr.Image components
-            # --- End Added Inputs ---
-            *framepack_lora_weights,
-            *framepack_lora_multipliers
+            # --- ADDED: Preview Params ---
+            framepack_enable_preview,
+            framepack_preview_every_n_sections,
+            # --- End Added ---
+            # Section Controls
+            *framepack_secs, *framepack_sec_prompts, *framepack_sec_images,
+            # LoRAs (actual components)
+            *framepack_lora_weights, *framepack_lora_multipliers
         ],
-        outputs=[framepack_output, framepack_batch_progress, framepack_progress_text],
+        # --- UPDATED: Outputs list includes preview video ---
+        outputs=[
+            framepack_output,           # Main gallery
+            framepack_preview_output,   # Preview video player
+            framepack_batch_progress,   # Status text
+            framepack_progress_text     # Progress text
+        ],
+        # --- End Updated ---
         queue=True
     )
 
+    framepack_random_seed.click(
+        fn=set_random_seed,
+        inputs=None, 
+        outputs=[framepack_seed] 
+    )
     # Connect FramePack Stop button
     framepack_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
@@ -7933,5 +7979,13 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
+if __name__ == "__main__":
+    # Make sure 'outputs' directory exists
+    os.makedirs("outputs", exist_ok=True)
+    # Optional: Clean temp_frames directory on startup
+    #if os.path.exists("temp_frames"):
+    #    try: shutil.rmtree("temp_frames")
+    #    except OSError as e: print(f"Error removing temp_frames: {e}")
+    os.makedirs("temp_frames", exist_ok=True)
 
 demo.queue().launch(server_name="0.0.0.0", share=False)
