@@ -180,6 +180,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
 
+    #parser.add_argument("--preview_latent_every", type=int, default=None, help="Preview latent every N sections")
+    parser.add_argument("--preview_suffix", type=str, default=None, help="Unique suffix for preview files to avoid conflicts in concurrent runs.")
+
     parser = add_blissful_args(parser)
     args = parser.parse_args()
     args = parse_blissful_args(args)
@@ -859,7 +862,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
         real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
         if args.preview_latent_every is not None and (section_index_reverse + 1) % args.preview_latent_every == 0:
-            previewer.preview(real_history_latents)
+            previewer.preview(real_history_latents.to(gen_settings.device), section_index, preview_suffix=args.preview_suffix)
 
         logger.info(f"Generated. Latent shape {real_history_latents.shape}")
 

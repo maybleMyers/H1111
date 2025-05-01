@@ -251,6 +251,13 @@ def process_framepack_video(
         if stop_event.is_set():
             yield all_videos, None, "Generation stopped by user.", ""
             return
+        
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"fpack_{run_id}" # Add prefix for clarity
+        # --- Construct unique preview paths ---
+        preview_base_path = os.path.join(save_path, f"latent_preview_{unique_preview_suffix}")
+        preview_mp4_path = preview_base_path + ".mp4"
+        preview_png_path = preview_base_path + ".png"
 
         current_seed = seed
         if seed == -1: current_seed = random.randint(0, 2**32 - 1)
@@ -306,7 +313,10 @@ def process_framepack_video(
         # --- ADDED: Add preview argument if enabled ---
         if enable_preview and preview_every_n_sections > 0:
             command.extend(["--preview_latent_every", str(preview_every_n_sections)])
-            print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections.")
+            # --- ADDED: Pass the unique suffix ---
+            command.extend(["--preview_suffix", unique_preview_suffix])
+            # --- End Pass Suffix ---
+            print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
 
         # Ensure all command parts are strings
         command_str = [str(c) for c in command]
@@ -763,7 +773,7 @@ def process_i2v_single_video(
         if stop_event.is_set():
             p.terminate()
             p.wait()
-            yield [], "", "Generation stopped by user."
+            yield videos, current_previews, "Generation stopped by user.", ""
             return
 
         line = p.stdout.readline()
@@ -3500,6 +3510,13 @@ def wanx_generate_video(
         yield [], [], "", "" # Yield empty previews
         return
 
+    run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    unique_preview_suffix = f"wanx_{run_id}" # Add prefix for clarity
+    # --- Construct unique preview paths ---
+    preview_base_path = os.path.join(save_path, f"latent_preview_{unique_preview_suffix}")
+    preview_mp4_path = preview_base_path + ".mp4"
+    preview_png_path = preview_base_path + ".png"
+
     # Check if this is a Fun-Control task
     is_fun_control = "-FC" in task and control_video is not None
     if is_fun_control:
@@ -3568,7 +3585,10 @@ def wanx_generate_video(
     # Fix 3: Only add boolean flags if they're True
     if enable_preview and preview_steps > 0:
         command.extend(["--preview", str(preview_steps)])
-        print(f"DEBUG - Enabling preview every {preview_steps} steps.")
+        # --- ADDED: Pass the unique suffix ---
+        command.extend(["--preview_suffix", unique_preview_suffix])
+        # --- End Pass Suffix ---
+        print(f"DEBUG - Enabling preview every {preview_steps} steps with suffix {unique_preview_suffix}.")
 
     if enable_cfg_skip and cfg_skip_mode != "none":
         command.extend([
@@ -3685,9 +3705,10 @@ def wanx_generate_video(
     )
 
     videos = []
-    # current_previews list initialized at the start
-    preview_dir = save_path
-    processed_preview_files = set() # Keep track of previews already yielded
+    processed_preview_files = set() # Keep track of previews already yielded - REMAINS THE SAME IN UI FUNCTION
+    # --- Reset preview state for this run ---
+    current_preview_yield_path = None
+    last_preview_mtime = 0
     
     while True:
         if stop_event.is_set():
@@ -3713,40 +3734,33 @@ def wanx_generate_video(
             status_text = f"Error (seed: {current_seed})"
             progress_text_update = line # Show error line
         # Add any other status parsing if needed
-        preview_list_for_update = [] # Default to empty list
+        preview_updated = False
+        current_mtime = 0
+        found_preview_path = None
+
         if enable_preview:
-            # Define potential paths
-            mp4_preview = os.path.join(preview_dir, "latent_preview.mp4")
-            png_preview = os.path.join(preview_dir, "latent_preview.png")
+            # --- MODIFIED: Check unique paths ---
+            if os.path.exists(preview_mp4_path):
+                current_mtime = os.path.getmtime(preview_mp4_path)
+                found_preview_path = preview_mp4_path
+            elif os.path.exists(preview_png_path):
+                current_mtime = os.path.getmtime(preview_png_path)
+                found_preview_path = preview_png_path
+            # --- End Modified Check ---
 
-            found_path = None
-            if os.path.exists(mp4_preview):
-                found_path = mp4_preview
-            elif os.path.exists(png_preview):
-                found_path = png_preview
+            if found_preview_path and current_mtime > last_preview_mtime:
+                print(f"DEBUG: Preview file updated: {found_preview_path} (mtime: {current_mtime})")
+                # Yield the clean path (already unique)
+                current_preview_yield_path = found_preview_path # No cache buster needed
+                last_preview_mtime = current_mtime
+                preview_updated = True
+        # --- End Preview Check ---
 
-            if found_path:
-                # Get absolute path and add it to the list for the gallery
-                abs_path = os.path.abspath(found_path)
-                preview_list_for_update = [abs_path] # <<< NO cache buster
-
-        yield videos.copy(), gr.update(value=preview_list_for_update), status_text, progress_text_update
-
-
-    # --- Final Yield ---
-    final_status = f"Completed (seed: {current_seed})" if rc == 0 and generated_video_path else f"Failed (seed: {current_seed}, rc={rc})"
-    final_progress = f"Video saved: {os.path.basename(generated_video_path)}" if rc == 0 and generated_video_path else f"Subprocess failed with exit code {rc}"
-    # Check for the preview file one last time for the final update
-    final_preview_list = []
-    mp4_preview = os.path.join(preview_dir, "latent_preview.mp4")
-    png_preview = os.path.join(preview_dir, "latent_preview.png")
-    if os.path.exists(mp4_preview):
-        final_preview_list = [os.path.abspath(mp4_preview)] # <<< NO cache buster
-    elif os.path.exists(png_preview):
-        final_preview_list = [os.path.abspath(png_preview)] # <<< NO cache buster
-
-    yield videos, gr.update(value=final_preview_list), final_status, final_progress
-
+        # --- YIELD ---
+        # Yield progress and potentially updated unique preview path
+            preview_list_for_yield = [current_preview_yield_path] if current_preview_yield_path else []
+            # Yield progress and potentially updated unique preview path list
+            yield videos.copy(), preview_list_for_yield, status_text, progress_text_update
 
     p.stdout.close()
     rc = p.wait() 
@@ -3804,7 +3818,21 @@ def wanx_generate_video(
 # --- Final Yield ---
     final_status = f"Completed (seed: {current_seed})" if rc == 0 and generated_video_path else f"Failed (seed: {current_seed}, rc={rc})"
     final_progress = f"Video saved: {os.path.basename(generated_video_path)}" if rc == 0 and generated_video_path else f"Subprocess failed with exit code {rc}"
-    yield videos, gr.update(value=current_previews), final_status, final_progress
+
+    # Check for the preview file one last time for the final update (using unique path)
+    # --- MODIFIED Final Preview Check and List Creation ---
+    final_preview_path = None
+    # --- Use the UNIQUE paths defined earlier in the function ---
+    if os.path.exists(preview_mp4_path):
+        final_preview_path = os.path.abspath(preview_mp4_path)
+    elif os.path.exists(preview_png_path):
+        final_preview_path = os.path.abspath(preview_png_path)
+    # --- End path checking ---
+
+    final_preview_list_for_yield = [final_preview_path] if final_preview_path else []
+    # --- End Modified ---
+
+    yield videos, final_preview_list_for_yield, final_status, final_progress
 
 def send_wanx_to_v2v(
     gallery: list,

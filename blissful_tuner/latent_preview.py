@@ -62,7 +62,7 @@ class LatentPreviewer():
 
 
     @torch.inference_mode()
-    def preview(self, noisy_latents, current_step=None):
+    def preview(self, noisy_latents, current_step=None, preview_suffix=None):
         if self.device == "cuda" or self.device == torch.device("cuda"):
             torch.cuda.empty_cache()
         if self.model_type == "wan":
@@ -100,7 +100,7 @@ class LatentPreviewer():
             upscaled = decoded
 
         _, _, h, w = upscaled.shape
-        self.write_preview(upscaled, w, h)
+        self.write_preview(upscaled, w, h, preview_suffix=preview_suffix)
 
     @torch.inference_mode()
     def subtract_original_and_normalize(self, noisy_latents, current_step):
@@ -119,16 +119,17 @@ class LatentPreviewer():
         return normalized_denoisy_latents
 
     @torch.inference_mode()
-    def write_preview(self, frames, width, height):
-        target = os.path.join(self.args.save_path, "latent_preview.mp4")
+    def write_preview(self, frames, width, height, preview_suffix=None):
+        suffix_str = f"_{preview_suffix}" if preview_suffix else ""
+        base_name = f"latent_preview{suffix_str}"
+        target = os.path.join(self.args.save_path, f"{base_name}.mp4")
+        target_img = os.path.join(self.args.save_path, f"{base_name}.png")
         # Check if we only have a single frame.
         if frames.shape[0] == 1:
             # Clamp, scale, convert to byte and move to CPU
             frame = frames[0].clamp(0, 1).mul(255).byte().cpu()
             # Permute from (3, H, W) to (H, W, 3) for PIL.
             frame_np = frame.permute(1, 2, 0).numpy()
-            # Change the target filename from .mp4 to .png
-            target_img = target.replace(".mp4", ".png")
             Image.fromarray(frame_np).save(target_img)
             #logger.info(f"Saved single frame preview to {target_img}") # Add log
             return
@@ -137,41 +138,44 @@ class LatentPreviewer():
         # Make sure fps is at least 1
         output_fps = max(1, self.fps)
         #logger.info(f"Writing preview video to {target} at {output_fps} FPS") # Add log
-        container = av.open(target, mode="w")
-        stream = container.add_stream("libx264", rate=output_fps) # Use output_fps
-        stream.pix_fmt = "yuv420p"
-        stream.width = width
-        stream.height = height
-        # Add option for higher quality preview encoding if needed
-        # stream.options = {'crf': '18'} # Example: Lower CRF = higher quality
-
-        # Loop through each frame.
-        for frame_idx, frame in enumerate(frames):
-            # Clamp to [0,1], scale, convert to byte and move to CPU.
-            frame = frame.clamp(0, 1).mul(255).byte().cpu()
-            # Permute from (3, H, W) -> (H, W, 3) for AV.
-            frame_np = frame.permute(1, 2, 0).numpy()
-            try:
-                video_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
-                for packet in stream.encode(video_frame):
-                    container.mux(packet)
-            except Exception as e:
-                 logger.error(f"Error encoding frame {frame_idx}: {e}")
-                 # Optionally break or continue if one frame fails
-                 break
-
-
-        # Flush out any remaining packets and close.
         try:
-            for packet in stream.encode():
-                container.mux(packet)
-            container.close()
-            #logger.info(f"Finished writing preview video: {target}") # Add log
+            container = av.open(target, mode="w")
+            stream = container.add_stream("libx264", rate=output_fps) # Use output_fps
+            stream.pix_fmt = "yuv420p"
+            stream.width = width
+            stream.height = height
+            # Add option for higher quality preview encoding if needed
+            # stream.options = {'crf': '18'} # Example: Lower CRF = higher quality
+
+            # Loop through each frame.
+            for frame_idx, frame in enumerate(frames):
+                # Clamp to [0,1], scale, convert to byte and move to CPU.
+                frame = frame.clamp(0, 1).mul(255).byte().cpu()
+                # Permute from (3, H, W) -> (H, W, 3) for AV.
+                frame_np = frame.permute(1, 2, 0).numpy()
+                try:
+                    video_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+                    for packet in stream.encode(video_frame):
+                        container.mux(packet)
+                except Exception as e:
+                     logger.error(f"Error encoding frame {frame_idx}: {e}")
+                     # Optionally break or continue if one frame fails
+                     break
+
+
+            # Flush out any remaining packets and close.
+            try:
+                for packet in stream.encode():
+                    container.mux(packet)
+                container.close()
+                #logger.info(f"Finished writing preview video: {target}") # Add log
+            except Exception as e:
+                 logger.error(f"Error finalizing preview video: {e}")
+                 # Clean up container if possible
+                 try: container.close()
+                 except: pass
         except Exception as e:
-             logger.error(f"Error finalizing preview video: {e}")
-             # Clean up container if possible
-             try: container.close()
-             except: pass
+            logger.error(f"Error opening or writing to preview container {target}: {e}")
 
     @torch.inference_mode()
     def decode_taehv(self, latents):

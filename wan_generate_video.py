@@ -215,6 +215,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview", type=int, default=None, metavar="N",
         help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory.",
     )
+    parser.add_argument("--preview_suffix", type=str, default=None,
+        help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
+    )
 
     args = parser.parse_args()
 
@@ -357,6 +360,8 @@ def create_funcontrol_conditioning_latent(
             img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
 
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
+                # vae.encode expects a list, returns a list. Take first element.
+                # Result shape [C', F', H', W'] - needs batch dim for processing here
                 end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
             # Calculate end image influence transition (S-curve / cubic)
@@ -1236,7 +1241,7 @@ def prepare_i2v_inputs(
         logger.info(f"Encoding image to CLIP context")
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
             # Use the [-1, 1] tensor directly if clip.visual expects that format
-            # clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Original had [img_tensor[:, None, :, :]] which adds frame dim
+            # clip_context = clip.visual([img_tensor[:, None, :, :]]).squeeze(1) # Original had [img_tensor[:, None, :, :]] which adds frame dim
             # Use unsqueeze(1) which seems more consistent with other parts
             clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Add Frame dim
         logger.info(f"CLIP Encoding complete")
@@ -1652,6 +1657,7 @@ def run_sampling(
     accelerator: Accelerator,
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
+    preview_suffix: Optional[str] = None # <<< ADD suffix argument
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
     Args:
@@ -1666,6 +1672,7 @@ def run_sampling(
         accelerator: Accelerator instance
         previewer: LatentPreviewer instance or None # Added description
         use_cpu_offload: Whether to offload tensors to CPU during processing (example)
+        preview_suffix: Unique suffix for preview files to avoid conflicts in concurrent runs.
     Returns:
         torch.Tensor: generated latent
     """
@@ -1812,7 +1819,7 @@ def run_sampling(
                       # Pass the *resulting* latent from this step (prev_latent).
                       # Ensure it's on the compute device for the previewer call.
                       # LatentPreviewer handles internal device management.
-                      # Need to pass without batch dim if previewer expects [C,F,H,W]
+                      # Need to pass without batch dim if previewer expects [C, F, H, W]
                       # Check LatentPreviewer.preview expects [C, F, H, W]
                       if len(prev_latent.shape) == 5:
                           preview_latent_input = prev_latent.squeeze(0) # Remove batch dim
@@ -1821,7 +1828,7 @@ def run_sampling(
 
                       # Pass the latent on the main compute device
                       print(f"DEBUG run_sampling: Step {i}, prev_latent shape: {prev_latent.shape}, preview_latent_input shape: {preview_latent_input.shape}")
-                      previewer.preview(preview_latent_input.to(device), i) # Pass 0-based index 'i'
+                      previewer.preview(preview_latent_input.to(device), i, preview_suffix=preview_suffix) # Pass 0-based index 'i'
                  except Exception as e:
                       logger.error(f"Error during latent preview generation at step {i + 1}: {e}", exc_info=True)
                       # Optional: Disable previewer after first error to avoid repeated logs/errors
@@ -2043,7 +2050,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         seed_g,
         accelerator,
         previewer=previewer, # MODIFIED: Pass the previewer instance
-        use_cpu_offload=(args.blocks_to_swap > 0) # Example: offload if swapping
+        use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
+        preview_suffix=args.preview_suffix # <<< Pass the suffix from args
     )
 
     # --- Cleanup ---
@@ -2433,9 +2441,9 @@ def main():
              width = lat_w * cfg.vae_stride[2]
              video_length = (lat_f - 1) * cfg.vae_stride[0] + 1
              logger.info(f"Inferred pixel dimensions: {height}x{width}@{video_length}")
-        # Store final dimensions in args for consistency
-        args.video_size = [height, width]
-        args.video_length = video_length
+             # Store final dimensions in args for consistency
+             args.video_size = [height, width]
+             args.video_length = video_length
 
     # --- Decode and Save ---
     if generated_latent is not None:
