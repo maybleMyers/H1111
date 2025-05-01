@@ -4435,24 +4435,29 @@ with gr.Blocks(
         function updateTitle(text) {
             if (text && text.trim()) {
                 // Regex for the FramePack format: "Item ... (...)% | ... Remaining: HH:MM"
-                // Captures: 1. Percentage (digits inside parens)
-                //           2. Remaining Time (HH:MM after "Remaining: ")
-                const framepackMatch = text.match(/.*?\((\d+)%\).*?Remaining:\s*(\d{2}:\d{2})/); // <--- NEW REGEX
+                const framepackMatch = text.match(/.*?\((\d+)%\).*?Remaining:\s*(\d{2}:\d{2})/);
+                // Regex for standard tqdm format (like WanX uses)
+                const tqdmMatch = text.match(/(\d+)%\|.*\[.*<(\d{2}:\d{2})/); // Adjusted slightly for robustness
+
                 if (framepackMatch) {
-                    const percentage = framepackMatch[1];     // Group 1: Percentage
-                    const timeRemaining = framepackMatch[2]; // Group 2: Remaining Time
+                    // Handle FramePack format
+                    const percentage = framepackMatch[1];
+                    const timeRemaining = framepackMatch[2];
+                    document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
+                } else if (tqdmMatch) { // <<< ADDED ELSE IF for standard tqdm
+                    // Handle standard tqdm format
+                    const percentage = tqdmMatch[1];
+                    const timeRemaining = tqdmMatch[2];
                     document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
                 } else {
-                   // Optional: Fallback or reset if no match? You could add the old regex here if needed.
-                   // const originalMatch = text.match(/(\d+)%.*\[.*<(\d+:\d+),/);
-                   // if (originalMatch) { ... }
-                   // else { document.title = 'H1111'; /* Reset title if nothing matches */ }
+                    // Optional: Reset title if neither format matches?
+                    // document.title = 'H1111';
                 }
             }
         }
 
         setTimeout(() => {
-            // QuerySelectorAll should still work fine even with the new regex logic
+            // This selector should still find all relevant progress textareas
             const progressElements = document.querySelectorAll('textarea.scroll-hide');
             progressElements.forEach(element => {
                 if (element) {
