@@ -1820,6 +1820,7 @@ def run_sampling(
                           preview_latent_input = prev_latent # Assume already [C, F, H, W]
 
                       # Pass the latent on the main compute device
+                      print(f"DEBUG run_sampling: Step {i}, prev_latent shape: {prev_latent.shape}, preview_latent_input shape: {preview_latent_input.shape}")
                       previewer.preview(preview_latent_input.to(device), i) # Pass 0-based index 'i'
                  except Exception as e:
                       logger.error(f"Error during latent preview generation at step {i + 1}: {e}", exc_info=True)

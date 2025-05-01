@@ -23,8 +23,8 @@ logger = BlissfulLogger(__name__, "#8e00ed")
 class LatentPreviewer():
     @torch.inference_mode()
     def __init__(self, args, original_latents, timesteps, device, dtype, model_type="hunyuan"):
-        self.mode = "latent2rgb" if args.preview_vae is None else "taehv"
-        logger.info(f"Initializing latent previewer with mode {self.mode}...")
+        self.mode = "latent2rgb" if not hasattr(args, 'preview_vae') or args.preview_vae is None else "taehv"
+        ##logger.info(f"Initializing latent previewer with mode {self.mode}...")
         # Correctly handle framepack - it should subtract noise like others unless specifically told otherwise
         self.subtract_noise = True # Default to True for all models now
         # If you specifically need framepack NOT to subtract noise, you'd add a condition here
@@ -43,7 +43,7 @@ class LatentPreviewer():
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         if self.mode == "taehv":
-            logger.info(f"Loading TAEHV: {args.preview_vae}...")
+            #logger.info(f"Loading TAEHV: {args.preview_vae}...")
             if os.path.exists(args.preview_vae):
                 tae_sd = load_torch_file(args.preview_vae, safe_load=True, device=args.device)
             else:
@@ -130,13 +130,13 @@ class LatentPreviewer():
             # Change the target filename from .mp4 to .png
             target_img = target.replace(".mp4", ".png")
             Image.fromarray(frame_np).save(target_img)
-            logger.info(f"Saved single frame preview to {target_img}") # Add log
+            #logger.info(f"Saved single frame preview to {target_img}") # Add log
             return
 
         # Otherwise, write out as a video.
         # Make sure fps is at least 1
         output_fps = max(1, self.fps)
-        logger.info(f"Writing preview video to {target} at {output_fps} FPS") # Add log
+        #logger.info(f"Writing preview video to {target} at {output_fps} FPS") # Add log
         container = av.open(target, mode="w")
         stream = container.add_stream("libx264", rate=output_fps) # Use output_fps
         stream.pix_fmt = "yuv420p"
@@ -166,7 +166,7 @@ class LatentPreviewer():
             for packet in stream.encode():
                 container.mux(packet)
             container.close()
-            logger.info(f"Finished writing preview video: {target}") # Add log
+            #logger.info(f"Finished writing preview video: {target}") # Add log
         except Exception as e:
              logger.error(f"Error finalizing preview video: {e}")
              # Clean up container if possible
@@ -267,12 +267,11 @@ class LatentPreviewer():
             num_frames = latents.shape[2]
             frame_dim_idx = 2
             channel_dim_idx = 1
-        else:
-            # Input: B, F, C, H, W
-            # We need to iterate through F (frames) dimension
-            num_frames = latents.shape[1]
-            frame_dim_idx = 1
-            channel_dim_idx = 2
+        else: # Wan (and potentially Hunyuan if prepared similarly)
+            # Input is expected as B, C, F, H, W after preview() method
+            num_frames = latents.shape[2] # F (frame dimension)
+            channel_dim_idx = 1           # C
+            frame_dim_idx = 2             # F
 
         latent_images = []
         for t in range(num_frames):
@@ -282,7 +281,7 @@ class LatentPreviewer():
                  extracted = latents[:, :, t, :, :].squeeze(0).permute(1, 2, 0)
             else:
                  # Extract B, C, H, W for frame t -> squeeze B -> C, H, W -> permute -> H, W, C
-                 extracted = latents[:, t, :, :, :].squeeze(0).permute(1, 2, 0)
+                 extracted = latents[:, :, t, :, :].squeeze(0).permute(1, 2, 0)
 
             # extracted should now be (H, W, C)
             rgb = torch.nn.functional.linear(extracted, latent_rgb_factors, bias=latent_rgb_factors_bias) # shape = (H, W, 3)

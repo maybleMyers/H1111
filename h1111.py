@@ -3686,7 +3686,7 @@ def wanx_generate_video(
 
     videos = []
     # current_previews list initialized at the start
-    preview_dir = os.path.join(save_path, "previews")
+    preview_dir = save_path
     processed_preview_files = set() # Keep track of previews already yielded
     
     while True:
@@ -3713,29 +3713,39 @@ def wanx_generate_video(
             status_text = f"Error (seed: {current_seed})"
             progress_text_update = line # Show error line
         # Add any other status parsing if needed
-
-        # --- ADDED: Check for new previews ---
+        preview_list_for_update = [] # Default to empty list
         if enable_preview:
-            if os.path.exists(preview_dir):
-                # Find all preview files (png or mp4)
-                found_files = glob.glob(os.path.join(preview_dir, f"latent_preview_step_*.png"))
-                found_files.extend(glob.glob(os.path.join(preview_dir, f"latent_preview_step_*.mp4")))
+            # Define potential paths
+            mp4_preview = os.path.join(preview_dir, "latent_preview.mp4")
+            png_preview = os.path.join(preview_dir, "latent_preview.png")
 
-                new_previews_found = False
-                for f_path in found_files:
-                    if f_path not in processed_preview_files:
-                        current_previews.append(f_path)
-                        processed_preview_files.add(f_path)
-                        new_previews_found = True
-                
-                if new_previews_found:
-                    # Sort previews by step number
-                    current_previews.sort(key=get_step_from_preview_path)
-                    print(f"DEBUG - Found {len(current_previews)} previews. Latest: {os.path.basename(current_previews[-1]) if current_previews else 'None'}")
+            found_path = None
+            if os.path.exists(mp4_preview):
+                found_path = mp4_preview
+            elif os.path.exists(png_preview):
+                found_path = png_preview
+
+            if found_path:
+                # Get absolute path and add it to the list for the gallery
+                abs_path = os.path.abspath(found_path)
+                preview_list_for_update = [abs_path] # <<< NO cache buster
+
+        yield videos.copy(), gr.update(value=preview_list_for_update), status_text, progress_text_update
 
 
-       # Yield final videos, current previews, status, progress
-        yield videos.copy(), current_previews.copy(), status_text, progress_text_update
+    # --- Final Yield ---
+    final_status = f"Completed (seed: {current_seed})" if rc == 0 and generated_video_path else f"Failed (seed: {current_seed}, rc={rc})"
+    final_progress = f"Video saved: {os.path.basename(generated_video_path)}" if rc == 0 and generated_video_path else f"Subprocess failed with exit code {rc}"
+    # Check for the preview file one last time for the final update
+    final_preview_list = []
+    mp4_preview = os.path.join(preview_dir, "latent_preview.mp4")
+    png_preview = os.path.join(preview_dir, "latent_preview.png")
+    if os.path.exists(mp4_preview):
+        final_preview_list = [os.path.abspath(mp4_preview)] # <<< NO cache buster
+    elif os.path.exists(png_preview):
+        final_preview_list = [os.path.abspath(png_preview)] # <<< NO cache buster
+
+    yield videos, gr.update(value=final_preview_list), final_status, final_progress
 
 
     p.stdout.close()
@@ -3791,10 +3801,10 @@ def wanx_generate_video(
             else:
                  print(f"Subprocess finished successfully (rc=0), but could not find generated video for seed {current_seed} in {save_path_abs}")
 
-    # --- Final Yield ---
+# --- Final Yield ---
     final_status = f"Completed (seed: {current_seed})" if rc == 0 and generated_video_path else f"Failed (seed: {current_seed}, rc={rc})"
     final_progress = f"Video saved: {os.path.basename(generated_video_path)}" if rc == 0 and generated_video_path else f"Subprocess failed with exit code {rc}"
-    yield videos, current_previews, final_status, final_progress
+    yield videos, gr.update(value=current_previews), final_status, final_progress
 
 def send_wanx_to_v2v(
     gallery: list,
