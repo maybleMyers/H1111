@@ -2882,16 +2882,21 @@ def wanx_batch_handler(
             current_previews_for_item = []
             yield all_videos.copy(), current_previews_for_item, f"Generating video {i + 1} of {batch_size}", progress_text # Yield cleared previews
 
-            # ... (Keep existing random image logic) ...
+            # ... (Keep existing random image logic: get random, resize) ...
             random_image, status = get_random_image_from_folder(input_folder_path)
             if random_image is None:
                 yield all_videos, current_previews_for_item, f"Error in batch {i+1}: {status}", ""
-                continue
+                continue # Skip to next batch item on error
 
             resized_image, size_info = resize_image_keeping_aspect_ratio(random_image, width, height)
             if resized_image is None:
                 yield all_videos, current_previews_for_item, f"Error resizing image in batch {i+1}: {size_info}", ""
-                continue
+                # Clean up the random image if resize failed but image exists
+                try:
+                    if os.path.exists(random_image) and "temp_resized" not in random_image: # Avoid double delete if resize output existed
+                       pass # Might not want to delete original random image here
+                except: pass
+                continue # Skip to next batch item on error
 
             local_width, local_height = width, height
             if isinstance(size_info, tuple): local_width, local_height = size_info
@@ -2902,8 +2907,12 @@ def wanx_batch_handler(
             if seed == -1: current_seed = random.randint(0, 2**32 - 1)
             elif batch_size > 1: current_seed = seed + i
 
-            # --- Modified call to wanx_generate_video ---
-            # Note: wanx_input_end is likely None here unless logic changes
+            # --- Corrected call to wanx_generate_video with accumulation ---
+            newly_generated_video = None # Track the video generated *in this iteration*
+            last_status_for_item = f"Generating video {i+1}/{batch_size}" # Keep track of last status
+            last_progress_for_item = progress_text # Keep track of last progress line
+
+            # Inner loop iterates through the generator for ONE batch item
             for videos_update, previews_update, status, progress in wanx_generate_video(
                 prompt, negative_prompt, resized_image, local_width, local_height,
                 video_length, fps, infer_steps, flow_shift, guidance_scale, current_seed,
@@ -2916,19 +2925,45 @@ def wanx_batch_handler(
                 lora_multipliers[0], lora_multipliers[1], lora_multipliers[2], lora_multipliers[3],
                 enable_cfg_skip, cfg_skip_mode, cfg_apply_ratio,
                 None, 1.0, 0.0, 1.0, # Placeholders for control video args in random mode
-                # --- Pass preview args ---
                 enable_preview=enable_preview,
                 preview_steps=preview_steps
             ):
-                if videos_update: all_videos = videos_update # Update main gallery list
-                current_previews_for_item = previews_update # Update previews for *this* item
-                yield all_videos.copy(), current_previews_for_item, f"Batch {i+1}/{batch_size}: {status}", progress
+                # Store the latest video info from this *specific* generator run
+                if videos_update:
+                    # wanx_generate_video yields the *full* list it knows about,
+                    # so we take the last item assuming it's the new one.
+                    newly_generated_video = videos_update[-1]
 
+                current_previews_for_item = previews_update # Update previews for *this* item
+                last_status_for_item = f"Batch {i+1}/{batch_size}: {status}" # Store last status
+                last_progress_for_item = progress # Store last progress line
+                # Yield the *current cumulative* list during progress updates
+                yield all_videos.copy(), current_previews_for_item, last_status_for_item, last_progress_for_item
+
+            # --- After the inner loop finishes for item 'i' ---
+            # Now, add the video generated in this iteration to the main list
+            if newly_generated_video and newly_generated_video not in all_videos:
+                all_videos.append(newly_generated_video)
+                print(f"DEBUG: Appended video {newly_generated_video[1] if isinstance(newly_generated_video, tuple) else 'unknown'} to all_videos (Total: {len(all_videos)})")
+                # Yield the updated cumulative list *immediately* after appending
+                yield all_videos.copy(), current_previews_for_item, last_status_for_item, last_progress_for_item
+            elif not newly_generated_video:
+                 print(f"DEBUG: No new video generated or yielded by wanx_generate_video for batch item {i+1}.")
+
+
+            # --- Cleanup for item 'i' (Correctly indented) ---
             try:
-                if os.path.exists(resized_image): os.remove(resized_image)
-            except: pass
+                # Only remove the temporary resized image
+                if os.path.exists(resized_image) and "temp_resized" in resized_image:
+                     os.remove(resized_image)
+                     print(f"DEBUG: Removed temporary resized image: {resized_image}")
+            except Exception as e:
+                print(f"Warning: Could not remove temp image {resized_image}: {e}")
             clear_cuda_cache()
             time.sleep(0.5)
+            # --- End Cleanup for item 'i' ---
+
+        # --- After the outer loop (all batch items processed) ---
         yield all_videos, [], "Batch complete", "" # Yield empty previews at the end
     else:
         # ... (Keep existing checks for non-random mode: input file, control video) ...
@@ -2962,7 +2997,12 @@ def wanx_batch_handler(
                 batch_text = f"Generating video {i+1}/{batch_size} (seed: {current_seed})"
                 yield all_videos.copy(), current_previews_for_item, batch_text, progress_text # Update status
 
-                # --- Modified call to wanx_generate_video ---
+                # --- Corrected call to wanx_generate_video with accumulation ---
+                newly_generated_video = None # Track the video generated *in this iteration*
+                last_status_for_item = f"Generating video {i+1}/{batch_size}" # Keep track of last status
+                last_progress_for_item = progress_text # Keep track of last progress line
+
+                # Inner loop iterates through the generator for ONE batch item
                 for videos_update, previews_update, status, progress in wanx_generate_video(
                     prompt, negative_prompt, input_file, width, height,
                     video_length, fps, infer_steps, flow_shift, guidance_scale, current_seed,
@@ -2979,10 +3019,29 @@ def wanx_batch_handler(
                     enable_preview=enable_preview,
                     preview_steps=preview_steps
                 ):
-                    if videos_update: all_videos = videos_update # Update main gallery
+                     # Store the latest video info from this *specific* generator run
+                    if videos_update:
+                        # wanx_generate_video yields the *full* list it knows about,
+                        # so we take the last item assuming it's the new one.
+                        newly_generated_video = videos_update[-1]
+
                     current_previews_for_item = previews_update # Update previews for *this* item
-                    yield all_videos.copy(), current_previews_for_item, f"Batch {i+1}/{batch_size}: {status}", progress
+                    last_status_for_item = f"Batch {i+1}/{batch_size}: {status}" # Store last status
+                    last_progress_for_item = progress # Store last progress line
+                    # Yield the *current cumulative* list during progress updates
+                    yield all_videos.copy(), current_previews_for_item, last_status_for_item, last_progress_for_item
+
+                # --- After the inner loop finishes for item 'i' ---
+                # Now, add the video generated in this iteration to the main list
+                if newly_generated_video and newly_generated_video not in all_videos:
+                    all_videos.append(newly_generated_video)
+                    print(f"DEBUG: Appended video {newly_generated_video[1] if isinstance(newly_generated_video, tuple) else 'unknown'} to all_videos (Total: {len(all_videos)})")
+                    # Yield the updated cumulative list *immediately* after appending
+                    yield all_videos.copy(), current_previews_for_item, last_status_for_item, last_progress_for_item
+                elif not newly_generated_video:
+                    print(f"DEBUG: No new video generated or yielded by wanx_generate_video for batch item {i+1}.")
                 # --- End modified call ---
+
                 clear_cuda_cache()
                 time.sleep(0.5)
             yield all_videos, [], "Batch complete", "" # Yield empty previews at the end
