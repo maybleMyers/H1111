@@ -530,7 +530,7 @@ def process_framepack_video(
 
             status_text = f"Completed (Seed: {current_seed})"
             progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
-            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
+            yield all_videos, current_preview_yield_path, status_text, progress_text
         elif rc != 0:
             status_text = f"Failed (Seed: {current_seed})"
             progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
