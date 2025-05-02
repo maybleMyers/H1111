@@ -88,9 +88,9 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 4/30/2025  
-    Previews for framepack in the preview branch. You will need to reinstall requirements and requirementsFP.txt (pip install -r requirements.txt)  
+    Previews for framepack.    
 4/29/2025  
-    Add initial preview support to the wanX-i2v tab based. If you want to use them use the preview branch. Thanks to Sarania (https://github.com/Sarania/musubi-tuner)   
+    Add initial preview support to the wanX-i2v tab based. If you want to use them use the preview branch. Thanks to Sarania.   
     Wan2.1-Fun-V1.1-14B-InP-FP16.safetensors is available at https://huggingface.co/maybleMyers/wan_files_for_h1111  
     Fix bug in hunyuan-t2v not loading lora.  
 4/26/2025  

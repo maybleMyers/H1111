@@ -34,6 +34,8 @@ from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+from blissful_tuner.latent_preview import LatentPreviewer
+
 try:
     from lycoris.kohya import create_network_from_weights
 except:
@@ -210,6 +212,12 @@ def parse_args() -> argparse.Namespace:
         default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
         help="Torch.compile settings",
     )
+    parser.add_argument("--preview", type=int, default=None, metavar="N",
+        help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory.",
+    )
+    parser.add_argument("--preview_suffix", type=str, default=None,
+        help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
+    )
 
     args = parser.parse_args()
 
@@ -352,6 +360,8 @@ def create_funcontrol_conditioning_latent(
             img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
 
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
+                # vae.encode expects a list, returns a list. Take first element.
+                # Result shape [C', F', H', W'] - needs batch dim for processing here
                 end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
             # Calculate end image influence transition (S-curve / cubic)
@@ -1231,7 +1241,7 @@ def prepare_i2v_inputs(
         logger.info(f"Encoding image to CLIP context")
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
             # Use the [-1, 1] tensor directly if clip.visual expects that format
-            # clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Original had [img_tensor[:, None, :, :]] which adds frame dim
+            # clip_context = clip.visual([img_tensor[:, None, :, :]]).squeeze(1) # Original had [img_tensor[:, None, :, :]] which adds frame dim
             # Use unsqueeze(1) which seems more consistent with other parts
             clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Add Frame dim
         logger.info(f"CLIP Encoding complete")
@@ -1645,7 +1655,9 @@ def run_sampling(
     device: torch.device,
     seed_g: torch.Generator,
     accelerator: Accelerator,
+    previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
+    preview_suffix: Optional[str] = None # <<< ADD suffix argument
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
     Args:
@@ -1658,20 +1670,24 @@ def run_sampling(
         device: device to use
         seed_g: random generator
         accelerator: Accelerator instance
+        previewer: LatentPreviewer instance or None # Added description
         use_cpu_offload: Whether to offload tensors to CPU during processing (example)
+        preview_suffix: Unique suffix for preview files to avoid conflicts in concurrent runs.
     Returns:
         torch.Tensor: generated latent
     """
     arg_c, arg_null = inputs
 
     latent = noise # Initialize latent state
-    latent_storage_device = device if not use_cpu_offload else "cpu"
+    # Determine storage device (CPU if offloading, otherwise compute device)
+    latent_storage_device = torch.device("cpu") if use_cpu_offload else device
     latent = latent.to(latent_storage_device) # Move initial state to storage device
 
     # cfg skip logic
     apply_cfg_array = []
     num_timesteps = len(timesteps)
 
+    # ... (keep existing cfg skip logic) ...
     if args.cfg_skip_mode != "none" and args.cfg_apply_ratio is not None:
         # Calculate thresholds based on cfg_apply_ratio
         apply_steps = int(num_timesteps * args.cfg_apply_ratio)
@@ -1721,27 +1737,31 @@ def run_sampling(
 
         # FIX: Check if latent_on_device has too many dimensions and fix it
         # The model expects input x as a list of tensors with shape [C, F, H, W]
+        # This adjustment seems specific to a potential bug elsewhere, keep it if needed.
         if len(latent_on_device.shape) > 5:
-            # Remove extra dimensions (likely [1, 1, C, F, H, W] -> [1, C, F, H, W])
             while len(latent_on_device.shape) > 5:
                 latent_on_device = latent_on_device.squeeze(0)
-            logger.info(f"Adjusted latent shape for model input: {latent_on_device.shape}")
+            logger.debug(f"Adjusted latent shape for model input: {latent_on_device.shape}")
 
         # The model expects the latent input 'x' as a list: [tensor]
         # If batch dimension is present, we need to split the tensor into a list of tensors
         if len(latent_on_device.shape) == 5:
             # Has batch dimension [B, C, F, H, W]
             latent_model_input_list = [latent_on_device[i] for i in range(latent_on_device.shape[0])]
-        else:
+        elif len(latent_on_device.shape) == 4:
             # No batch dimension [C, F, H, W]
             latent_model_input_list = [latent_on_device]
+        else:
+            # Handle unexpected shape
+            raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
 
         timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
+            # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
             # 1. Predict conditional noise estimate
-            # Pass the list here
             noise_pred_cond = model(latent_model_input_list, t=timestep, **arg_c)[0]
+            # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
             # 2. Predict unconditional noise estimate (potentially with SLG)
@@ -1752,54 +1772,68 @@ def run_sampling(
                 uncond_input_args = arg_null
 
                 if apply_slg_step and args.slg_mode == "original":
-                    # Standard uncond prediction first - Pass the list here
                     noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
-                    # SLG prediction (skipping layers in uncond) - Pass the list here
                     skip_layer_out = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
-
-                    # Combine using SD3 formula: scaled = uncond + scale * (cond - uncond) + slg_scale * (cond - skip)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                 elif apply_slg_step and args.slg_mode == "uncond":
-                     # SLG prediction (skipping layers in uncond) replaces standard uncond - Pass the list here
                     noise_pred_uncond = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
-                    # Combine: scaled = slg_uncond + scale * (cond - slg_uncond)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                else:
-                    # Regular CFG (no SLG or SLG not active this step) - Pass the list here
+                else: # Regular CFG
                     noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
-                    # Combine: scaled = uncond + scale * (cond - uncond)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
-                # CFG is skipped for this step, use conditional prediction directly
+                # CFG is skipped, use conditional prediction directly
                 noise_pred = noise_pred_cond
+            # --- End prediction logic ---
 
             # 3. Compute previous sample state with the scheduler
-            # Scheduler expects noise_pred [B, C, F, H, W] and latent [B, C, F, H, W]
-            # Ensure shapes match what scheduler expects
-            if len(noise_pred.shape) < 5:
-                # Add batch dimension if missing
-                noise_pred = noise_pred.unsqueeze(0)
+            # Ensure noise_pred and latent_on_device have matching batch dimensions for scheduler
+            if len(noise_pred.shape) < len(latent_on_device.shape):
+                 noise_pred = noise_pred.unsqueeze(0) # Add batch dim if missing ([C,F,H,W]->[1,C,F,H,W])
+            elif len(noise_pred.shape) > len(latent_on_device.shape):
+                 # This shouldn't happen if latent_on_device handles batch correctly
+                 logger.warning(f"Noise pred shape {noise_pred.shape} has more dims than latent {latent_on_device.shape}")
 
-            # Similarly, ensure latent_on_device has batch dimension
-            if len(latent_on_device.shape) < 5:
-                latent_on_device_batched = latent_on_device.unsqueeze(0)
-            else:
-                latent_on_device_batched = latent_on_device
-
+            # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
+            # latent_on_device should already have the batch dim handled by the logic above
             scheduler_output = scheduler.step(
-                noise_pred.to(device), # Ensure noise_pred is on compute device
+                noise_pred.to(device), # Ensure noise_pred is on compute device for step
                 t,
-                latent_on_device_batched, # Pass the tensor with batch dimension to scheduler step
+                latent_on_device, # Pass the tensor (with batch dim) on compute device
                 return_dict=False,
-                generator=seed_g # Pass generator
+                generator=seed_g
             )
-            prev_latent = scheduler_output[0] # Get the new latent state
+            prev_latent = scheduler_output[0] # Get the new latent state [B, C, F, H, W]
 
             # 4. Update latent state (move back to storage device)
             latent = prev_latent.to(latent_storage_device)
+
+            # --- Latent Preview Call ---
+            # Preview the state *after* step 'i' is completed
+            if previewer is not None and (i + 1) % args.preview == 0 and (i + 1) < num_timesteps:
+                 try:
+                      logger.debug(f"Generating preview for step {i + 1}")
+                      # Pass the *resulting* latent from this step (prev_latent).
+                      # Ensure it's on the compute device for the previewer call.
+                      # LatentPreviewer handles internal device management.
+                      # Need to pass without batch dim if previewer expects [C, F, H, W]
+                      # Check LatentPreviewer.preview expects [C, F, H, W]
+                      if len(prev_latent.shape) == 5:
+                          preview_latent_input = prev_latent.squeeze(0) # Remove batch dim
+                      else:
+                          preview_latent_input = prev_latent # Assume already [C, F, H, W]
+
+                      # Pass the latent on the main compute device
+                      print(f"DEBUG run_sampling: Step {i}, prev_latent shape: {prev_latent.shape}, preview_latent_input shape: {preview_latent_input.shape}")
+                      previewer.preview(preview_latent_input.to(device), i, preview_suffix=preview_suffix) # Pass 0-based index 'i'
+                 except Exception as e:
+                      logger.error(f"Error during latent preview generation at step {i + 1}: {e}", exc_info=True)
+                      # Optional: Disable previewer after first error to avoid repeated logs/errors
+                      # logger.warning("Disabling latent preview due to error.")
+                      # previewer = None
 
     # Return the final denoised latent (should be on storage device)
     logger.info("Sampling loop finished.")
@@ -1913,7 +1947,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_i2v_inputs moves VAE to CPU/cache after use
 
-    elif is_fun_control: # Pure FunControl T2V (no image input)
+    elif is_fun_control: # Pure FunControl T2V (no image input unless using start/end image)
         if args.video_length is None:
              raise ValueError("video_length must be specified for Fun-Control T2V mode.")
         noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
@@ -1936,6 +1970,10 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         merge_lora_weights(model, args, device)
         if args.save_merged_model:
             logger.info("Merged model saved. Exiting without generation.")
+            # Clean up resources if exiting early
+            if 'model' in locals(): del model
+            if 'vae' in locals() and vae is not None: del vae
+            clean_memory_on_device(device)
             return None # Exit early
 
     # --- Optimize Model (FP8, Swapping, Compile) ---
@@ -1948,6 +1986,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
 
+    # `latent` here is the initial state *before* the sampling loop starts
     latent = noise # Start with noise (already shaped correctly for T2V/I2V/V2V)
 
     # --- V2V Strength Adjustment ---
@@ -1964,25 +2003,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         if t_start_idx < 0: t_start_idx = 0 # Ensure non-negative index
         t_start = timesteps[t_start_idx] # Timestep value at the start of sampling
 
-        # Mix noise and video latents based on starting timestep
-        # Need to map timestep value to noise schedule (e.g., sigma) - scheduler might help
-        # Simple linear interpolation for now, assuming t goes 0 to 1000 roughly
-        # A more accurate approach would use scheduler.add_noise or sigmas
-        mix_ratio = t_start.item() / scheduler.config.num_train_timesteps # Approximate ratio
-        mix_ratio = max(0.0, min(1.0, mix_ratio)) # Clamp to [0, 1]
-        logger.info(f"Mixing noise and video latents with ratio (noise={mix_ratio:.3f}, video={1.0-mix_ratio:.3f}) based on start timestep {t_start.item():.1f}")
-
+        # Mix noise and video latents based on starting timestep using scheduler
         # Ensure video_latents are on the same device and dtype as noise for mixing
-        video_latents = video_latents.to(device=noise.device, dtype=noise.dtype)
+        video_latents = video_latents.to(device=latent.device, dtype=latent.dtype)
 
-        # V2V expects noise and latents to have the same shape B,C,F,H,W
-        # Check if shapes match before mixing
-        if noise.shape != video_latents.shape:
-            logger.error(f"Noise shape {noise.shape} does not match video latent shape {video_latents.shape} for V2V mixing. Cannot proceed.")
-            # Potentially resize/pad noise or error out. For now, error out.
+        if latent.shape != video_latents.shape:
+            logger.error(f"Noise shape {latent.shape} does not match video latent shape {video_latents.shape} for V2V mixing. Cannot proceed.")
             raise ValueError("Shape mismatch between noise and video latents in V2V.")
 
-        latent = noise * mix_ratio + video_latents * (1.0 - mix_ratio)
+        # Use scheduler's add_noise for better mixing
+        latent = scheduler.add_noise(video_latents, latent, t_start.unsqueeze(0))
+        logger.info(f"Mixed video latents and noise using scheduler at timestep {t_start.item():.1f}")
 
         # Use only the required subset of timesteps
         timesteps = timesteps[t_start_idx:]
@@ -1991,6 +2022,20 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
          logger.info(f"Using full {len(timesteps)} timesteps for sampling.")
          # Latent remains the initial noise
 
+    # --- Initialize Latent Previewer --- # ADDED SECTION
+    previewer = None
+    if LatentPreviewer is not None and args.preview is not None and args.preview > 0:
+        logger.info(f"Initializing Latent Previewer (every {args.preview} steps)...")
+        try:
+             # Use the initial 'latent' state which might be pure noise or mixed V2V start
+             # Pass without batch dim [C, F, H, W]
+             initial_latent_for_preview = latent.clone().squeeze(0)
+             previewer = LatentPreviewer(args, initial_latent_for_preview, timesteps, device, dit_dtype, model_type="wan")
+             logger.info("Latent Previewer initialized successfully.")
+        except Exception as e:
+             logger.error(f"Failed to initialize Latent Previewer: {e}", exc_info=True)
+             previewer = None # Ensure it's None if init fails
+    # --- END ADDED SECTION ---
 
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
@@ -2004,17 +2049,22 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         device,
         seed_g,
         accelerator,
-        use_cpu_offload=(args.blocks_to_swap > 0) # Example: offload if swapping
+        previewer=previewer, # MODIFIED: Pass the previewer instance
+        use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
+        preview_suffix=args.preview_suffix # <<< Pass the suffix from args
     )
 
     # --- Cleanup ---
     del model
-    del scheduler
-    del context, context_null, inputs # Free memory from encoded inputs
+    if 'scheduler' in locals(): del scheduler
+    if 'context' in locals(): del context
+    if 'context_null' in locals(): del context_null
+    if 'inputs' in locals(): del inputs # Free memory from encoded inputs
     if video_latents is not None: del video_latents
+    # previewer instance will be garbage collected
+
     synchronize_device(device)
 
-    # Wait for potential block swap operations to finish
     if args.blocks_to_swap > 0:
         logger.info("Waiting for 5 seconds to ensure block swap finishes...")
         time.sleep(5)
@@ -2026,11 +2076,11 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     args._vae = vae # Store VAE instance (might be None if T2V)
 
     # Return latent with batch dimension [1, C, F, H, W]
+    # final_latent is potentially on CPU if use_cpu_offload=True
     if len(final_latent.shape) == 4: # If run_sampling returned [C, F, H, W]
         final_latent = final_latent.unsqueeze(0)
 
     return final_latent
-
 
 def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.Tensor:
     """decode latent tensor to video frames
@@ -2391,9 +2441,9 @@ def main():
              width = lat_w * cfg.vae_stride[2]
              video_length = (lat_f - 1) * cfg.vae_stride[0] + 1
              logger.info(f"Inferred pixel dimensions: {height}x{width}@{video_length}")
-        # Store final dimensions in args for consistency
-        args.video_size = [height, width]
-        args.video_length = video_length
+             # Store final dimensions in args for consistency
+             args.video_size = [height, width]
+             args.video_length = video_length
 
     # --- Decode and Save ---
     if generated_latent is not None:
