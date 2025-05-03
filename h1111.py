@@ -3769,29 +3769,65 @@ def wanx_generate_video(
     current_preview_yield_path = None
     last_preview_mtime = 0
     
+    current_phase = "Preparing" # Add phase tracking like FramePack
     while True:
         if stop_event.is_set():
-            p.terminate()
-            p.wait()
-            yield [], "", "Generation stopped by user."
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            except Exception as e:
+                print(f"Error terminating subprocess: {e}")
+            yield [], [], "Generation stopped by user.", "" # Yield empty previews
             return
 
         line = p.stdout.readline()
         if not line:
             if p.poll() is not None:
                 break
-            continue
-            
-        print(line, end='')
-        status_text = f"Processing (seed: {current_seed})" # Default status
-        progress_text_update = line.strip() # Default progress is the current line
+            time.sleep(0.01); continue
 
-        if '|' in line and '%' in line and '[' in line and ']' in line:
-            status_text = f"Processing (seed: {current_seed})"
-            progress_text_update = line.strip()
+        line = line.strip()
+        if not line: continue
+        print(f"WANX SUBPROCESS: {line}") # Log subprocess output
+
+        # --- Adopt FramePack's Parsing Logic ---
+        status_text = f"Processing (seed: {current_seed})" # Default status
+        progress_text_update = line # Default progress
+
+        # Check for TQDM progress using regex
+        tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
+
+        if tqdm_match:
+             percentage = int(tqdm_match.group(1))
+             current_step = int(tqdm_match.group(2))
+             total_steps = int(tqdm_match.group(3))
+             time_elapsed = tqdm_match.group(4)
+             time_remaining = tqdm_match.group(5)
+
+             current_phase = f"Denoising Step {current_step}/{total_steps}" # Update phase
+
+             # Format progress text like FramePack for JS compatibility
+             progress_text_update = f"Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
+             status_text = f"Generating (seed: {current_seed}) - {current_phase}"
+
         elif "ERROR" in line.upper() or "TRACEBACK" in line.upper():
-            status_text = f"Error (seed: {current_seed})"
-            progress_text_update = line # Show error line
+             status_text = f"Error (seed: {current_seed})"
+             progress_text_update = line # Show error line
+             current_phase = "Error"
+
+        # Add more phases if needed (e.g., "Decoding", "Saving") by checking logs
+        elif "Decoding video..." in line: # Placeholder check
+             current_phase = "Decoding Video"
+             status_text = f"Generating (seed: {current_seed}) - {current_phase}"
+             progress_text_update = "Decoding video..."
+
+        elif "Video saved to:" in line: # Placeholder check
+             current_phase = "Saved"
+             status_text = f"Completed (seed: {current_seed})"
+             progress_text_update = line # Show the save line
         # Add any other status parsing if needed
         preview_updated = False
         current_mtime = 0
