@@ -35,8 +35,6 @@ pip install -r requirementsTorch27.txt
 
 ## To Use FramePack
 
-Install as normal, then install the frame pack requirements in requirementsFP.txt.  
-pip install -r requirementsFP.txt  
 
 download these 5 files from https://huggingface.co/maybleMyers/framepack_h1111 and put them in a subfolder named hunyuan (H1111/hunyuan), or reference where they are in the gui if you have already aquired them.  
 
@@ -60,7 +58,9 @@ Here is an example prompt for a 5 second video with 4 sections using sectional p
 
 I have added support for 4 sectional images during inference. It works best when the images are close together. Refer to the screen shot for an example of a working 5 second video.  
 
-For more details on using framepack with musubi go here https://github.com/kohya-ss/musubi-tuner/blob/main/docs/framepack.md  
+For more details on using framepack with musubi go here https://github.com/kohya-ss/musubi-tuner/blob/main/docs/framepack.md   
+
+Fastest speed will be achieved with fp8 and fp8 scaled, then you can reduce block swapping to your memory constraints. (leave about 1gb free)  
 
 ## To Use the new Skyreels-V2 models
 
@@ -90,7 +90,7 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 5/3/2025  
-    Add support for framepack F1! download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/FramePack_F1_I2V_HY_20250503.safetensors  put it in your hunyuan folder.  
+    Add support for framepack F1! download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/FramePack_F1_I2V_HY_20250503.safetensors  put it in your hunyuan folder. You might need to reinstall reqs "pip install -r requirements.txt"  
     Add support for Wan2.1 i2v-14B-FC-1.1. It is a fun control model and is very good. Use it in the WanX-i2v tab and make sure to select the task i2v-14B-FC-1.1 at the bottom of the page.  Download the weights from https://huggingface.co/maybleMyers/wan_files_for_h1111  
 4/30/2025  
     Previews for framepack.    
