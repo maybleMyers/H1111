@@ -5910,7 +5910,7 @@ with gr.Blocks(
                         # End Frame Blending Params - Use UI defaults
                         params.get("end_frame_influence", "last"),
                         params.get("end_frame_weight", 0.5),
-                        is_f1_meta
+                        params.get("is_f1", False)
                     ]
                 )[-1] # Return the list of values we just built
             ) if params else [gr.update()] * 32, # CORRECTED fallback count to 32
