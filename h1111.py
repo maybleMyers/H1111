@@ -96,7 +96,7 @@ def process_framepack_video(
     lora_folder: str,
     enable_preview: bool,
     preview_every_n_sections: int,
-    # --- CORRECTED: Use *args to capture variable inputs ---
+    is_f1: bool,
     *args: Any
     # --- End Corrected ---
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]: # Modified return type for preview path
@@ -294,6 +294,7 @@ def process_framepack_video(
             "--latent_window_size", str(latent_window_size),
             "--sample_solver", sample_solver, "--output_type", "video", "--attn_mode", attn_mode
         ]
+        if is_f1: command.append("--is_f1")      
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
         if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
@@ -355,59 +356,48 @@ def process_framepack_video(
             if not line: continue
             print(f"SUBPROCESS: {line}") # Log subprocess output
 
-            # --- Update Status/Progress ---
-            phase_changed = False
-            # Check for Section Log first
-            current_section_log_match = re.search(r"INFO:__main__:Section (\d+):", line)
+# --- Check for Section Start Log ---
+            # More robust regex that captures Section X/Y regardless of prefixes or suffixes
+            section_match = re.search(r"---.*?Section\s+(\d+)\s*/\s*(\d+)(?:\s+|$|\()", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
-
-            # --- Determine current total sections ---
-            current_total_sections = actual_total_sections if actual_total_sections is not None else total_sections_estimate
-
-            if current_section_log_match:
-                # Extract the backend's section number (counts down from N-1 to 0)
-                backend_section_num = int(current_section_log_match.group(1))
-
-                # --- Dynamically determine total sections from first log ---
-                if actual_total_sections is None:
-                    actual_total_sections = backend_section_num + 1
-                    current_total_sections = actual_total_sections # Update current_total immediately
-                    print(f"Detected actual total sections from backend: {actual_total_sections}")
-                # --- End dynamic determination ---
-
-                # Calculate the display section number (counts up from 1 to N) using the current total
-                display_section_num = max(1, current_total_sections - backend_section_num)
-
-                # Update phase and progress text immediately when a new section starts
+            phase_changed = False
+            if section_match:
+                # Directly extract current section number and total sections
+                current_section_num_display = int(section_match.group(1))
+                total_sections_from_log = int(section_match.group(2))
+                # Update state variables
+                display_section_num = current_section_num_display
+                # Update actual total only if it changes or hasn't been set
+                if actual_total_sections != total_sections_from_log:
+                    actual_total_sections = total_sections_from_log
+                    print(f"Detected/Updated actual total sections: {actual_total_sections}")
+                # Update phase and status/progress text
                 new_phase = f"Generating Section {display_section_num}"
                 if current_phase != new_phase:
                     current_phase = new_phase
                     phase_changed = True
-
-                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{current_total_sections} | Preparing..."
+                # Use the latest section info directly
+                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{actual_total_sections} | Preparing..."
+                status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
+            # --- Process TQDM Progress ---
+            elif tqdm_match:
+                percentage = int(tqdm_match.group(1))
+                current_step = int(tqdm_match.group(2))
+                total_steps = int(tqdm_match.group(3))
+                time_elapsed = tqdm_match.group(4)
+                time_remaining = tqdm_match.group(5)
+                # Use the last known section numbers. If no section log seen yet, use estimate.
+                current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
+                section_str = f"Section {display_section_num}/{current_total_for_display}"
+                # Update progress text with TQDM info and the current section string
+                progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
+                denoising_phase = f"Denoising Section {display_section_num}"
+                if current_phase != denoising_phase:
+                    current_phase = denoising_phase
+                    phase_changed = True
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
-            # Then check for TQDM progress
-            elif tqdm_match:
-                 percentage = int(tqdm_match.group(1))
-                 current_step = int(tqdm_match.group(2))
-                 total_steps = int(tqdm_match.group(3))
-                 time_elapsed = tqdm_match.group(4)
-                 time_remaining = tqdm_match.group(5)
-
-                 # Use the most recently calculated display_section_num and current_total_sections
-                 section_str = f"Section {display_section_num}/{current_total_sections}"
-
-                 new_phase = f"Generating Section {display_section_num}"
-                 if current_phase != new_phase and not current_section_log_match: # Only update phase if not already updated by section log
-                     current_phase = new_phase
-                     phase_changed = True
-
-                 # Update progress text with TQDM info and the current section
-                 progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
-                 # Status text can remain focused on the current phase (which is now section-aware)
-                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
-
+            # --- Process Other Log Lines ---
             elif "Decoding video..." in line:
                  if current_phase != "Decoding Video":
                      current_phase = "Decoding Video"
@@ -415,24 +405,22 @@ def process_framepack_video(
                  progress_text = f"Item {i+1}/{batch_size} | {current_phase}..."
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
-            # Check for the specific "Video saved to:" line
             elif "INFO:__main__:Video saved to:" in line:
-                match = re.search(r"Video saved to:\s*(.*\.mp4)", line)
-                if match:
-                    found_video_path = match.group(1).strip()
-                    if os.path.exists(found_video_path):
-                        current_video_path = found_video_path
-                        all_videos.append((current_video_path, f"Seed: {current_seed}"))
-                        print(f"Video path found and added to gallery list: {current_video_path}")
-                    else:
-                         print(f"Warning: Parsed video path does not exist: {found_video_path}") # Use found_video_path
-
-                    status_text = f"Video {i+1}/{batch_size} Saved (Seed: {current_seed})"
-                    progress_text = f"Saved: {os.path.basename(found_video_path)}" # Use found_video_path
-                    current_phase = "Saved"
-                    phase_changed = True
-                else:
-                    print(f"Warning: Could not parse video path from INFO line: {line}")
+                 match = re.search(r"Video saved to:\s*(.*\.mp4)", line)
+                 if match:
+                     found_video_path = match.group(1).strip()
+                     if os.path.exists(found_video_path):
+                         current_video_path = found_video_path
+                         all_videos.append((current_video_path, f"Seed: {current_seed}"))
+                         print(f"Video path found and added to gallery list: {current_video_path}")
+                     else:
+                          print(f"Warning: Parsed video path does not exist: {found_video_path}")
+                     status_text = f"Video {i+1}/{batch_size} Saved (Seed: {current_seed})"
+                     progress_text = f"Saved: {os.path.basename(found_video_path)}"
+                     current_phase = "Saved"
+                     phase_changed = True
+                 else:
+                     print(f"Warning: Could not parse video path from INFO line: {line}")
 
             elif "ERROR" in line.upper() or "TRACEBACK" in line.upper():
                  status_text = f"Item {i+1}/{batch_size}: Error Detected (Check Console)"
@@ -441,7 +429,8 @@ def process_framepack_video(
                     current_phase = "Error"
                     phase_changed = True
 
-            # Update status_text if phase changed for other reasons (and not a specific end state)
+            # --- Update status_text if phase changed implicitly ---
+            # This covers cases where phase changes but isn't explicitly set above (e.g., transitioning between tqdm steps within the same section)
             elif phase_changed and current_phase not in ["Saved", "Error"]:
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
@@ -520,7 +509,8 @@ def process_framepack_video(
                 "lora_weights": [os.path.basename(p) for p in valid_loras_paths],
                 "lora_multipliers": [float(m) for m in valid_loras_mults],
                 "original_dims_str": original_dims_str,
-                "target_resolution": target_resolution
+                "target_resolution": target_resolution,
+                "is_f1": is_f1
             }
             try:
                 add_metadata_to_video(current_video_path, parameters)
@@ -4585,6 +4575,8 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
+                                                  info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
                     framepack_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
@@ -4755,7 +4747,7 @@ with gr.Blocks(
 
             with gr.Accordion("Model Paths / Advanced", open=False):
                  with gr.Row():
-                    framepack_transformer_path = gr.Textbox(label="Transformer Path (DiT)", value="hunyuan/FramePackI2V_HY_bf16.safetensors")
+                    framepack_transformer_path = gr.Textbox(label="Transformer Path (DiT)", value="hunyuan/FramePackI2V_HY_bf16.safetensors", interactive=True)
                     framepack_vae_path = gr.Textbox(label="VAE Path", value="hunyuan/pytorch_model.pt")
                  with gr.Row():
                     framepack_text_encoder_path = gr.Textbox(label="Text Encoder 1 (Llama) Path *Required*", value="hunyuan/llava_llama3_fp16.safetensors")
@@ -5878,10 +5870,11 @@ with gr.Blocks(
                         params.get("device", ""),
                         # End Frame Blending Params - Use UI defaults
                         params.get("end_frame_influence", "last"),
-                        params.get("end_frame_weight", 0.5)
+                        params.get("end_frame_weight", 0.5),
+                        params.get("is_f1", False)
                     ]
                 )[-1] # Return the list of values we just built
-            ) if params else [gr.update()] * 32, # CORRECTED fallback count to 32
+            ) if params else [gr.update()] * 32, 
             inputs=params_state, # Read parameters from state
             outputs=[
                 # Map to FramePack components (UI only - 32 components)
@@ -5913,7 +5906,8 @@ with gr.Blocks(
                 framepack_device,
                 # Map to new UI components
                 framepack_end_frame_influence,
-                framepack_end_frame_weight
+                framepack_end_frame_weight,
+                framepack_is_f1
             ]
         ).then(
             fn=change_to_framepack_tab, # Switch to the FramePack tab
@@ -5993,6 +5987,35 @@ with gr.Blocks(
         inputs=[framepack_target_resolution],
         outputs=[framepack_width, framepack_height]
     )
+    def toggle_f1_model_path(is_f1):
+        f1_path = "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"
+        standard_path = "hunyuan/FramePackI2V_HY_bf16.safetensors"
+        target_path = f1_path if is_f1 else standard_path
+
+        # Check if the target path exists
+        if not os.path.exists(target_path):
+             print(f"Warning: F1 model path '{target_path}' not found. Falling back to standard path.")
+             # Optionally fall back or just update with the non-existent path
+             # Let's fall back to standard if F1 is missing, but keep standard if standard is missing (error handled later)
+             if is_f1 and os.path.exists(standard_path):
+                 print(f"Falling back to standard path: {standard_path}")
+                 return gr.update(value=standard_path)
+             elif is_f1:
+                 print(f"F1 path missing and standard path also missing. Cannot automatically switch.")
+                 # Return the intended (missing) path, error will be caught later
+                 return gr.update(value=target_path)
+             else: # Standard path is missing
+                  print(f"Warning: Standard path '{standard_path}' not found.")
+                  return gr.update(value=target_path) # Return the missing standard path
+
+        print(f"Switching DiT path to: {target_path}")
+        return gr.update(value=target_path)
+
+    framepack_is_f1.change(
+        fn=toggle_f1_model_path,
+        inputs=[framepack_is_f1],
+        outputs=[framepack_transformer_path]
+    )    
 
     framepack_generate_btn.click(
         fn=process_framepack_video,
@@ -6018,11 +6041,9 @@ with gr.Blocks(
             framepack_batch_size, framepack_save_path,
             # LoRA Params
             framepack_lora_folder,
-            # --- ADDED: Preview Params ---
             framepack_enable_preview,
             framepack_preview_every_n_sections,
-            # --- End Added ---
-            # Section Controls
+            framepack_is_f1,
             *framepack_secs, *framepack_sec_prompts, *framepack_sec_images,
             # LoRAs (actual components)
             *framepack_lora_weights, *framepack_lora_multipliers

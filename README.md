@@ -40,7 +40,7 @@ pip install -r requirementsFP.txt
 
 download these 5 files from https://huggingface.co/maybleMyers/framepack_h1111 and put them in a subfolder named hunyuan (H1111/hunyuan), or reference where they are in the gui if you have already aquired them.  
 
-FramePackI2V_HY_bf16.safetensors  
+FramePackI2V_HY_bf16.safetensors  or  FramePack_F1_I2V_HY_20250503.safetensors for F1  
 
 clip_l.safetensors  
 
@@ -90,6 +90,7 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 5/3/2025  
+    Add support for framepack F1! download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/FramePack_F1_I2V_HY_20250503.safetensors  put it in your hunyuan folder.  
     Add support for Wan2.1 i2v-14B-FC-1.1. It is a fun control model and is very good. Use it in the WanX-i2v tab and make sure to select the task i2v-14B-FC-1.1 at the bottom of the page.  Download the weights from https://huggingface.co/maybleMyers/wan_files_for_h1111  
 4/30/2025  
     Previews for framepack.    
