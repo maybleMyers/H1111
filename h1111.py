@@ -356,39 +356,31 @@ def process_framepack_video(
             if not line: continue
             print(f"SUBPROCESS: {line}") # Log subprocess output
 
-            # --- Update Status/Progress ---
+# --- Update Status/Progress ---
             phase_changed = False
-            # Check for Section Log first
-            current_section_log_match = re.search(r"INFO:__main__:Section (\d+):", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
-
-            # --- Determine current total sections ---
+            current_section_start_match = re.search(r"INFO:__main__:--- (?:Standard |F1 )?Section (\d+)\s*/\s*(\d+) ---", line)
             current_total_sections = actual_total_sections if actual_total_sections is not None else total_sections_estimate
 
-            if current_section_log_match:
-                # Extract the backend's section number (counts down from N-1 to 0)
-                backend_section_num = int(current_section_log_match.group(1))
-
-                # --- Dynamically determine total sections from first log ---
+            if current_section_start_match:
+                current_section_num_display = int(current_section_start_match.group(1))
+                total_sections_from_log = int(current_section_start_match.group(2))
                 if actual_total_sections is None:
-                    actual_total_sections = backend_section_num + 1
+                    actual_total_sections = total_sections_from_log
                     current_total_sections = actual_total_sections # Update current_total immediately
                     print(f"Detected actual total sections from backend: {actual_total_sections}")
-                # --- End dynamic determination ---
 
-                # Calculate the display section number (counts up from 1 to N) using the current total
-                display_section_num = max(1, current_total_sections - backend_section_num)
+                display_section_num = current_section_num_display
 
-                # Update phase and progress text immediately when a new section starts
                 new_phase = f"Generating Section {display_section_num}"
                 if current_phase != new_phase:
                     current_phase = new_phase
                     phase_changed = True
 
-                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{current_total_sections} | Preparing..."
+                total_display = actual_total_sections if actual_total_sections is not None else total_sections_from_log
+                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{total_display} | Preparing..." # Show "Preparing..." initially
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
-            # Then check for TQDM progress
             elif tqdm_match:
                  percentage = int(tqdm_match.group(1))
                  current_step = int(tqdm_match.group(2))
@@ -396,17 +388,14 @@ def process_framepack_video(
                  time_elapsed = tqdm_match.group(4)
                  time_remaining = tqdm_match.group(5)
 
-                 # Use the most recently calculated display_section_num and current_total_sections
-                 section_str = f"Section {display_section_num}/{current_total_sections}"
+                 section_str = f"Section {display_section_num}/{current_total_sections}" # Use the updated numbers
 
-                 new_phase = f"Generating Section {display_section_num}"
-                 if current_phase != new_phase and not current_section_log_match: # Only update phase if not already updated by section log
+                 new_phase = f"Generating Section {display_section_num}" # Update phase based on latest display_section_num
+                 if current_phase != new_phase: # Only update if different from the section start log update
                      current_phase = new_phase
                      phase_changed = True
 
-                 # Update progress text with TQDM info and the current section
                  progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
-                 # Status text can remain focused on the current phase (which is now section-aware)
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             elif "Decoding video..." in line:
