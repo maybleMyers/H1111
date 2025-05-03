@@ -356,60 +356,33 @@ def process_framepack_video(
             if not line: continue
             print(f"SUBPROCESS: {line}") # Log subprocess output
 
-# --- Update Status/Progress ---
-            phase_changed = False
+# --- Check for Section Start Log ---
+            # Use a single regex that matches both Standard and F1 formats
+            new_section_match = re.search(r"INFO:__main__:--- (?:Standard |F1 )?Section (\d+)\s*/\s*(\d+) ---", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
 
-            # --- Check for Section Start Log (New format first, then old) ---
-            new_section_match = re.search(r"INFO:__main__:--- (?:Standard |F1 )?Section (\d+)\s*/\s*(\d+) ---", line)
-            old_section_match = None
-            if not new_section_match: # Only check old format if new one doesn't match
-                 old_section_match = re.search(r"INFO:__main__:Section (\d+):", line) # Old format counts down from N-1
+            phase_changed = False
 
-            # Determine current total sections (initialize with estimate)
-            current_total_sections = actual_total_sections if actual_total_sections is not None else total_sections_estimate
-
-            section_start_detected = False
             if new_section_match:
-                section_start_detected = True
-                # Extract current section number (1-based) and total sections from the new format log
+                # Extract current section number (1-based) and total sections directly
                 current_section_num_display = int(new_section_match.group(1))
                 total_sections_from_log = int(new_section_match.group(2))
 
-                # Dynamically determine actual total sections if not already known
+                # Update actual total sections only once if needed
                 if actual_total_sections is None:
                     actual_total_sections = total_sections_from_log
-                    current_total_sections = actual_total_sections
-                    print(f"Detected actual total sections from backend (New Format): {actual_total_sections}")
+                    print(f"Detected actual total sections from backend: {actual_total_sections}")
 
-                display_section_num = current_section_num_display # Use 1-based number directly
+                # Directly use the extracted numbers for display
+                display_section_num = current_section_num_display
+                total_display = actual_total_sections # Use the detected total
 
-            elif old_section_match:
-                 section_start_detected = True
-                 # Extract the backend's section number (0-based, counts down)
-                 backend_section_num_0_based = int(old_section_match.group(1))
-
-                 # Dynamically determine total sections from first log (if not already set)
-                 if actual_total_sections is None:
-                     estimated_total_old = backend_section_num_0_based + 1
-                     actual_total_sections = estimated_total_old
-                     current_total_sections = actual_total_sections
-                     print(f"Detected actual total sections from backend (Old Format Estimation): {actual_total_sections}")
-
-                 # Calculate the display section number (1-based) using the current total
-                 # display = total - backend_0_based
-                 display_section_num = max(1, current_total_sections - backend_section_num_0_based)
-
-            # --- Update Phase and Texts if a Section Start Was Detected ---
-            if section_start_detected:
                 new_phase = f"Generating Section {display_section_num}"
                 if current_phase != new_phase:
                     current_phase = new_phase
                     phase_changed = True
 
-                # Use the most reliable total section count available
-                total_display = actual_total_sections if actual_total_sections is not None else current_total_sections
-                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{total_display} | Preparing..." # Show "Preparing..." initially
+                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{total_display} | Preparing..."
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             # --- Process TQDM Progress ---
@@ -419,22 +392,13 @@ def process_framepack_video(
                  total_steps = int(tqdm_match.group(3))
                  time_elapsed = tqdm_match.group(4)
                  time_remaining = tqdm_match.group(5)
-
-
-                 current_total_sections = actual_total_sections if actual_total_sections is not None else current_total_sections
-                 section_str = f"Section {display_section_num}/{current_total_sections}" # Use the potentially updated numbers
-
-                 # Update phase based on current display_section_num ONLY if it changed from the section start log
+                 current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
+                 section_str = f"Section {display_section_num}/{current_total_for_display}"
                  new_phase = f"Generating Section {display_section_num}"
                  if current_phase != new_phase:
-                     current_phase = new_phase
-                     phase_changed = True
-
-                 # Update progress text with TQDM info and the current section
+                     pass
                  progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
-                 # Update status text if phase changed
-                 if phase_changed:
-                     status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
+                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             # --- Process Other Log Lines ---
             elif "Decoding video..." in line:
@@ -5913,7 +5877,7 @@ with gr.Blocks(
                         params.get("is_f1", False)
                     ]
                 )[-1] # Return the list of values we just built
-            ) if params else [gr.update()] * 32, # CORRECTED fallback count to 32
+            ) if params else [gr.update()] * 32, 
             inputs=params_state, # Read parameters from state
             outputs=[
                 # Map to FramePack components (UI only - 32 components)
