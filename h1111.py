@@ -357,54 +357,45 @@ def process_framepack_video(
             print(f"SUBPROCESS: {line}") # Log subprocess output
 
 # --- Check for Section Start Log ---
-            # Simplified regex to ONLY capture the "Section X / Y" part, ignoring F1/Standard distinction
-            section_match = re.search(r"--- .*?Section (\d+)\s*/\s*(\d+) ---", line) # More generic regex
+            # More robust regex that captures Section X/Y regardless of prefixes or suffixes
+            section_match = re.search(r"---.*?Section\s+(\d+)\s*/\s*(\d+)(?:\s+|$|\()", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
-
             phase_changed = False
-
             if section_match:
                 # Directly extract current section number and total sections
                 current_section_num_display = int(section_match.group(1))
                 total_sections_from_log = int(section_match.group(2))
-
                 # Update state variables
                 display_section_num = current_section_num_display
                 # Update actual total only if it changes or hasn't been set
                 if actual_total_sections != total_sections_from_log:
-                     actual_total_sections = total_sections_from_log
-                     print(f"Detected/Updated actual total sections: {actual_total_sections}")
-
+                    actual_total_sections = total_sections_from_log
+                    print(f"Detected/Updated actual total sections: {actual_total_sections}")
                 # Update phase and status/progress text
                 new_phase = f"Generating Section {display_section_num}"
                 if current_phase != new_phase:
                     current_phase = new_phase
                     phase_changed = True
-
                 # Use the latest section info directly
                 progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{actual_total_sections} | Preparing..."
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
-
             # --- Process TQDM Progress ---
             elif tqdm_match:
-                 percentage = int(tqdm_match.group(1))
-                 current_step = int(tqdm_match.group(2))
-                 total_steps = int(tqdm_match.group(3))
-                 time_elapsed = tqdm_match.group(4)
-                 time_remaining = tqdm_match.group(5)
-
-                 # Use the last known section numbers. If no section log seen yet, use estimate.
-                 current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
-                 section_str = f"Section {display_section_num}/{current_total_for_display}"
-
-                 # Update progress text with TQDM info and the current section string
-                 progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
-                 denoising_phase = f"Denoising Section {display_section_num}"
-                 if current_phase != denoising_phase:
+                percentage = int(tqdm_match.group(1))
+                current_step = int(tqdm_match.group(2))
+                total_steps = int(tqdm_match.group(3))
+                time_elapsed = tqdm_match.group(4)
+                time_remaining = tqdm_match.group(5)
+                # Use the last known section numbers. If no section log seen yet, use estimate.
+                current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
+                section_str = f"Section {display_section_num}/{current_total_for_display}"
+                # Update progress text with TQDM info and the current section string
+                progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
+                denoising_phase = f"Denoising Section {display_section_num}"
+                if current_phase != denoising_phase:
                     current_phase = denoising_phase
                     phase_changed = True
-
-                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
+                status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             # --- Process Other Log Lines ---
             elif "Decoding video..." in line:
