@@ -5281,8 +5281,8 @@ with gr.Blocks(
                         allow_preview=True,
                         preview=True
                     )
-                    with gr.Accordion("Latent Preview (During Generation)", open=False):
-                        wanx_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        wanx_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
                         wanx_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
                                                        label="Preview Every N Steps", info="Generates previews during the sampling loop.")
                         wanx_preview_output = gr.Gallery(
