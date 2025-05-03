@@ -263,7 +263,7 @@ def soft_append_bcthw(history, current, overlap=0):
     return output.to(history)
 
 
-def save_bcthw_as_mp4(x, output_filename, fps=10):
+def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     b, c, t, h, w = x.shape
 
     per_row = b
@@ -276,7 +276,7 @@ def save_bcthw_as_mp4(x, output_filename, fps=10):
     x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
     x = x.detach().cpu().to(torch.uint8)
     x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
-    torchvision.io.write_video(output_filename, x, fps=fps, video_codec='h264', options={'crf': '0'})
+    torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
     return x
 
 

@@ -96,7 +96,7 @@ def process_framepack_video(
     lora_folder: str,
     enable_preview: bool,
     preview_every_n_sections: int,
-    # --- CORRECTED: Use *args to capture variable inputs ---
+    is_f1: bool,
     *args: Any
     # --- End Corrected ---
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]: # Modified return type for preview path
@@ -294,6 +294,7 @@ def process_framepack_video(
             "--latent_window_size", str(latent_window_size),
             "--sample_solver", sample_solver, "--output_type", "video", "--attn_mode", attn_mode
         ]
+        if is_f1: command.append("--is_f1")      
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
         if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
@@ -520,7 +521,8 @@ def process_framepack_video(
                 "lora_weights": [os.path.basename(p) for p in valid_loras_paths],
                 "lora_multipliers": [float(m) for m in valid_loras_mults],
                 "original_dims_str": original_dims_str,
-                "target_resolution": target_resolution
+                "target_resolution": target_resolution,
+                "is_f1": is_f1
             }
             try:
                 add_metadata_to_video(current_video_path, parameters)
@@ -4585,6 +4587,8 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
+                                                  info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
                     framepack_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
@@ -4755,7 +4759,7 @@ with gr.Blocks(
 
             with gr.Accordion("Model Paths / Advanced", open=False):
                  with gr.Row():
-                    framepack_transformer_path = gr.Textbox(label="Transformer Path (DiT)", value="hunyuan/FramePackI2V_HY_bf16.safetensors")
+                    framepack_transformer_path = gr.Textbox(label="Transformer Path (DiT)", value="hunyuan/FramePackI2V_HY_bf16.safetensors", interactive=True)
                     framepack_vae_path = gr.Textbox(label="VAE Path", value="hunyuan/pytorch_model.pt")
                  with gr.Row():
                     framepack_text_encoder_path = gr.Textbox(label="Text Encoder 1 (Llama) Path *Required*", value="hunyuan/llava_llama3_fp16.safetensors")
@@ -5878,7 +5882,8 @@ with gr.Blocks(
                         params.get("device", ""),
                         # End Frame Blending Params - Use UI defaults
                         params.get("end_frame_influence", "last"),
-                        params.get("end_frame_weight", 0.5)
+                        params.get("end_frame_weight", 0.5),
+                        is_f1_meta
                     ]
                 )[-1] # Return the list of values we just built
             ) if params else [gr.update()] * 32, # CORRECTED fallback count to 32
@@ -5913,7 +5918,8 @@ with gr.Blocks(
                 framepack_device,
                 # Map to new UI components
                 framepack_end_frame_influence,
-                framepack_end_frame_weight
+                framepack_end_frame_weight,
+                framepack_is_f1
             ]
         ).then(
             fn=change_to_framepack_tab, # Switch to the FramePack tab
@@ -5993,6 +5999,35 @@ with gr.Blocks(
         inputs=[framepack_target_resolution],
         outputs=[framepack_width, framepack_height]
     )
+    def toggle_f1_model_path(is_f1):
+        f1_path = "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"
+        standard_path = "hunyuan/FramePackI2V_HY_bf16.safetensors"
+        target_path = f1_path if is_f1 else standard_path
+
+        # Check if the target path exists
+        if not os.path.exists(target_path):
+             print(f"Warning: F1 model path '{target_path}' not found. Falling back to standard path.")
+             # Optionally fall back or just update with the non-existent path
+             # Let's fall back to standard if F1 is missing, but keep standard if standard is missing (error handled later)
+             if is_f1 and os.path.exists(standard_path):
+                 print(f"Falling back to standard path: {standard_path}")
+                 return gr.update(value=standard_path)
+             elif is_f1:
+                 print(f"F1 path missing and standard path also missing. Cannot automatically switch.")
+                 # Return the intended (missing) path, error will be caught later
+                 return gr.update(value=target_path)
+             else: # Standard path is missing
+                  print(f"Warning: Standard path '{standard_path}' not found.")
+                  return gr.update(value=target_path) # Return the missing standard path
+
+        print(f"Switching DiT path to: {target_path}")
+        return gr.update(value=target_path)
+
+    framepack_is_f1.change(
+        fn=toggle_f1_model_path,
+        inputs=[framepack_is_f1],
+        outputs=[framepack_transformer_path]
+    )    
 
     framepack_generate_btn.click(
         fn=process_framepack_video,
@@ -6018,11 +6053,9 @@ with gr.Blocks(
             framepack_batch_size, framepack_save_path,
             # LoRA Params
             framepack_lora_folder,
-            # --- ADDED: Preview Params ---
             framepack_enable_preview,
             framepack_preview_every_n_sections,
-            # --- End Added ---
-            # Section Controls
+            framepack_is_f1,
             *framepack_secs, *framepack_sec_prompts, *framepack_sec_images,
             # LoRAs (actual components)
             *framepack_lora_weights, *framepack_lora_multipliers
