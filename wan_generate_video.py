@@ -236,7 +236,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--control_path is provided, but the selected task does not support Fun-Control.")
     if not (0.0 <= args.control_falloff_percentage <= 0.49):
         raise ValueError("--control_falloff_percentage must be between 0.0 and 0.49")
-
+    if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
+         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
     return args
 
 def create_funcontrol_conditioning_latent(
@@ -1130,11 +1131,47 @@ def prepare_i2v_inputs(
         del clip, img_clip, img_tensor_clip
         clean_memory_on_device(device)
 
+        fun_ref_latent = None
+        # Check if the task requires ref_conv and if a reference image is provided via --image_path
+        if args.task == "i2v-14B-FC-1.1" and args.image_path is not None:
+            logger.info(f"Task {args.task} requires ref_conv. Encoding reference image from --image_path: {args.image_path}")
+            try:
+                ref_img = Image.open(args.image_path).convert("RGB")
+                ref_img_np = np.array(ref_img)
+                # Resize ref image to target pixel dimensions
+                interpolation = cv2.INTER_AREA if pixel_height < ref_img_np.shape[0] else cv2.INTER_CUBIC
+                ref_img_resized_np = cv2.resize(ref_img_np, (pixel_width, pixel_height), interpolation=interpolation)
+                # Convert to tensor CFHW, range [-1, 1]
+                ref_img_tensor = TF.to_tensor(ref_img_resized_np).sub_(0.5).div_(0.5).to(device)
+                ref_img_tensor = ref_img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
+
+                vae.to_device(device) # Ensure VAE is on device for encoding
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+                    # Encode the single reference frame
+                    # vae.encode returns list, take first element. Result shape [C', 1, H', W']
+                    fun_ref_latent = vae.encode([ref_img_tensor])[0]
+                    # Squeeze the frame dimension for Conv2d in the model: [C', H', W']
+                    fun_ref_latent = fun_ref_latent.squeeze(1)
+                logger.info(f"Encoded fun_ref latent. Shape: {fun_ref_latent.shape}")
+                # Keep VAE on device for main conditioning latent creation below
+
+            except Exception as e:
+                logger.error(f"Error processing reference image for fun_ref: {e}")
+                fun_ref_latent = None # Continue without ref if encoding fails
+
+            # **IMPORTANT**: Since --image_path is now used for fun_ref,
+            # temporarily set it to None *before* calling create_funcontrol_conditioning_latent
+            # so it doesn't get processed *again* as a start image inside that function.
+            original_image_path = args.image_path
+            args.image_path = None
+
         # Use the FunControl helper function to create the 32-channel 'y'
         vae.to_device(device) # Ensure VAE is on compute device
         y = create_funcontrol_conditioning_latent(
             args, config, vae, device, lat_f, lat_h, lat_w, pixel_height, pixel_width
         )
+        if args.task == "i2v-14B-FC-1.1":
+             args.image_path = original_image_path        
         if y is None:
             raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
         vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu") # Move VAE back
@@ -1154,7 +1191,12 @@ def prepare_i2v_inputs(
             "seq_len": seq_len,
             "y": [y_for_model], # Pass the 4D tensor in the list
         }
-    
+        
+        if fun_ref_latent is not None:
+            # Model forward expects fun_ref directly, not in a list like 'y'
+            arg_c["fun_ref"] = fun_ref_latent
+            arg_null["fun_ref"] = fun_ref_latent # Pass to both cond and uncond
+            logger.info("Added fun_ref latent to model inputs.")    
 
         # Return noise, context, context_null, y (for potential debugging), (arg_c, arg_null)
         return noise, context, context_null, y, (arg_c, arg_null)

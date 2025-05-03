@@ -5329,7 +5329,7 @@ with gr.Blocks(
                 # Update the wanx_task dropdown choices to include Fun-Control options
                 wanx_task = gr.Dropdown(
                     label="Task",
-                    choices=["i2v-14B", "i2v-14B-FC", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new"],
+                    choices=["i2v-14B", "i2v-14B-FC", "i2v-14B-FC-1.1", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new"],
                     value="i2v-14B",
                     info="Select model type. *-FC options enable Fun-Control features"
                 )

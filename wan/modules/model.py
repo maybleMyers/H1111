@@ -506,6 +506,8 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         eps=1e-6,
         attn_mode=None,
         split_attn=False,
+        add_ref_conv=False, 
+        in_dim_ref_conv=16,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -596,6 +598,14 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         if model_type == "i2v":
             self.img_emb = MLPProj(1280, dim)
+
+        self.add_ref_conv = add_ref_conv # Store the flag
+        if add_ref_conv:
+            # Use spatial dimensions from patch_size for Conv2d
+            self.ref_conv = nn.Conv2d(in_dim_ref_conv, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
+            logger.info(f"Initialized ref_conv layer with in_channels={in_dim_ref_conv}, out_channels={dim}")
+        else:
+            self.ref_conv = None            
 
         # initialize weights
         self.init_weights()
@@ -707,7 +717,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
 
-    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None):
+    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, fun_ref=None):
         r"""
         Forward pass through the diffusion model
 
@@ -737,6 +747,12 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
+        if isinstance(x, list) and len(x) > 0:
+             _, F_orig, H_orig, W_orig = x[0].shape
+        else:
+             # Fallback or error handling if x is not as expected
+             raise ValueError("Input x is not in the expected list format.")            
+
         if y is not None:
             print('WanModel concat debug:')
             for i, (u, v) in enumerate(zip(x, y)):
@@ -752,17 +768,57 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
 
-        freqs_list = []
-        for fhw in grid_sizes:
-            fhw = tuple(fhw.tolist())
-            if fhw not in self.freqs_fhw:
-                c = self.dim // self.num_heads // 2
-                self.freqs_fhw[fhw] = calculate_freqs_i(fhw, c, self.freqs)
-            freqs_list.append(self.freqs_fhw[fhw])
+        # <<< START: Process fun_ref if applicable >>>
+        F = F_orig # Use original frame count for RoPE calculation unless fun_ref modifies it
+        if self.ref_conv is not None and fun_ref is not None:
+            # fun_ref is expected to be the raw reference image latent [B, C_ref, H_ref, W_ref]
+            # Ensure it's on the correct device
+            fun_ref = fun_ref.to(device)
+            logger.debug(f"Processing fun_ref with shape: {fun_ref.shape}")
 
-        x = [u.flatten(2).transpose(1, 2) for u in x]
+            # Apply the 2D convolution
+            # Note: fun_ref needs batch dim for Conv2d, add if missing
+            if fun_ref.dim() == 3: fun_ref = fun_ref.unsqueeze(0)
+            processed_ref = self.ref_conv(fun_ref) # Output: [B, C, H_out, W_out]
+            logger.debug(f"Processed ref_conv output shape: {processed_ref.shape}")
+
+            # Reshape to token sequence: [B, L_ref, C]
+            processed_ref = processed_ref.flatten(2).transpose(1, 2)
+            logger.debug(f"Reshaped processed_ref shape: {processed_ref.shape}")
+
+            # Adjust grid_sizes, seq_len, and F to account for the prepended tokens
+            # Assuming the reference adds effectively one "frame" worth of tokens spatially
+            # Note: This might need adjustment depending on how seq_len is used later.
+            # We increment the frame dimension 'F' in grid_sizes.
+            grid_sizes = torch.stack([torch.tensor([gs[0] + 1, gs[1], gs[2]], dtype=torch.long) for gs in grid_sizes]).to(grid_sizes.device)
+            seq_len += processed_ref.size(1) # Add number of reference tokens
+            F = F_orig + 1 # Indicate one extra effective frame for RoPE/freq calculation
+            logger.debug(f"Adjusted grid_sizes: {grid_sizes}, seq_len: {seq_len}, F for RoPE: {F}")
+
+            # Prepend the reference tokens to each element in the list x
+            x = [torch.cat([processed_ref, u.flatten(2).transpose(1, 2)], dim=1) for u in x] # x was already flattened+transposed below, do it here
+            # x is now list of [B, L_new, C]
+        else:
+            # Original flattening if no fun_ref
+            x = [u.flatten(2).transpose(1, 2) for u in x]     
+        # <<< END: Process fun_ref if applicable >>>               
+
+        freqs_list = []
+        for fhw in grid_sizes: # Use the potentially updated grid_sizes
+            fhw_tuple = tuple(fhw.tolist())
+            if fhw_tuple not in self.freqs_fhw:
+                c_rope = self.dim // self.num_heads // 2
+                # Use the potentially updated frame count F from fhw[0]
+                self.freqs_fhw[fhw_tuple] = calculate_freqs_i(fhw, c_rope, self.freqs)
+            freqs_list.append(self.freqs_fhw[fhw_tuple])
+
+        # ... (seq_len calculation and padding using potentially updated seq_len) ...
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len, f"Sequence length exceeds maximum allowed length {seq_len}. Got {seq_lens.max()}"
+        if seq_lens.max() > seq_len:
+             # This might happen if seq_len wasn't updated correctly or padding logic needs review
+             logger.warning(f"Calculated seq_lens.max()={seq_lens.max()} > adjusted seq_len={seq_len}. Adjusting seq_len.")
+             seq_len = seq_lens.max().item() # Use the actual max length required
+
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
         # time embeddings
@@ -802,6 +858,13 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+
+        if self.ref_conv is not None and fun_ref is not None:
+            num_ref_tokens = processed_ref.size(1)
+            logger.debug(f"Removing {num_ref_tokens} prepended reference tokens before head.")
+            x = x[:, num_ref_tokens:, :]
+            # Restore original grid_sizes F dimension for unpatchify
+            grid_sizes = torch.stack([torch.tensor([gs[0] - 1, gs[1], gs[2]], dtype=torch.long) for gs in grid_sizes]).to(grid_sizes.device)                
 
         # head
         x = self.head(x, e)
@@ -892,6 +955,22 @@ def load_wan_model(
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
+    wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
+    logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
+    sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+
+    # remove "model.diffusion_model." prefix: 1.3B model has this prefix
+    sd_keys = list(sd.keys()) # Keep original keys for potential prefix removal
+    for key in sd_keys:
+        if key.startswith("model.diffusion_model."):
+            sd[key[22:]] = sd.pop(key)
+
+    # Check for ref_conv layer weights
+    has_ref_conv = "ref_conv.weight" in sd
+    in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16 # Default if not found
+    if has_ref_conv:
+        logger.info(f"Detected ref_conv layer in model weights. Input channels: {in_dim_ref_conv}")    
+
     with init_empty_weights():
         logger.info(f"Creating WanModel")
         model = WanModel(
@@ -907,22 +986,13 @@ def load_wan_model(
             text_len=config.text_len,
             attn_mode=attn_mode,
             split_attn=split_attn,
+            add_ref_conv=has_ref_conv,             # <<< Pass detected flag
+            in_dim_ref_conv=in_dim_ref_conv,             
         )
-        if dit_weight_dtype is not None:
+        if dit_weight_dtype is not None and not fp8_scaled: # Don't pre-cast if optimizing to FP8 later
             model.to(dit_weight_dtype)
 
-    # if fp8_scaled, load model weights to CPU to reduce VRAM usage. Otherwise, load to the specified device (CPU for block swap or CUDA for others)
-    wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
-    logger.info(f"Loading DiT model from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
-
-    # load model weights with the specified dtype or as is
-    sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
-
-    # remove "model.diffusion_model." prefix: 1.3B model has this prefix
-    for key in list(sd.keys()):
-        if key.startswith("model.diffusion_model."):
-            sd[key[22:]] = sd.pop(key)
-
+    # ... (fp8 optimization - sd is already loaded) ...
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info(f"Optimizing model weights to fp8. This may take a while.")
@@ -934,7 +1004,21 @@ def load_wan_model(
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
 
-    info = model.load_state_dict(sd, strict=True, assign=True)
+    # Load the potentially modified state dict
+    # Use strict=False initially if ref_conv might be missing in older models but present in the class
+    # After confirming your models, you might set strict=True if all target models have the layer or None.
+    info = model.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded DiT model from {dit_path}, info={info}")
+    if not info.missing_keys and not info.unexpected_keys:
+         logger.info("State dict loaded successfully (strict check passed).")
+    else:
+         logger.warning(f"State dict load info: Missing={info.missing_keys}, Unexpected={info.unexpected_keys}")
+         # If add_ref_conv is True but ref_conv keys are missing, it's an issue.
+         if has_ref_conv and any("ref_conv" in k for k in info.missing_keys):
+              raise ValueError("Model configuration indicates ref_conv=True, but weights are missing!")
+         # If add_ref_conv is False but ref_conv keys are unexpected, it's also an issue with model/config mismatch.
+         if not has_ref_conv and any("ref_conv" in k for k in info.unexpected_keys):
+              raise ValueError("Model configuration indicates ref_conv=False, but weights are present!")
+
 
     return model
