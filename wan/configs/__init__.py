@@ -79,6 +79,13 @@ i2v_14B_FC.__name__ = "Config: Wan-Fun-Control I2V 14B"
 i2v_14B_FC.in_dim = 48
 i2v_14B_FC.is_fun_control = True
 
+i2v_14B_FC_1_1 = copy.deepcopy(i2v_14B_FC) # Copy the existing FunControl I2V 14B config
+i2v_14B_FC_1_1.__name__ = "Config: Wan-Fun-Control I2V 14B v1.1"
+# Explicitly add the flag for clarity, though loading logic will derive it
+# i2v_14B_FC_1_1.add_ref_conv = True # This flag isn't directly used by the Python config struct, but good for documentation
+# The key is that the loaded weights for this model WILL contain 'ref_conv.weight'
+# All other parameters are inherited from i2v_14B_FC (in_dim=48, is_fun_control=True, etc.)
+
 WAN_CONFIGS = {
     "t2v-14B": t2v_14B,
     "t2v-1.3B": t2v_1_3B,
@@ -89,6 +96,7 @@ WAN_CONFIGS = {
     "t2v-1.3B-FC": t2v_1_3B_FC,
     "t2v-14B-FC": t2v_14B_FC,
     "i2v-14B-FC": i2v_14B_FC,
+    "i2v-14B-FC-1.1": i2v_14B_FC_1_1,
 }
 
 SIZE_CONFIGS = {
@@ -128,6 +136,8 @@ SUPPORTED_SIZES = {
     "t2v-1.3B-FC": ("480*832", "832*480"),
     "t2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
+    "i2v-14B-FC-1.1": ("720*1280", "1280*720", "480*832", "832*480"),
     # Add supported sizes for the new model
-    "i2v-1.3B-new": ("480*832", "832*480", "512*512", "672*352", "352*672"), # <--- ADD THIS LINE (Adjust sizes as needed)
+    "i2v-1.3B-new": ("480*832", "832*480", "512*512", "672*352", "352*672"), 
+    
 }
