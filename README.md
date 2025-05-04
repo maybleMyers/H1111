@@ -20,7 +20,7 @@ SkyReels-t2v
 
 I have mostly been workiing on the framepack tab and the WanX-i2v tab. They are the best to use right now. WanX-i2v is used for skyreels v2 and the fun control models.    
 
-If you are running out of vram use block swapping and some form of attention besides sdpa or torch and use split attention. Sage attention is the fastest/lowest vram but difficult to install in windows. I would say the easiest to get to run is xformers attention, you can usually get it with "pip install xformers".
+If you are running out of vram use more block swapping. Using FP8 scaled is also a decent option to lower memory usage, select fp8 and fp8 scaled to use it. Scaled fp8 tries to duplicate the important parts of the model from FP16. Sage attention is the fastest/lowest vram but difficult to install in windows.
 
 Best quality will be obtained with only enabling block swapping and using the fp16 model with sdpa attention. You can speed things up with cfg skip, fp8 scaled, slg skip is small speedup, sage attention is fastest but all speedups come with quality degradations. I designed this to try to focus on quality over speed.
 
