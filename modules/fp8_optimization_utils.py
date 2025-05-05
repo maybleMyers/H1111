@@ -6,6 +6,8 @@ import logging
 
 from tqdm import tqdm
 
+from utils.safetensors_utils import MemoryEfficientSafeOpen
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -86,6 +88,104 @@ def quantize_tensor_to_fp8(tensor, scale, exp_bits=4, mantissa_bits=3, sign_bits
     quantized = torch.round(clamped_tensor / quant_factor) * quant_factor
 
     return quantized, scale
+
+
+def optimize_state_dict_with_fp8_on_the_fly(
+    model_files,
+    calc_device,
+    target_layer_keys=None,
+    exclude_layer_keys=None,
+    exp_bits=4,
+    mantissa_bits=3,
+    move_to_device=False,
+    weight_hook=None,
+):
+    """
+    Optimize Linear layer weights in a model's state dict to FP8 format.
+
+    Args:
+        model_files (list): List of model files to optimize
+        calc_device (str): Device to quantize tensors on
+        target_layer_keys (list, optional): Layer key patterns to target (None for all Linear layers)
+        exclude_layer_keys (list, optional): Layer key patterns to exclude
+        exp_bits (int): Number of exponent bits
+        mantissa_bits (int): Number of mantissa bits
+        move_to_device (bool): Move optimized tensors to the calculating device
+
+    Returns:
+        dict: FP8 optimized state dict
+    """
+    if exp_bits == 4 and mantissa_bits == 3:
+        fp8_dtype = torch.float8_e4m3fn
+    elif exp_bits == 5 and mantissa_bits == 2:
+        fp8_dtype = torch.float8_e5m2
+    else:
+        raise ValueError(f"Unsupported FP8 format: E{exp_bits}M{mantissa_bits}")
+
+    # Calculate FP8 max value
+    max_value = calculate_fp8_maxval(exp_bits, mantissa_bits)
+    min_value = -max_value  # this function supports only signed FP8
+
+    # Create optimized state dict
+    def is_target_key(key):
+        # Check if it's a weight key and matches target patterns
+        is_target = (target_layer_keys is None or any(pattern in key for pattern in target_layer_keys)) and key.endswith(".weight")
+        is_excluded = exclude_layer_keys is not None and any(pattern in key for pattern in exclude_layer_keys)
+        is_target = is_target and not is_excluded
+        return is_target
+
+    optimized_count = 0
+    # process each model file
+    state_dict = {}
+    for model_file in model_files:
+        with MemoryEfficientSafeOpen(model_file) as f:
+            keys = f.keys()
+            for key in tqdm(keys, desc=f"Loading {model_file}", unit="key"):
+                value = f.get_tensor(key)
+                if weight_hook is not None:
+                    value = weight_hook(key, value)
+
+                if not is_target_key(key):
+                    state_dict[key] = value
+                    continue
+
+                # Save original device and dtype
+                original_device = value.device
+                original_dtype = value.dtype
+
+                # Move to calculation device
+                if calc_device is not None:
+                    value = value.to(calc_device)
+
+                # Calculate scale factor
+                scale = torch.max(torch.abs(value.flatten())) / max_value
+                # print(f"Optimizing {key} with scale: {scale}")
+
+                # Quantize weight to FP8
+                quantized_weight, _ = quantize_tensor_to_fp8(value, scale, exp_bits, mantissa_bits, 1, max_value, min_value)
+
+                # Add to state dict using original key for weight and new key for scale
+                fp8_key = key  # Maintain original key
+                scale_key = key.replace(".weight", ".scale_weight")
+
+                quantized_weight = quantized_weight.to(fp8_dtype)
+
+                if not move_to_device:
+                    quantized_weight = quantized_weight.to(original_device)
+
+                scale_tensor = torch.tensor([scale], dtype=original_dtype, device=quantized_weight.device)
+
+                state_dict[fp8_key] = quantized_weight
+                state_dict[scale_key] = scale_tensor
+
+                optimized_count += 1
+
+                if calc_device is not None:  # optimized_count % 10 == 0 and
+                    # free memory on calculation device
+                    clean_memory_on_device(calc_device)
+
+    logger.info(f"Number of optimized Linear layers: {optimized_count}")
+    return state_dict
 
 
 def optimize_state_dict_with_fp8(

@@ -89,6 +89,9 @@ def process_framepack_video(
     vae_chunk_size: Optional[int],
     vae_spatial_tile_sample_min_size: Optional[int],
     device: Optional[str],
+    use_teacache: bool,
+    teacache_steps: int,
+    teacache_thresh: float,
     # --- Batching & Saving ---
     batch_size: int,
     save_path: str, # Argument being checked
@@ -98,7 +101,6 @@ def process_framepack_video(
     preview_every_n_sections: int,
     is_f1: bool,
     *args: Any
-    # --- End Corrected ---
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]: # Modified return type for preview path
     """Generate video using fpack_generate_video.py"""
     global stop_event
@@ -110,7 +112,6 @@ def process_framepack_video(
         save_path = "outputs"
     # --- End Fallback ---
 
-    # --- CORRECTED: Reconstruct lists from *args ---
     num_section_controls = 4
     num_loras = 4
     # Calculate slice indices based on the number of components for each group
@@ -310,14 +311,16 @@ def process_framepack_video(
         if valid_loras_paths:
             command.extend(["--lora_weight"] + valid_loras_paths)
             command.extend(["--lora_multiplier"] + valid_loras_mults)
-
-        # --- ADDED: Add preview argument if enabled ---
         if enable_preview and preview_every_n_sections > 0:
             command.extend(["--preview_latent_every", str(preview_every_n_sections)])
             # --- ADDED: Pass the unique suffix ---
             command.extend(["--preview_suffix", unique_preview_suffix])
             # --- End Pass Suffix ---
             print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
+        if use_teacache:
+            command.append("--use_teacache")
+            command.extend(["--teacache_steps", str(teacache_steps)])
+            command.extend(["--teacache_thresh", str(teacache_thresh)])            
 
         # Ensure all command parts are strings
         command_str = [str(c) for c in command]
@@ -344,7 +347,7 @@ def process_framepack_video(
                     p.wait()
                 except Exception as e:
                     print(f"Error terminating subprocess: {e}")
-                yield all_videos.copy(), "Generation stopped by user.", ""
+                yield all_videos.copy(), None, "Generation stopped by user.", ""
                 return
 
             line = p.stdout.readline()
@@ -4744,6 +4747,10 @@ with gr.Blocks(
                     framepack_vae_chunk_size = gr.Number(label="VAE Chunk Size (CausalConv3d)", value=32, step=1, minimum=0, info="0 or None=disable (Default: None)")
                     framepack_vae_spatial_tile_sample_min_size = gr.Number(label="VAE Spatial Tile Min Size", value=128, step=16, minimum=0, info="0 or None=disable (Default: None)")
                     framepack_device = gr.Textbox(label="Device Override (optional)", placeholder="e.g., cuda:0, cpu")
+                with gr.Row():
+                    framepack_use_teacache = gr.Checkbox(label="Use TeaCache", value=False, info="Enable TeaCache for faster generation (shits hands).")
+                    framepack_teacache_steps = gr.Number(label="TeaCache Init Steps", value=25, step=1, minimum=1, info="Steps for TeaCache init (match Inference Steps)")
+                    framepack_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.15, info="Relative L1 distance threshold for skipping.")                    
 
             with gr.Accordion("Model Paths / Advanced", open=False):
                  with gr.Row():
@@ -6063,6 +6070,9 @@ with gr.Blocks(
             framepack_blocks_to_swap, framepack_bulk_decode, framepack_attn_mode,
             framepack_vae_chunk_size, framepack_vae_spatial_tile_sample_min_size,
             framepack_device,
+            framepack_use_teacache,
+            framepack_teacache_steps,
+            framepack_teacache_thresh,
             # Batching & Saving
             framepack_batch_size, framepack_save_path,
             # LoRA Params
@@ -6074,14 +6084,12 @@ with gr.Blocks(
             # LoRAs (actual components)
             *framepack_lora_weights, *framepack_lora_multipliers
         ],
-        # --- UPDATED: Outputs list includes preview video ---
         outputs=[
             framepack_output,           # Main gallery
             framepack_preview_output,   # Preview video player
             framepack_batch_progress,   # Status text
             framepack_progress_text     # Progress text
         ],
-        # --- End Updated ---
         queue=True
     )
 

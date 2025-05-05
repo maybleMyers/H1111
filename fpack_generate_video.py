@@ -187,6 +187,11 @@ def parse_args() -> argparse.Namespace:
     #parser.add_argument("--preview_latent_every", type=int, default=None, help="Preview latent every N sections")
     parser.add_argument("--preview_suffix", type=str, default=None, help="Unique suffix for preview files to avoid conflicts in concurrent runs.")
 
+    # TeaCache arguments
+    parser.add_argument("--use_teacache", action="store_true", help="Enable TeaCache for faster generation.")
+    parser.add_argument("--teacache_steps", type=int, default=25, help="Number of steps for TeaCache initialization (should match --infer_steps).")
+    parser.add_argument("--teacache_thresh", type=float, default=0.15, help="Relative L1 distance threshold for TeaCache skipping.")
+
     parser = add_blissful_args(parser)
     args = parser.parse_args()
     args = parse_blissful_args(args)
@@ -923,6 +928,18 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
         # optimize model: fp8 conversion, block swap etc.
         optimize_model(model, args, device)
+        if args.use_teacache:
+            logger.info(f"Initializing TeaCache: steps={args.teacache_steps}, threshold={args.teacache_thresh}")
+            # The model's initialize_teacache expects num_steps and rel_l1_thresh
+            model.initialize_teacache(
+                enable_teacache=True,
+                num_steps=args.teacache_steps,
+                rel_l1_thresh=args.teacache_thresh
+            )
+        else:
+            logger.info("TeaCache is disabled.")
+            # Ensure it's explicitly disabled in the model too, just in case
+            model.initialize_teacache(enable_teacache=False)
 
     # --- Sampling ---
     latent_window_size = args.latent_window_size  # default is 9 (consistent with F1 demo)
