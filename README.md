@@ -89,6 +89,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+5/5/2025  
+    Include an experimental hunyuan to framepack convert lora option in the convert lora tab.  
 5/3/2025  
     Add support for framepack F1! download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/FramePack_F1_I2V_HY_20250503.safetensors  put it in your hunyuan folder. You might need to reinstall reqs "pip install -r requirements.txt"  
     Add support for Wan2.1 i2v-14B-FC-1.1. It is a fun control model and is very good. Use it in the WanX-i2v tab and make sure to select the task i2v-14B-FC-1.1 at the bottom of the page.  Download the weights from https://huggingface.co/maybleMyers/wan_files_for_h1111  

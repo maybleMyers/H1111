@@ -5696,7 +5696,7 @@ with gr.Blocks(
             def convert_lora(input_file, output_name: str, target_format: str) -> str:
                 """Convert LoRA file to specified format"""
                 try:
-                    if not input_file:
+                    if input_file is None:
                         return "Error: No input file selected"
 
                     # Ensure output directory exists
@@ -5705,16 +5705,31 @@ with gr.Blocks(
                     # Construct output path
                     output_path = os.path.join("lora", f"{output_name}.safetensors")
 
-                    # Build command
-                    cmd = [
-                        sys.executable,
-                        "convert_lora.py",
-                        "--input", input_file.name,
-                        "--output", output_path,
-                        "--target", target_format
-                    ]
+                    # Determine which script to use based on target_format
+                    if target_format == "Hunyuan to FramePack":
+                        script_name = "convert_hunyuan_to_framepack.py"
+                        cmd = [
+                            sys.executable,
+                            script_name,
+                            "--input", input_file.name,
+                            "--output", output_path
+                        ]
+                        print(f"Using '{script_name}' to convert {input_file.name} to {output_path} for FramePack.")
+                    else: # Existing logic for "default" and "other"
+                        script_name = "convert_lora.py"
+                        cmd = [
+                            sys.executable,
+                            script_name,
+                            "--input", input_file.name,
+                            "--output", output_path,
+                            "--target", target_format.lower()
+                        ]
 
-                    print(f"Converting {input_file.name} to {output_path}")
+                    print(f"Running conversion command: {' '.join(cmd)}")
+
+                    # Check if the selected script file exists
+                    if not os.path.exists(script_name):
+                         return f"Error: Conversion script '{script_name}' not found. Please ensure it's in the same directory as h1111.py."
 
                     # Execute conversion
                     result = subprocess.run(
@@ -5724,24 +5739,35 @@ with gr.Blocks(
                         check=True
                     )
 
+                    if result.returncode != 0:
+                        return f"Conversion failed with exit code {result.returncode}. See console for details:\n{result.stderr}\n{result.stdout}"
+
+
                     if os.path.exists(output_path):
                         return f"Successfully converted LoRA to {output_path}"
                     else:
                         return "Error: Output file not created"
 
                 except subprocess.CalledProcessError as e:
+                    print(f"Subprocess error:\n{e.stderr}\n{e.stdout}")
                     return f"Error during conversion: {e.stderr}"
+                except FileNotFoundError as e:
+                    # This catches errors like python executable not found, or the script itself not found
+                    print(f"File not found error: {e}")
+                    return f"Error: Required file not found. Make sure Python and the conversion script are accessible. Details: {e}"
                 except Exception as e:
+                    traceback.print_exc() # Print traceback for debugging
                     return f"Error: {str(e)}"
+
 
             with gr.Row():
                 input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
                 output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
                 format_radio = gr.Radio(
-                    choices=["default", "other"],
+                    choices=["default", "other", "Hunyuan to FramePack"], # <-- Added new choice here
                     value="default",
                     label="Target Format",
-                    info="Choose 'default' for H1111/MUSUBI format or 'other' for diffusion pipe format"
+                    info="Choose 'default' for H1111/MUSUBI format, 'other' for diffusion pipe format, or 'Hunyuan to FramePack' for FramePack compatibility."
                 )
 
             with gr.Row():
