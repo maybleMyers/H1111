@@ -71,6 +71,7 @@ def process_framepack_video(
     framepack_height: Optional[int],
     original_dims_str: str,
     total_second_length: float,
+    framepack_video_sections: Optional[int],
     fps: int,
     seed: int,
     steps: int,
@@ -217,8 +218,13 @@ def process_framepack_video(
     # --- Batch Loop (Simulated for UI) ---
     all_videos = []
     # Calculate total sections for display (doesn't affect backend's internal logic)
-    total_sections_estimate_float = (total_second_length * fps) / (latent_window_size * 4) # Use fixed latent_window_size
-    total_sections_estimate = int(max(round(total_sections_estimate_float), 1))
+    if framepack_video_sections is not None and framepack_video_sections > 0:
+        total_sections_estimate = framepack_video_sections
+        print(f"Using user-defined total sections for UI: {total_sections_estimate}")
+    else:
+        total_sections_estimate_float = (total_second_length * fps) / (latent_window_size * 4) # Use fixed latent_window_size
+        total_sections_estimate = int(max(round(total_sections_estimate_float), 1))
+        print(f"Calculated total sections for UI from duration: {total_sections_estimate}")
     progress_text = f"Starting FramePack generation batch ({total_sections_estimate} estimated sections per video)..."
     status_text = "Preparing batch..."
     yield all_videos, None, status_text, progress_text
@@ -288,7 +294,7 @@ def process_framepack_video(
             *(["--image_path", final_image_path_arg] if final_image_path_arg else []),
             "--save_path", save_path, "--prompt", final_prompt_arg,
             "--video_size", str(final_height), str(final_width),
-            "--video_seconds", str(total_second_length), "--fps", str(fps),
+            *(["--video_sections", str(framepack_video_sections)] if framepack_video_sections is not None and framepack_video_sections > 0 else ["--video_seconds", str(total_second_length)]),
             "--infer_steps", str(steps), "--seed", str(current_seed),
             "--embedded_cfg_scale", str(distilled_guidance_scale),
             "--guidance_scale", str(cfg), "--guidance_rescale", str(rs),
@@ -4631,6 +4637,11 @@ with gr.Blocks(
                                  info="Must be divisible by 32.", interactive=True
                              )
                     framepack_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Total Video Length (seconds)", value=5.0)
+                    framepack_video_sections = gr.Number(
+                        label="Total Video Sections (Overrides seconds if > 0)",
+                        value=None, minimum=1, step=1,
+                        info="Specify exact number of sections. If set, 'Total Video Length (seconds)' is ignored by the backend."
+                    )                    
                     framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
                     with gr.Row():
                         framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -6062,7 +6073,7 @@ with gr.Blocks(
             framepack_text_encoder_2_path, framepack_image_encoder_path,
             # Core Params
             framepack_target_resolution, framepack_width, framepack_height, framepack_original_dims,
-            framepack_total_second_length, framepack_fps, framepack_seed, framepack_steps,
+            framepack_total_second_length, framepack_video_sections, framepack_fps, framepack_seed, framepack_steps,
             framepack_distilled_guidance_scale, framepack_guidance_scale, framepack_guidance_rescale,
             framepack_sample_solver, framepack_latent_window_size,
             # Performance/Memory

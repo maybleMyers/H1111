@@ -54,7 +54,7 @@ Lora trained with musubi tuner's framepack training confirmed to work great. Nor
 
 Put loras in a /lora subfolder, if not trained with musubi you need to convert them.  
 
-Only unipc is supported for now. Sage attn is expiremental. When using the F1 model not all options available for the original framepack model will work, like endframe and sectional images.  
+Only unipc is supported for now. Sage attn is experimental. When using the F1 model not all options available for the original framepack model will work, like endframe and sectional images.  
 
 Here is an example prompt for a 5 second video with 4 sections using sectional prompting, also supports longer videos with indexes ie 0-2  ;;;3-5 etc:  
 
@@ -93,6 +93,8 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
+5/11/2025  
+    Fix some bugs, add resolution with slider working to f1 model, add section specifications.  
 5/9/2025  
     Add testing branch for framepack F1 end image, kinda glitchygo https://github.com/maybleMyers/H1111/tree/f1_end  
 5/5/2025  

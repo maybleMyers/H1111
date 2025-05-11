@@ -192,6 +192,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacache_steps", type=int, default=25, help="Number of steps for TeaCache initialization (should match --infer_steps).")
     parser.add_argument("--teacache_thresh", type=float, default=0.15, help="Relative L1 distance threshold for TeaCache skipping.")
 
+    parser.add_argument(
+    "--video_sections",
+    type=int,
+    default=None,
+    help="number of video sections, Default is None (auto calculate from video seconds). Overrides --video_seconds if set.",
+    )
+
     parser = add_blissful_args(parser)
     args = parser.parse_args()
     args = parse_blissful_args(args)
@@ -277,7 +284,7 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
     return args_copy
 
 
-def check_inputs(args: argparse.Namespace) -> Tuple[int, int, int]:
+def check_inputs(args: argparse.Namespace) -> Tuple[int, int, float]:
     """Validate video size and length
 
     Args:
@@ -289,7 +296,13 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int, int]:
     height = args.video_size[0]
     width = args.video_size[1]
 
-    video_seconds = args.video_seconds
+    if args.video_sections is not None:
+        video_seconds = (args.video_sections * (args.latent_window_size * 4) + 1) / args.fps
+        logger.info(f"--video_sections is set to {args.video_sections}. Calculated video_seconds: {video_seconds:.2f}s")
+        args.video_seconds = video_seconds
+    else:
+        video_seconds = args.video_seconds
+
 
     if height % 8 != 0 or width % 8 != 0:
         raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -941,8 +954,14 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
     # --- Sampling ---
     latent_window_size = args.latent_window_size  # default is 9 (consistent with F1 demo)
-    total_latent_sections = (video_seconds * args.fps) / (latent_window_size * 4) # Use args.fps
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+    
+    if args.video_sections is not None:
+        total_latent_sections = args.video_sections
+        logger.info(f"Using --video_sections: {total_latent_sections} sections.")
+    else:
+        total_latent_sections = (video_seconds * args.fps) / (latent_window_size * 4) 
+        total_latent_sections = int(max(round(total_latent_sections), 1))
+        logger.info(f"Calculated total_latent_sections from video_seconds: {total_latent_sections} sections.")
 
     # set random generator
     seed_g = torch.Generator(device="cpu") # Keep noise on CPU initially
@@ -1439,11 +1458,13 @@ def save_output(
     if args.output_type == "latent":
         return
 
-    # Calculate total sections based on final latent length and window size?
-    # Or use the value from args/generation loop? Let's use args.
-    total_latent_sections = (args.video_seconds * args.fps) / (args.latent_window_size * 4) # Use args.fps
-    total_latent_sections = int(max(round(total_latent_sections), 1))
-    logger.info(f"Decoding using total_latent_sections = {total_latent_sections} based on args.")
+    if args.video_sections is not None:
+        total_latent_sections = args.video_sections
+    else:
+        total_latent_sections = (args.video_seconds * args.fps) / (args.latent_window_size * 4)
+        total_latent_sections = int(max(round(total_latent_sections), 1))
+    
+    logger.info(f"Decoding using total_latent_sections = {total_latent_sections} (derived from {'--video_sections' if args.video_sections is not None else '--video_seconds'}).")
 
     # Decode (handle potential batch > 1?)
     # decode_latent expects BCTHW or CTHW, and returns CTHW
