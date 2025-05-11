@@ -299,7 +299,9 @@ def process_framepack_video(
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
         if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
-        if input_end_frame and os.path.exists(input_end_frame): command.extend(["--end_image_path", input_end_frame])
+        if input_end_frame and os.path.exists(input_end_frame):
+            command.extend(["--end_image_path", input_end_frame])
+            command.extend(["--end_image_strength", str(end_frame_weight)])
         if fp8: command.append("--fp8")
         if fp8 and fp8_scaled: command.append("--fp8_scaled")
         if fp8_llm: command.append("--fp8_llm")
@@ -4578,7 +4580,7 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
+                    framepack_is_f1 = gr.Checkbox(label="️ Use F1 Model", value=False,
                                                   info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -4592,7 +4594,7 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath")
-                    with gr.Accordion("Optional End Frame Control", open=True):
+                    with gr.Accordion("Optional End Frame Control", open=False):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1)
                         framepack_end_frame_influence = gr.Dropdown(
                             label="End Frame Influence Mode",
@@ -4605,7 +4607,7 @@ with gr.Blocks(
                             minimum=0.0, maximum=1.0, step=0.05, value=0.5, # Default changed from 0.3
                             label="End Frame Weight",
                             info="Influence strength of the end frame (if provided)",
-                            visible=False
+                            visible=True
                         )
 
                     gr.Markdown("### Resolution Options (Choose One)")
@@ -4634,7 +4636,7 @@ with gr.Blocks(
                     framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
                     with gr.Row():
                         framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        framepack_random_seed =gr.Button("🎲️")
+                        framepack_random_seed =gr.Button("️")
                     framepack_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Steps", value=25, interactive=True) # Moved here
 
                 # --- Right Column ---
@@ -4660,7 +4662,7 @@ with gr.Blocks(
                         )
                     with gr.Group():
                         with gr.Row():
-                            framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
+                            framepack_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
                             framepack_lora_folder = gr.Textbox(label="LoRa Folder", value="lora", scale=4)
                         framepack_lora_weights = []
                         framepack_lora_multipliers = []
@@ -4808,7 +4810,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -4906,7 +4908,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v") # Keep sending to original V2V
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -5005,7 +5007,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -5131,7 +5133,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -5303,7 +5305,7 @@ with gr.Blocks(
                     wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -5449,7 +5451,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -5596,7 +5598,7 @@ with gr.Blocks(
                     wanx_v2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
 
                     # Add LoRA section for WanX-v2v
-                    wanx_v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_v2v_lora_weights = []
                     wanx_v2v_lora_multipliers = []
                     for i in range(4):
@@ -5805,7 +5807,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
