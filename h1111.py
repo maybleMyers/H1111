@@ -4604,7 +4604,7 @@ with gr.Blocks(
                             visible=False
                         )
                         framepack_end_frame_weight = gr.Slider(
-                            minimum=0.0, maximum=1.0, step=0.05, value=0.5, # Default changed from 0.3
+                            minimum=0.0, maximum=2.0, step=0.05, value=0.5, # Default changed from 0.3
                             label="End Frame Weight",
                             info="Influence strength of the end frame (if provided)",
                             visible=True
