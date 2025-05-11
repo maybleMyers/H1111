@@ -43,7 +43,6 @@ from dataset.image_video_dataset import load_video
 from blissful_tuner.blissful_args import add_blissful_args, parse_blissful_args
 from blissful_tuner.video_processing_common import save_videos_grid_advanced
 from blissful_tuner.latent_preview import LatentPreviewer
-import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger(__name__)
@@ -192,8 +191,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_teacache", action="store_true", help="Enable TeaCache for faster generation.")
     parser.add_argument("--teacache_steps", type=int, default=25, help="Number of steps for TeaCache initialization (should match --infer_steps).")
     parser.add_argument("--teacache_thresh", type=float, default=0.15, help="Relative L1 distance threshold for TeaCache skipping.")
-    parser.add_argument(
-        "--end_image_strength", type=float, default=1.0, help="Strength of the end image's influence on the final section.")
 
     parser = add_blissful_args(parser)
     args = parser.parse_args()
@@ -407,6 +404,9 @@ def optimize_model(model: HunyuanVideoTransformer3DModelPacked, args: argparse.N
     clean_memory_on_device(device)
 
 
+# endregion
+
+
 def decode_latent(
     latent_window_size: int,
     total_latent_sections: int,
@@ -581,36 +581,11 @@ def prepare_i2v_inputs(
              first_image_processed = True
 
 
-# Process end image if provided
-    final_video_height, final_video_width = args.video_size[0], args.video_size[1]
+    # Process end image if provided
     if args.end_image_path is not None:
-        logger.info(f"Preprocessing end image with target HxW: {final_video_height}x{final_video_width}")
-        end_img_tensor, end_img_np, _, _ = preprocess_image(args.end_image_path, final_video_height, final_video_width, args.is_f1)
+        end_img_tensor, end_img_np, _, _ = preprocess_image(args.end_image_path, height, width, args.is_f1)
     else:
         end_img_tensor, end_img_np = None, None
-
-    # VAE encoding
-    logger.info(f"Encoding image(s) to latent space...")
-    vae.to(device)
-    vae_dtype = vae.dtype 
-    logger.info(f"VAE dtype set to: {vae_dtype}") 
-
-    section_start_latents = {}
-    with torch.autocast(device_type=device.type, dtype=vae_dtype), torch.no_grad(): 
-        for index, (img_tensor, img_np) in section_images.items():
-            start_latent = hunyuan.vae_encode(img_tensor, vae).cpu() # Move to CPU
-            section_start_latents[index] = start_latent
-        
-        # Ensure end_latent is also encoded if end_img_tensor was prepared
-        if end_img_tensor is not None:
-            logger.info(f"Encoding end image to latent. Image tensor shape: {end_img_tensor.shape}")
-            end_latent = hunyuan.vae_encode(end_img_tensor, vae).cpu() # Move to CPU
-            logger.info(f"Encoded end_latent shape: {end_latent.shape if end_latent is not None else 'None'}")
-        else:
-            end_latent = None
-    
-    vae.to("cpu")  # move VAE to CPU to save memory
-    clean_memory_on_device(device)
 
     # configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else ""
@@ -733,23 +708,16 @@ def prepare_i2v_inputs(
     # VAE encoding
     logger.info(f"Encoding image(s) to latent space...")
     vae.to(device)
-    vae_dtype = vae.dtype # Assign vae_dtype immediately after vae is on the correct device
-    logger.info(f"VAE dtype set to: {vae_dtype}") # Added log for confirmation
+    vae_dtype = vae.dtype # Get VAE dtype
 
     section_start_latents = {}
     with torch.autocast(device_type=device.type, dtype=vae_dtype), torch.no_grad():
         for index, (img_tensor, img_np) in section_images.items():
             start_latent = hunyuan.vae_encode(img_tensor, vae).cpu() # Move to CPU
             section_start_latents[index] = start_latent
-        
-        # Ensure end_latent is also encoded if end_img_tensor was prepared
-        if end_img_tensor is not None:
-            logger.info(f"Encoding end image to latent. Image tensor shape: {end_img_tensor.shape}")
-            end_latent = hunyuan.vae_encode(end_img_tensor, vae).cpu() # Move to CPU
-            logger.info(f"Encoded end_latent shape: {end_latent.shape if end_latent is not None else 'None'}")
-        else:
-            end_latent = None
-    
+
+        end_latent = hunyuan.vae_encode(end_img_tensor, vae).cpu() if end_img_tensor is not None else None # Move to CPU
+
     vae.to("cpu")  # move VAE to CPU to save memory
     clean_memory_on_device(device)
 
@@ -1032,7 +1000,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
              raise ValueError("Cannot find start_latent for section 0 in context_img.")
         history_latents = torch.cat([history_latents, start_latent_0.cpu().float()], dim=2) # Ensure float32, on CPU
 
-        total_generated_latent_frames = 1 # Start with 1 frame (start_latent: the actual content part)
+        total_generated_latent_frames = 1 # Start with 1 frame (start_latent)
 
         if args.preview_latent_every:
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
@@ -1040,172 +1008,106 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         for section_index in range(total_latent_sections):
             logger.info(f"--- F1 Section {section_index + 1} / {total_latent_sections} ---")
 
-            # Determine prompt context for this section
+            # Determine which context index to use (simple fallback for now)
+            # A more robust approach might be needed for complex section prompts/images
             context_section_idx = section_index if section_index in context else 0
+            image_context_section_idx = section_index if section_index in context_img else 0
+
             current_prompt = context.get(context_section_idx, {}).get("prompt", "N/A")
             logger.info(f"Using prompt from section {context_section_idx}: '{current_prompt[:100]}...'")
+            logger.info(f"Using image context from section {image_context_section_idx}")
 
-            # Prepare text conditioning tensors for the current section, move to device
+            # Prepare conditioning tensors for the current section, move to device
             llama_vec = context[context_section_idx]["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask = context[context_section_idx]["llama_attention_mask"].to(device)
             clip_l_pooler = context[context_section_idx]["clip_l_pooler"].to(device, dtype=compute_dtype)
+
+            image_encoder_last_hidden_state = context_img[image_context_section_idx]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
+            start_latent = context_img[image_context_section_idx]["start_latent"].to(device, dtype=torch.float32) # Keep start latent as float32? sample_hunyuan might expect float32 inputs
 
             # Negative prompts (same for all sections)
             llama_vec_n = context_null["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
             clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=compute_dtype)
 
-            # Global start latent for conditioning (always frame 0 of the video)
-            global_start_latent_for_conditioning = context_img[0]["start_latent"].to(device, dtype=torch.float32)
-            # Global start image's embedding (can be from section 0 or a specific global context)
-            global_start_image_embedding = context_img[0]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
 
-            # --- Temporal Indices and Conditioning Latent Setup ---
-            num_new_latents_to_denoise = latent_window_size # e.g., 9 latent frames the model denoises
+            # Prepare clean latents based on history (F1 demo logic)
+            # indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0) # Sum = 1 + 16 + 2 + 1 + 9 = 29
+            # clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+            # clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
 
-            # Indices for the new latents being generated in this step (actual frame numbers)
-            idx_first_new_latent = total_generated_latent_frames
-            actual_new_latent_indices = torch.arange(
-                idx_first_new_latent, idx_first_new_latent + num_new_latents_to_denoise,
-                device=device, dtype=torch.long
-            ).unsqueeze(0)
+            # Let's replicate the index definition logic carefully from the *target script* version of the model code
+            # Assuming latent_window_size is the number of *new* latent frames to generate in the window
+            # The indices seem related to how different levels of clean latents are embedded.
+            # Check HunyuanVideoTransformer3DModelPacked.process_input_hidden_states
+            # It expects latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices
 
-            # Index for the global start_latent (always frame 0)
-            idx_global_start_latent = 0
+            # Let's redefine indices based on the logic potentially expected by the *target* script's sample_hunyuan
+            # The F1 Demo uses hardcoded split sizes: [1, 16, 2, 1, latent_window_size]
+            # Let's try using that directly.
+            num_new_latents = latent_window_size # Number of *new* latent frames in this step
+            split_sizes = [1, 16, 2, 1, num_new_latents]
+            indices = torch.arange(0, sum(split_sizes)).unsqueeze(0).to(device)
 
-            # Determine the 1x clean latent component and its index
-            is_final_generation_step_for_video = (section_index == total_latent_sections - 1)
-            vae_temporal_downscale = 4
-            total_video_latent_frames = int(round(video_seconds * args.fps / vae_temporal_downscale))
+            # These indices define *which* positions in the *input* sequence correspond to different types of latents
+            # The names match the F1 demo's usage in sample_hunyuan
+            (
+                clean_latent_indices_start, # Index for the very start frame latent
+                clean_latent_4x_indices,    # Indices for the 4x downsampled clean history
+                clean_latent_2x_indices,    # Indices for the 2x downsampled clean history
+                clean_latent_1x_indices,    # Indices for the 1x (original res) clean history (often just the last frame?)
+                latent_indices,             # Indices for the actual latents being denoised in this step
+            ) = indices.split(split_sizes, dim=1)
 
-            # Default: 1x clean latent comes from the last frame of generated history
-            # `history_latents` includes: initial_zeros(19), global_start_latent(1), generated_frames(...)
-            # So, the last actual content frame is at `history_latents[:, :, -1:, :, :]`
-            model_natural_progression_target = history_latents[:, :, -1:, :, :].to(device, dtype=torch.float32)
-            idx_clean_1x_component = total_generated_latent_frames - 1 # Frame number of the last generated frame
+            # Combine indices representing clean latents (used for RoPE)
+            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
 
-            if is_final_generation_step_for_video:
-                if end_latent is not None:
-                    # Ensure end_latent is on the correct device and dtype
-                    current_end_latent_on_device = end_latent.to(device, dtype=torch.float32)
+            # Get the actual clean latent tensors from history
+            # History shape is (B, C, T_hist, H, W) - T_hist grows
+            # We need the last 19 frames for the clean inputs
+            # F1 Demo: history_latents[:, :, -sum([16, 2, 1]):, :, :] -> T=19
+            current_history_for_clean = history_latents[:, :, -19:, :, :].to(device, dtype=torch.float32) # Move relevant history part to device, ensure float32
+            clean_latents_4x, clean_latents_2x, clean_latents_1x = current_history_for_clean.split([16, 2, 1], dim=2)
 
-                    # Check and resize spatial dimensions if necessary
-                    start_h, start_w = global_start_latent_for_conditioning.shape[-2:]
-                    end_h, end_w = current_end_latent_on_device.shape[-2:]
+            # The 'clean_latents' input to sample_hunyuan seems to combine the start frame and the 1x clean history frame
+            clean_latents = torch.cat([start_latent, clean_latents_1x], dim=2)
 
-                    if start_h != end_h or start_w != end_w:
-                        logger.warning(f"F1 Mode: End latent spatial dim ({end_h}x{end_w}) mismatch with start ({start_h}x{start_w}). Resizing end_latent.")
-                        current_end_latent_on_device = F.interpolate(current_end_latent_on_device, size=(start_h, start_w), mode='bilinear', align_corners=False)
-                        logger.info(f"F1 Mode: Resized end_latent to {current_end_latent_on_device.shape[-2:]}")
-                    
-                    # Blend the model's natural progression with the user-provided end_latent
-                    strength = args.end_image_strength
-                    clean_1x_latent_component_data = ( (1.0 - strength) * model_natural_progression_target +
-                                                       strength * current_end_latent_on_device )
-                    
-                    # The index still refers to the *final* frame of the video
-                    idx_clean_1x_component = total_video_latent_frames - 1 
-                    logger.info(f"F1 Mode: Last section, using blended end_latent (strength {strength:.2f}) as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-                else:
-                    # No end latent provided, use model's natural progression
-                    clean_1x_latent_component_data = model_natural_progression_target
-                    idx_clean_1x_component = total_generated_latent_frames -1 # index of last frame in history
-                    logger.info(f"F1 Mode: Last section (no end_latent), using history frame {idx_clean_1x_component} as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-            else:
-                # Not the final step, use model's natural progression
-                clean_1x_latent_component_data = model_natural_progression_target
-                idx_clean_1x_component = total_generated_latent_frames -1 # index of last frame in history
-                logger.info(f"F1 Mode: Using history frame {idx_clean_1x_component} as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-            
-            # Ensure idx_clean_1x_component is not negative if history is very short (e.g. first step after start_latent)
-            idx_clean_1x_component = max(0, idx_clean_1x_component)
-
-            actual_clean_latent_indices = torch.tensor(
-                [[idx_global_start_latent, idx_clean_1x_component]], device=device, dtype=torch.long
-            )
-            # `clean_latents_input_for_model` is `[global_start_latent, determined_1x_clean_latent]`
-            logger.info(f"Concatenating global_start_latent ({global_start_latent_for_conditioning.shape}) with clean_1x_latent_component ({clean_1x_latent_component_data.shape})")
-            clean_latents_input_for_model = torch.cat([global_start_latent_for_conditioning, clean_1x_latent_component_data], dim=2)
-
-            # Material for 4x and 2x downsampled clean latents comes from the last 19 frames of `history_latents`
-            # These 19 frames conceptually represent the history leading up to the `determined_1x_clean_latent` (if from history)
-            # or leading up to the point where `end_latent` would be (if `end_latent` is used).
-            # The F1 demo structure takes the last 19 frames from `history_latents` regardless.
-            current_history_material_for_2x_4x = history_latents[:, :, -19:, :, :].to(device, dtype=torch.float32)
-            clean_latents_4x_hist_data, clean_latents_2x_hist_data, _ = current_history_material_for_2x_4x.split([16, 2, 1], dim=2)
-            
-            # Temporal indices for these 2x and 4x historical components.
-            # These are relative to the frame index of the last frame in `current_history_material_for_2x_4x`.
-            # The last frame of `history_latents` is `total_generated_latent_frames - 1`.
-            # The 19 frames of material end at `total_generated_latent_frames - 1`.
-            # The 1x part of this material is at `total_generated_latent_frames - 1`.
-            # The 2x part is at `total_generated_latent_frames - 3` and `total_generated_latent_frames - 2`.
-            # The 4x part is from `total_generated_latent_frames - 19` to `total_generated_latent_frames - 4`.
-            idx_base_for_2x_4x_temporal_indices = total_generated_latent_frames -1 # Index of last frame in history_latents
-
-            idx_2x_start = max(0, idx_base_for_2x_4x_temporal_indices - 1 - 2 + 1) # Start of the 2 frames for 2x
-            actual_clean_latent_2x_indices = torch.arange(
-                idx_2x_start, idx_base_for_2x_4x_temporal_indices - 1 + 1, # End of the 2 frames for 2x
-                device=device, dtype=torch.long
-            ).unsqueeze(0)
-            if actual_clean_latent_2x_indices.shape[1] < 2: # Pad if history too short relative to start_latent
-                 actual_clean_latent_2x_indices = F.pad(actual_clean_latent_2x_indices, (max(0, 2 - actual_clean_latent_2x_indices.shape[1]), 0), value=0)
-
-
-            idx_4x_end_exclusive = idx_2x_start # This is where the 2x data *starts*, so 4x ends *before* this.
-            idx_4x_start = max(0, idx_4x_end_exclusive - 16)
-
-            if idx_4x_start < idx_4x_end_exclusive: # Ensure valid range for arange
-                actual_clean_latent_4x_indices = torch.arange(
-                    idx_4x_start, idx_4x_end_exclusive,
-                    device=device, dtype=torch.long
-                ).unsqueeze(0)
-            else: # History is too short to form a 4x sequence before 2x, create empty/dummy
-                actual_clean_latent_4x_indices = torch.empty((1,0), device=device, dtype=torch.long)
-
-            # Pad if the generated sequence is shorter than 16
-            if actual_clean_latent_4x_indices.shape[1] < 16:
-                 padding_needed = 16 - actual_clean_latent_4x_indices.shape[1]
-                 # Pad on the left with earliest possible frame index (0)
-                 actual_clean_latent_4x_indices = F.pad(actual_clean_latent_4x_indices, (padding_needed, 0), value=0)
-
-
-            # Call sample_hunyuan
+            # Call sample_hunyuan with F1 specific parameters and conditioning
+            # Ensure sample_hunyuan is imported from frame_pack.k_diffusion_hunyuan
             generated_latents_step = sample_hunyuan(
                 transformer=model,
                 sampler=f1_sampler,
                 width=width,
                 height=height,
-                frames=f1_frames_per_section, # Output length of this segment
+                frames=f1_frames_per_section, # Should be latent_window_size * 4 - 3 = 33 for window=9
                 real_guidance_scale=f1_guidance_scale,
                 distilled_guidance_scale=f1_embedded_cfg_scale,
                 guidance_rescale=f1_guidance_rescale,
                 num_inference_steps=args.infer_steps,
-                generator=seed_g,
+                generator=seed_g, # Use the CPU generator
                 prompt_embeds=llama_vec,
                 prompt_embeds_mask=llama_attention_mask,
                 prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n,
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
-                device=device,
-                dtype=compute_dtype,
-                image_embeddings=global_start_image_embedding, # Use global start image's embedding
-                # --- Pass F1 specific conditioning with corrected temporal indices ---
-                latent_indices=actual_new_latent_indices,             # Temporal indices for latents being denoised
-                clean_latents=clean_latents_input_for_model,        # Data: [global_start_latent, target_1x_latent]
-                clean_latent_indices=actual_clean_latent_indices,      # Temporal indices for clean_latents_input_for_model
-                clean_latents_2x=clean_latents_2x_hist_data,        # Data from history_latents
-                clean_latent_2x_indices=actual_clean_latent_2x_indices, # Temporal indices for clean_latents_2x_hist_data
-                clean_latents_4x=clean_latents_4x_hist_data,        # Data from history_latents
-                clean_latent_4x_indices=actual_clean_latent_4x_indices, # Temporal indices for clean_latents_4x_hist_data
+                device=device, # Pass compute device
+                dtype=compute_dtype, # Pass compute dtype
+                image_embeddings=image_encoder_last_hidden_state,
+                # --- Pass F1 specific conditioning ---
+                latent_indices=latent_indices, # Indices for new latents being generated
+                clean_latents=clean_latents, # Combined start frame + 1x history
+                clean_latent_indices=clean_latent_indices, # Indices for the above
+                clean_latents_2x=clean_latents_2x, # 2x downsampled history
+                clean_latent_2x_indices=clean_latent_2x_indices, # Indices for 2x history
+                clean_latents_4x=clean_latents_4x, # 4x downsampled history
+                clean_latent_4x_indices=clean_latent_4x_indices, # Indices for 4x history
                 # --- End F1 conditioning ---
-            )
+                # callback=callback, # Add callback support if needed
+            ) # .to('cpu') # Move generated latents immediately to CPU
 
             # Append generated latents to history (on CPU)
             history_latents = torch.cat([history_latents, generated_latents_step.cpu().float()], dim=2)
-            # `total_generated_latent_frames` tracks the number of content frames in `history_latents`
-            # (i.e., global_start_latent + all generated_latents_step outputs)
             total_generated_latent_frames += int(generated_latents_step.shape[2])
 
             # Preview logic (using CPU history latents)
@@ -1220,14 +1122,9 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             logger.info(f"Section {section_index + 1} finished. Total latent frames: {total_generated_latent_frames}. History shape: {history_latents.shape}")
 
             # Clean up GPU memory after each section
-            del generated_latents_step, current_history_material_for_2x_4x, clean_latents_input_for_model, clean_latents_2x_hist_data, clean_latents_4x_hist_data # Removed current_history_for_clean
-            del llama_vec, llama_attention_mask, clip_l_pooler, global_start_image_embedding, global_start_latent_for_conditioning
+            del generated_latents_step, current_history_for_clean, clean_latents, clean_latents_1x, clean_latents_2x, clean_latents_4x
+            del llama_vec, llama_attention_mask, clip_l_pooler, image_encoder_last_hidden_state, start_latent
             del llama_vec_n, llama_attention_mask_n, clip_l_pooler_n
-            # Also ensure clean_1x_latent_component_data is cleaned up if it's a tensor moved to device and distinct from history_latents slice
-            if 'clean_1x_latent_component_data' in locals() and isinstance(clean_1x_latent_component_data, torch.Tensor) and clean_1x_latent_component_data is not end_latent : # only delete if it was created from history and not the end_latent itself
-                if end_latent is None or clean_1x_latent_component_data.data_ptr() != end_latent.data_ptr(): # Double check it's not end_latent
-                    del clean_1x_latent_component_data
-
             clean_memory_on_device(device)
 
 

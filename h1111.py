@@ -299,9 +299,7 @@ def process_framepack_video(
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
         if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
-        if input_end_frame and os.path.exists(input_end_frame):
-            command.extend(["--end_image_path", input_end_frame])
-            command.extend(["--end_image_strength", str(end_frame_weight)])
+        if input_end_frame and os.path.exists(input_end_frame): command.extend(["--end_image_path", input_end_frame])
         if fp8: command.append("--fp8")
         if fp8 and fp8_scaled: command.append("--fp8_scaled")
         if fp8_llm: command.append("--fp8_llm")
@@ -4594,7 +4592,7 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath")
-                    with gr.Accordion("Optional End Frame Control", open=False):
+                    with gr.Accordion("Optional End Frame Control", open=True):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1)
                         framepack_end_frame_influence = gr.Dropdown(
                             label="End Frame Influence Mode",
@@ -4607,7 +4605,7 @@ with gr.Blocks(
                             minimum=0.0, maximum=1.0, step=0.05, value=0.5, # Default changed from 0.3
                             label="End Frame Weight",
                             info="Influence strength of the end frame (if provided)",
-                            visible=True
+                            visible=False
                         )
 
                     gr.Markdown("### Resolution Options (Choose One)")
