@@ -480,7 +480,6 @@ def prepare_i2v_inputs(
             (height, width, video_seconds, context, context_null, context_img, end_latent)
     """
 
-    # define parsing function (remains the same)
     def parse_section_strings(input_string: str) -> dict[int, str]:
         section_strings = {}
         if not input_string: # Handle empty input string
@@ -558,10 +557,7 @@ def prepare_i2v_inputs(
         image_tensor = image_tensor.permute(2, 0, 1)[None, :, None]  # HWC -> CHW -> NCFHW, N=1, C=3, F=1
         return image_tensor, image_np, processed_height, processed_width
 
-    # Check if the user explicitly set video_size, default is [256, 256]
-    user_had_specified_video_size = (args.video_size[0] != 256 or args.video_size[1] != 256)
-
-    # Initial height/width from args.video_size (user's desired final dimensions or defaults)
+    # Initial height/width check (will be potentially updated by F1 logic)
     height, width, video_seconds = check_inputs(args)
 
     section_image_paths = parse_section_strings(args.image_path)
@@ -570,36 +566,18 @@ def prepare_i2v_inputs(
     # Process the first image to determine potential F1 size override
     first_image_processed = False
     for index, image_path in section_image_paths.items():
-
         img_tensor, img_np, proc_h, proc_w = preprocess_image(image_path, height, width, args.is_f1)
         section_images[index] = (img_tensor, img_np)
-        
-        if not first_image_processed and image_path: # Ensure there was an image path
-            if args.is_f1:
-                if not user_had_specified_video_size:
-                    # User did not specify a size, so F1 bucket can dictate video dimensions.
-                    logger.info(f"F1 Mode: User did not specify video size. Video dimensions will be based on first image's F1 bucket: {proc_h}x{proc_w}.")
-                    height, width = proc_h, proc_w
-                    args.video_size = [height, width] # Update args for consistency.
-                else:
-                    # User specified a size. Use it for video dimensions.
-                    # Image was processed to (proc_h, proc_w) for F1 conditioning.
-                    logger.info(f"F1 Mode: User specified video size {height}x{width}. "
-                                f"First image (for conditioning) processed to F1 bucket {proc_h}x{proc_w}. Final video will be {height}x{width}.")
-                    # `height`, `width`, and `args.video_size` remain as per user's input.
-            else: # Standard mode (not args.is_f1)
-                if not user_had_specified_video_size:
-                    # User did not specify a size, so image processing guides video dimensions.
-                    logger.info(f"Standard Mode: User did not specify video size. Video dimensions set to {proc_h}x{proc_w} based on image processing.")
-                    height, width = proc_h, proc_w
-                    args.video_size = [height, width]
-                else:
-                    # User specified a size. Use it for video dimensions.
-                    # Image was processed to (proc_h, proc_w) for conditioning.
-                    logger.info(f"Standard Mode: User specified video size {height}x{width}. "
-                                f"First image (for conditioning) processed to {proc_h}x{proc_w}. Final video will be {height}x{width}.")
-                    # `height`, `width`, and `args.video_size` remain as per user's input.
+        if args.is_f1 and not first_image_processed:
+            logger.info(f"F1 Mode: Overriding video size to {proc_h}x{proc_w} based on first image bucket.")
+            height, width = proc_h, proc_w
+            args.video_size = [height, width] # Update args for consistency
             first_image_processed = True
+        elif not args.is_f1 and not first_image_processed:
+             # Update H/W if original resize changed aspect ratio significantly
+             height, width = proc_h, proc_w
+             args.video_size = [height, width]
+             first_image_processed = True
 
 
     # Process end image if provided
@@ -684,12 +662,18 @@ def prepare_i2v_inputs(
         logger.info(f"Encoding images with {'SigLIP' if args.is_f1 else 'Image Encoder'}...")
         section_image_encoder_last_hidden_states = {}
         img_encoder_dtype = image_encoder.dtype # Get dtype from loaded model
+        end_image_embedding_for_f1 = None # Initialize for F1 end image
         with torch.autocast(device_type=device.type, dtype=img_encoder_dtype), torch.no_grad():
             for index, (img_tensor, img_np) in section_images.items():
                 # Use hf_clip_vision_encode (works for SigLIP too)
                 image_encoder_output = hf_clip_vision_encode(img_np, feature_extractor, image_encoder)
                 image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.cpu() # Move to CPU
                 section_image_encoder_last_hidden_states[index] = image_encoder_last_hidden_state
+            
+            if args.is_f1 and end_img_np is not None: # end_img_np is from args.end_image_path
+                logger.info("F1 Mode: Encoding end image for potential conditioning.")
+                end_image_encoder_output_f1 = hf_clip_vision_encode(end_img_np, feature_extractor, image_encoder)
+                end_image_embedding_for_f1 = end_image_encoder_output_f1.last_hidden_state.cpu()              
 
         # free image encoder and clean memory
         del image_encoder, feature_extractor
@@ -799,7 +783,7 @@ def prepare_i2v_inputs(
         raise ValueError("Failed to prepare conditioning arguments. Check prompts and image paths.")
 
 
-    return height, width, video_seconds, arg_c, arg_null, arg_c_img, end_latent
+    return height, width, video_seconds, arg_c, arg_null, arg_c_img, end_latent, end_image_embedding_for_f1
 
 
 # def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> Tuple[Any, torch.Tensor]:
@@ -919,8 +903,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     else:
         # prepare inputs without shared models
         vae = load_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, device)
-        height, width, video_seconds, context, context_null, context_img, end_latent = prepare_i2v_inputs(args, device, vae)
-
+        height, width, video_seconds, context, context_null, context_img, end_latent, end_image_embedding_for_f1 = prepare_i2v_inputs(args, device, vae)
         # load DiT model
         model = load_dit_model(args, device) # Handles F1 class loading implicitly
 
@@ -1028,24 +1011,50 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
         for section_index in range(total_latent_sections):
             logger.info(f"--- F1 Section {section_index + 1} / {total_latent_sections} ---")
+            is_last_f1_section = (section_index == total_latent_sections - 1)
 
-            # Determine which context index to use (simple fallback for now)
-            # A more robust approach might be needed for complex section prompts/images
-            context_section_idx = section_index if section_index in context else 0
-            image_context_section_idx = section_index if section_index in context_img else 0
+            # Determine text prompt conditioning
+            # Priority: current section_index, then -1 (if not first section and -1 exists), then 0
+            if section_index in context:
+                current_text_prompt_key = section_index
+            elif section_index > 0 and -1 in context : # Check if -1 key exists for non-first sections
+                current_text_prompt_key = -1
+            elif 0 in context: # Fallback to 0 if specific or -1 not found or not applicable
+                current_text_prompt_key = 0
+            else:
+                # This should ideally not happen if prepare_i2v_inputs guarantees section 0
+                raise ValueError(f"Could not determine text prompt key for section_index {section_index}")
 
-            current_prompt = context.get(context_section_idx, {}).get("prompt", "N/A")
-            logger.info(f"Using prompt from section {context_section_idx}: '{current_prompt[:100]}...'")
-            logger.info(f"Using image context from section {image_context_section_idx}")
+            current_prompt_data = context[current_text_prompt_key]
+            current_prompt = current_prompt_data.get("prompt", "N/A")
+            logger.info(f"F1 Section {section_index + 1}: Using text prompt from resolved key {current_text_prompt_key} ('{current_prompt[:50]}...') (original section index {section_index})")
 
-            # Prepare conditioning tensors for the current section, move to device
-            llama_vec = context[context_section_idx]["llama_vec"].to(device, dtype=compute_dtype)
-            llama_attention_mask = context[context_section_idx]["llama_attention_mask"].to(device)
-            clip_l_pooler = context[context_section_idx]["clip_l_pooler"].to(device, dtype=compute_dtype)
+            llama_vec = current_prompt_data["llama_vec"].to(device, dtype=compute_dtype)
+            llama_attention_mask = current_prompt_data["llama_attention_mask"].to(device)
+            clip_l_pooler = current_prompt_data["clip_l_pooler"].to(device, dtype=compute_dtype)
+            
 
-            image_encoder_last_hidden_state = context_img[image_context_section_idx]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
-            start_latent = context_img[image_context_section_idx]["start_latent"].to(device, dtype=torch.float32) # Keep start latent as float32? sample_hunyuan might expect float32 inputs
-
+            # Determine image conditioning: Use end image for the last F1 section if specified, otherwise sectional/default.
+            if is_last_f1_section and args.end_image_path is not None and end_latent is not None and end_image_embedding_for_f1 is not None:
+                logger.info(f"F1 Mode: Using end image '{args.end_image_path}' for conditioning last section {section_index + 1}.")
+                start_latent = end_latent.to(device, dtype=torch.float32) # end_latent is from VAE of end image
+                image_encoder_last_hidden_state = end_image_embedding_for_f1.to(device, dtype=compute_dtype)
+            else:
+                # Use sectional image logic. Priority: current section_index, then -1 (if not first section and -1 exists), then 0
+                if section_index in context_img:
+                    current_image_cond_key = section_index
+                elif section_index > 0 and -1 in context_img: # Check if -1 key exists for non-first sections
+                    current_image_cond_key = -1
+                elif 0 in context_img: # Fallback to 0 if specific or -1 not found or not applicable
+                     current_image_cond_key = 0
+                else:
+                    # This should ideally not happen if prepare_i2v_inputs guarantees section 0
+                    raise ValueError(f"Could not determine image conditioning key for section_index {section_index}")
+                
+                image_cond_data = context_img[current_image_cond_key]
+                logger.info(f"F1 Mode: Using image context from resolved key {current_image_cond_key} (original section index {section_index}).")
+                start_latent = image_cond_data["start_latent"].to(device, dtype=torch.float32)
+                image_encoder_last_hidden_state = image_cond_data["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
             # Negative prompts (same for all sections)
             llama_vec_n = context_null["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
