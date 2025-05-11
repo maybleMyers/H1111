@@ -54,6 +54,8 @@ Lora trained with musubi tuner's framepack training confirmed to work great. Nor
 
 Put loras in a /lora subfolder, if not trained with musubi you need to convert them.  
 
+Only unipc is supported for now. Sage attn is expiremental. When using the F1 model not all options available for the original framepack model will work, like endframe and sectional images.  
+
 Here is an example prompt for a 5 second video with 4 sections using sectional prompting, also supports longer videos with indexes ie 0-2  ;;;3-5 etc:  
 
 0:A cinematic video showcases a cute blue penguin wearing sunglasses. The penguin runs quickly into mcdonalds.;;;1:The penguin runs quickly into mcdonalds and jumps up on a table and starts eating his food. The penguin's name is Piplup he is a famous Pokemon actor. The video is a fast action sequence animation showing the penguin running into a mcdonalds an jumping up onto a table.;;;2:The penguin is seated at a table and is enjoying his happy meal. The penguin's name is Piplup he is a famous Pokemon actor. The video is a fast action sequence animation showing the penguin running into a mcdonalds and jumping up onto a table.;;;3:The penguin is seated at a table and is happily enjoying his happy meal. The penguin's name is Piplup he is a famous Pokemon actor. The penguin flexes his huge arm muscles at the end of the video.  
