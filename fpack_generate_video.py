@@ -406,7 +406,6 @@ def optimize_model(model: HunyuanVideoTransformer3DModelPacked, args: argparse.N
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
 
-
 def decode_latent(
     latent_window_size: int,
     total_latent_sections: int, # This will be total_latent_sections_to_pass_to_decode from save_output
@@ -439,6 +438,7 @@ def decode_latent(
 
             generated_latent_frames_advance = (num_frames + 3) // 4 + (1 if is_last_section_in_loop else 0)
             current_section_vae_input_len = (latent_window_size * 2 + 1) if is_last_section_in_loop else (latent_window_size * 2)
+            
             start_idx = latent_frame_index
             end_idx = min(latent_frame_index + current_section_vae_input_len, latent.shape[2])
             
@@ -479,7 +479,6 @@ def decode_latent(
                 else:
                     history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
             clean_memory_on_device(device)
-        # --- End of logic adopted from Version 2 ---
     else:
         # bulk decode
         logger.info(f"Bulk decoding")
