@@ -4635,7 +4635,7 @@ with gr.Blocks(
                     with gr.Row():
                         framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         framepack_random_seed =gr.Button("🎲️")
-                    framepack_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Steps", value=25, interactive=True) # Moved here
+                    framepack_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Steps", value=25, interactive=True) # Moved here
 
                 # --- Right Column ---
                 with gr.Column():
