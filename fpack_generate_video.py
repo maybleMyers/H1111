@@ -1113,19 +1113,22 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             idx_global_start_latent = 0
 
             # Determine the 1x clean latent component and its index
-            is_final_generation_step_for_video = (section_index == total_latent_sections - 1)
             vae_temporal_downscale = 4
             total_video_latent_frames = int(round(video_seconds * args.fps / vae_temporal_downscale))
 
             # Default: 1x clean latent comes from the last frame of generated history
-            # `history_latents` includes: initial_zeros(19), global_start_latent(1), generated_frames(...)
-            # So, the last actual content frame is at `history_latents[:, :, -1:, :, :]`
             model_natural_progression_target = history_latents[:, :, -1:, :, :].to(device, dtype=torch.float32)
-            idx_clean_1x_component = total_generated_latent_frames - 1 # Frame number of the last generated frame
+            clean_1x_latent_component_data = model_natural_progression_target
+            idx_clean_1x_component = total_generated_latent_frames - 1 # Index of the last frame in current history
 
-            if is_final_generation_step_for_video:
-                if end_latent is not None:
-                    # Ensure end_latent is on the correct device and dtype
+            num_ramp_sections_config = 2 # Define how many sections the ramp spans (e.g., last 4 sections)
+            
+            if end_latent is not None and total_latent_sections > 0 : # Only ramp if there's an end_latent and video has sections
+                effective_num_ramp_sections = min(num_ramp_sections_config, total_latent_sections)
+                ramp_start_section_index = total_latent_sections - effective_num_ramp_sections
+
+                if section_index >= ramp_start_section_index:
+                    # We are in a ramp section and have an end latent
                     current_end_latent_on_device = end_latent.to(device, dtype=torch.float32)
 
                     # Check and resize spatial dimensions if necessary
@@ -1137,25 +1140,20 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                         current_end_latent_on_device = F.interpolate(current_end_latent_on_device, size=(start_h, start_w), mode='bilinear', align_corners=False)
                         logger.info(f"F1 Mode: Resized end_latent to {current_end_latent_on_device.shape[-2:]}")
                     
-                    # Blend the model's natural progression with the user-provided end_latent
-                    strength = args.end_image_strength
-                    clean_1x_latent_component_data = ( (1.0 - strength) * model_natural_progression_target +
-                                                       strength * current_end_latent_on_device )
+                    k = section_index - ramp_start_section_index # k ranges from 0 to effective_num_ramp_sections-1
+                    current_strength = ((k + 1) / float(effective_num_ramp_sections)) * args.end_image_strength
                     
-                    # The index still refers to the *final* frame of the video
+                    # Blend the model's natural progression with the user-provided end_latent
+                    clean_1x_latent_component_data = ( (1.0 - current_strength) * model_natural_progression_target +
+                                                       current_strength * current_end_latent_on_device )
+                    
+                    # The index refers to the *final* frame of the video when applying end_latent influence
                     idx_clean_1x_component = total_video_latent_frames - 1 
-                    logger.info(f"F1 Mode: Last section, using blended end_latent (strength {strength:.2f}) as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-                else:
-                    # No end latent provided, use model's natural progression
-                    clean_1x_latent_component_data = model_natural_progression_target
-                    idx_clean_1x_component = total_generated_latent_frames -1 # index of last frame in history
-                    logger.info(f"F1 Mode: Last section (no end_latent), using history frame {idx_clean_1x_component} as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-            else:
-                # Not the final step, use model's natural progression
-                clean_1x_latent_component_data = model_natural_progression_target
-                idx_clean_1x_component = total_generated_latent_frames -1 # index of last frame in history
-                logger.info(f"F1 Mode: Using history frame {idx_clean_1x_component} as clean_latents_1x_component. Shape: {clean_1x_latent_component_data.shape}")
-            
+                    logger.info(f"F1 Mode: Ramping end_latent influence. Section {section_index + 1}/{total_latent_sections}, Strength {current_strength:.2f}. Target frame index for 1x clean: {idx_clean_1x_component}. Data shape: {clean_1x_latent_component_data.shape}")
+                else: # Not in ramp yet, but end_latent exists (will be used later)
+                    logger.info(f"F1 Mode: Section {section_index + 1}/{total_latent_sections}. Using history frame {idx_clean_1x_component} as clean_latents_1x_component. End latent will be applied in later sections. Shape: {clean_1x_latent_component_data.shape}")
+            else: # No end_latent provided, or total_latent_sections is 0
+                logger.info(f"F1 Mode: Section {section_index + 1}/{total_latent_sections}. Using history frame {idx_clean_1x_component} as clean_latents_1x_component. No end_latent or ramp. Shape: {clean_1x_latent_component_data.shape}")
             # Ensure idx_clean_1x_component is not negative if history is very short (e.g. first step after start_latent)
             idx_clean_1x_component = max(0, idx_clean_1x_component)
 
