@@ -537,47 +537,41 @@ def prepare_i2v_inputs(
         return section_strings
 
     # prepare image preprocessing function
-    def preprocess_image(image_path: str, target_height: int, target_width: int, is_f1: bool):
+    def preprocess_image(image_path: str, target_height: int, target_width: int, is_f1: bool): # is_f1 is kept for signature, but not used differently here
         image = Image.open(image_path).convert("RGB")
         image_np = np.array(image)  # PIL to numpy, HWC
 
-        if is_f1:
-            # F1 specific preprocessing: find bucket (fixed 640 res) and resize/crop
-            f1_height, f1_width = find_nearest_bucket(image_np.shape[0], image_np.shape[1], resolution=640)
-            logger.info(f"F1 Mode: Using nearest bucket ({f1_height}, {f1_width}) for image preprocessing.")
-            image_np = resize_and_center_crop(image_np, target_width=f1_width, target_height=f1_height)
-            # Update target_height/width based on F1 bucket for consistency downstream
-            processed_height, processed_width = f1_height, f1_width
-        else:
-            # Original preprocessing
-            image_np = image_video_dataset.resize_image_to_bucket(image_np, (target_width, target_height))
-            processed_height, processed_width = image_np.shape[0], image_np.shape[1] # Get actual size after resize
+        # Consistent image preprocessing for both F1 and standard mode,
+        # using target_height/target_width which come from args.video_size
+        image_np = image_video_dataset.resize_image_to_bucket(image_np, (target_width, target_height))
+        processed_height, processed_width = image_np.shape[0], image_np.shape[1] # Get actual size after resize
 
         image_tensor = torch.from_numpy(image_np).float() / 127.5 - 1.0  # -1 to 1.0, HWC
         image_tensor = image_tensor.permute(2, 0, 1)[None, :, None]  # HWC -> CHW -> NCFHW, N=1, C=3, F=1
         return image_tensor, image_np, processed_height, processed_width
 
-    # Initial height/width check (will be potentially updated by F1 logic)
+    # Initial height/width check. These dimensions will be used for image processing and generation.
     height, width, video_seconds = check_inputs(args)
+    logger.info(f"Video dimensions for processing and generation set to: {height}x{width} (from --video_size or default).")
 
     section_image_paths = parse_section_strings(args.image_path)
 
     section_images = {}
-    # Process the first image to determine potential F1 size override
     first_image_processed = False
     for index, image_path in section_image_paths.items():
+
         img_tensor, img_np, proc_h, proc_w = preprocess_image(image_path, height, width, args.is_f1)
         section_images[index] = (img_tensor, img_np)
-        if args.is_f1 and not first_image_processed:
-            logger.info(f"F1 Mode: Overriding video size to {proc_h}x{proc_w} based on first image bucket.")
-            height, width = proc_h, proc_w
-            args.video_size = [height, width] # Update args for consistency
+        if not first_image_processed and image_path:
+            default_video_size_used = (args.video_size[0] == 256 and args.video_size[1] == 256) # Check if default was used
+            if default_video_size_used and (proc_h != height or proc_w != width):
+                logger.info(f"Video dimensions updated to {proc_h}x{proc_w} based on first image processing (as default --video_size was used).")
+                height, width = proc_h, proc_w
+                args.video_size = [height, width] # Update args for consistency for downstream logging/metadata.
+            elif not default_video_size_used and (proc_h != height or proc_w != width):
+                logger.warning(f"User specified --video_size {height}x{width}, but first image processed to {proc_h}x{proc_w}. "
+                               f"Generation will use {height}x{width}. Conditioning image aspect might differ.")
             first_image_processed = True
-        elif not args.is_f1 and not first_image_processed:
-             # Update H/W if original resize changed aspect ratio significantly
-             height, width = proc_h, proc_w
-             args.video_size = [height, width]
-             first_image_processed = True
 
 
     # Process end image if provided
@@ -974,204 +968,132 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     logger.info(f"Using compute dtype: {compute_dtype}")
 
 
-    # --- F1 Model Specific Sampling Logic ---
-    if args.is_f1:
+# --- F1 Model Specific Sampling Logic ---
+    if args.is_f1: # Renamed from args.f1 in simpler script to args.is_f1
         logger.info("Starting F1 model sampling process.")
 
-        # Use F1 default parameters, overriding args for the sampling call
-        f1_sampler = 'unipc'
-        f1_guidance_scale = 1.0
-        f1_embedded_cfg_scale = 10.0
-        f1_guidance_rescale = 0.0
-        logger.info(f"F1 Mode: Using sampler={f1_sampler}, guidance_scale={f1_guidance_scale}, "
-                    f"embedded_cfg_scale={f1_embedded_cfg_scale}, guidance_rescale={f1_guidance_rescale}")
+        logger.info(f"F1 Mode: Using video dimensions {height}x{width} for latent operations and generation.")
+        history_latents = torch.zeros((1, 16, 19, height // 8, width // 8), dtype=torch.float32, device='cpu')
 
-
-        # Initialize history latents (similar to F1 demo)
-        # B, C, T, H, W - T includes space for end latent, clean latents etc.
-        # The exact size depends on how clean latents are handled in sample_hunyuan.
-        # Let's use the demo's size for history init, assuming start_latent is appended later.
-        # Demo uses: size=(1, 16, 16 + 2 + 1, H//8, W//8) -> (B, C, T_clean, H, W)
-        # And appends start_latent: torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
-        # The `sample_hunyuan` call uses history[:, :, -sum([16, 2, 1]):, :, :] which implies T_clean=19
-        # So, initialize history T dim to 19, then append start_latent to make it 20?
-        # Let's stick closely to demo: init T=19, append start_latent.
-        history_latents = torch.zeros((1, 16, 19, height // 8, width // 8), dtype=torch.float32, device='cpu') # Keep history on CPU initially
-
-        # Append start_latent (using section 0)
         start_latent_0 = context_img.get(0, {}).get("start_latent")
         if start_latent_0 is None:
              raise ValueError("Cannot find start_latent for section 0 in context_img.")
-        history_latents = torch.cat([history_latents, start_latent_0.cpu().float()], dim=2) # Ensure float32, on CPU
+        
+        # Ensure start_latent_0 matches history_latents spatial dimensions.
+        # It should, as prepare_i2v_inputs now uses `height`, `width` for image processing.
+        if start_latent_0.shape[3] != (height // 8) or start_latent_0.shape[4] != (width // 8):
+            logger.error(f"Mismatch between start_latent_0 dimensions ({start_latent_0.shape[3]}x{start_latent_0.shape[4]}) "
+                         f"and history_latents dimensions ({height//8}x{width//8}). This should not happen with current logic.")
+            # Potentially resize start_latent_0 here as a fallback, though it indicates a logic issue upstream.
+            # For now, we assume they match due to changes in prepare_i2v_inputs.
+
+        history_latents = torch.cat([history_latents, start_latent_0.cpu().float()], dim=2)
 
         total_generated_latent_frames = 1 # Start with 1 frame (start_latent)
 
-        if args.preview_latent_every:
+        if args.preview_latent_every: # Keep previewer if desired
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
 
-        for section_index in range(total_latent_sections):
+        for section_index in range(total_latent_sections): # Simpler script uses loop_index
             logger.info(f"--- F1 Section {section_index + 1} / {total_latent_sections} ---")
-            is_last_f1_section = (section_index == total_latent_sections - 1)
+            f1_split_sizes = [1, 16, 2, 1, args.latent_window_size] # Use args.latent_window_size
+            f1_indices = torch.arange(0, sum(f1_split_sizes)).unsqueeze(0).to(device)
+            (
+                f1_clean_latent_indices_start,
+                f1_clean_latent_4x_indices,
+                f1_clean_latent_2x_indices,
+                f1_clean_latent_1x_indices,
+                f1_latent_indices, # This will be `latent_indices` for sample_hunyuan
+            ) = f1_indices.split(f1_split_sizes, dim=1)
+            f1_clean_latent_indices = torch.cat([f1_clean_latent_indices_start, f1_clean_latent_1x_indices], dim=1)
 
-            # Determine text prompt conditioning
-            # Priority: current section_index, then -1 (if not first section and -1 exists), then 0
-            if section_index in context:
-                current_text_prompt_key = section_index
-            elif section_index > 0 and -1 in context : # Check if -1 key exists for non-first sections
-                current_text_prompt_key = -1
-            elif 0 in context: # Fallback to 0 if specific or -1 not found or not applicable
-                current_text_prompt_key = 0
-            else:
-                # This should ideally not happen if prepare_i2v_inputs guarantees section 0
-                raise ValueError(f"Could not determine text prompt key for section_index {section_index}")
+            # Get current start_latent for this section (from context_img, as in simpler script)
+            current_image_context_section_idx = section_index if section_index in context_img else 0
+            current_start_latent = context_img[current_image_context_section_idx]["start_latent"].to(device, dtype=torch.float32) # Matches simpler script
 
-            current_prompt_data = context[current_text_prompt_key]
-            current_prompt = current_prompt_data.get("prompt", "N/A")
-            logger.info(f"F1 Section {section_index + 1}: Using text prompt from resolved key {current_text_prompt_key} ('{current_prompt[:50]}...') (original section index {section_index})")
-
-            llama_vec = current_prompt_data["llama_vec"].to(device, dtype=compute_dtype)
-            llama_attention_mask = current_prompt_data["llama_attention_mask"].to(device)
-            clip_l_pooler = current_prompt_data["clip_l_pooler"].to(device, dtype=compute_dtype)
+            # Get clean history latents from `history_latents`
+            # `history_latents` on CPU, so move to device and ensure correct dtype
+            current_history_for_f1_clean = history_latents[:, :, -sum([16, 2, 1]):, :, :].to(device, dtype=torch.float32)
+            f1_clean_latents_4x, f1_clean_latents_2x, f1_clean_latents_1x = current_history_for_f1_clean.split([16, 2, 1], dim=2)
             
-
-            # Determine image conditioning: Use end image for the last F1 section if specified, otherwise sectional/default.
-            if is_last_f1_section and args.end_image_path is not None and end_latent is not None and end_image_embedding_for_f1 is not None:
-                logger.info(f"F1 Mode: Using end image '{args.end_image_path}' for conditioning last section {section_index + 1}.")
-                start_latent = end_latent.to(device, dtype=torch.float32) # end_latent is from VAE of end image
-                image_encoder_last_hidden_state = end_image_embedding_for_f1.to(device, dtype=compute_dtype)
-            else:
-                # Use sectional image logic. Priority: current section_index, then -1 (if not first section and -1 exists), then 0
-                if section_index in context_img:
-                    current_image_cond_key = section_index
-                elif section_index > 0 and -1 in context_img: # Check if -1 key exists for non-first sections
-                    current_image_cond_key = -1
-                elif 0 in context_img: # Fallback to 0 if specific or -1 not found or not applicable
-                     current_image_cond_key = 0
-                else:
-                    # This should ideally not happen if prepare_i2v_inputs guarantees section 0
-                    raise ValueError(f"Could not determine image conditioning key for section_index {section_index}")
-                
-                image_cond_data = context_img[current_image_cond_key]
-                logger.info(f"F1 Mode: Using image context from resolved key {current_image_cond_key} (original section index {section_index}).")
-                start_latent = image_cond_data["start_latent"].to(device, dtype=torch.float32)
-                image_encoder_last_hidden_state = image_cond_data["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
-            # Negative prompts (same for all sections)
+            # `clean_latents` for sample_hunyuan
+            f1_clean_latents_combined = torch.cat([current_start_latent, f1_clean_latents_1x], dim=2)
+            
+            # Prepare prompt conditioning (same as before)
+            context_section_idx = section_index if section_index in context else 0
+            llama_vec = context[context_section_idx]["llama_vec"].to(device, dtype=compute_dtype)
+            llama_attention_mask = context[context_section_idx]["llama_attention_mask"].to(device)
+            clip_l_pooler = context[context_section_idx]["clip_l_pooler"].to(device, dtype=compute_dtype)
+            image_encoder_last_hidden_state = context_img[current_image_context_section_idx]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
             llama_vec_n = context_null["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
             clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=compute_dtype)
 
 
-            # Prepare clean latents based on history (F1 demo logic)
-            # indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0) # Sum = 1 + 16 + 2 + 1 + 9 = 29
-            # clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
-            # clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
-
-            # Let's replicate the index definition logic carefully from the *target script* version of the model code
-            # Assuming latent_window_size is the number of *new* latent frames to generate in the window
-            # The indices seem related to how different levels of clean latents are embedded.
-            # Check HunyuanVideoTransformer3DModelPacked.process_input_hidden_states
-            # It expects latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices
-
-            # Let's redefine indices based on the logic potentially expected by the *target* script's sample_hunyuan
-            # The F1 Demo uses hardcoded split sizes: [1, 16, 2, 1, latent_window_size]
-            # Let's try using that directly.
-            num_new_latents = latent_window_size # Number of *new* latent frames in this step
-            split_sizes = [1, 16, 2, 1, num_new_latents]
-            indices = torch.arange(0, sum(split_sizes)).unsqueeze(0).to(device)
-
-            # These indices define *which* positions in the *input* sequence correspond to different types of latents
-            # The names match the F1 demo's usage in sample_hunyuan
-            (
-                clean_latent_indices_start, # Index for the very start frame latent
-                clean_latent_4x_indices,    # Indices for the 4x downsampled clean history
-                clean_latent_2x_indices,    # Indices for the 2x downsampled clean history
-                clean_latent_1x_indices,    # Indices for the 1x (original res) clean history (often just the last frame?)
-                latent_indices,             # Indices for the actual latents being denoised in this step
-            ) = indices.split(split_sizes, dim=1)
-
-            # Combine indices representing clean latents (used for RoPE)
-            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
-
-            # Get the actual clean latent tensors from history
-            # History shape is (B, C, T_hist, H, W) - T_hist grows
-            # We need the last 19 frames for the clean inputs
-            # F1 Demo: history_latents[:, :, -sum([16, 2, 1]):, :, :] -> T=19
-            current_history_for_clean = history_latents[:, :, -19:, :, :].to(device, dtype=torch.float32) # Move relevant history part to device, ensure float32
-            clean_latents_4x, clean_latents_2x, clean_latents_1x = current_history_for_clean.split([16, 2, 1], dim=2)
-
-            # The 'clean_latents' input to sample_hunyuan seems to combine the start frame and the 1x clean history frame
-            clean_latents = torch.cat([start_latent, clean_latents_1x], dim=2)
-
-            # Call sample_hunyuan with F1 specific parameters and conditioning
-            # Ensure sample_hunyuan is imported from frame_pack.k_diffusion_hunyuan
             generated_latents_step = sample_hunyuan(
                 transformer=model,
-                sampler=f1_sampler,
-                width=width,
-                height=height,
-                frames=f1_frames_per_section, # Should be latent_window_size * 4 - 3 = 33 for window=9
-                real_guidance_scale=f1_guidance_scale,
-                distilled_guidance_scale=f1_embedded_cfg_scale,
-                guidance_rescale=f1_guidance_rescale,
+                sampler=args.sample_solver, # Use args directly like simpler script
+                width=width,                # Use `width` from args.video_size
+                height=height,              # Use `height` from args.video_size
+                frames=f1_frames_per_section,
+                real_guidance_scale=args.guidance_scale, # Use args
+                distilled_guidance_scale=args.embedded_cfg_scale, # Use args
+                guidance_rescale=args.guidance_rescale, # Use args
                 num_inference_steps=args.infer_steps,
-                generator=seed_g, # Use the CPU generator
+                generator=seed_g,
                 prompt_embeds=llama_vec,
                 prompt_embeds_mask=llama_attention_mask,
                 prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n,
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
-                device=device, # Pass compute device
-                dtype=compute_dtype, # Pass compute dtype
+                device=device,
+                dtype=compute_dtype,
                 image_embeddings=image_encoder_last_hidden_state,
-                # --- Pass F1 specific conditioning ---
-                latent_indices=latent_indices, # Indices for new latents being generated
-                clean_latents=clean_latents, # Combined start frame + 1x history
-                clean_latent_indices=clean_latent_indices, # Indices for the above
-                clean_latents_2x=clean_latents_2x, # 2x downsampled history
-                clean_latent_2x_indices=clean_latent_2x_indices, # Indices for 2x history
-                clean_latents_4x=clean_latents_4x, # 4x downsampled history
-                clean_latent_4x_indices=clean_latent_4x_indices, # Indices for 4x history
-                # --- End F1 conditioning ---
-                # callback=callback, # Add callback support if needed
-            ) # .to('cpu') # Move generated latents immediately to CPU
+                # --- F1 specific conditioning based on simpler script's structure ---
+                latent_indices=f1_latent_indices,
+                clean_latents=f1_clean_latents_combined,
+                clean_latent_indices=f1_clean_latent_indices,
+                clean_latents_2x=f1_clean_latents_2x,
+                clean_latent_2x_indices=f1_clean_latent_2x_indices,
+                clean_latents_4x=f1_clean_latents_4x,
+                clean_latent_4x_indices=f1_clean_latent_4x_indices,
+            )
 
-            # Append generated latents to history (on CPU)
+            # Append generated latents to history (on CPU) - matches simpler script's F1 append
             history_latents = torch.cat([history_latents, generated_latents_step.cpu().float()], dim=2)
             total_generated_latent_frames += int(generated_latents_step.shape[2])
 
-            # Preview logic (using CPU history latents)
+            # Preview logic (using CPU history latents, no resizing needed here as latents are already target size)
             if args.preview_latent_every is not None and (section_index + 1) % args.preview_latent_every == 0:
                 logger.info(f"Previewing latents at section {section_index + 1}")
-                # Previewer expects latents on device, move relevant part temporarily
-                preview_latents = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
-                previewer.preview(preview_latents, section_index, preview_suffix=args.preview_suffix)
-                del preview_latents # Free preview tensor
+                preview_latents_f1 = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
+                previewer.preview(preview_latents_f1, section_index, preview_suffix=args.preview_suffix)
+                del preview_latents_f1
                 clean_memory_on_device(gen_settings.device)
-
-            logger.info(f"Section {section_index + 1} finished. Total latent frames: {total_generated_latent_frames}. History shape: {history_latents.shape}")
-
+            
             # Clean up GPU memory after each section
-            del generated_latents_step, current_history_for_clean, clean_latents, clean_latents_1x, clean_latents_2x, clean_latents_4x
-            del llama_vec, llama_attention_mask, clip_l_pooler, image_encoder_last_hidden_state, start_latent
+            del generated_latents_step, current_history_for_f1_clean, f1_clean_latents_combined
+            del f1_clean_latents_1x, f1_clean_latents_2x, f1_clean_latents_4x, current_start_latent
+            del llama_vec, llama_attention_mask, clip_l_pooler, image_encoder_last_hidden_state
             del llama_vec_n, llama_attention_mask_n, clip_l_pooler_n
             clean_memory_on_device(device)
 
 
-        # Final history contains all generated latents including the start frame
-        # Remove the initial zeros used for padding clean history?
-        # The F1 demo uses history_latents[:, :, -total_generated_latent_frames:, :, :]
-        # total_generated_latent_frames includes the start_latent (+1)
+        # Final history processing - matches simpler script's F1 logic
         real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+        # No resizing needed as generation happened at target dimensions.
 
     # --- Standard Model Sampling Logic ---
-    else:
+    else: # Standard mode
         logger.info("Starting standard model sampling process.")
         # Original history initialization (includes end latent space)
-        history_latents = torch.zeros((1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32, device='cpu') # Keep on CPU
-        if end_latent is not None:
+        # `height`, `width` are already from args.video_size
+        history_latents = torch.zeros((1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32, device='cpu')
+        if end_latent is not None: # No `and not f1_mode` check needed here, already in else block
             logger.info(f"Using end image: {args.end_image_path}")
-            history_latents[:, :, 0:1] = end_latent.cpu().float() # Ensure float32, on CPU
+            # Ensure end_latent matches history_latents spatial dims. It should due to prepare_i2v_inputs changes.
+            history_latents[:, :, 0:1] = end_latent.cpu().float()
 
         total_generated_latent_frames = 0
 
