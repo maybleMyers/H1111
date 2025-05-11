@@ -558,7 +558,10 @@ def prepare_i2v_inputs(
         image_tensor = image_tensor.permute(2, 0, 1)[None, :, None]  # HWC -> CHW -> NCFHW, N=1, C=3, F=1
         return image_tensor, image_np, processed_height, processed_width
 
-    # Initial height/width check (will be potentially updated by F1 logic)
+    # Check if the user explicitly set video_size, default is [256, 256]
+    user_had_specified_video_size = (args.video_size[0] != 256 or args.video_size[1] != 256)
+
+    # Initial height/width from args.video_size (user's desired final dimensions or defaults)
     height, width, video_seconds = check_inputs(args)
 
     section_image_paths = parse_section_strings(args.image_path)
@@ -567,18 +570,36 @@ def prepare_i2v_inputs(
     # Process the first image to determine potential F1 size override
     first_image_processed = False
     for index, image_path in section_image_paths.items():
+
         img_tensor, img_np, proc_h, proc_w = preprocess_image(image_path, height, width, args.is_f1)
         section_images[index] = (img_tensor, img_np)
-        if args.is_f1 and not first_image_processed:
-            logger.info(f"F1 Mode: Overriding video size to {proc_h}x{proc_w} based on first image bucket.")
-            height, width = proc_h, proc_w
-            args.video_size = [height, width] # Update args for consistency
+        
+        if not first_image_processed and image_path: # Ensure there was an image path
+            if args.is_f1:
+                if not user_had_specified_video_size:
+                    # User did not specify a size, so F1 bucket can dictate video dimensions.
+                    logger.info(f"F1 Mode: User did not specify video size. Video dimensions will be based on first image's F1 bucket: {proc_h}x{proc_w}.")
+                    height, width = proc_h, proc_w
+                    args.video_size = [height, width] # Update args for consistency.
+                else:
+                    # User specified a size. Use it for video dimensions.
+                    # Image was processed to (proc_h, proc_w) for F1 conditioning.
+                    logger.info(f"F1 Mode: User specified video size {height}x{width}. "
+                                f"First image (for conditioning) processed to F1 bucket {proc_h}x{proc_w}. Final video will be {height}x{width}.")
+                    # `height`, `width`, and `args.video_size` remain as per user's input.
+            else: # Standard mode (not args.is_f1)
+                if not user_had_specified_video_size:
+                    # User did not specify a size, so image processing guides video dimensions.
+                    logger.info(f"Standard Mode: User did not specify video size. Video dimensions set to {proc_h}x{proc_w} based on image processing.")
+                    height, width = proc_h, proc_w
+                    args.video_size = [height, width]
+                else:
+                    # User specified a size. Use it for video dimensions.
+                    # Image was processed to (proc_h, proc_w) for conditioning.
+                    logger.info(f"Standard Mode: User specified video size {height}x{width}. "
+                                f"First image (for conditioning) processed to {proc_h}x{proc_w}. Final video will be {height}x{width}.")
+                    # `height`, `width`, and `args.video_size` remain as per user's input.
             first_image_processed = True
-        elif not args.is_f1 and not first_image_processed:
-             # Update H/W if original resize changed aspect ratio significantly
-             height, width = proc_h, proc_w
-             args.video_size = [height, width]
-             first_image_processed = True
 
 
     # Process end image if provided
