@@ -94,7 +94,8 @@ I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
 
-<div style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px;">
+<details>
+<summary>Click to view Changlog</summary>
 
 **5/12/2025**  
     Add skip button to framepack.  
@@ -156,7 +157,7 @@ download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and 
 skyreels_hunyuan_i2v_bf16.safetensors
 skyreels_hunyuan_t2v_bf16.safetensors
 
-</div>
+</details>
 
 ## Requirements
 
