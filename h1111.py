@@ -4639,7 +4639,7 @@ with gr.Blocks(
                     framepack_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Total Video Length (seconds)", value=5.0)
                     framepack_video_sections = gr.Number(
                         label="Total Video Sections (Overrides seconds if > 0)",
-                        value=None, minimum=1, step=1,
+                        value=None, step=1,
                         info="Specify exact number of sections. If set, 'Total Video Length (seconds)' is ignored by the backend."
                     )                    
                     framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
