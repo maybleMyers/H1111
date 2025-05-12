@@ -93,8 +93,11 @@ pip install -r requirements.txt
 I have tested the 14B i2v and t2v models so far to be working
 
 ## changlog
-5/11/2025  
-    Fix some bugs, add resolution with slider working to f1 model, add section specifications.  
+
+<div style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px;">
+
+**5/12/2025**  
+    Add skip button to framepack.  
 5/9/2025  
     Add testing branch for framepack F1 end image, kinda glitchygo https://github.com/maybleMyers/H1111/tree/f1_end  
 5/5/2025  
@@ -152,6 +155,8 @@ I have tested the 14B i2v and t2v models so far to be working
 download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and add them to your hunyuan folder
 skyreels_hunyuan_i2v_bf16.safetensors
 skyreels_hunyuan_t2v_bf16.safetensors
+
+</div>
 
 ## Requirements
 

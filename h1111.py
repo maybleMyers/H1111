@@ -29,7 +29,7 @@ import time
 
 # Add global stop event
 stop_event = threading.Event()
-
+skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
 def set_random_seed():
@@ -258,7 +258,7 @@ def process_framepack_video(
         if stop_event.is_set():
             yield all_videos, None, "Generation stopped by user.", ""
             return
-        
+        skip_event.clear()
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"fpack_{run_id}" # Add prefix for clarity
         # --- Construct unique preview paths ---
@@ -355,6 +355,19 @@ def process_framepack_video(
                     print(f"Error terminating subprocess: {e}")
                 yield all_videos.copy(), None, "Generation stopped by user.", ""
                 return
+            if skip_event.is_set():
+                print(f"Skip signal received for batch item {i+1}. Terminating subprocess...")
+                try:
+                    p.terminate()
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+                except Exception as e:
+                    print(f"Error terminating subprocess during skip: {e}")
+                skip_event.clear() 
+                yield all_videos.copy(), current_preview_yield_path, f"Skipping item {i+1}/{batch_size}...", ""
+                break            
 
             line = p.stdout.readline()
             if not line:
@@ -4503,6 +4516,15 @@ with gr.Blocks(
         align-items: center !important;
         justify-content: center !important;
     }
+    .light-blue-btn {
+        background: linear-gradient(to bottom right, #AEC6CF, #9AB8C4) !important; /* Light blue gradient */
+        color: #333 !important; /* Darker text for readability */
+        border: 1px solid #9AB8C4 !important; /* Subtle border */
+    }
+    .light-blue-btn:hover {
+        background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important; /* Slightly darker on hover */
+        border-color: #8AA9B5 !important;
+    }    
     """, 
 
 ) as demo:
@@ -4669,6 +4691,7 @@ with gr.Blocks(
                              interactive=False, # Not interactive for display
                              elem_id="framepack_preview_video"
                         )
+                        framepack_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn")
                     with gr.Group():
                         with gr.Row():
                             framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
@@ -5701,7 +5724,7 @@ with gr.Blocks(
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
 
-        #Merge Model's tab        
+        #Convert lora tab        
         with gr.Tab("Convert LoRA") as convert_lora_tab:
             def suggest_output_name(file_obj) -> str:
                 """Generate suggested output name from input file"""
@@ -5757,25 +5780,27 @@ with gr.Blocks(
                         check=True
                     )
 
-                    if result.returncode != 0:
-                        return f"Conversion failed with exit code {result.returncode}. See console for details:\n{result.stderr}\n{result.stdout}"
-
-
-                    if os.path.exists(output_path):
-                        return f"Successfully converted LoRA to {output_path}"
-                    else:
-                        return "Error: Output file not created"
-
+                    console_output = result.stdout if result.stdout else ""
+                    if result.stderr:
+                        console_output += f"\n--- Script STDERR ---\n{result.stderr}"
+                    if not console_output.strip():
+                        console_output = "Conversion script completed with no output."
+                        if os.path.exists(output_path):
+                            console_output += f"\n[UI Info] Output file confirmed by h1111.py at: {output_path}"
+                        else:
+                            console_output += f"\n[UI Warning] Output file NOT found by h1111.py at expected location: {output_path}"               
+                    return console_output.strip()
                 except subprocess.CalledProcessError as e:
-                    print(f"Subprocess error:\n{e.stderr}\n{e.stdout}")
-                    return f"Error during conversion: {e.stderr}"
-                except FileNotFoundError as e:
-                    # This catches errors like python executable not found, or the script itself not found
-                    print(f"File not found error: {e}")
-                    return f"Error: Required file not found. Make sure Python and the conversion script are accessible. Details: {e}"
-                except Exception as e:
-                    traceback.print_exc() # Print traceback for debugging
-                    return f"Error: {str(e)}"
+                    error_message = f"Conversion Script Error (Exit Code: {e.returncode}):\n"
+                    if e.stdout and e.stdout.strip():
+                        error_message += f"--- Script STDOUT ---\n{e.stdout.strip()}\n"
+                    if e.stderr and e.stderr.strip():
+                        error_message += f"--- Script STDERR ---\n{e.stderr.strip()}\n"
+                    if not (e.stdout and e.stdout.strip()) and not (e.stderr and e.stderr.strip()):
+                        error_message += "Script produced no output on STDOUT or STDERR."
+                    
+                    print(f"Subprocess error details logged to console. UI will show combined script output.") # Log for server console
+                    return error_message.strip()
 
 
             with gr.Row():
@@ -6138,12 +6163,23 @@ with gr.Blocks(
     for i in range(len(framepack_lora_weights)):
         framepack_lora_refresh_outputs.extend([framepack_lora_weights[i], framepack_lora_multipliers[i]])
 
-    # <<< Modify this click handler >>>
     framepack_refresh_lora_btn.click(
         fn=refresh_lora_dropdowns_simple, # Use the new simplified function
         inputs=[framepack_lora_folder],   # Only needs the folder path as input
         outputs=framepack_lora_refresh_outputs # Still outputs updates to all 8 components
     )
+    def trigger_skip():
+        """Sets the skip event and returns a status message."""
+        print("FramePack Skip button clicked, setting skip_event.")
+        skip_event.set()
+        return "Skip signal sent..."
+
+    framepack_skip_btn.click(
+        fn=trigger_skip,
+        inputs=None,
+        outputs=[framepack_batch_progress], # Update status text
+        queue=False # Send signal immediately
+    )    
 
     def toggle_fun_control(use_fun_control):
         """Toggle control video visibility and update task suffix"""
