@@ -4766,7 +4766,7 @@ with gr.Blocks(
             with gr.Accordion("Performance / Memory", open=True):
                 with gr.Row():
                     framepack_fp8 = gr.Checkbox(label="Use FP8 DiT", value=False, info="Enable FP8 precision for the main Transformer model.")
-                    framepack_fp8_llm = gr.Checkbox(label="Use FP8 LLM (Text Encoder 1)", value=False, info="Enable FP8 for the Llama text encoder.")
+                    framepack_fp8_llm = gr.Checkbox(label="Use FP8 LLM (Text Encoder 1)", value=False, info="Enable FP8 for the Llama text encoder.", visible=False)
                     framepack_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 DiT", value=False, info="Requires FP8 DiT. Use scaled math (potential quality improvement).")
                     framepack_blocks_to_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Blocks to Swap (to Save VRAM, 0=disable)", value=26,
                                     info="Higher values = less VRAM usage but slower generation")
