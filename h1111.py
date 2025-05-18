@@ -32,6 +32,268 @@ stop_event = threading.Event()
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
+def refresh_lora_dropdowns_simple(lora_folder: str) -> List[gr.update]:
+    """Refreshes LoRA choices, always defaulting the selection to 'None'."""
+    new_choices = get_lora_options(lora_folder)
+    results = []
+    print(f"Refreshing LoRA dropdowns. Found choices: {new_choices}") # Debug print
+    for i in range(4): # Update all 4 slots
+        results.extend([
+            gr.update(choices=new_choices, value="None"), # Always reset value to None
+            gr.update(value=1.0) # Reset multiplier
+        ])
+    return results
+
+def process_framepack_extension_video(
+    input_video: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    batch_count: int,
+    resolution_max_dim: int,
+    total_second_length: float,
+    latent_window_size: int,
+    steps: int,
+    cfg_scale: float, # Maps to --cfg
+    distilled_guidance_scale: float, # Maps to --gs
+    # rs_scale: float, # --rs, usually 0.0, can be fixed or advanced option
+    gpu_memory_preservation: float,
+    use_teacache: bool,
+    no_resize: bool,
+    mp4_crf: int,
+    num_clean_frames: int,
+    vae_batch_size: int,
+    save_path: str, # Maps to --output_dir
+    # Model Paths
+    fpe_transformer_path: str, # DiT
+    fpe_vae_path: str,
+    fpe_text_encoder_path: str, # TE1
+    fpe_text_encoder_2_path: str, # TE2
+    fpe_image_encoder_path: str,
+    # Advanced performance
+    fpe_attn_mode: str,
+    fpe_fp8_llm: bool,
+    fpe_vae_chunk_size: Optional[int],
+    fpe_vae_spatial_tile_sample_min_size: Optional[int],
+    # LoRAs
+    fpe_lora_folder: str,
+    fpe_lora_weight_1: str, fpe_lora_mult_1: float,
+    fpe_lora_weight_2: str, fpe_lora_mult_2: float,
+    fpe_lora_weight_3: str, fpe_lora_mult_3: float,
+    fpe_lora_weight_4: str, fpe_lora_mult_4: float,
+    # Preview
+    fpe_enable_preview: bool,
+    fpe_preview_interval: int, # This arg is not used by f1_video_cli_local.py
+    *args: Any # For future expansion or unmapped params, not strictly needed here
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event, skip_event
+    stop_event.clear()
+    skip_event.clear() # Assuming skip_event might be used for batch items
+
+    if not input_video or not os.path.exists(input_video):
+        yield [], None, "Error: Input video for extension not found.", ""
+        return
+
+    if not save_path or not save_path.strip():
+        save_path = "outputs/framepack_extensions" # Default save path for extensions
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Prepare LoRA arguments
+    lora_weights_paths = []
+    lora_multipliers_values = []
+    lora_params_ui = [
+        (fpe_lora_weight_1, fpe_lora_mult_1), (fpe_lora_weight_2, fpe_lora_mult_2),
+        (fpe_lora_weight_3, fpe_lora_mult_3), (fpe_lora_weight_4, fpe_lora_mult_4)
+    ]
+    if fpe_lora_folder and os.path.exists(fpe_lora_folder):
+        for weight_name, mult_val in lora_params_ui:
+            if weight_name and weight_name != "None":
+                lora_path = os.path.join(fpe_lora_folder, weight_name)
+                if os.path.exists(lora_path):
+                    lora_weights_paths.append(lora_path)
+                    lora_multipliers_values.append(str(mult_val))
+                else:
+                    print(f"Warning: LoRA file not found: {lora_path}")
+
+    all_generated_videos = [] 
+    
+    for i in range(batch_count):
+        if stop_event.is_set():
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+        skip_event.clear() 
+
+        current_seed_val = seed
+        if seed == -1:
+            current_seed_val = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed_val = seed + i
+        
+        # This run_id is not directly used for preview file naming by f1_video_cli_local.py
+        # as it constructs its own job_id based filenames for section previews.
+        # run_id = f"{int(time.time())}_{random.randint(1000, 9999)}_ext_s{current_seed_val}"
+        
+        current_preview_yield_path = None 
+        last_preview_section_processed = -1 
+        
+        status_text = f"Processing Extension {i + 1}/{batch_count} (Seed: {current_seed_val})"
+        progress_text = "Preparing extension subprocess..."
+        yield all_generated_videos, current_preview_yield_path, status_text, progress_text
+
+        command = [
+            sys.executable, "f1_video_cli_local.py",
+            "--input_video", str(input_video),
+            "--prompt", str(prompt),
+            "--n_prompt", str(negative_prompt),
+            "--seed", str(current_seed_val),
+            "--resolution_max_dim", str(resolution_max_dim),
+            "--total_second_length", str(total_second_length),
+            "--latent_window_size", str(latent_window_size),
+            "--steps", str(steps),
+            "--cfg", str(cfg_scale),
+            "--gs", str(distilled_guidance_scale),
+            "--rs", "0.0", # Fixed as per UI, can be made configurable if needed
+            "--gpu_memory_preservation", str(gpu_memory_preservation),
+            "--mp4_crf", str(mp4_crf),
+            "--num_clean_frames", str(num_clean_frames),
+            "--vae_batch_size", str(vae_batch_size),
+            "--output_dir", str(save_path), 
+            "--dit", str(fpe_transformer_path), "--vae", str(fpe_vae_path),
+            "--text_encoder1", str(fpe_text_encoder_path), "--text_encoder2", str(fpe_text_encoder_2_path),
+            "--image_encoder", str(fpe_image_encoder_path),
+            "--attn_mode", str(fpe_attn_mode),
+        ]
+        if use_teacache: command.append("--use_teacache")
+        if no_resize: command.append("--no_resize")
+        if fpe_fp8_llm: command.append("--fp8_llm") # Though F1 script might not use this
+        if fpe_vae_chunk_size is not None and fpe_vae_chunk_size > 0:
+            command.extend(["--vae_chunk_size", str(fpe_vae_chunk_size)])
+        if fpe_vae_spatial_tile_sample_min_size is not None and fpe_vae_spatial_tile_sample_min_size > 0:
+            command.extend(["--vae_spatial_tile_sample_min_size", str(fpe_vae_spatial_tile_sample_min_size)])
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        print(f"Running FramePack-Extension Command: {' '.join(command)}")
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1, universal_newlines=True)
+        
+        final_video_path_regex = re.compile(r"Final video for seed \d+ \(extension \d+\) saved as: (.*\.mp4)")
+        fpe_section_progress_regex = re.compile(r"--- F1 Extension: .*?: Section (\d+)\s*/\s*(\d+) ---")
+        tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),")
+        fpe_preview_saved_regex = re.compile(r"MP4 Preview for section (\d+) saved: (.*\.mp4)")
+        
+        current_video_file_for_item = None
+        current_section_being_processed = 0 
+        total_sections_from_log = 0
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+                except Exception as e: print(f"Error terminating FPE subprocess: {e}")
+                yield all_generated_videos, None, "Generation stopped by user.", ""
+                return
+            if skip_event.is_set() and batch_count > 1:
+                print(f"Skip signal received for FPE batch item {i+1}. Terminating subprocess...")
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+                except Exception as e: print(f"Error terminating FPE subprocess during skip: {e}")
+                skip_event.clear()
+                yield all_generated_videos, current_preview_yield_path, f"Skipping FPE item {i+1}/{batch_count}...", ""
+                break 
+
+            line_strip = line.strip()
+            if not line_strip:
+                continue
+            print(f"FPE_SUBPROCESS: {line_strip}")
+            
+            progress_text_update = line_strip 
+            
+            section_match = fpe_section_progress_regex.search(line_strip)
+            tqdm_match_cli = tqdm_cli_progress_regex.search(line_strip)
+            final_video_match = final_video_path_regex.search(line_strip)
+            preview_saved_match = fpe_preview_saved_regex.search(line_strip)
+
+            if preview_saved_match and fpe_enable_preview:
+                saved_section_num = int(preview_saved_match.group(1))
+                preview_mp4_path_from_log = preview_saved_match.group(2).strip()
+                if os.path.exists(preview_mp4_path_from_log) and saved_section_num > last_preview_section_processed:
+                    current_preview_yield_path = preview_mp4_path_from_log # Yield clean path
+                    last_preview_section_processed = saved_section_num
+                    print(f"DEBUG FPE: MP4 Preview updated from log - {current_preview_yield_path}")
+                # This log usually comes *after* the section info, so status might already be updated
+
+            if section_match:
+                current_section_being_processed = int(section_match.group(1))
+                total_sections_from_log = int(section_match.group(2))
+                status_text = f"Extending Video {i + 1}/{batch_count} (Seed: {current_seed_val}) - Section {current_section_being_processed}/{total_sections_from_log}"
+                progress_text_update = f"Starting Section {current_section_being_processed}..."
+                # Fallback logic for preview (if enabled and explicit log was missed)
+                # This is less likely to be needed if fpe_preview_saved_regex is robust
+                if fpe_enable_preview and current_section_being_processed > 1:
+                    section_to_check_for_preview = current_section_being_processed - 1
+                    if section_to_check_for_preview > last_preview_section_processed:
+                        # Construct the expected preview filename based on f1_video_cli_local.py's naming
+                        # It uses a job_id that includes seed, resolution, etc. We don't know the exact job_id here.
+                        # Relying on "MP4 Preview for section X saved:" log is more reliable.
+                        # For a fallback, we could glob for *partX*.mp4, but that's risky.
+                        # For now, this fallback is removed as the primary log line should be sufficient.
+                        pass
+
+
+            elif tqdm_match_cli:
+                percentage = tqdm_match_cli.group(1)
+                steps_iter_total = tqdm_match_cli.group(2)
+                time_elapsed = tqdm_match_cli.group(3).strip()
+                time_remaining = tqdm_match_cli.group(4).strip()
+                # Ensure total_sections_from_log is not zero before using in f-string
+                total_sections_display = total_sections_from_log if total_sections_from_log > 0 else "?"
+                progress_text_update = f"Section {current_section_being_processed}/{total_sections_display} - Step {steps_iter_total} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Extending Video {i + 1}/{batch_count} (Seed: {current_seed_val}) - Sampling Section {current_section_being_processed}"
+            
+            elif final_video_match:
+                found_video_path = final_video_match.group(1).strip()
+                if os.path.exists(found_video_path):
+                    current_video_file_for_item = found_video_path
+                    progress_text_update = f"Finalizing: {os.path.basename(current_video_file_for_item)}"
+                    status_text = f"Extension {i + 1}/{batch_count} (Seed: {current_seed_val}) - Saved"
+                else:
+                    print(f"Warning FPE: Final video path from log not found: {found_video_path}")
+            
+            yield all_generated_videos, current_preview_yield_path, status_text, progress_text_update
+        
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item and os.path.exists(current_video_file_for_item):
+            all_generated_videos.append((current_video_file_for_item, f"Extended - Seed: {current_seed_val}"))
+            status_text = f"Extension {i + 1}/{batch_count} (Seed: {current_seed_val}) - Completed and Added"
+            progress_text = f"Saved: {os.path.basename(current_video_file_for_item)}"
+            yield all_generated_videos.copy(), None, status_text, progress_text # Clear preview after item completion
+        elif return_code != 0:
+            status_text = f"Extension {i + 1}/{batch_count} (Seed: {current_seed_val}) - Failed (Code: {return_code})"
+            progress_text = f"Subprocess failed. Check console for errors from f1_video_cli_local.py"
+            yield all_generated_videos.copy(), None, status_text, progress_text
+        else: # rc == 0 but no video path
+            status_text = f"Extension {i + 1}/{batch_count} (Seed: {current_seed_val}) - Finished, but no video file confirmed."
+            progress_text = "Check console logs from f1_video_cli_local.py for the saved path."
+            yield all_generated_videos.copy(), None, status_text, progress_text
+
+        # The F1 script already cleans up its intermediate _partX files.
+        # No need for unique_preview_suffix based cleanup here for FPE.
+    
+    yield all_generated_videos, None, "FramePack-Extension Batch complete.", ""
+
 def set_random_seed():
     """Returns -1 to set the seed input to random."""
     return -1
@@ -4544,6 +4806,7 @@ with gr.Blocks(
     wanx_t2v_selected_index = gr.State(value=None)
     framepack_selected_index = gr.State(value=None)
     framepack_original_dims = gr.State(value="")
+    fpe_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -4796,6 +5059,102 @@ with gr.Blocks(
                  with gr.Row():
                     framepack_image_encoder_path = gr.Textbox(label="Image Encoder (SigLIP) Path *Required*", value="hunyuan/model.safetensors")
                     framepack_save_path = gr.Textbox(label="Save Path *Required*", value="outputs")
+
+        with gr.Tab(id=11, label="FramePack-Extension") as framepack_extension_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    fpe_prompt = gr.Textbox(
+                        scale=3, label="Prompt",
+                        value="cinematic video of a cat wizard casting a spell, epic action scene", lines=3
+                    )
+                    fpe_negative_prompt = gr.Textbox(scale=3, label="Negative Prompt", value="low quality, blurry, watermark", lines=3)
+                with gr.Column(scale=1):
+                    fpe_batch_count = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    fpe_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    fpe_progress_text = gr.Textbox(label="Progress", interactive=False, lines=1, elem_id="fpe_progress_text") # Unique elem_id
+
+            with gr.Row():
+                fpe_generate_btn = gr.Button("Generate Extended Video", elem_classes="green-btn")
+                fpe_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column(): # Left column for inputs
+                    fpe_input_video = gr.Video(label="Input Video for Extension", sources=['upload'], height=300)
+                    
+                    gr.Markdown("### Core Generation Parameters")
+                    with gr.Row():
+                        fpe_seed = gr.Number(label="Seed (-1 for random)", value=31337)
+                        # fpe_random_seed_btn = gr.Button("🎲️") # Optional: Add random seed button
+                    
+                    fpe_resolution_max_dim = gr.Number(label="Resolution (Max Dimension)", value=640, step=32, info="Target max width/height for bucket.")
+                    fpe_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Additional Video Length (seconds)", value=5.0)
+                    fpe_latent_window_size = gr.Slider(minimum=9, maximum=33, step=1, label="Latent Window Size", value=9, info="Default 9 for F1 model.")
+                    fpe_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=25)
+
+                    with gr.Row():
+                        fpe_cfg_scale = gr.Slider(minimum=1.0, maximum=32.0, step=0.1, label="CFG Scale", value=1.0, info="Usually 1.0 for F1 (no external CFG).")
+                        fpe_distilled_guidance_scale = gr.Slider(minimum=1.0, maximum=32.0, step=0.1, label="Distilled Guidance (GS)", value=3.0)
+                    # fpe_rs_scale = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="CFG Rescale (RS)", value=0.0, visible=False)
+                    with gr.Row():
+                        with gr.Accordion("Advanced & Performance", open=True):
+                            fpe_gpu_memory_preservation = gr.Slider(label="GPU Memory Preserve (GB)", minimum=1.0, maximum=16.0, value=6.0, step=0.1)
+                            fpe_use_teacache = gr.Checkbox(label="Use TeaCache", value=False)
+                            fpe_no_resize = gr.Checkbox(label="Force Original Video Resolution (No Resize)", value=False)
+                            fpe_mp4_crf = gr.Slider(label="MP4 CRF (Quality)", minimum=0, maximum=51, value=16, step=1, info="Lower is better quality, larger file.")
+                            fpe_num_clean_frames = gr.Slider(label="Context Frames (1x from Input)", minimum=1, maximum=10, value=5, step=1)
+                            fpe_vae_batch_size = gr.Slider(label="VAE Batch Size (Input Video Encoding)", minimum=4, maximum=128, value=16, step=4)
+
+                            fpe_attn_mode = gr.Dropdown(label="Attention Mode (DiT)", choices=["torch", "sdpa", "flash", "xformers", "sageattn"], value="torch")
+                            fpe_fp8_llm = gr.Checkbox(label="Use FP8 LLM (Text Encoder 1)", value=False, visible=False)
+                            fpe_vae_chunk_size = gr.Number(label="VAE Chunk Size (CausalConv3d)", value=32, step=1, minimum=0, info="0 or None=disable")
+                            fpe_vae_spatial_tile_sample_min_size = gr.Number(label="VAE Spatial Tile Min Size", value=128, step=16, minimum=0, info="0 or None=disable")
+
+                
+                with gr.Column(): # Right column for outputs and advanced settings
+                    fpe_output_gallery = gr.Gallery(
+                        label="Generated Extended Videos", columns=[1], rows=[1], # Show one main video at a time
+                        object_fit="contain", height=480, show_label=True,
+                        elem_id="gallery_framepack_extension", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Live Preview (During Generation)", open=True):
+                        with gr.Row():
+                            fpe_enable_preview = gr.Checkbox(label="Enable Live Preview", value=True, visible=False)
+                            fpe_preview_interval = gr.Slider(
+                                minimum=1, maximum=50, step=1, value=5,
+                                label="Preview Every N Steps",
+                                info="Saves a PNG preview during sampling.",
+                                visible=False
+                            )
+                        fpe_preview_output_component = gr.Video( # Changed to Video for MP4 previews
+                             label="Latest Section Preview", height=300,
+                             interactive=False, elem_id="fpe_preview_video"
+                        )
+                        # fpe_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn") # Optional
+                    gr.Markdown("### LoRA Configuration")
+                    with gr.Row():
+                        fpe_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        fpe_lora_folder = gr.Textbox(label="LoRA Folder", value="lora", scale=4)
+                    fpe_lora_weights_ui = []
+                    fpe_lora_multipliers_ui = []
+                    for i in range(4):
+                        with gr.Row():
+                            fpe_lora_weights_ui.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                value="None", allow_custom_value=False, interactive=True, scale=2
+                            ))
+                            fpe_lora_multipliers_ui.append(gr.Slider(
+                                label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                            ))
+            with gr.Row():        
+                with gr.Accordion("Model Paths (FramePack-Extension)", open=False):
+                    fpe_transformer_path = gr.Textbox(label="DiT Path (F1 Model)", value="hunyuan/FramePack_F1_I2V_HY_20250503.safetensors") # Default to F1
+                    fpe_vae_path = gr.Textbox(label="VAE Path", value="hunyuan/pytorch_model.pt")
+                    fpe_text_encoder_path = gr.Textbox(label="Text Encoder 1 (Llama)", value="hunyuan/llava_llama3_fp16.safetensors")
+                    fpe_text_encoder_2_path = gr.Textbox(label="Text Encoder 2 (CLIP)", value="hunyuan/clip_l.safetensors")
+                    fpe_image_encoder_path = gr.Textbox(label="Image Encoder (SigLIP)", value="hunyuan/model.safetensors")
+                    fpe_save_path = gr.Textbox(label="Save Path (Output Directory)", value="outputs/framepack_extensions")
+
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
@@ -5875,7 +6234,53 @@ with gr.Blocks(
 
     #Event handlers etc
 
-    # <<< Function to switch to FramePack Tab >>>
+    fpe_generate_btn.click(
+        fn=process_framepack_extension_video,
+        inputs=[
+            fpe_input_video, fpe_prompt, fpe_negative_prompt, fpe_seed, fpe_batch_count,
+            fpe_resolution_max_dim, fpe_total_second_length, fpe_latent_window_size,
+            fpe_steps, fpe_cfg_scale, fpe_distilled_guidance_scale, #fpe_rs_scale,
+            fpe_gpu_memory_preservation, fpe_use_teacache, fpe_no_resize, fpe_mp4_crf,
+            fpe_num_clean_frames, fpe_vae_batch_size, fpe_save_path,
+            # Model Paths
+            fpe_transformer_path, fpe_vae_path, fpe_text_encoder_path,
+            fpe_text_encoder_2_path, fpe_image_encoder_path,
+            # Advanced
+            fpe_attn_mode, fpe_fp8_llm, fpe_vae_chunk_size, fpe_vae_spatial_tile_sample_min_size,
+            # LoRAs
+            fpe_lora_folder,
+            fpe_lora_weights_ui[0], fpe_lora_multipliers_ui[0],
+            fpe_lora_weights_ui[1], fpe_lora_multipliers_ui[1],
+            fpe_lora_weights_ui[2], fpe_lora_multipliers_ui[2],
+            fpe_lora_weights_ui[3], fpe_lora_multipliers_ui[3],
+            # Preview
+            fpe_enable_preview, fpe_preview_interval,
+        ],
+        outputs=[
+            fpe_output_gallery,
+            fpe_preview_output_component, # Output to the Image/Video preview component
+            fpe_batch_progress,
+            fpe_progress_text
+        ],
+        queue=True
+    )
+
+    fpe_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    
+    def handle_fpe_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+    fpe_output_gallery.select(fn=handle_fpe_gallery_select, outputs=fpe_selected_index)
+
+    fpe_lora_refresh_outputs_list = []
+    for i in range(len(fpe_lora_weights_ui)):
+        fpe_lora_refresh_outputs_list.extend([fpe_lora_weights_ui[i], fpe_lora_multipliers_ui[i]])
+
+    fpe_refresh_lora_btn.click(
+        fn=refresh_lora_dropdowns_simple,
+        inputs=[fpe_lora_folder],
+        outputs=fpe_lora_refresh_outputs_list
+    )
+
     def change_to_framepack_tab():
         return gr.Tabs(selected=10) # FramePack tab has id=10
 
@@ -6145,18 +6550,6 @@ with gr.Blocks(
         fn=handle_framepack_gallery_select,
         outputs=framepack_selected_index
     )
-
-    def refresh_lora_dropdowns_simple(lora_folder: str) -> List[gr.update]:
-        """Refreshes LoRA choices, always defaulting the selection to 'None'."""
-        new_choices = get_lora_options(lora_folder)
-        results = []
-        print(f"Refreshing LoRA dropdowns. Found choices: {new_choices}") # Debug print
-        for i in range(4): # Update all 4 slots
-            results.extend([
-                gr.update(choices=new_choices, value="None"), # Always reset value to None
-                gr.update(value=1.0) # Reset multiplier
-            ])
-        return results
     
     # FramePack LoRA Refresh Button Handler
     framepack_lora_refresh_outputs = []

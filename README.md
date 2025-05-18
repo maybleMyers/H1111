@@ -92,12 +92,69 @@ pip install -r requirements.txt
 
 I have tested the 14B i2v and t2v models so far to be working
 
+## Requirements
+
+- Python 3.10
+- CUDA 12.4
+
+## Basic Installation (Linux)
+
+Tested on ubuntu 24
+
+to update navigate to H1111 and git pull
+
+```powershell
+git clone https://github.com/maybleMyers/H1111
+cd H1111
+python -m venv env
+#(if you have another version of python do python3.10 -m venv env after you install it with sudo apt install python3.10 python3.10-venv python3.10-distutils)
+source env/bin/activate 
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
+pip install -r requirements.txt
+pip install flash-attn --no-build-isolation
+pip install sageattention==1.0.6
+might need python3.10-dev as well for sage attention to work
+
+```
+
+run with  
+source env/bin/activate  
+python h1111.py
+
+for GPU1
+CUDA_VISIBLE_DEVICES=1 python h1111.py
+
+## Basic Installation (Windows)
+
+
+
+First, open PowerShell and navigate to your desired installation directory. Then run these commands:
+
+```powershell
+git clone https://github.com/maybleMyers/H1111
+cd H1111
+python -m venv env
+./env/scripts/activate
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
+pip install -r requirements.txt
+
+```
+
+## To run
+
+```
+env/scripts/activate
+python h1111.py
+```
+
+open 127.0.0.1:7860 in a browser
+
+You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.
+
 ## changlog
-
-<details>
-<summary>Click to view Changlog</summary>
-
-**5/12/2025**  
+5/18/2025  
+    Add video extension tab. Currently only works with f1 model.  
+5/12/2025  
     Add skip button to framepack.  
 5/9/2025  
     Add testing branch for framepack F1 end image, kinda glitchygo https://github.com/maybleMyers/H1111/tree/f1_end  
@@ -157,66 +214,6 @@ download models from https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy and 
 skyreels_hunyuan_i2v_bf16.safetensors
 skyreels_hunyuan_t2v_bf16.safetensors
 
-</details>
-
-## Requirements
-
-- Python 3.10
-- CUDA 12.4
-
-## Basic Installation (Linux)
-
-Tested on ubuntu 24
-
-to update navigate to H1111 and git pull
-
-```powershell
-git clone https://github.com/maybleMyers/H1111
-cd H1111
-python -m venv env
-#(if you have another version of python do python3.10 -m venv env after you install it with sudo apt install python3.10 python3.10-venv python3.10-distutils)
-source env/bin/activate 
-pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
-pip install sageattention==1.0.6
-might need python3.10-dev as well for sage attention to work
-
-```
-
-run with  
-source env/bin/activate  
-python h1111.py
-
-for GPU1
-CUDA_VISIBLE_DEVICES=1 python h1111.py
-
-## Basic Installation (Windows)
-
-
-
-First, open PowerShell and navigate to your desired installation directory. Then run these commands:
-
-```powershell
-git clone https://github.com/maybleMyers/H1111
-cd H1111
-python -m venv env
-./env/scripts/activate
-pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 
-pip install -r requirements.txt
-
-```
-
-## To run
-
-```
-env/scripts/activate
-python h1111.py
-```
-
-open 127.0.0.1:7860 in a browser
-
-You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.
 
 ## to use stock hunyuan models
 
