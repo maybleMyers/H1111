@@ -524,17 +524,23 @@ if __name__ == '__main__':
             args.lora_multiplier = args.lora_multiplier * len(args.lora_weight)
         elif len(args.lora_multiplier) != len(args.lora_weight):
             parser.error(f"Number of LoRA weights ({len(args.lora_weight)}) and multipliers ({len(args.lora_multiplier)}) must match, or provide a single multiplier.")
+        
         try:
+            if not hasattr(args, 'lycoris'):
+                args.lycoris = False
+            if not hasattr(args, 'save_merged_model'):
+                args.save_merged_model = None
+            current_device_for_lora = torch.device(loading_device_str)
+
+
             merge_lora_weights(
-                network_module=lora_framepack,
-                text_encoder=None,
-                unet=transformer,
-                models=args.lora_weight,
-                ratios=args.lora_multiplier,
-                device=torch.device(loading_device_str),
-                args_for_lora=args
+                lora_framepack,   
+                transformer,      
+                args,             
+                current_device_for_lora 
             )
-            print("LoRA weights merged successfully.")
+            print("LoRA weights merged successfully using the same call structure as fpack_generate_video.py.")
+
         except Exception as e_lora:
             print(f"Error merging LoRA weights: {e_lora}")
             traceback.print_exc()
