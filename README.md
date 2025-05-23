@@ -66,6 +66,9 @@ For more details on using framepack with musubi go here https://github.com/kohya
 
 Fastest speed will be achieved with fp8 and fp8 scaled, then you can reduce block swapping to your memory constraints. (leave about 1gb free)  
 
+Framepack Extension tab is still a work in progress and I am working on it this weekend.  
+Thanks to @pftq https://github.com/pftq and @chaojie https://github.com/chaojie for their work on the extension logics.  
+
 ## To Use the new Skyreels-V2 models
 
 I have provided these 2 at https://huggingface.co/maybleMyers/wan_files_for_h1111  
@@ -152,8 +155,10 @@ open 127.0.0.1:7860 in a browser
 You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.
 
 ## changlog
+5/23/2025  
+    Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
 5/18/2025  
-    Add video extension tab. Currently only works with f1 model.  
+    Add video extension tab. Currently only works with f1 model. Full credit to @pfqt and @chaojie for their amazing work!  
 5/12/2025  
     Add skip button to framepack.  
 5/9/2025  
