@@ -457,12 +457,10 @@ def process_framepack_video(
     # --- Resolution Calculation ---
     final_height, final_width = None, None
     # Prioritize explicit width/height if valid and divisible by 8
-    # (Note: Backend script fpack_generate_video.py checks divisibility by 8,
-    #  but the UI logic used 32 based on bucket assumptions. Sticking to 8 here
-    #  to match the backend script's direct requirement.)
     if framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0:
         if framepack_width % 8 != 0 or framepack_height % 8 != 0:
-             yield [], "Error: Explicit Width and Height must be divisible by 8.", ""
+             # Ensure 4 values are yielded here: videos, preview_path, status, progress
+             yield [], None, "Error: Explicit Width and Height must be divisible by 8.", "" 
              return
         final_height = int(framepack_height)
         final_width = int(framepack_width)
@@ -470,31 +468,33 @@ def process_framepack_video(
     # Fallback to target resolution using bucket logic
     elif target_resolution is not None and target_resolution > 0:
          if not original_dims_str:
-              yield [], "Error: Cannot use Target Resolution without an input image to determine aspect ratio.", ""
+              # Ensure 4 values are yielded here
+              yield [], None, "Error: Cannot use Target Resolution without an input image to determine aspect ratio.", ""
               return
          try:
              orig_w, orig_h = map(int, original_dims_str.split('x'))
              if orig_w <= 0 or orig_h <= 0:
-                 yield [], "Error: Invalid original dimensions stored.", ""
+                 # Ensure 4 values are yielded here
+                 yield [], None, "Error: Invalid original dimensions stored.", ""
                  return
 
-             # Use find_nearest_bucket (ensure divisible by 8, though buckets often use 32/64)
-             # Let's stick to the 32 divisibility from find_nearest_bucket for aspect ratio calc
-             bucket_dims = find_nearest_bucket(orig_h, orig_w, resolution=target_resolution) # Bucket logic usually uses 32/64
+             bucket_dims = find_nearest_bucket(orig_h, orig_w, resolution=target_resolution)
 
              if bucket_dims:
-                 # Bucket dimensions should already be divisible by 32 (and thus 8)
                  final_height, final_width = bucket_dims
                  print(f"Using Target Resolution {target_resolution}. Found nearest bucket: H={final_height}, W={final_width}")
              else:
-                 yield [], f"Error: Could not find a suitable bucket for Target Resolution {target_resolution} and input image aspect ratio.", ""
+                 # Ensure 4 values are yielded here
+                 yield [], None, f"Error: Could not find a suitable bucket for Target Resolution {target_resolution} and input image aspect ratio.", ""
                  return
 
          except Exception as e:
-             yield [], f"Error calculating bucket dimensions: {e}", ""
+             # THIS IS THE CORRECTED LINE:
+             yield [], None, f"Error calculating bucket dimensions: {e}", "" # Was: yield [], f"Error calculating bucket dimensions: {e}", ""
              return
     else:
-        yield [], "Error: Resolution required. Please provide Target Resolution OR both valid Width and Height (divisible by 8).", ""
+        # Ensure 4 values are yielded here
+        yield [], None, "Error: Resolution required. Please provide Target Resolution OR both valid Width and Height (divisible by 8).", ""
         return
 
     # --- Batch Loop (Simulated for UI) ---
