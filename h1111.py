@@ -50,6 +50,9 @@ def process_framepack_extension_video(
     negative_prompt: str,
     seed: int,
     batch_count: int,
+    fpe_use_normal_framepack: bool,
+    fpe_end_frame: Optional[str],
+    fpe_end_frame_weight: float,    
     resolution_max_dim: int,
     total_second_length: float,
     latent_window_size: int,
@@ -116,6 +119,9 @@ def process_framepack_extension_video(
                     print(f"Warning: LoRA file not found: {lora_path}")
 
     all_generated_videos = [] 
+    script_to_use = "f_video_end_cli_local.py" if fpe_use_normal_framepack else "f1_video_cli_local.py"
+    model_type_str = "Normal FramePack" if fpe_use_normal_framepack else "FramePack F1"
+    print(f"Using {model_type_str} model for extension via script: {script_to_use}")    
     
     for i in range(batch_count):
         if stop_event.is_set():
@@ -141,18 +147,18 @@ def process_framepack_extension_video(
         yield all_generated_videos, current_preview_yield_path, status_text, progress_text
 
         command = [
-            sys.executable, "f1_video_cli_local.py",
+            sys.executable, script_to_use,
             "--input_video", str(input_video),
             "--prompt", str(prompt),
             "--n_prompt", str(negative_prompt),
             "--seed", str(current_seed_val),
             "--resolution_max_dim", str(resolution_max_dim),
-            "--total_second_length", str(total_second_length),
+            "--total_second_length", str(total_second_length), # Script uses this for *additional* length
             "--latent_window_size", str(latent_window_size),
             "--steps", str(steps),
             "--cfg", str(cfg_scale),
             "--gs", str(distilled_guidance_scale),
-            "--rs", "0.0", # Fixed as per UI, can be made configurable if needed
+            "--rs", "0.0", 
             "--gpu_memory_preservation", str(gpu_memory_preservation),
             "--mp4_crf", str(mp4_crf),
             "--num_clean_frames", str(num_clean_frames),
@@ -174,6 +180,13 @@ def process_framepack_extension_video(
         if lora_weights_paths:
             command.extend(["--lora_weight"] + lora_weights_paths)
             command.extend(["--lora_multiplier"] + lora_multipliers_values)
+        # Script-specific arguments
+        if fpe_use_normal_framepack:
+            if fpe_fp8_llm: # Normal FP script uses this
+                 command.append("--fp8_llm")
+            if fpe_end_frame and os.path.exists(fpe_end_frame):
+                command.extend(["--end_frame", str(fpe_end_frame)])
+                command.extend(["--end_frame_weight", str(fpe_end_frame_weight)])
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -181,9 +194,16 @@ def process_framepack_extension_video(
 
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1, universal_newlines=True)
         
-        final_video_path_regex = re.compile(r"Final video for seed \d+ \(extension \d+\) saved as: (.*\.mp4)")
-        fpe_section_progress_regex = re.compile(r"--- F1 Extension: .*?: Section (\d+)\s*/\s*(\d+) ---")
-        tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),")
+        # Regex patterns based on script
+        if fpe_use_normal_framepack:
+            final_video_path_regex = re.compile(r"Final extended video saved: (.*_final\.mp4)")
+            # Regex for "--- Generating Extension: ... Section X / Y (backward) ---"
+            fpe_section_progress_regex = re.compile(r"--- Generating Extension: .*?: Section\s+(\d+)\s*/\s*(\d+)\s+\(backward\)")
+            tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),") # Same
+        else: # F1 script
+            final_video_path_regex = re.compile(r"Final video for seed \d+ \(extension \d+\) saved as: (.*\.mp4)")
+            fpe_section_progress_regex = re.compile(r"--- F1 Extension: .*?: Section (\d+)\s*/\s*(\d+) ---")
+            tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),")
         fpe_preview_saved_regex = re.compile(r"MP4 Preview for section (\d+) saved: (.*\.mp4)")
         
         current_video_file_for_item = None
@@ -5059,7 +5079,7 @@ with gr.Blocks(
                  with gr.Row():
                     framepack_image_encoder_path = gr.Textbox(label="Image Encoder (SigLIP) Path *Required*", value="hunyuan/model.safetensors")
                     framepack_save_path = gr.Textbox(label="Save Path *Required*", value="outputs")
-
+### FRAMEPACK EXTENSION
         with gr.Tab(id=11, label="FramePack-Extension") as framepack_extension_tab:
             with gr.Row():
                 with gr.Column(scale=4):
@@ -5067,8 +5087,9 @@ with gr.Blocks(
                         scale=3, label="Prompt",
                         value="cinematic video of a cat wizard casting a spell, epic action scene", lines=3
                     )
-                    fpe_negative_prompt = gr.Textbox(scale=3, label="Negative Prompt", value="low quality, blurry, watermark", lines=3)
+                    fpe_negative_prompt = gr.Textbox(scale=3, label="Negative Prompt", value="", lines=3)
                 with gr.Column(scale=1):
+                    fpe_use_normal_framepack = gr.Checkbox(label="Use Normal FramePack Model", value=False, info="Uses og model supports end frame. Default is F1 model.")                    
                     fpe_batch_count = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
                     fpe_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -5081,6 +5102,9 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column(): # Left column for inputs
                     fpe_input_video = gr.Video(label="Input Video for Extension", sources=['upload'], height=300)
+                    with gr.Accordion("Optional End Frame (for Normal FramePack Model)", open=False, visible=True) as fpe_end_frame_accordion:
+                        fpe_end_frame = gr.Image(label="End Frame for Extension", type="filepath")
+                        fpe_end_frame_weight = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=1.0, label="End Frame Weight")                    
                     
                     gr.Markdown("### Core Generation Parameters")
                     with gr.Row():
@@ -6234,12 +6258,38 @@ with gr.Blocks(
 
     #Event handlers etc
 
+# Toggle visibility of End Frame controls and DiT path based on fpe_use_normal_framepack
+    def toggle_fpe_normal_framepack_options(use_normal_fp):
+        f1_dit_path = "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"
+        normal_fp_dit_path = "hunyuan/FramePackI2V_HY_bf16.safetensors" 
+        
+        updated_dit_path = normal_fp_dit_path if use_normal_fp else f1_dit_path
+        
+        # Check if the target path exists and fallback if necessary
+        if not os.path.exists(updated_dit_path):
+            fallback_path = f1_dit_path if use_normal_fp and os.path.exists(f1_dit_path) else normal_fp_dit_path if not use_normal_fp and os.path.exists(normal_fp_dit_path) else None
+            if fallback_path and os.path.exists(fallback_path):
+                print(f"Warning: DiT path '{updated_dit_path}' not found. Falling back to '{fallback_path}'.")
+                updated_dit_path = fallback_path
+            else: # If preferred and fallback are missing, stick to the intended one and let later checks handle it.
+                print(f"Warning: DiT path '{updated_dit_path}' not found. No fallback available or fallback also missing.")
+
+
+        return gr.update(visible=use_normal_fp), gr.update(value=updated_dit_path), gr.update(visible=use_normal_fp)
+
+    fpe_use_normal_framepack.change(
+        fn=toggle_fpe_normal_framepack_options,
+        inputs=[fpe_use_normal_framepack],
+        outputs=[fpe_end_frame_accordion, fpe_transformer_path, fpe_fp8_llm] # Accordion, DiT path, FP8 LLM checkbox
+    )
+
     fpe_generate_btn.click(
         fn=process_framepack_extension_video,
         inputs=[
             fpe_input_video, fpe_prompt, fpe_negative_prompt, fpe_seed, fpe_batch_count,
+            fpe_use_normal_framepack, fpe_end_frame, fpe_end_frame_weight,
             fpe_resolution_max_dim, fpe_total_second_length, fpe_latent_window_size,
-            fpe_steps, fpe_cfg_scale, fpe_distilled_guidance_scale, #fpe_rs_scale,
+            fpe_steps, fpe_cfg_scale, fpe_distilled_guidance_scale,
             fpe_gpu_memory_preservation, fpe_use_teacache, fpe_no_resize, fpe_mp4_crf,
             fpe_num_clean_frames, fpe_vae_batch_size, fpe_save_path,
             # Model Paths
@@ -6253,12 +6303,12 @@ with gr.Blocks(
             fpe_lora_weights_ui[1], fpe_lora_multipliers_ui[1],
             fpe_lora_weights_ui[2], fpe_lora_multipliers_ui[2],
             fpe_lora_weights_ui[3], fpe_lora_multipliers_ui[3],
-            # Preview
-            fpe_enable_preview, fpe_preview_interval,
+            # Preview (UI state, not directly passed to scripts)
+            fpe_enable_preview, fpe_preview_interval, 
         ],
         outputs=[
             fpe_output_gallery,
-            fpe_preview_output_component, # Output to the Image/Video preview component
+            fpe_preview_output_component, 
             fpe_batch_progress,
             fpe_progress_text
         ],
