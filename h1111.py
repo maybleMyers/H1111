@@ -5145,7 +5145,7 @@ with gr.Blocks(
                     
                     gr.Markdown("### Core Generation Parameters")
                     with gr.Row():
-                        fpe_seed = gr.Number(label="Seed (-1 for random)", value=31337)
+                        fpe_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         # fpe_random_seed_btn = gr.Button("🎲️") # Optional: Add random seed button
                     
                     fpe_resolution_max_dim = gr.Number(label="Resolution (Max Dimension)", value=640, step=32, info="Target max width/height for bucket.")
