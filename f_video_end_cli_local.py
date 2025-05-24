@@ -273,9 +273,10 @@ def do_generation_work(
     additional_second_length, 
     latent_window_size, steps, cfg, gs, rs,
     gpu_memory_preservation, use_teacache, no_resize, mp4_crf,
-    num_clean_frames, vae_batch_size
+    num_clean_frames, vae_batch_size,
+    extension_only
 ):
-    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer
+    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer, args
 
     print('--- Starting Video Generation (with End Frame support) ---')
 
@@ -388,8 +389,13 @@ def do_generation_work(
         print(f"Input video FPS: {fps}, Target additional length: {additional_second_length}s")
         print(f"Generating {total_extension_latent_sections} new sections for extension (approx {total_extension_latent_sections * num_output_pixel_frames_per_section / fps:.2f}s).")
 
-        job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + \
+        job_id_base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + \
                  f"_framepack-vidEndFrm_{width}x{height}_{additional_second_length:.1f}s_seed{seed}_s{steps}_gs{gs}_cfg{cfg}"
+        
+        job_id = job_id_base
+        if args.extension_only: # <<< Access args directly
+            job_id += "_extonly"
+            print("Extension-only mode enabled. Filenames will reflect this.")
 
         rnd = torch.Generator("cpu").manual_seed(seed)
         
@@ -630,14 +636,24 @@ def do_generation_work(
                 break
         
         # --- Final Video Assembly ---
-        print("Appending generated extension to the input video...")
-        # input_video_pixels_cpu is (1, C, F_in, H, W)
-        # history_pixels_decoded_cpu is (1, C, F_ext, H, W)
-        final_video_pixels_cpu = torch.cat([input_video_pixels_cpu, history_pixels_decoded_cpu], dim=2)
+        if args.extension_only: # <<< Access args directly
+            print("Saving only the generated extension...")
+            # history_pixels_decoded_cpu already contains only the generated extension due to backward generation
+            # and how it's accumulated.
+            video_to_save_cpu = history_pixels_decoded_cpu 
+            final_output_filename_suffix = "_extension_only_final.mp4"
+            final_log_message = "Final extension-only video saved:"
+        else:
+            print("Appending generated extension to the input video...")
+            # input_video_pixels_cpu is (1, C, F_in, H, W)
+            # history_pixels_decoded_cpu is (1, C, F_ext, H, W)
+            video_to_save_cpu = torch.cat([input_video_pixels_cpu, history_pixels_decoded_cpu], dim=2)
+            final_output_filename_suffix = "_final.mp4"
+            final_log_message = "Final extended video saved:"
         
-        final_output_filename = os.path.join(outputs_folder, f'{job_id}_final.mp4')
-        save_bcthw_as_mp4(final_video_pixels_cpu, final_output_filename, fps=fps, crf=mp4_crf)
-        print(f"Final extended video saved: {final_output_filename}")
+        final_output_filename = os.path.join(outputs_folder, f'{job_id}{final_output_filename_suffix}') # job_id already has _extonly if needed
+        save_bcthw_as_mp4(video_to_save_cpu, final_output_filename, fps=fps, crf=mp4_crf)
+        print(f"{final_log_message} {final_output_filename}")
         set_mp4_comments_imageio_ffmpeg(final_output_filename, f"Prompt: {prompt} | Neg: {n_prompt} | Seed: {seed}");
 
         if previous_video_path_for_cleanup is not None and os.path.exists(previous_video_path_for_cleanup) and previous_video_path_for_cleanup != final_output_filename:
@@ -700,6 +716,7 @@ if __name__ == '__main__':
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=[1.0], help="LoRA multiplier(s).")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns.")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns.")
+    parser.add_argument('--extension_only', action='store_true', help="Save only the extension video without the input video attached.")
 
     args = parser.parse_args()
     
@@ -836,7 +853,8 @@ if __name__ == '__main__':
         no_resize=args.no_resize, 
         mp4_crf=args.mp4_crf, 
         num_clean_frames=args.num_clean_frames, 
-        vae_batch_size=args.vae_batch_size
+        vae_batch_size=args.vae_batch_size,
+        extension_only=args.extension_only
     )
 
     print("Video generation process completed.")

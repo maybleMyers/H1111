@@ -2,7 +2,7 @@
 
 # Recent update
 5/24/2025  
-    Batch images from folder now available for framepack.  
+    Batch images from folder now available for framepack. Save only extension option in framepack extension tab.    
 5/23/2025  
     Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
 5/18/2025  

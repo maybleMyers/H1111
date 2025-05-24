@@ -208,7 +208,8 @@ def do_extension_work(
     additional_second_length, # Duration of the extension
     latent_window_size, steps, cfg, gs, rs,
     gpu_memory_preservation, use_teacache, no_resize, mp4_crf,
-    num_clean_frames, vae_batch_size
+    num_clean_frames, vae_batch_size,
+    extension_only
 ):
     global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer
 
@@ -284,8 +285,13 @@ def do_extension_work(
         print(f"Input video FPS: {fps}, Target additional length: {additional_second_length}s")
         print(f"Generating {total_extension_latent_sections} new sections for extension (approx {total_extension_latent_sections * num_output_pixel_frames_per_section / fps:.2f}s).")
 
-        job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + \
+        job_id_base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + \
                  f"_framepackf1-vidEXT_{width}x{height}_{additional_second_length:.1f}s_seed{seed}_s{steps}_gs{gs}_cfg{cfg}"
+        
+        job_id = job_id_base
+        if extension_only: # <<< Use the passed parameter
+            job_id += "_extonly"
+            print("Extension-only mode enabled. Filenames will reflect this.")
 
         rnd = torch.Generator("cpu").manual_seed(seed)
         
@@ -299,11 +305,16 @@ def do_extension_work(
             if vae: vae.to(target_vae_device_for_initial_decode)
         
         initial_video_pixels_cpu = vae_decode(video_latents_history_cpu.to(target_vae_device_for_initial_decode), vae).cpu()
-        history_pixels_decoded_cpu = initial_video_pixels_cpu.clone() 
+        if extension_only:
+            history_pixels_decoded_cpu = None # Will be set with the first decoded extension part
+            print("Extension only mode: Intermediate and final videos will contain only the generated extension.")
+        else:
+            history_pixels_decoded_cpu = initial_video_pixels_cpu.clone() 
+            print("Normal mode: Intermediate and final videos will contain input video + extension.")
         
         if not high_vram and vae: unload_complete_models(vae)
 
-        total_current_pixel_frames_count = history_pixels_decoded_cpu.shape[2]
+        total_current_pixel_frames_count = history_pixels_decoded_cpu.shape[2] if history_pixels_decoded_cpu is not None else 0
         previous_video_path_for_cleanup = None
 
         for section_index in range(total_extension_latent_sections):
@@ -401,19 +412,22 @@ def do_extension_work(
                 vae
             ).cpu()
 
-            overlap_for_soft_append = latent_window_size * 4 - 3 
-            overlap_for_soft_append = min(overlap_for_soft_append, history_pixels_decoded_cpu.shape[2], pixels_for_current_part_decoded_cpu.shape[2])
+            if extension_only and history_pixels_decoded_cpu is None: # First extension part in extension_only mode
+                history_pixels_decoded_cpu = pixels_for_current_part_decoded_cpu
+            else: # Normal mode, or subsequent parts in extension_only mode
+                overlap_for_soft_append = latent_window_size * 4 - 3 
+                # Ensure overlap is not greater than the shortest of the two tensors' frame dimension
+                overlap_for_soft_append = min(overlap_for_soft_append, history_pixels_decoded_cpu.shape[2], pixels_for_current_part_decoded_cpu.shape[2])
 
-            if overlap_for_soft_append <= 0: 
-                 history_pixels_decoded_cpu = torch.cat([history_pixels_decoded_cpu, pixels_for_current_part_decoded_cpu[:,:,history_pixels_decoded_cpu.shape[2]:] ], dim=2) 
-            else:
-                # Corrected call to soft_append_bcthw
-                history_pixels_decoded_cpu = soft_append_bcthw(
-                    history_pixels_decoded_cpu, # Positional argument 1: history
-                    pixels_for_current_part_decoded_cpu, # Positional argument 2: current
-                    overlap=overlap_for_soft_append # Keyword argument: overlap
-                )
-
+                if overlap_for_soft_append <= 0: 
+                    history_pixels_decoded_cpu = torch.cat([history_pixels_decoded_cpu, pixels_for_current_part_decoded_cpu], dim=2) 
+                else:
+                    history_pixels_decoded_cpu = soft_append_bcthw(
+                        history_pixels_decoded_cpu, 
+                        pixels_for_current_part_decoded_cpu, 
+                        overlap=overlap_for_soft_append 
+                    )
+            
             total_current_pixel_frames_count = history_pixels_decoded_cpu.shape[2] 
 
             if not high_vram: 
@@ -432,8 +446,11 @@ def do_extension_work(
                     print(f"Error deleting previous partial video {previous_video_path_for_cleanup}: {e_del}")
             previous_video_path_for_cleanup = current_output_filename
         
-        final_video_path_for_item = previous_video_path_for_cleanup
-        print(f"Final video for seed {seed} (extension 1) saved as: {final_video_path_for_item}")
+        final_video_path_for_item = previous_video_path_for_cleanup 
+        if extension_only:
+            print(f"Final extension-only video for seed {seed} saved as: {final_video_path_for_item}")
+        else:
+            print(f"Final video for seed {seed} (extension 1) saved as: {final_video_path_for_item}")
 
     except Exception as e_outer:
         traceback.print_exc()
@@ -482,6 +499,7 @@ if __name__ == '__main__':
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=[1.0], help="LoRA multiplier(s).")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns.")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns.")
+    parser.add_argument('--extension_only', action='store_true', help="Save only the extension video without the input video attached.")
 
     args = parser.parse_args()
     
@@ -618,7 +636,8 @@ if __name__ == '__main__':
         no_resize=args.no_resize, 
         mp4_crf=args.mp4_crf, 
         num_clean_frames=args.num_clean_frames, 
-        vae_batch_size=args.vae_batch_size
+        vae_batch_size=args.vae_batch_size,
+        extension_only=args.extension_only
     )
 
     print("Video extension process completed.")

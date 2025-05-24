@@ -87,6 +87,7 @@ def process_framepack_extension_video(
     # Preview
     fpe_enable_preview: bool,
     fpe_preview_interval: int, # This arg is not used by f1_video_cli_local.py
+    fpe_extension_only: bool,
     *args: Any # For future expansion or unmapped params, not strictly needed here
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event, skip_event
@@ -180,6 +181,8 @@ def process_framepack_extension_video(
         if lora_weights_paths:
             command.extend(["--lora_weight"] + lora_weights_paths)
             command.extend(["--lora_multiplier"] + lora_multipliers_values)
+        if fpe_extension_only:
+            command.append("--extension_only")
         # Script-specific arguments
         if fpe_use_normal_framepack:
             if fpe_fp8_llm: # Normal FP script uses this
@@ -195,13 +198,13 @@ def process_framepack_extension_video(
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1, universal_newlines=True)
         
         # Regex patterns based on script
-        if fpe_use_normal_framepack:
-            final_video_path_regex = re.compile(r"Final extended video saved: (.*_final\.mp4)")
+        if fpe_use_normal_framepack: # This means f_video_end_cli_local.py was used
+            final_video_path_regex = re.compile(r"Final (?:extended video saved:|extension-only video saved:) (.*\.mp4)")
             # Regex for "--- Generating Extension: ... Section X / Y (backward) ---"
             fpe_section_progress_regex = re.compile(r"--- Generating Extension: .*?: Section\s+(\d+)\s*/\s*(\d+)\s+\(backward\)")
-            tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),") # Same
-        else: # F1 script
-            final_video_path_regex = re.compile(r"Final video for seed \d+ \(extension \d+\) saved as: (.*\.mp4)")
+            tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),") 
+        else: # F1 script (f1_video_cli_local.py) was used
+            final_video_path_regex = re.compile(r"Final (?:extension-only )?video for seed \d+.*? saved as: (.*\.mp4)")
             fpe_section_progress_regex = re.compile(r"--- F1 Extension: .*?: Section (\d+)\s*/\s*(\d+) ---")
             tqdm_cli_progress_regex = re.compile(r"Sampling Extension Section .*?:\s*(\d+)%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),")
         fpe_preview_saved_regex = re.compile(r"MP4 Preview for section (\d+) saved: (.*\.mp4)")
@@ -5159,6 +5162,7 @@ with gr.Blocks(
                             fpe_gpu_memory_preservation = gr.Slider(label="GPU Memory Preserve (GB)", minimum=1.0, maximum=16.0, value=6.0, step=0.1)
                             fpe_use_teacache = gr.Checkbox(label="Use TeaCache", value=False)
                             fpe_no_resize = gr.Checkbox(label="Force Original Video Resolution (No Resize)", value=False)
+                            fpe_extension_only = gr.Checkbox(label="Save Extension Only", value=False, info="If checked, only the newly generated extension part of the video will be saved.")
                             fpe_mp4_crf = gr.Slider(label="MP4 CRF (Quality)", minimum=0, maximum=51, value=16, step=1, info="Lower is better quality, larger file.")
                             fpe_num_clean_frames = gr.Slider(label="Context Frames (1x from Input)", minimum=1, maximum=10, value=5, step=1)
                             fpe_vae_batch_size = gr.Slider(label="VAE Batch Size (Input Video Encoding)", minimum=4, maximum=128, value=16, step=4)
@@ -6339,6 +6343,7 @@ with gr.Blocks(
             fpe_lora_weights_ui[3], fpe_lora_multipliers_ui[3],
             # Preview (UI state, not directly passed to scripts)
             fpe_enable_preview, fpe_preview_interval, 
+            fpe_extension_only,
         ],
         outputs=[
             fpe_output_gallery,
