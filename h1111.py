@@ -5163,9 +5163,9 @@ with gr.Blocks(
                             fpe_use_teacache = gr.Checkbox(label="Use TeaCache", value=False)
                             fpe_no_resize = gr.Checkbox(label="Force Original Video Resolution (No Resize)", value=False)
                             fpe_extension_only = gr.Checkbox(label="Save Extension Only", value=False, info="If checked, only the newly generated extension part of the video will be saved.")
-                            fpe_mp4_crf = gr.Slider(label="MP4 CRF (Quality)", minimum=0, maximum=51, value=16, step=1, info="Lower is better quality, larger file.")
+                            fpe_mp4_crf = gr.Slider(label="MP4 CRF (Quality)", minimum=0, maximum=51, value=1, step=1, info="Lower is better quality, larger file.")
                             fpe_num_clean_frames = gr.Slider(label="Context Frames (1x from Input)", minimum=1, maximum=10, value=5, step=1)
-                            fpe_vae_batch_size = gr.Slider(label="VAE Batch Size (Input Video Encoding)", minimum=4, maximum=128, value=16, step=4)
+                            fpe_vae_batch_size = gr.Slider(label="VAE Batch Size (Input Video Encoding)", minimum=4, maximum=128, value=72, step=4)
 
                             fpe_attn_mode = gr.Dropdown(label="Attention Mode (DiT)", choices=["torch", "sdpa", "flash", "xformers", "sageattn"], value="torch")
                             fpe_fp8_llm = gr.Checkbox(label="Use FP8 LLM (Text Encoder 1)", value=False, visible=False)
