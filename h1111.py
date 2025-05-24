@@ -402,11 +402,9 @@ def process_framepack_video(
     lora_weights_list = list(args[images_end:lora_weights_end])
     lora_multipliers_list = list(args[lora_weights_end:lora_mults_end])
 
-    # <<< MODIFICATION 1: Adjusted early check for input image >>>
     if not use_random_folder and not input_image and not any(img for img in framepack_sec_images if img):
         yield [], None, "Error: Input start image or at least one section image override is required when not using folder mode.", ""
         return
-    # <<< END MODIFICATION 1 >>>
 
     if use_random_folder and (not input_folder_path or not os.path.isdir(input_folder_path)):
         yield [], None, f"Error: Random image folder path '{input_folder_path}' is invalid or not a directory.", ""
@@ -440,7 +438,6 @@ def process_framepack_video(
         final_image_path_arg = input_image
         print(f"Using base input image for --image_path: {final_image_path_arg}")
 
-    # <<< MODIFICATION 2: Revised initial resolution determination >>>
     # These are batch-wide defaults if not overridden by folder mode + target res per item.
     batch_wide_final_height, batch_wide_final_width = None, None
 
@@ -482,7 +479,6 @@ def process_framepack_video(
         # This is the fallback if no resolution strategy is active for the batch.
         yield [], None, "Error: Resolution required. Please provide Target Resolution OR valid Width and Height (divisible by 8).", ""
         return
-    # <<< END MODIFICATION 2 >>>
 
     all_videos = []
     if framepack_video_sections is not None and framepack_video_sections > 0:
@@ -517,9 +513,7 @@ def process_framepack_video(
             return
         skip_event.clear()
 
-        # <<< MODIFICATION 3: Initialize last_preview_mtime here >>>
         last_preview_mtime = 0
-        # <<< END MODIFICATION 3 >>>
 
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"fpack_{run_id}"
@@ -585,7 +579,6 @@ def process_framepack_video(
             yield [], None, f"Error for item {i+1}: No valid start image could be determined. Ensure an image is provided.", ""
             continue
 
-        # <<< MODIFICATION 4: Per-item resolution determination >>>
         final_height_for_item, final_width_for_item = None, None
 
         # 1. Use batch-wide dimensions if they were set (from explicit UI W/H or target_res + UI image)
@@ -622,7 +615,6 @@ def process_framepack_video(
         if final_height_for_item is None or final_width_for_item is None: # Final check for the item
             yield [], None, f"Error for item {i+1}: Final resolution could not be determined for this item.", ""
             continue
-        # <<< END MODIFICATION 4 >>>
 
         # Update status text with the preparing subprocess message
         yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update # Use progress_text_update
