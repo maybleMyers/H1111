@@ -333,25 +333,21 @@ def get_step_from_preview_path(path): # Helper function
     return -1 # Default if no number found
 
 def process_framepack_video(
-    # --- Standard initial args ---
     prompt: str,
     negative_prompt: str,
     input_image: str, # Start image path
-    # --- End Frame Args ---
     input_end_frame: Optional[str], # End image path
     end_frame_influence: str,
     end_frame_weight: float,
-    # --- Model Paths ---
     transformer_path: str,
     vae_path: str,
     text_encoder_path: str,
     text_encoder_2_path: str,
     image_encoder_path: str,
-    # --- Core Generation Params ---
     target_resolution: Optional[int],
     framepack_width: Optional[int],
     framepack_height: Optional[int],
-    original_dims_str: str,
+    original_dims_str: str, # This comes from framepack_original_dims state
     total_second_length: float,
     framepack_video_sections: Optional[int],
     fps: int,
@@ -362,7 +358,6 @@ def process_framepack_video(
     rs: float,
     sample_solver: str,
     latent_window_size: int,
-    # --- Performance/Memory ---
     fp8: bool,
     fp8_scaled: bool,
     fp8_llm: bool,
@@ -375,175 +370,159 @@ def process_framepack_video(
     use_teacache: bool,
     teacache_steps: int,
     teacache_thresh: float,
-    # --- Batching & Saving ---
     batch_size: int,
-    save_path: str, # Argument being checked
-    # --- LoRA Params ---
+    save_path: str,
     lora_folder: str,
     enable_preview: bool,
     preview_every_n_sections: int,
     is_f1: bool,
+    use_random_folder: bool,
+    input_folder_path: str,
     *args: Any
-) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]: # Modified return type for preview path
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """Generate video using fpack_generate_video.py"""
     global stop_event
     stop_event.clear()
 
-    # --- Fallback for empty save_path ---
     if not save_path or not save_path.strip():
         print("Warning: save_path was empty, defaulting to 'outputs'")
         save_path = "outputs"
-    # --- End Fallback ---
 
     num_section_controls = 4
     num_loras = 4
-    # Calculate slice indices based on the number of components for each group
     secs_end = num_section_controls
     prompts_end = secs_end + num_section_controls
     images_end = prompts_end + num_section_controls
     lora_weights_end = images_end + num_loras
     lora_mults_end = lora_weights_end + num_loras
 
-    # Slice the args tuple to get the values for each group
     framepack_secs = args[0:secs_end]
     framepack_sec_prompts = args[secs_end:prompts_end]
     framepack_sec_images = args[prompts_end:images_end]
-    lora_weights_list = list(args[images_end:lora_weights_end]) # Convert tuple slice to list
-    lora_multipliers_list = list(args[lora_weights_end:lora_mults_end]) # Convert tuple slice to list
+    lora_weights_list = list(args[images_end:lora_weights_end])
+    lora_multipliers_list = list(args[lora_weights_end:lora_mults_end])
 
-    if not input_image and not any(img for img in framepack_sec_images if img):
-        # Yield empty preview path on error
-        yield [], None, "Error: Input start image or at least one section image override is required.", ""
+    # <<< MODIFICATION 1: Adjusted early check for input image >>>
+    if not use_random_folder and not input_image and not any(img for img in framepack_sec_images if img):
+        yield [], None, "Error: Input start image or at least one section image override is required when not using folder mode.", ""
+        return
+    # <<< END MODIFICATION 1 >>>
+
+    if use_random_folder and (not input_folder_path or not os.path.isdir(input_folder_path)):
+        yield [], None, f"Error: Random image folder path '{input_folder_path}' is invalid or not a directory.", ""
         return
 
-    # --- Prepare Section Control Strings ---
     section_prompts_parts = []
     section_images_parts = []
-
     index_pattern = re.compile(r"^\d+(-\d+)?$")
 
     for idx_str, sec_prompt, sec_image in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images):
-        # Validate the index string format
         if not idx_str or not isinstance(idx_str, str) or not index_pattern.match(idx_str.strip()):
-             if idx_str and idx_str.strip(): # Only warn if there was actual input
+             if idx_str and idx_str.strip():
                  print(f"Warning: Invalid section index/range format '{idx_str}'. Skipping.")
-             continue # Skip this entry if the index format is invalid
-
-        current_idx_str = idx_str.strip() # Use the validated string directly
-
-        # Check prompt validity (index string is already validated)
+             continue
+        current_idx_str = idx_str.strip()
         if sec_prompt and sec_prompt.strip():
-            section_prompts_parts.append(f"{current_idx_str}:{sec_prompt.strip()}") # <<< Uses string index/range
-
-        # Check image path validity (index string is already validated)
+            section_prompts_parts.append(f"{current_idx_str}:{sec_prompt.strip()}")
         if sec_image and os.path.exists(sec_image):
              section_images_parts.append(f"{current_idx_str}:{sec_image}")
-    # --- End Section Control String Preparation ---
 
-    final_prompt_arg = prompt # Default to base prompt
+    final_prompt_arg = prompt
     if section_prompts_parts:
         final_prompt_arg = ";;;".join(section_prompts_parts)
         print(f"Using section prompt overrides: {final_prompt_arg}")
 
-    # Determine the image path argument based on section image overrides
-    final_image_path_arg = None # Initialize to None
+    final_image_path_arg = None
     if section_images_parts:
         final_image_path_arg = ";;;".join(section_images_parts)
         print(f"Using section image overrides for --image_path: {final_image_path_arg}")
-    elif input_image: # Only use base input_image if no section overrides are present
+    elif input_image:
         final_image_path_arg = input_image
         print(f"Using base input image for --image_path: {final_image_path_arg}")
 
-    # --- Resolution Calculation ---
-    final_height, final_width = None, None
-    # Prioritize explicit width/height if valid and divisible by 8
+    # <<< MODIFICATION 2: Revised initial resolution determination >>>
+    # These are batch-wide defaults if not overridden by folder mode + target res per item.
+    batch_wide_final_height, batch_wide_final_width = None, None
+
     if framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0:
         if framepack_width % 8 != 0 or framepack_height % 8 != 0:
-             # Ensure 4 values are yielded here: videos, preview_path, status, progress
-             yield [], None, "Error: Explicit Width and Height must be divisible by 8.", "" 
+             yield [], None, "Error: Explicit Width and Height must be divisible by 8.", ""
              return
-        final_height = int(framepack_height)
-        final_width = int(framepack_width)
-        print(f"Using explicit dimensions (divisible by 8): H={final_height}, W={final_width}")
-    # Fallback to target resolution using bucket logic
-    elif target_resolution is not None and target_resolution > 0:
-         if not original_dims_str:
-              # Ensure 4 values are yielded here
-              yield [], None, "Error: Cannot use Target Resolution without an input image to determine aspect ratio.", ""
-              return
-         try:
-             orig_w, orig_h = map(int, original_dims_str.split('x'))
-             if orig_w <= 0 or orig_h <= 0:
-                 # Ensure 4 values are yielded here
-                 yield [], None, "Error: Invalid original dimensions stored.", ""
-                 return
-
-             bucket_dims = find_nearest_bucket(orig_h, orig_w, resolution=target_resolution)
-
-             if bucket_dims:
-                 final_height, final_width = bucket_dims
-                 print(f"Using Target Resolution {target_resolution}. Found nearest bucket: H={final_height}, W={final_width}")
-             else:
-                 # Ensure 4 values are yielded here
-                 yield [], None, f"Error: Could not find a suitable bucket for Target Resolution {target_resolution} and input image aspect ratio.", ""
-                 return
-
-         except Exception as e:
-             # THIS IS THE CORRECTED LINE:
-             yield [], None, f"Error calculating bucket dimensions: {e}", "" # Was: yield [], f"Error calculating bucket dimensions: {e}", ""
-             return
-    else:
-        # Ensure 4 values are yielded here
-        yield [], None, "Error: Resolution required. Please provide Target Resolution OR both valid Width and Height (divisible by 8).", ""
+        batch_wide_final_height = int(framepack_height)
+        batch_wide_final_width = int(framepack_width)
+        print(f"Using explicit dimensions for all items: H={batch_wide_final_height}, W={batch_wide_final_width}")
+    elif target_resolution is not None and target_resolution > 0 and not use_random_folder:
+        # This case applies if:
+        # 1. Target resolution is set.
+        # 2. We are NOT in random folder mode (so aspect ratio from UI image is reliable).
+        if not original_dims_str: # original_dims_str comes from the UI input image
+            yield [], None, "Error: Target Resolution selected (not in folder mode), but no UI input image provided for aspect ratio.", ""
+            return
+        try:
+            orig_w, orig_h = map(int, original_dims_str.split('x'))
+            if orig_w <= 0 or orig_h <= 0:
+                yield [], None, "Error: Invalid original dimensions stored from UI image.", ""
+                return
+            bucket_dims = find_nearest_bucket(orig_h, orig_w, resolution=target_resolution)
+            if bucket_dims:
+                batch_wide_final_height, batch_wide_final_width = bucket_dims
+                print(f"Using Target Resolution {target_resolution} with UI image aspect. Batch-wide bucket: H={batch_wide_final_height}, W={batch_wide_final_width}")
+            else:
+                yield [], None, f"Error: Could not find bucket for Target Res {target_resolution} and UI image aspect.", ""
+                return
+        except Exception as e:
+            yield [], None, f"Error calculating bucket dimensions from UI image: {e}", ""
+            return
+    elif use_random_folder and target_resolution is not None and target_resolution > 0:
+        # Folder mode with target resolution: resolution will be determined per item.
+        # batch_wide_final_height and batch_wide_final_width remain None.
+        print(f"Folder mode with Target Resolution {target_resolution}. Resolution will be determined per item.")
+    elif not (framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0) and \
+         not (target_resolution is not None and target_resolution > 0):
+        # This is the fallback if no resolution strategy is active for the batch.
+        yield [], None, "Error: Resolution required. Please provide Target Resolution OR valid Width and Height (divisible by 8).", ""
         return
+    # <<< END MODIFICATION 2 >>>
 
-    # --- Batch Loop (Simulated for UI) ---
     all_videos = []
-    # Calculate total sections for display (doesn't affect backend's internal logic)
     if framepack_video_sections is not None and framepack_video_sections > 0:
         total_sections_estimate = framepack_video_sections
         print(f"Using user-defined total sections for UI: {total_sections_estimate}")
     else:
-        total_sections_estimate_float = (total_second_length * fps) / (latent_window_size * 4) # Use fixed latent_window_size
+        total_sections_estimate_float = (total_second_length * fps) / (latent_window_size * 4)
         total_sections_estimate = int(max(round(total_sections_estimate_float), 1))
         print(f"Calculated total sections for UI from duration: {total_sections_estimate}")
     progress_text = f"Starting FramePack generation batch ({total_sections_estimate} estimated sections per video)..."
     status_text = "Preparing batch..."
     yield all_videos, None, status_text, progress_text
 
-    # --- LoRA Setup ---
     valid_loras_paths = []
     valid_loras_mults = []
     if lora_folder and os.path.exists(lora_folder):
-        # Use the lora_weights_list and lora_multipliers_list reconstructed from *args
         for weight_name, mult in zip(lora_weights_list, lora_multipliers_list):
             if weight_name and weight_name != "None":
-                 # Handle potential full paths or just filenames from dropdown
                  if os.path.isabs(weight_name):
                      lora_path = weight_name
                  else:
                      lora_path = os.path.join(lora_folder, weight_name)
-
                  if os.path.exists(lora_path):
                      valid_loras_paths.append(lora_path)
-                     # Ensure multiplier is converted to string for command line
                      valid_loras_mults.append(str(mult))
                  else:
                      print(f"Warning: LoRA file not found: {lora_path}")
-    # Define preview file path base name (backend script creates .mp4 or .png)
-    preview_base_path = os.path.join(save_path, "latent_preview")
-    preview_mp4_path = preview_base_path + ".mp4"
-    preview_png_path = preview_base_path + ".png"
 
-    # --- Loop for UI Batching ---
-    for i in range(batch_size):
+    for i in range(batch_size): # <<< START OF THE BATCH LOOP >>>
         if stop_event.is_set():
             yield all_videos, None, "Generation stopped by user.", ""
             return
         skip_event.clear()
+
+        # <<< MODIFICATION 3: Initialize last_preview_mtime here >>>
+        last_preview_mtime = 0
+        # <<< END MODIFICATION 3 >>>
+
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        unique_preview_suffix = f"fpack_{run_id}" # Add prefix for clarity
-        # --- Construct unique preview paths ---
+        unique_preview_suffix = f"fpack_{run_id}"
         preview_base_path = os.path.join(save_path, f"latent_preview_{unique_preview_suffix}")
         preview_mp4_path = preview_base_path + ".mp4"
         preview_png_path = preview_base_path + ".png"
@@ -553,29 +532,113 @@ def process_framepack_video(
         elif batch_size > 1: current_seed = seed + i
 
         status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed})"
-        progress_text = f"Item {i+1}/{batch_size}: Preparing subprocess..."
+        progress_text_update = f"Item {i+1}/{batch_size}: Preparing..." # Renamed progress_text to progress_text_update for clarity
         current_video_path = None
-        # --- Reset preview state for this batch item ---
         current_preview_yield_path = None
-        last_preview_mtime = 0
-        # --- End Reset ---
-        # Initial yield for the new item starting (with empty preview)
-        yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
+        current_input_image_for_item = input_image
+        current_original_dims_str_for_item = original_dims_str # Use batch-wide original_dims_str initially
 
-        # --- Prepare Environment and Command ---
+        if use_random_folder:
+            progress_text_update = f"Item {i+1}/{batch_size}: Selecting random image..."
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+
+            random_image_path, random_status = get_random_image_from_folder(input_folder_path)
+            if random_image_path is None:
+                error_msg = f"Error for item {i+1}/{batch_size}: {random_status}. Skipping."
+                print(error_msg)
+                yield all_videos.copy(), None, status_text, error_msg
+                continue
+
+            current_input_image_for_item = random_image_path
+            progress_text_update = f"Item {i+1}/{batch_size}: Using random image: {os.path.basename(random_image_path)}"
+            print(progress_text_update)
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+
+            # Derive original_dims_str_for_item from the random image if using target resolution
+            # and explicit UI W/H were not provided.
+            if target_resolution is not None and target_resolution > 0 and \
+               not (framepack_width is not None and framepack_width > 0 and framepack_height is not None and framepack_height > 0):
+                try:
+                    img_for_dims = Image.open(random_image_path)
+                    rand_w, rand_h = img_for_dims.size
+                    current_original_dims_str_for_item = f"{rand_w}x{rand_h}"
+                    print(f"Folder mode item {i+1}: Using random image dims {current_original_dims_str_for_item} for target resolution bucketing.")
+                except Exception as e:
+                    error_msg = f"Error getting dims for random image {random_image_path}: {e}. Skipping item {i+1}."
+                    print(error_msg)
+                    yield all_videos.copy(), None, status_text, error_msg
+                    continue
+        
+        final_image_path_arg_for_item = None
+        if section_images_parts:
+            final_image_path_arg_for_item = ";;;".join(section_images_parts)
+            if current_input_image_for_item:
+                has_section_0_override = any(part.strip().startswith("0:") for part in section_images_parts)
+                if not has_section_0_override:
+                    final_image_path_arg_for_item = f"0:{current_input_image_for_item};;;{final_image_path_arg_for_item}"
+            print(f"Using section image overrides (potentially with prepended base) for --image_path (item {i+1}): {final_image_path_arg_for_item}")
+        elif current_input_image_for_item:
+            final_image_path_arg_for_item = current_input_image_for_item
+            print(f"Using {'random' if use_random_folder else 'base'} input image as the primary for --image_path (item {i+1}): {final_image_path_arg_for_item}")
+        
+        if final_image_path_arg_for_item is None:
+            yield [], None, f"Error for item {i+1}: No valid start image could be determined. Ensure an image is provided.", ""
+            continue
+
+        # <<< MODIFICATION 4: Per-item resolution determination >>>
+        final_height_for_item, final_width_for_item = None, None
+
+        # 1. Use batch-wide dimensions if they were set (from explicit UI W/H or target_res + UI image)
+        if batch_wide_final_height is not None and batch_wide_final_width is not None:
+            final_height_for_item = batch_wide_final_height
+            final_width_for_item = batch_wide_final_width
+            print(f"Item {i+1}: Using batch-wide dimensions: H={final_height_for_item}, W={final_width_for_item}")
+        # 2. Else, if using target resolution (this implies folder mode, as other cases were handled above)
+        elif target_resolution is not None and target_resolution > 0:
+             if not current_original_dims_str_for_item: # This should now be populated for folder mode
+                  yield [], None, f"Error for item {i+1}: Target Resolution selected, but no original dimensions available for aspect ratio.", ""
+                  continue
+             try:
+                 orig_w_item, orig_h_item = map(int, current_original_dims_str_for_item.split('x'))
+                 if orig_w_item <= 0 or orig_h_item <= 0:
+                     yield [], None, f"Error for item {i+1}: Invalid original dimensions '{current_original_dims_str_for_item}'.", ""
+                     continue
+                 bucket_dims_item = find_nearest_bucket(orig_h_item, orig_w_item, resolution=target_resolution)
+                 if bucket_dims_item:
+                     final_height_for_item, final_width_for_item = bucket_dims_item
+                     print(f"Item {i+1}: Using Target Resolution {target_resolution} with item-specific aspect from '{current_original_dims_str_for_item}'. Bucket: H={final_height_for_item}, W={final_width_for_item}")
+                 else:
+                     yield [], None, f"Error for item {i+1}: Could not find bucket for Target Res {target_resolution} and aspect {current_original_dims_str_for_item}.", ""
+                     continue
+             except Exception as e_res:
+                 yield [], None, f"Error calculating bucket dimensions for item {i+1} ({current_original_dims_str_for_item}): {e_res}", ""
+                 continue
+        else:
+            # This case should ideally not be hit if the initial batch-wide resolution checks were thorough.
+            # It implies no explicit W/H, no target_res, or some other unhandled state.
+            yield [], None, f"Error for item {i+1}: Failed to determine resolution strategy for the item.", ""
+            continue # Skip this item
+
+        if final_height_for_item is None or final_width_for_item is None: # Final check for the item
+            yield [], None, f"Error for item {i+1}: Final resolution could not be determined for this item.", ""
+            continue
+        # <<< END MODIFICATION 4 >>>
+
+        # Update status text with the preparing subprocess message
+        yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update # Use progress_text_update
+
         env = os.environ.copy()
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         env["PYTHONIOENCODING"] = "utf-8"
         clear_cuda_cache()
 
-        # --- Command Construction for fpack_generate_video.py ---
         command = [
             sys.executable, "fpack_generate_video.py",
             "--text_encoder1", text_encoder_path, "--text_encoder2", text_encoder_2_path,
             "--image_encoder", image_encoder_path,
-            *(["--image_path", final_image_path_arg] if final_image_path_arg else []),
+            *(["--image_path", final_image_path_arg_for_item] if final_image_path_arg_for_item else []),
             "--save_path", save_path, "--prompt", final_prompt_arg,
-            "--video_size", str(final_height), str(final_width),
+            "--video_size", str(final_height_for_item), str(final_width_for_item),
             *(["--video_sections", str(framepack_video_sections)] if framepack_video_sections is not None and framepack_video_sections > 0 else ["--video_seconds", str(total_second_length)]),
             "--infer_steps", str(steps), "--seed", str(current_seed),
             "--embedded_cfg_scale", str(distilled_guidance_scale),
@@ -583,7 +646,7 @@ def process_framepack_video(
             "--latent_window_size", str(latent_window_size),
             "--sample_solver", sample_solver, "--output_type", "video", "--attn_mode", attn_mode
         ]
-        if is_f1: command.append("--is_f1")      
+        if is_f1: command.append("--is_f1")
         if transformer_path and os.path.exists(transformer_path): command.extend(["--dit", transformer_path.strip()])
         if vae_path and os.path.exists(vae_path): command.extend(["--vae", vae_path.strip()])
         if negative_prompt and negative_prompt.strip(): command.extend(["--negative_prompt", negative_prompt.strip()])
@@ -601,38 +664,31 @@ def process_framepack_video(
             command.extend(["--lora_multiplier"] + valid_loras_mults)
         if enable_preview and preview_every_n_sections > 0:
             command.extend(["--preview_latent_every", str(preview_every_n_sections)])
-            # --- ADDED: Pass the unique suffix ---
             command.extend(["--preview_suffix", unique_preview_suffix])
-            # --- End Pass Suffix ---
             print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
         if use_teacache:
             command.append("--use_teacache")
             command.extend(["--teacache_steps", str(teacache_steps)])
-            command.extend(["--teacache_thresh", str(teacache_thresh)])            
+            command.extend(["--teacache_thresh", str(teacache_thresh)])
 
-        # Ensure all command parts are strings
         command_str = [str(c) for c in command]
         print(f"Running FramePack Command: {' '.join(command_str)}")
 
-        # --- Execute Subprocess & Monitor ---
         p = subprocess.Popen(
             command_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, text=True, encoding='utf-8', errors='replace', bufsize=1
         )
         current_phase = "Preparing"
-        # --- State variables for tracking actual progress ---
-        actual_total_sections = None # Will store the dynamically detected total
-        display_section_num = 1 # Initialize display at 1, will be updated
-        # --- End State variables ---
+        actual_total_sections = None
+        display_section_num = 1
 
         while True:
             if stop_event.is_set():
                 try:
                     p.terminate()
-                    p.wait(timeout=5) # Wait a bit for termination
+                    p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    p.kill() # Force kill if it doesn't terminate
-                    p.wait()
+                    p.kill(); p.wait()
                 except Exception as e:
                     print(f"Error terminating subprocess: {e}")
                 yield all_videos.copy(), None, "Generation stopped by user.", ""
@@ -643,176 +699,137 @@ def process_framepack_video(
                     p.terminate()
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
+                    p.kill(); p.wait()
                 except Exception as e:
                     print(f"Error terminating subprocess during skip: {e}")
-                skip_event.clear() 
+                skip_event.clear()
                 yield all_videos.copy(), current_preview_yield_path, f"Skipping item {i+1}/{batch_size}...", ""
-                break            
+                break
 
             line = p.stdout.readline()
             if not line:
-                if p.poll() is not None: break # Process finished
-                time.sleep(0.01); continue # Wait for more output
+                if p.poll() is not None: break
+                time.sleep(0.01); continue
 
             line = line.strip()
             if not line: continue
-            print(f"SUBPROCESS: {line}") # Log subprocess output
+            print(f"SUBPROCESS: {line}")
 
-# --- Check for Section Start Log ---
-            # More robust regex that captures Section X/Y regardless of prefixes or suffixes
             section_match = re.search(r"---.*?Section\s+(\d+)\s*/\s*(\d+)(?:\s+|$|\()", line)
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+)/(\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line)
-            phase_changed = False
+            phase_changed = False # Initialize phase_changed inside the loop
+            
+            # Default progress_text_update to the current line for general logging
+            progress_text_update = line # This was defined outside the loop before, moved inside
+
             if section_match:
-                # Directly extract current section number and total sections
                 current_section_num_display = int(section_match.group(1))
                 total_sections_from_log = int(section_match.group(2))
-                # Update state variables
                 display_section_num = current_section_num_display
-                # Update actual total only if it changes or hasn't been set
                 if actual_total_sections != total_sections_from_log:
                     actual_total_sections = total_sections_from_log
                     print(f"Detected/Updated actual total sections: {actual_total_sections}")
-                # Update phase and status/progress text
                 new_phase = f"Generating Section {display_section_num}"
                 if current_phase != new_phase:
                     current_phase = new_phase
                     phase_changed = True
-                # Use the latest section info directly
-                progress_text = f"Item {i+1}/{batch_size} | Section {display_section_num}/{actual_total_sections} | Preparing..."
+                progress_text_update = f"Item {i+1}/{batch_size} | Section {display_section_num}/{actual_total_sections} | Preparing..."
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
-            # --- Process TQDM Progress ---
             elif tqdm_match:
                 percentage = int(tqdm_match.group(1))
                 current_step = int(tqdm_match.group(2))
                 total_steps = int(tqdm_match.group(3))
                 time_elapsed = tqdm_match.group(4)
                 time_remaining = tqdm_match.group(5)
-                # Use the last known section numbers. If no section log seen yet, use estimate.
                 current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
                 section_str = f"Section {display_section_num}/{current_total_for_display}"
-                # Update progress text with TQDM info and the current section string
-                progress_text = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
+                progress_text_update = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
                 denoising_phase = f"Denoising Section {display_section_num}"
                 if current_phase != denoising_phase:
                     current_phase = denoising_phase
                     phase_changed = True
                 status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
-
-            # --- Process Other Log Lines ---
             elif "Decoding video..." in line:
                  if current_phase != "Decoding Video":
                      current_phase = "Decoding Video"
                      phase_changed = True
-                 progress_text = f"Item {i+1}/{batch_size} | {current_phase}..."
+                 progress_text_update = f"Item {i+1}/{batch_size} | {current_phase}..."
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
-
             elif "INFO:__main__:Video saved to:" in line:
                  match = re.search(r"Video saved to:\s*(.*\.mp4)", line)
                  if match:
                      found_video_path = match.group(1).strip()
                      if os.path.exists(found_video_path):
                          current_video_path = found_video_path
-                         all_videos.append((current_video_path, f"Seed: {current_seed}"))
-                         print(f"Video path found and added to gallery list: {current_video_path}")
+                         # Don't add to all_videos here, add after subprocess completion
                      else:
                           print(f"Warning: Parsed video path does not exist: {found_video_path}")
                      status_text = f"Video {i+1}/{batch_size} Saved (Seed: {current_seed})"
-                     progress_text = f"Saved: {os.path.basename(found_video_path)}"
+                     progress_text_update = f"Saved: {os.path.basename(found_video_path) if found_video_path else 'Unknown Path'}"
                      current_phase = "Saved"
                      phase_changed = True
                  else:
                      print(f"Warning: Could not parse video path from INFO line: {line}")
-
             elif "ERROR" in line.upper() or "TRACEBACK" in line.upper():
                  status_text = f"Item {i+1}/{batch_size}: Error Detected (Check Console)"
-                 progress_text = line # Show the error line
+                 progress_text_update = line
                  if current_phase != "Error":
                     current_phase = "Error"
                     phase_changed = True
-
-            # --- Update status_text if phase changed implicitly ---
-            # This covers cases where phase changes but isn't explicitly set above (e.g., transitioning between tqdm steps within the same section)
             elif phase_changed and current_phase not in ["Saved", "Error"]:
                  status_text = f"Generating video {i + 1} of {batch_size} (Seed: {current_seed}) - {current_phase}"
 
             preview_updated = False
-            current_mtime = 0
-            found_preview_path = None
+            current_mtime_check = 0 # Renamed from current_mtime to avoid conflict
+            found_preview_path_check = None # Renamed
 
             if enable_preview:
-                # Check MP4 first, then PNG
                 if os.path.exists(preview_mp4_path):
-                    current_mtime = os.path.getmtime(preview_mp4_path)
-                    found_preview_path = preview_mp4_path
+                    current_mtime_check = os.path.getmtime(preview_mp4_path)
+                    found_preview_path_check = preview_mp4_path
                 elif os.path.exists(preview_png_path):
-                    current_mtime = os.path.getmtime(preview_png_path)
-                    found_preview_path = preview_png_path
+                    current_mtime_check = os.path.getmtime(preview_png_path)
+                    found_preview_path_check = preview_png_path
 
-                if found_preview_path and current_mtime > last_preview_mtime:
-                    print(f"DEBUG: Preview file updated: {found_preview_path} (mtime: {current_mtime})")
-                    # --- FIX: Yield the clean path ---
-                    current_preview_yield_path = found_preview_path # REMOVED the cache buster
-                    # --- END FIX ---
-                    last_preview_mtime = current_mtime
+                if found_preview_path_check and current_mtime_check > last_preview_mtime:
+                    print(f"DEBUG: Preview file updated: {found_preview_path_check} (mtime: {current_mtime_check})")
+                    current_preview_yield_path = found_preview_path_check
+                    last_preview_mtime = current_mtime_check
                     preview_updated = True
-            # --- End Preview Check ---
+            
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
 
-            # --- YIELD ---
-            # Yield progress and potentially updated clean preview path
-            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
-
-        # --- Subprocess Finished ---
         p.stdout.close(); rc = p.wait()
         clear_cuda_cache(); time.sleep(0.1)
 
-        # --- Collect Output and Save Metadata (If successful) ---
         if rc == 0 and current_video_path and os.path.exists(current_video_path):
-            # Create metadata dictionary matching backend arguments
+            all_videos.append((current_video_path, f"Seed: {current_seed}")) # Add video here
             parameters = {
                 "prompt": prompt, "negative_prompt": negative_prompt,
-                "input_image": os.path.basename(input_image) if input_image else None,
-                 # --- ADDED: Metadata for Section Control ---
+                "input_image": os.path.basename(current_input_image_for_item) if current_input_image_for_item else None,
                 "section_controls": [
-                     {"index": s, "prompt_override": p, "image_override": os.path.basename(i) if i else None}
-                     for s, p, i in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images)
-                     if (p and p.strip()) or i # Only record if prompt or image was set
+                     {"index": s, "prompt_override": p_override, "image_override": os.path.basename(img_override) if img_override else None}
+                     for s, p_override, img_override in zip(framepack_secs, framepack_sec_prompts, framepack_sec_images)
+                     if (p_override and p_override.strip()) or img_override
                  ],
-                "final_prompt_arg": final_prompt_arg, # Store the actual argument passed
-                "final_image_path_arg": final_image_path_arg, # Store the actual argument passed
+                "final_prompt_arg": final_prompt_arg,
+                "final_image_path_arg": final_image_path_arg_for_item, # Use item-specific image path
                 "input_end_frame": os.path.basename(input_end_frame) if input_end_frame else None,
-                # Model Paths
-                "transformer_path": transformer_path,
-                "vae_path": vae_path,
-                "text_encoder_path": text_encoder_path,
-                "text_encoder_2_path": text_encoder_2_path,
+                "transformer_path": transformer_path, "vae_path": vae_path,
+                "text_encoder_path": text_encoder_path, "text_encoder_2_path": text_encoder_2_path,
                 "image_encoder_path": image_encoder_path,
-                # Core Params
-                "video_width": final_width, "video_height": final_height,
+                "video_width": final_width_for_item, "video_height": final_height_for_item,
                 "video_seconds": total_second_length, "fps": fps, "seed": current_seed,
                 "infer_steps": steps, "embedded_cfg_scale": distilled_guidance_scale,
                 "guidance_scale": cfg, "guidance_rescale": rs, "sample_solver": sample_solver,
                 "latent_window_size": latent_window_size,
-                 # --- Add End Frame Blending Params to Metadata ---
-                #"end_frame_influence": end_frame_influence if input_end_frame else "none",
-                #"end_frame_weight": end_frame_weight if input_end_frame else 0.0,
-                # --- End Metadata Addition ---
-                # Performance/Memory
-                "fp8": fp8,
-                "fp8_scaled": fp8_scaled,
-                "fp8_llm": fp8_llm,
-                "blocks_to_swap": blocks_to_swap,
-                "bulk_decode": bulk_decode,
-                "attn_mode": attn_mode,
-                "vae_chunk_size": vae_chunk_size,
-                "vae_spatial_tile_sample_min_size": vae_spatial_tile_sample_min_size,
+                "fp8": fp8, "fp8_scaled": fp8_scaled, "fp8_llm": fp8_llm,
+                "blocks_to_swap": blocks_to_swap, "bulk_decode": bulk_decode, "attn_mode": attn_mode,
+                "vae_chunk_size": vae_chunk_size, "vae_spatial_tile_sample_min_size": vae_spatial_tile_sample_min_size,
                 "device": device,
-                # LoRA
                 "lora_weights": [os.path.basename(p) for p in valid_loras_paths],
                 "lora_multipliers": [float(m) for m in valid_loras_mults],
-                "original_dims_str": original_dims_str,
+                "original_dims_str": current_original_dims_str_for_item,
                 "target_resolution": target_resolution,
                 "is_f1": is_f1
             }
@@ -821,24 +838,34 @@ def process_framepack_video(
                 print(f"Added metadata to {current_video_path}")
             except Exception as meta_err:
                 print(f"Warning: Failed to add metadata to {current_video_path}: {meta_err}")
-
-            status_text = f"Completed (Seed: {current_seed})"
-            progress_text = f"Video saved to: {os.path.basename(current_video_path)}"
-            yield all_videos, current_preview_yield_path, status_text, progress_text
+            status_text = f"Item {i+1}/{batch_size} Completed (Seed: {current_seed})"
+            progress_text_update = f"Video saved: {os.path.basename(current_video_path)}"
+            current_preview_yield_path = None # Clear preview for next item
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
         elif rc != 0:
-            status_text = f"Failed (Seed: {current_seed})"
-            progress_text = f"Subprocess failed with exit code {rc}. Check console logs."
-            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text
-            # Don't add to all_videos if failed
-        else: # rc == 0 but current_video_path is not set or doesn't exist
-            status_text = f"Failed (Seed: {current_seed})"
-            progress_text = "Subprocess finished, but could not confirm generated video file. Check logs."
-    yield all_videos, current_preview_yield_path, "FramePack Batch complete", ""
+            status_text = f"Item {i+1}/{batch_size} Failed (Seed: {current_seed}, Code: {rc})"
+            progress_text_update = f"Subprocess failed. Check console logs."
+            current_preview_yield_path = None # Clear preview
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+        else:
+            status_text = f"Item {i+1}/{batch_size} Finished (Seed: {current_seed}), but no video file confirmed."
+            progress_text_update = "Check console logs for the saved path."
+            current_preview_yield_path = None # Clear preview
+            yield all_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+        
+        # Cleanup preview files for the completed item to avoid them being picked up by next item
+        if enable_preview:
+            for prev_file in [preview_mp4_path, preview_png_path]:
+                if os.path.exists(prev_file):
+                    try:
+                        os.remove(prev_file)
+                        print(f"Cleaned up preview file: {prev_file}")
+                    except Exception as e_clean:
+                        print(f"Warning: Could not remove preview file {prev_file}: {e_clean}")
+        
+        time.sleep(0.2)
 
-    time.sleep(0.2) # Small delay between batch items
-
-    # --- Final Yield ---
-    yield all_videos, current_preview_yield_path, "FramePack Batch complete", ""
+    yield all_videos, None, "FramePack Batch complete", ""
 
 def calculate_framepack_width(height, original_dims):
     """Calculate FramePack width based on height maintaining aspect ratio (divisible by 32)"""
@@ -4903,7 +4930,22 @@ with gr.Blocks(
                 # --- Left Column ---
                 with gr.Column():
                     framepack_input_image = gr.Image(label="Input Image (Video Start)", type="filepath")
-                    with gr.Accordion("Optional End Frame Control", open=True):
+                    with gr.Row():
+                        framepack_use_random_folder = gr.Checkbox(label="Use Random Images from Folder", value=False,
+                                                                  info="If checked, 'Input Image (Video Start)' is hidden. Each batch item uses a random image from the folder.")
+                        framepack_input_folder_path = gr.Textbox(
+                            label="Image Folder Path", 
+                            placeholder="Path to folder containing images for batch processing",
+                            visible=False # Initially hidden
+                        )
+                    with gr.Row(visible=False) as framepack_folder_options_row: # Parent Row for folder options
+                        framepack_validate_folder_btn = gr.Button("Validate Folder")
+                        framepack_folder_status_text = gr.Textbox(
+                            label="Folder Status", 
+                            placeholder="Validation status will appear here",
+                            interactive=False
+                        )                    
+                    with gr.Accordion("Optional End Frame Control (normal model only)", open=False):
                         framepack_input_end_frame = gr.Image(label="End Frame Image (Video End)", type="filepath", scale=1)
                         framepack_end_frame_influence = gr.Dropdown(
                             label="End Frame Influence Mode",
@@ -4922,7 +4964,7 @@ with gr.Blocks(
                     gr.Markdown("### Resolution Options (Choose One)")
                     framepack_target_resolution = gr.Number(
                         label="Option 1: Target Resolution (Uses Buckets)",
-                        value=640, minimum=128, maximum=1280, step=32,
+                        value=640, minimum=0, maximum=1280, step=32,
                         info="Target bucket size (e.g., 640 for 640x640). Uses input image aspect ratio. Final size divisible by 32.",
                         interactive=True
                     )
@@ -4932,13 +4974,13 @@ with gr.Blocks(
                          )
                          with gr.Row():
                              framepack_width = gr.Number(
-                                 label="Width", value=None, minimum=64, step=32, 
+                                 label="Width", value=None, minimum=0, step=32, 
                                  info="Must be divisible by 32.", interactive=True
                              )
                              framepack_calc_height_btn = gr.Button("→")
                              framepack_calc_width_btn = gr.Button("←")
                              framepack_height = gr.Number(
-                                 label="Height", value=None, minimum=64, step=32,
+                                 label="Height", value=None, minimum=0, step=32,
                                  info="Must be divisible by 32.", interactive=True
                              )
                     framepack_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Total Video Length (seconds)", value=5.0)
@@ -6511,6 +6553,22 @@ with gr.Blocks(
         inputs=[framepack_target_resolution],
         outputs=[framepack_width, framepack_height]
     )
+    framepack_use_random_folder.change(
+        fn=lambda use_folder_mode: (
+            gr.update(visible=use_folder_mode),  # framepack_input_folder_path
+            gr.update(visible=use_folder_mode),  # framepack_folder_options_row (which contains validate button and status)
+            gr.update(visible=not use_folder_mode)   # framepack_input_image
+        ),
+        inputs=[framepack_use_random_folder],
+        outputs=[framepack_input_folder_path, framepack_folder_options_row, framepack_input_image]
+    )
+
+    # Validate folder button handler
+    framepack_validate_folder_btn.click(
+        fn=lambda folder: get_random_image_from_folder(folder)[1], # Reuse existing helper
+        inputs=[framepack_input_folder_path],
+        outputs=[framepack_folder_status_text]
+    )
     def toggle_f1_model_path(is_f1):
         f1_path = "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"
         standard_path = "hunyuan/FramePackI2V_HY_bf16.safetensors"
@@ -6544,19 +6602,14 @@ with gr.Blocks(
     framepack_generate_btn.click(
         fn=process_framepack_video,
         inputs=[
-            # Standard args
             framepack_prompt, framepack_negative_prompt, framepack_input_image,
-            # End Frame args
             framepack_input_end_frame, framepack_end_frame_influence, framepack_end_frame_weight,
-            # Model Paths
             framepack_transformer_path, framepack_vae_path, framepack_text_encoder_path,
             framepack_text_encoder_2_path, framepack_image_encoder_path,
-            # Core Params
             framepack_target_resolution, framepack_width, framepack_height, framepack_original_dims,
             framepack_total_second_length, framepack_video_sections, framepack_fps, framepack_seed, framepack_steps,
             framepack_distilled_guidance_scale, framepack_guidance_scale, framepack_guidance_rescale,
             framepack_sample_solver, framepack_latent_window_size,
-            # Performance/Memory
             framepack_fp8, framepack_fp8_scaled, framepack_fp8_llm,
             framepack_blocks_to_swap, framepack_bulk_decode, framepack_attn_mode,
             framepack_vae_chunk_size, framepack_vae_spatial_tile_sample_min_size,
@@ -6564,15 +6617,14 @@ with gr.Blocks(
             framepack_use_teacache,
             framepack_teacache_steps,
             framepack_teacache_thresh,
-            # Batching & Saving
             framepack_batch_size, framepack_save_path,
-            # LoRA Params
             framepack_lora_folder,
             framepack_enable_preview,
             framepack_preview_every_n_sections,
             framepack_is_f1,
+            framepack_use_random_folder,
+            framepack_input_folder_path,
             *framepack_secs, *framepack_sec_prompts, *framepack_sec_images,
-            # LoRAs (actual components)
             *framepack_lora_weights, *framepack_lora_multipliers
         ],
         outputs=[

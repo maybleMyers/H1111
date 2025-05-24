@@ -1,8 +1,21 @@
 ![GUI Screenshot](images/screenshot.png)
 
+# Recent update
+5/24/2025  
+    Batch images from folder now available for framepack.  
+5/23/2025  
+    Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
+5/18/2025  
+    Add video extension tab. Currently only works with f1 model. Full credit to @pfqt and @chaojie for their amazing work!  
+5/12/2025  
+    Add skip button to framepack.  
+5/9/2025  
+    Add testing branch for framepack F1 end image, kinda glitchygo https://github.com/maybleMyers/H1111/tree/f1_end  
+5/5/2025  
+    Update a scaling hunyuan to framepack convert lora option in the convert lora tab.  
+    Add tea cache to frame pack.  
+
 # H1111
-
-
 
 This is a GUI for tech wizard kohya-ss's musubi tuner's inference script.
 https://github.com/kohya-ss/musubi-tuner
@@ -66,7 +79,7 @@ For more details on using framepack with musubi go here https://github.com/kohya
 
 Fastest speed will be achieved with fp8 and fp8 scaled, then you can reduce block swapping to your memory constraints. (leave about 1gb free)  
 
-Framepack Extension tab is still a work in progress and I am working on it this weekend.  
+Framepack Extension tab is still a work in progress.  
 Thanks to @pftq https://github.com/pftq and @chaojie https://github.com/chaojie for their work on the extension logics.  
 
 ## To Use the new Skyreels-V2 models
@@ -152,9 +165,12 @@ python h1111.py
 
 open 127.0.0.1:7860 in a browser
 
-You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.
+You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.  
+ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
-## changlog
+## full changlog
+5/24/2025  
+    Batch images from folder now available for framepack.  
 5/23/2025  
     Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
 5/18/2025  
