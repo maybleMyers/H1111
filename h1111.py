@@ -88,6 +88,9 @@ def process_framepack_extension_video(
     fpe_enable_preview: bool,
     fpe_preview_interval: int, # This arg is not used by f1_video_cli_local.py
     fpe_extension_only: bool,
+    fpe_start_guidance_image: Optional[str],
+    fpe_start_guidance_image_clip_weight: float,
+    fpe_use_guidance_image_as_first_latent: bool,
     *args: Any # For future expansion or unmapped params, not strictly needed here
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event, skip_event
@@ -190,6 +193,12 @@ def process_framepack_extension_video(
             if fpe_end_frame and os.path.exists(fpe_end_frame):
                 command.extend(["--end_frame", str(fpe_end_frame)])
                 command.extend(["--end_frame_weight", str(fpe_end_frame_weight)])
+        else: 
+            if fpe_start_guidance_image and os.path.exists(fpe_start_guidance_image):
+                command.extend(["--start_guidance_image", str(fpe_start_guidance_image)])
+                command.extend(["--start_guidance_image_clip_weight", str(fpe_start_guidance_image_clip_weight)])
+                if fpe_use_guidance_image_as_first_latent:
+                    command.append("--use_guidance_image_as_first_latent")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -5139,10 +5148,20 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column(): # Left column for inputs
                     fpe_input_video = gr.Video(label="Input Video for Extension", sources=['upload'], height=300)
-                    with gr.Accordion("Optional End Frame (for Normal FramePack Model)", open=False, visible=True) as fpe_end_frame_accordion:
+                    with gr.Accordion("Optional End Frame (for Normal FramePack Model)", open=False, visible=False) as fpe_end_frame_accordion:
                         fpe_end_frame = gr.Image(label="End Frame for Extension", type="filepath")
                         fpe_end_frame_weight = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=1.0, label="End Frame Weight")                    
-                    
+                    with gr.Accordion("Optional Start Guidance Image (for F1 Model Extension)", open=False, visible=True) as fpe_start_guidance_accordion: # Initially hidden
+                        fpe_start_guidance_image = gr.Image(label="Start Guidance Image for Extension", type="filepath")
+                        fpe_start_guidance_image_clip_weight = gr.Slider(
+                            minimum=0.0, maximum=1.0, step=0.05, value=0.75, 
+                            label="Start Guidance Image CLIP Weight",
+                            info="Blend weight for the guidance image's CLIP embedding with input video's first frame CLIP."
+                        )
+                        fpe_use_guidance_image_as_first_latent = gr.Checkbox(
+                            label="Use Guidance Image as First Latent", value=False,
+                            info="If checked, the VAE latent of the guidance image will be used as the initial conditioning for the first generated segment. Turn down context frames when using this"
+                        )                    
                     gr.Markdown("### Core Generation Parameters")
                     with gr.Row():
                         fpe_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -6314,13 +6333,22 @@ with gr.Blocks(
             else: # If preferred and fallback are missing, stick to the intended one and let later checks handle it.
                 print(f"Warning: DiT path '{updated_dit_path}' not found. No fallback available or fallback also missing.")
 
-
-        return gr.update(visible=use_normal_fp), gr.update(value=updated_dit_path), gr.update(visible=use_normal_fp)
+        return (
+            gr.update(visible=use_normal_fp),  # fpe_end_frame_accordion
+            gr.update(visible=not use_normal_fp), # fpe_start_guidance_accordion (NEW)
+            gr.update(value=updated_dit_path), # fpe_transformer_path
+            gr.update(visible=use_normal_fp)   # fpe_fp8_llm
+        )
 
     fpe_use_normal_framepack.change(
         fn=toggle_fpe_normal_framepack_options,
         inputs=[fpe_use_normal_framepack],
-        outputs=[fpe_end_frame_accordion, fpe_transformer_path, fpe_fp8_llm] # Accordion, DiT path, FP8 LLM checkbox
+        outputs=[
+            fpe_end_frame_accordion, 
+            fpe_start_guidance_accordion, # NEW output
+            fpe_transformer_path, 
+            fpe_fp8_llm
+        ]
     )
 
     fpe_generate_btn.click(
@@ -6346,6 +6374,9 @@ with gr.Blocks(
             # Preview (UI state, not directly passed to scripts)
             fpe_enable_preview, fpe_preview_interval, 
             fpe_extension_only,
+            fpe_start_guidance_image,
+            fpe_start_guidance_image_clip_weight,
+            fpe_use_guidance_image_as_first_latent,            
         ],
         outputs=[
             fpe_output_gallery,

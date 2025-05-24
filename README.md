@@ -2,7 +2,7 @@
 
 # Recent update
 5/24/2025  
-    Batch images from folder now available for framepack. Save only extension option in framepack extension tab.    
+    Batch images from folder now available for framepack. Save only extension option and experimental start image for f1 in framepack extension tab.    
 5/23/2025  
     Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
 5/18/2025  
@@ -11,9 +11,6 @@
     Add skip button to framepack.  
 5/9/2025  
     Add testing branch for framepack F1 end image, kinda glitchygo https://github.com/maybleMyers/H1111/tree/f1_end  
-5/5/2025  
-    Update a scaling hunyuan to framepack convert lora option in the convert lora tab.  
-    Add tea cache to frame pack.  
 
 # H1111
 

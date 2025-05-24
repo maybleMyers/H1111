@@ -63,6 +63,52 @@ free_mem_gb = 0.0
 outputs_folder = './outputs/' # Default, can be overridden by --output_dir
 
 @torch.no_grad()
+def image_encode(image_np, target_width, target_height, vae_model, image_encoder_model, feature_extractor_model, device="cuda"):
+    """
+    Encode a single image into a latent and compute its CLIP vision embedding.
+    """
+    global high_vram 
+    print("Processing single image for encoding (e.g., start_guidance_image)...")
+    try:
+        print(f"Using target resolution for image encoding: {target_width}x{target_height}")
+
+        processed_image_np = resize_and_center_crop(image_np, target_width=target_width, target_height=target_height)
+
+        image_pt = torch.from_numpy(processed_image_np).float() / 127.5 - 1.0
+        image_pt = image_pt.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # N C F H W (N=1, F=1)
+        
+        target_vae_device = device
+        # Assuming vae_model, image_encoder_model are the global models from f1_video_cli_local.py
+        if not high_vram: load_model_as_complete(vae_model, target_device=target_vae_device)
+        else: vae_model.to(target_vae_device)
+        image_pt_device = image_pt.to(target_vae_device)
+        
+        latent = vae_encode(image_pt_device, vae_model).cpu() # Encode and move to CPU
+        print(f"Single image VAE output shape (latent): {latent.shape}")
+
+        if not high_vram: unload_complete_models(vae_model) # Offload VAE if low VRAM
+
+        target_img_enc_device = device
+        if not high_vram: load_model_as_complete(image_encoder_model, target_device=target_img_enc_device)
+        else: image_encoder_model.to(target_img_enc_device)
+
+        clip_embedding_output = hf_clip_vision_encode(processed_image_np, feature_extractor_model, image_encoder_model)
+        clip_embedding = clip_embedding_output.last_hidden_state.cpu() # Encode and move to CPU
+        print(f"Single image CLIP embedding shape: {clip_embedding.shape}")
+
+        if not high_vram: unload_complete_models(image_encoder_model) # Offload image encoder if low VRAM
+        
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        return latent, clip_embedding # We don't need processed_image_np back for this use case
+
+    except Exception as e:
+        print(f"Error in image_encode: {str(e)}")
+        traceback.print_exc()
+        raise
+
+@torch.no_grad()
 def video_encode(video_path, resolution, no_resize, vae_model, vae_batch_size=16, device="cuda", width=None, height=None):
     video_path = str(pathlib.Path(video_path).resolve())
     print(f"Processing video for encoding: {video_path}")
@@ -211,9 +257,9 @@ def do_extension_work(
     num_clean_frames, vae_batch_size,
     extension_only
 ):
-    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer
+    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer, args # Added args here for clarity
 
-    print('--- Starting Video Extension Work ---')
+    print('--- Starting Video Extension Work (with optional Start Guidance Image) ---')
 
     try:
         if not high_vram:
@@ -238,25 +284,74 @@ def do_extension_work(
         llama_vec_n_padded_cpu, llama_attention_mask_n_cpu = crop_or_pad_yield_mask(llama_vec_n_gpu.cpu(), length=512)
         clip_l_pooler_cpu = clip_l_pooler_gpu.cpu()
         clip_l_pooler_n_cpu = clip_l_pooler_n_gpu.cpu()
+        
+        if not high_vram: unload_complete_models(text_encoder_2)
+
 
         print('Encoding input video for extension base...')
         video_encode_device = str(gpu if torch.cuda.is_available() else cpu)
-        start_latent_cpu, input_image_np_for_clip, video_latents_history_cpu, fps, height, width, _ = video_encode(
+        # Renamed last return value for clarity if we use it for concatenation (though f1 script decodes later)
+        start_latent_input_video_cpu, input_image_np_for_clip, video_latents_history_cpu, fps, height, width, _ = video_encode(
             input_video_path, resolution_max_dim, no_resize, vae, vae_batch_size=vae_batch_size, device=video_encode_device
         )
         if fps <= 0:
             raise ValueError("FPS from input video is 0 or invalid. Cannot proceed with extension.")
 
+        guidance_latent_cpu = None
+        guidance_clip_embedding_cpu = None
 
-        print('CLIP Vision encoding for extension...')
+        if args.start_guidance_image: # Accessing global args
+            print(f"Encoding provided start guidance image from: {args.start_guidance_image}")
+            try:
+                guidance_pil = Image.open(args.start_guidance_image).convert("RGB")
+                guidance_np = np.array(guidance_pil)
+                
+                # image_encode handles its own model loading/unloading for vae & image_encoder
+                guidance_latent_cpu, guidance_clip_embedding_cpu = image_encode(
+                    guidance_np, target_width=width, target_height=height, 
+                    vae_model=vae, image_encoder_model=image_encoder, 
+                    feature_extractor_model=feature_extractor, device=video_encode_device # Use same temp device
+                )
+                print("Start guidance image encoded successfully.")
+            except Exception as e_img_enc:
+                print(f"Warning: Could not encode start_guidance_image: {e_img_enc}. Proceeding without it.")
+                guidance_latent_cpu = None
+                guidance_clip_embedding_cpu = None
+
+        print('CLIP Vision encoding for input video (first frame)...')
         target_img_enc_device = str(gpu if torch.cuda.is_available() else cpu)
-        if not high_vram:
-            if image_encoder: load_model_as_complete(image_encoder, target_device=target_img_enc_device)
-        else:
-            if image_encoder: image_encoder.to(target_img_enc_device)
+        # Manage image_encoder loading/unloading
+        # If guidance_clip_embedding_cpu is None, image_encoder might not have been loaded by image_encode
+        image_encoder_was_already_on_gpu = False
+        if image_encoder is not None and hasattr(image_encoder, 'device') and image_encoder.device.type == 'cuda':
+            image_encoder_was_already_on_gpu = True
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np_for_clip, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state_cpu = image_encoder_output.last_hidden_state.cpu()
+        if not image_encoder_was_already_on_gpu: # Only load if not already on GPU (e.g., by image_encode)
+            if not high_vram:
+                if image_encoder: load_model_as_complete(image_encoder, target_device=target_img_enc_device)
+            else:
+                if image_encoder: image_encoder.to(target_img_enc_device)
+        
+        input_video_first_frame_clip_output = hf_clip_vision_encode(input_image_np_for_clip, feature_extractor, image_encoder)
+        input_video_first_frame_clip_embedding_cpu = input_video_first_frame_clip_output.last_hidden_state.cpu()
+
+        # --- Determine final CLIP embedding for sampling loop  ---
+        final_clip_embedding_for_sampling_cpu = input_video_first_frame_clip_embedding_cpu.clone()
+        if guidance_clip_embedding_cpu is not None and args.start_guidance_image_clip_weight > 0:
+            print(f"Blending input video's first frame CLIP with guidance image CLIP (weight: {args.start_guidance_image_clip_weight})")
+            final_clip_embedding_for_sampling_cpu = \
+                (1.0 - args.start_guidance_image_clip_weight) * input_video_first_frame_clip_embedding_cpu + \
+                args.start_guidance_image_clip_weight * guidance_clip_embedding_cpu
+        elif guidance_clip_embedding_cpu is not None and args.start_guidance_image_clip_weight == 0:
+            print("Guidance image provided, but weight is 0. Using input video's first frame CLIP only.")
+        else:
+            print("Using input video's first frame CLIP embedding for image conditioning (no guidance image or weight is 0).")
+
+        # Unload image_encoder if it was loaded here and not by image_encode or high_vram
+        if not image_encoder_was_already_on_gpu:
+            if not high_vram and image_encoder: unload_complete_models(image_encoder)
+        # If it was loaded by image_encode, image_encode itself handled its offloading (if not high_vram)
+
 
         target_transformer_device = str(gpu if torch.cuda.is_available() else cpu)
         if not high_vram:
@@ -273,8 +368,11 @@ def do_extension_work(
         llama_attention_mask_n = llama_attention_mask_n_cpu.to(device=cond_device)
         clip_l_pooler = clip_l_pooler_cpu.to(device=cond_device, dtype=cond_dtype)
         clip_l_pooler_n = clip_l_pooler_n_cpu.to(device=cond_device, dtype=cond_dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state_cpu.to(device=cond_device, dtype=cond_dtype)
-        start_latent_for_cond = start_latent_cpu.to(device=cond_device, dtype=torch.float32)
+        
+        image_embeddings_for_sampling_loop = final_clip_embedding_for_sampling_cpu.to(device=cond_device, dtype=cond_dtype)
+        
+        # This is the first VAE latent of the input video, for conditioning if no guidance image latent is used
+        start_latent_from_input_video_gpu = start_latent_input_video_cpu.to(device=cond_device, dtype=torch.float32)
 
 
         num_output_pixel_frames_per_section = latent_window_size * 4 
@@ -289,7 +387,7 @@ def do_extension_work(
                  f"_framepackf1-vidEXT_{width}x{height}_{additional_second_length:.1f}s_seed{seed}_s{steps}_gs{gs}_cfg{cfg}"
         
         job_id = job_id_base
-        if extension_only: # <<< Use the passed parameter
+        if extension_only: 
             job_id += "_extonly"
             print("Extension-only mode enabled. Filenames will reflect this.")
 
@@ -306,7 +404,7 @@ def do_extension_work(
         
         initial_video_pixels_cpu = vae_decode(video_latents_history_cpu.to(target_vae_device_for_initial_decode), vae).cpu()
         if extension_only:
-            history_pixels_decoded_cpu = None # Will be set with the first decoded extension part
+            history_pixels_decoded_cpu = None 
             print("Extension only mode: Intermediate and final videos will contain only the generated extension.")
         else:
             history_pixels_decoded_cpu = initial_video_pixels_cpu.clone() 
@@ -372,7 +470,15 @@ def do_extension_work(
                 slice_end = min(current_offset_in_context_cpu + effective_clean_frames_count, context_latents_for_split_cpu.shape[2])
                 clean_latents_1x_gpu = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
             
-            clean_latents_for_sampler_gpu = torch.cat([start_latent_for_cond, clean_latents_1x_gpu], dim=2)
+            # --- Determine the actual start_latent for this sampling iteration's clean_latents (NEW) ---
+            actual_start_latent_for_clean_latents_gpu = start_latent_from_input_video_gpu
+            if section_index == 0 and args.use_guidance_image_as_first_latent and guidance_latent_cpu is not None: # Accessing global args
+                print("Using guidance image VAE latent as the start_latent for the first generated segment.")
+                actual_start_latent_for_clean_latents_gpu = guidance_latent_cpu.to(device=cond_device, dtype=torch.float32)
+            elif section_index == 0: # First segment but no guidance latent or not requested
+                 print("Using input video's first VAE latent as start_latent for first generated segment.")
+
+            clean_latents_for_sampler_gpu = torch.cat([actual_start_latent_for_clean_latents_gpu, clean_latents_1x_gpu], dim=2)
             
             generated_latents_gpu_step = sample_hunyuan( 
                 transformer=transformer, sampler='unipc', width=width, height=height,
@@ -382,8 +488,10 @@ def do_extension_work(
                 prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
                 device=cond_device, dtype=cond_dtype, 
-                image_embeddings=image_encoder_last_hidden_state,
+                # MODIFIED: Use the potentially blended image embedding
+                image_embeddings=image_embeddings_for_sampling_loop,
                 latent_indices=latent_indices_for_denoising_gpu, 
+                # MODIFIED: Uses clean_latents_for_sampler_gpu which has the potentially overridden start latent
                 clean_latents=clean_latents_for_sampler_gpu, 
                 clean_latent_indices=clean_latent_indices_combined_gpu,
                 clean_latents_2x=clean_latents_2x_gpu, 
@@ -412,11 +520,10 @@ def do_extension_work(
                 vae
             ).cpu()
 
-            if extension_only and history_pixels_decoded_cpu is None: # First extension part in extension_only mode
+            if extension_only and history_pixels_decoded_cpu is None: 
                 history_pixels_decoded_cpu = pixels_for_current_part_decoded_cpu
-            else: # Normal mode, or subsequent parts in extension_only mode
+            else: 
                 overlap_for_soft_append = latent_window_size * 4 - 3 
-                # Ensure overlap is not greater than the shortest of the two tensors' frame dimension
                 overlap_for_soft_append = min(overlap_for_soft_append, history_pixels_decoded_cpu.shape[2], pixels_for_current_part_decoded_cpu.shape[2])
 
                 if overlap_for_soft_append <= 0: 
@@ -432,11 +539,14 @@ def do_extension_work(
 
             if not high_vram: 
                 if vae: unload_complete_models(vae) 
+                # Reload transformer for next iteration if not high vram (original logic)
+                if transformer and not (section_index == total_extension_latent_sections - 1): # Don't reload on last section
+                     move_model_to_device_with_memory_preservation(transformer, target_device=target_transformer_device, preserved_memory_gb=gpu_memory_preservation)
     
             current_output_filename = os.path.join(outputs_folder, f'{job_id}_part{section_index + 1}_totalframes{history_pixels_decoded_cpu.shape[2]}.mp4')
             save_bcthw_as_mp4(history_pixels_decoded_cpu, current_output_filename, fps=fps, crf=mp4_crf)
             print(f"MP4 Preview for section {section_index + 1} saved: {current_output_filename}")
-            set_mp4_comments_imageio_ffmpeg(current_output_filename, f"Prompt: {prompt} | Neg: {n_prompt} | Seed: {seed}");
+            set_mp4_comments_imageio_ffmpeg(current_output_filename, f"Prompt: {prompt} | Neg: {n_prompt} | Seed: {seed}"); # Add guidance image info if desired
     
             if previous_video_path_for_cleanup is not None and os.path.exists(previous_video_path_for_cleanup):
                 try:
@@ -450,7 +560,7 @@ def do_extension_work(
         if extension_only:
             print(f"Final extension-only video for seed {seed} saved as: {final_video_path_for_item}")
         else:
-            print(f"Final video for seed {seed} (extension 1) saved as: {final_video_path_for_item}")
+            print(f"Final video for seed {seed} (extension) saved as: {final_video_path_for_item}")
 
     except Exception as e_outer:
         traceback.print_exc()
@@ -460,7 +570,6 @@ def do_extension_work(
         if not high_vram: 
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
         print("--- Extension work cycle finished. ---")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="FramePack F1 Video Extension CLI")
@@ -500,6 +609,12 @@ if __name__ == '__main__':
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns.")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns.")
     parser.add_argument('--extension_only', action='store_true', help="Save only the extension video without the input video attached.")
+    parser.add_argument('--start_guidance_image', type=str, default=None, 
+                        help='Optional path to an image to guide the start of the generated extension.')
+    parser.add_argument('--start_guidance_image_clip_weight', type=float, default=0.75, 
+                        help='Weight for the start_guidance_image CLIP embedding (0.0 to 1.0). Default 0.75. Blends with input video\'s first frame CLIP.')
+    parser.add_argument('--use_guidance_image_as_first_latent', action='store_true', default=False,
+                        help='If true, use the VAE latent of the start_guidance_image as the initial conditioning latent for the first generated segment.')
 
     args = parser.parse_args()
     
