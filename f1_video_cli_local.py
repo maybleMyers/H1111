@@ -498,7 +498,7 @@ if __name__ == '__main__':
     print(f"Outputting extensions to: {outputs_folder}")
 
     free_mem_gb = get_cuda_free_memory_gb(gpu if torch.cuda.is_available() else None)
-    high_vram = free_mem_gb > 40 
+    high_vram = free_mem_gb > 60 
     print(f'Free VRAM {free_mem_gb:.2f} GB. High-VRAM Mode: {high_vram}')
 
     if args.vae_batch_size == -1: 
