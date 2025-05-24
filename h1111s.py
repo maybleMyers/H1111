@@ -89,6 +89,9 @@ def process_framepack_extension_video(
     fpe_enable_preview: bool,
     fpe_preview_interval: int, # This arg is not used by f1_video_cli_local.py
     fpe_extension_only: bool,
+    fpe_start_guidance_image: Optional[str],
+    fpe_start_guidance_image_clip_weight: float,
+    fpe_use_guidance_image_as_first_latent: bool,
     *args: Any # For future expansion or unmapped params, not strictly needed here
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event, skip_event
@@ -191,6 +194,12 @@ def process_framepack_extension_video(
             if fpe_end_frame and os.path.exists(fpe_end_frame):
                 command.extend(["--end_frame", str(fpe_end_frame)])
                 command.extend(["--end_frame_weight", str(fpe_end_frame_weight)])
+        else: 
+            if fpe_start_guidance_image and os.path.exists(fpe_start_guidance_image):
+                command.extend(["--start_guidance_image", str(fpe_start_guidance_image)])
+                command.extend(["--start_guidance_image_clip_weight", str(fpe_start_guidance_image_clip_weight)])
+                if fpe_use_guidance_image_as_first_latent:
+                    command.append("--use_guidance_image_as_first_latent")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -5140,10 +5149,20 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column(): # Left column for inputs
                     fpe_input_video = gr.Video(label="Input Video for Extension", sources=['upload'], height=300)
-                    with gr.Accordion("Optional End Frame (for Normal FramePack Model)", open=False, visible=True) as fpe_end_frame_accordion:
+                    with gr.Accordion("Optional End Frame (for Normal FramePack Model)", open=False, visible=False) as fpe_end_frame_accordion:
                         fpe_end_frame = gr.Image(label="End Frame for Extension", type="filepath")
                         fpe_end_frame_weight = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=1.0, label="End Frame Weight")                    
-                    
+                    with gr.Accordion("Optional Start Guidance Image (for F1 Model Extension)", open=False, visible=True) as fpe_start_guidance_accordion: # Initially hidden
+                        fpe_start_guidance_image = gr.Image(label="Start Guidance Image for Extension", type="filepath")
+                        fpe_start_guidance_image_clip_weight = gr.Slider(
+                            minimum=0.0, maximum=1.0, step=0.05, value=0.75, 
+                            label="Start Guidance Image CLIP Weight",
+                            info="Blend weight for the guidance image's CLIP embedding with input video's first frame CLIP."
+                        )
+                        fpe_use_guidance_image_as_first_latent = gr.Checkbox(
+                            label="Use Guidance Image as First Latent", value=False,
+                            info="If checked, the VAE latent of the guidance image will be used as the initial conditioning for the first generated segment. Turn down context frames when using this"
+                        )                    
                     gr.Markdown("### Core Generation Parameters")
                     with gr.Row():
                         fpe_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -6135,9 +6154,11 @@ with gr.Blocks(
                 metadata_output = gr.JSON(label="Generation Parameters")
 
             with gr.Row():
-                send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
+                send_to_fpe_btn = gr.Button("Send to FramePack-Extension", variant="primary")                
                 send_to_t2v_btn = gr.Button("Send to Text2Video", variant="primary")
                 send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
+            with gr.Row():
+                send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
@@ -6313,13 +6334,22 @@ with gr.Blocks(
             else: # If preferred and fallback are missing, stick to the intended one and let later checks handle it.
                 print(f"Warning: DiT path '{updated_dit_path}' not found. No fallback available or fallback also missing.")
 
-
-        return gr.update(visible=use_normal_fp), gr.update(value=updated_dit_path), gr.update(visible=use_normal_fp)
+        return (
+            gr.update(visible=use_normal_fp),  # fpe_end_frame_accordion
+            gr.update(visible=not use_normal_fp), # fpe_start_guidance_accordion (NEW)
+            gr.update(value=updated_dit_path), # fpe_transformer_path
+            gr.update(visible=use_normal_fp)   # fpe_fp8_llm
+        )
 
     fpe_use_normal_framepack.change(
         fn=toggle_fpe_normal_framepack_options,
         inputs=[fpe_use_normal_framepack],
-        outputs=[fpe_end_frame_accordion, fpe_transformer_path, fpe_fp8_llm] # Accordion, DiT path, FP8 LLM checkbox
+        outputs=[
+            fpe_end_frame_accordion, 
+            fpe_start_guidance_accordion, # NEW output
+            fpe_transformer_path, 
+            fpe_fp8_llm
+        ]
     )
 
     fpe_generate_btn.click(
@@ -6345,6 +6375,9 @@ with gr.Blocks(
             # Preview (UI state, not directly passed to scripts)
             fpe_enable_preview, fpe_preview_interval, 
             fpe_extension_only,
+            fpe_start_guidance_image,
+            fpe_start_guidance_image_clip_weight,
+            fpe_use_guidance_image_as_first_latent,            
         ],
         outputs=[
             fpe_output_gallery,
@@ -7250,7 +7283,101 @@ with gr.Blocks(
     ).then(
         fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
     )
+    # FramePack-Extension send-to logic
+    def handle_send_to_fpe_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+        """Prepare parameters and video path for the FramePack-Extension tab."""
+        if not video_path:
+            return "No video selected to send to FramePack-Extension", {}, None
+        
+        # If metadata is empty, provide a message but still allow video transfer
+        status_msg = "Parameters ready for FramePack-Extension."
+        if not metadata:
+            status_msg = "Video sent to FramePack-Extension (no parameters found in metadata)."
+            metadata = {} # Ensure metadata is a dict
 
+        return status_msg, metadata, video_path
+
+    def change_to_fpe_tab():
+        return gr.Tabs(selected=11) # FramePack-Extension tab has id=11
+
+    send_to_fpe_btn.click(
+        fn=handle_send_to_fpe_tab,
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, fpe_input_video] # status, state for params, and video input for FPE
+    ).then(
+        lambda params: (
+            (
+                (is_f1_from_meta := params.get("is_f1", True)), # Default to F1 if not specified
+                (use_normal_fp_val := not is_f1_from_meta), # fpe_use_normal_framepack is opposite of is_f1
+                
+                # Determine resolution_max_dim
+                (target_res_meta := params.get("target_resolution")),
+                (video_w_meta := params.get("video_width")),
+                (video_h_meta := params.get("video_height")),
+                (
+                    res_max_dim_val := int(target_res_meta) if target_res_meta and int(target_res_meta) > 0
+                    else max(int(video_w_meta), int(video_h_meta)) if video_w_meta and video_h_meta and int(video_w_meta) > 0 and int(video_h_meta) > 0
+                    else 640 # Default
+                ),
+                 # LoRA handling
+                (weights_from_meta := params.get("lora_weights", [])),
+                (mults_from_meta := params.get("lora_multipliers", [])),
+                (padded_weights := (weights_from_meta + ["None"] * 4)[:4]),
+                (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 4)[:4]),
+
+                [
+                    params.get("prompt", "cinematic video of a cat wizard casting a spell"),
+                    params.get("negative_prompt", ""),
+                    params.get("seed", -1),
+                    use_normal_fp_val,
+                    # fpe_end_frame and fpe_end_frame_weight are typically not in generic metadata, use defaults
+                    gr_update(value=None), # fpe_end_frame (Image)
+                    gr_update(value=1.0),  # fpe_end_frame_weight
+                    res_max_dim_val,
+                    params.get("video_seconds", params.get("total_second_length", 5.0)), # Map from FramePack's video_seconds
+                    params.get("latent_window_size", 9),
+                    params.get("infer_steps", params.get("steps", 25)), # Map from FramePack's infer_steps
+                    params.get("guidance_scale", params.get("cfg_scale", 1.0)), # Map from FramePack's guidance_scale to fpe_cfg_scale
+                    params.get("embedded_cfg_scale", params.get("distilled_guidance_scale", 3.0)), # Map from FramePack's embedded_cfg_scale
+                    # Model Paths - use FPE defaults or specific paths from metadata if available
+                    # The DiT path is now primarily handled by the fpe_use_normal_framepack.change event
+                    params.get("transformer_path", "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"), # Placeholder, will be overridden
+                    params.get("vae_path", "hunyuan/pytorch_model.pt"),
+                    params.get("text_encoder_path", "hunyuan/llava_llama3_fp16.safetensors"),
+                    params.get("text_encoder_2_path", "hunyuan/clip_l.safetensors"),
+                    params.get("image_encoder_path", "hunyuan/model.safetensors"),
+                    # Advanced performance
+                    params.get("attn_mode", "torch"),
+                    params.get("fp8_llm", False), # This will be correctly set by fpe_use_normal_framepack.change
+                    params.get("vae_chunk_size", 32),
+                    params.get("vae_spatial_tile_sample_min_size", 128),
+                    # LoRAs
+                    *padded_weights,
+                    *padded_mults,
+                ]
+            )[-1] # Return the list of values
+        ) if params else [gr.update()] * (18 + 8), # 18 direct params + 4 lora weights + 4 lora mults
+        inputs=params_state,
+        outputs=[
+            fpe_prompt, fpe_negative_prompt, fpe_seed,
+            fpe_use_normal_framepack, # This will trigger its own .change event
+            fpe_end_frame, fpe_end_frame_weight, # These are UI only if fpe_use_normal_framepack is True
+            fpe_resolution_max_dim, fpe_total_second_length, fpe_latent_window_size,
+            fpe_steps, fpe_cfg_scale, fpe_distilled_guidance_scale,
+            # Model Paths
+            fpe_transformer_path, # Will be set by fpe_use_normal_framepack.change
+            fpe_vae_path, fpe_text_encoder_path, fpe_text_encoder_2_path, fpe_image_encoder_path,
+            # Advanced
+            fpe_attn_mode, fpe_fp8_llm, # fpe_fp8_llm also set by fpe_use_normal_framepack.change
+            fpe_vae_chunk_size, fpe_vae_spatial_tile_sample_min_size,
+            # LoRAs
+            *fpe_lora_weights_ui, *fpe_lora_multipliers_ui,
+        ]
+    ).then(
+        fn=change_to_fpe_tab,
+        inputs=None,
+        outputs=[tabs]
+    )
     #text to video
     def change_to_tab_one():
         return gr.Tabs(selected=1) #This will navigate
@@ -8712,6 +8839,7 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch H1111 Gradio Interface.")
     parser.add_argument(
