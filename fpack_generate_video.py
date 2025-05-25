@@ -1095,13 +1095,23 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                         logger.error("VAE not available for full F1 preview.")
                     else:
                         preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
+                        # Get the currently accumulated latents for F1 mode
+                        # -total_generated_latent_frames ensures we only take generated content, not the initial zeros
                         latents_to_decode_full_f1 = history_latents[:, :, -total_generated_latent_frames:, :, :].clone() # BCTHW CPU
-
+                        
                         vae.to(device)
-                        # vae_decode expects BCFHW or NCFHW, history_latents is BCTHW (B=1, C=16, T=frames, H=h/8, W=w/8)
-                        # Hunyuan VAE expects (B, C, F, H, W) where C is channels (e.g. 4 for latent, 3 for pixel)
-                        # history_latents is (1, 16, T, H_latent, W_latent). This is correct for vae_decode.
-                        decoded_pixels_full_preview_f1 = hunyuan.vae_decode(latents_to_decode_full_f1.to(device), vae).cpu() # BCTHW
+                        # For F1, total_latent_sections for decode_latent is the number of F1 sampling steps completed.
+                        num_f1_sampling_sections_completed = section_index + 1
+                        
+                        # Use decode_latent with bulk_decode=False for F1 previews
+                        decoded_pixels_full_preview_f1 = decode_latent(
+                            args.latent_window_size,
+                            num_f1_sampling_sections_completed, # Tells decode_latent how many F1 sampling sections to expect
+                            False, # Force non-bulk decode
+                            vae,
+                            latents_to_decode_full_f1, # The accumulated F1 latents
+                            device
+                        ) # decode_latent returns pixels on CPU
                         vae.to("cpu")
 
                         save_bcthw_as_mp4(decoded_pixels_full_preview_f1, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
