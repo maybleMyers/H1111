@@ -187,6 +187,7 @@ def parse_args() -> argparse.Namespace:
 
     #parser.add_argument("--preview_latent_every", type=int, default=None, help="Preview latent every N sections")
     parser.add_argument("--preview_suffix", type=str, default=None, help="Unique suffix for preview files to avoid conflicts in concurrent runs.")
+    parser.add_argument("--full_preview", action="store_true", help="Save full intermediate video previews instead of latent previews.")
 
     # TeaCache arguments
     parser.add_argument("--use_teacache", action="store_true", help="Enable TeaCache for faster generation.")
@@ -199,7 +200,6 @@ def parse_args() -> argparse.Namespace:
     default=None,
     help="number of video sections, Default is None (auto calculate from video seconds). Overrides --video_seconds if set.",
     )
-    parser.add_argument("--full_preview", action="store_true", help="Save full intermediate video previews instead of latent previews.")
 
     parser = add_blissful_args(parser)
     args = parser.parse_args()
@@ -1000,49 +1000,59 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         if start_latent_0 is None:
              raise ValueError("Cannot find start_latent for section 0 in context_img.")
         
-        # Ensure start_latent_0 matches history_latents spatial dimensions.
-        # It should, as prepare_i2v_inputs now uses `height`, `width` for image processing.
         if start_latent_0.shape[3] != (height // 8) or start_latent_0.shape[4] != (width // 8):
             logger.error(f"Mismatch between start_latent_0 dimensions ({start_latent_0.shape[3]}x{start_latent_0.shape[4]}) "
                          f"and history_latents dimensions ({height//8}x{width//8}). This should not happen with current logic.")
-            # Potentially resize start_latent_0 here as a fallback, though it indicates a logic issue upstream.
-            # For now, we assume they match due to changes in prepare_i2v_inputs.
 
         history_latents = torch.cat([history_latents, start_latent_0.cpu().float()], dim=2)
+        
+        history_pixels_for_preview_f1_cpu = None
+        if args.full_preview and args.preview_latent_every is not None:
+            if vae is None:
+                logger.error("VAE not available for initial F1 preview setup.")
+            else:
+                logger.info("F1 Full Preview: Decoding initial start_latent for preview history.")
+                vae.to(device)
+                initial_latent_for_preview = start_latent_0.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
+                # Assuming vae_decode returns BCTHW or CTHW. Ensure BCTHW for history_pixels.
+                decoded_initial = hunyuan.vae_decode(initial_latent_for_preview, vae).cpu()
+                if decoded_initial.ndim == 4: # CTHW
+                    history_pixels_for_preview_f1_cpu = decoded_initial.unsqueeze(0)
+                elif decoded_initial.ndim == 5: # BCTHW
+                    history_pixels_for_preview_f1_cpu = decoded_initial
+                else:
+                    logger.error(f"Unexpected dimensions from initial VAE decode: {decoded_initial.shape}")
+                vae.to("cpu")
+                clean_memory_on_device(device)
 
-        total_generated_latent_frames = 1 # Start with 1 frame (start_latent)
+        total_generated_latent_frames = 1 # Account for the initial start_latent_0 in history_latents
 
-        if args.preview_latent_every and not args.full_preview: # Keep previewer if desired and not doing full preview
+        if args.preview_latent_every and not args.full_preview: 
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
         else:
             previewer = None
 
-        for section_index in range(total_latent_sections): # Simpler script uses loop_index
+        for section_index in range(total_latent_sections): 
             logger.info(f"--- F1 Section {section_index + 1} / {total_latent_sections} ---")
-            f1_split_sizes = [1, 16, 2, 1, args.latent_window_size] # Use args.latent_window_size
+            f1_split_sizes = [1, 16, 2, 1, args.latent_window_size] 
             f1_indices = torch.arange(0, sum(f1_split_sizes)).unsqueeze(0).to(device)
             (
                 f1_clean_latent_indices_start,
                 f1_clean_latent_4x_indices,
                 f1_clean_latent_2x_indices,
                 f1_clean_latent_1x_indices,
-                f1_latent_indices, # This will be `latent_indices` for sample_hunyuan
+                f1_latent_indices, 
             ) = f1_indices.split(f1_split_sizes, dim=1)
             f1_clean_latent_indices = torch.cat([f1_clean_latent_indices_start, f1_clean_latent_1x_indices], dim=1)
 
-            # Get current start_latent for this section (from context_img, as in simpler script)
             current_image_context_section_idx = section_index if section_index in context_img else 0
-            current_start_latent = context_img[current_image_context_section_idx]["start_latent"].to(device, dtype=torch.float32) # Matches simpler script
+            current_start_latent = context_img[current_image_context_section_idx]["start_latent"].to(device, dtype=torch.float32) 
 
-            # Get clean history latents from `history_latents`
-            # `history_latents` on CPU, so move to device and ensure correct dtype
             current_history_for_f1_clean = history_latents[:, :, -sum([16, 2, 1]):, :, :].to(device, dtype=torch.float32)
             f1_clean_latents_4x, f1_clean_latents_2x, f1_clean_latents_1x = current_history_for_f1_clean.split([16, 2, 1], dim=2)
             
-            # `clean_latents` for sample_hunyuan
             f1_clean_latents_combined = torch.cat([current_start_latent, f1_clean_latents_1x], dim=2)
             
-            # Prepare prompt conditioning (same as before)
             context_section_idx = section_index if section_index in context else 0
             llama_vec = context[context_section_idx]["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask = context[context_section_idx]["llama_attention_mask"].to(device)
@@ -1052,109 +1062,104 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
             clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=compute_dtype)
 
-
+            # generated_latents_step is on GPU after sample_hunyuan
             generated_latents_step = sample_hunyuan(
-                transformer=model,
-                sampler=args.sample_solver, # Use args directly like simpler script
-                width=width,                # Use `width` from args.video_size
-                height=height,              # Use `height` from args.video_size
-                frames=f1_frames_per_section,
-                real_guidance_scale=args.guidance_scale, # Use args
-                distilled_guidance_scale=args.embedded_cfg_scale, # Use args
-                guidance_rescale=args.guidance_rescale, # Use args
-                num_inference_steps=args.infer_steps,
-                generator=seed_g,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=device,
-                dtype=compute_dtype,
-                image_embeddings=image_encoder_last_hidden_state,
-                # --- F1 specific conditioning based on simpler script's structure ---
-                latent_indices=f1_latent_indices,
-                clean_latents=f1_clean_latents_combined,
-                clean_latent_indices=f1_clean_latent_indices,
-                clean_latents_2x=f1_clean_latents_2x,
-                clean_latent_2x_indices=f1_clean_latent_2x_indices,
-                clean_latents_4x=f1_clean_latents_4x,
-                clean_latent_4x_indices=f1_clean_latent_4x_indices,
+                transformer=model, sampler=args.sample_solver, width=width, height=height,
+                frames=f1_frames_per_section, real_guidance_scale=args.guidance_scale, 
+                distilled_guidance_scale=args.embedded_cfg_scale, guidance_rescale=args.guidance_rescale,
+                num_inference_steps=args.infer_steps, generator=seed_g,
+                prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
+                negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
+                device=device, dtype=compute_dtype, image_embeddings=image_encoder_last_hidden_state,
+                latent_indices=f1_latent_indices, clean_latents=f1_clean_latents_combined, clean_latent_indices=f1_clean_latent_indices,
+                clean_latents_2x=f1_clean_latents_2x, clean_latent_2x_indices=f1_clean_latent_2x_indices,
+                clean_latents_4x=f1_clean_latents_4x, clean_latent_4x_indices=f1_clean_latent_4x_indices,
             )
-
-            # Append generated latents to history (on CPU) - matches simpler script's F1 append
+            
+            newly_generated_latent_frames_count_this_step = int(generated_latents_step.shape[2])
             history_latents = torch.cat([history_latents, generated_latents_step.cpu().float()], dim=2)
-            total_generated_latent_frames += int(generated_latents_step.shape[2])
+            total_generated_latent_frames += newly_generated_latent_frames_count_this_step
 
-            # Preview logic
             if args.preview_latent_every is not None and (section_index + 1) % args.preview_latent_every == 0:
                 if args.full_preview:
-                    logger.info(f"Saving full preview at F1 section {section_index + 1}")
+                    logger.info(f"Saving full F1 preview at section {section_index + 1}")
                     if vae is None:
                         logger.error("VAE not available for full F1 preview.")
                     else:
-                        preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
-                        # Get the currently accumulated latents for F1 mode
-                        # -total_generated_latent_frames ensures we only take generated content, not the initial zeros
-                        latents_to_decode_full_f1 = history_latents[:, :, -total_generated_latent_frames:, :, :].clone() # BCTHW CPU
+                        preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index + 1}.mp4")
+                        
+                        latents_this_step_for_decode = generated_latents_step.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
                         
                         vae.to(device)
-                        # For F1, total_latent_sections for decode_latent is the number of F1 sampling steps completed.
-                        num_f1_sampling_sections_completed = section_index + 1
-                        
-                        # Use decode_latent with bulk_decode=False for F1 previews
-                        decoded_pixels_full_preview_f1 = decode_latent(
-                            args.latent_window_size,
-                            num_f1_sampling_sections_completed, # Tells decode_latent how many F1 sampling sections to expect
-                            False, # Force non-bulk decode
-                            vae,
-                            latents_to_decode_full_f1, # The accumulated F1 latents
-                            device
-                        ) # decode_latent returns pixels on CPU (CTHW)
+                        pixels_this_step_decoded_cpu = hunyuan.vae_decode(latents_this_step_for_decode, vae).cpu()
                         vae.to("cpu")
+                        
+                        if pixels_this_step_decoded_cpu.ndim == 4: 
+                            pixels_this_step_decoded_cpu = pixels_this_step_decoded_cpu.unsqueeze(0)
 
-                        # Add batch dimension before saving
-                        decoded_pixels_full_preview_f1_batched = decoded_pixels_full_preview_f1.unsqueeze(0) # CTHW -> BCTHW
-                        save_bcthw_as_mp4(decoded_pixels_full_preview_f1_batched, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        if history_pixels_for_preview_f1_cpu is None: 
+                            history_pixels_for_preview_f1_cpu = pixels_this_step_decoded_cpu
+                        else:
+                            overlap_pixels = args.latent_window_size * 4 - 3
+                            history_pixels_for_preview_f1_cpu = soft_append_bcthw(
+                                history_pixels_for_preview_f1_cpu,
+                                pixels_this_step_decoded_cpu,
+                                overlap=overlap_pixels
+                            )
+                        
+                        save_bcthw_as_mp4(history_pixels_for_preview_f1_cpu, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
                         logger.info(f"Full F1 preview saved to {preview_filename_full}")
                         
-                        del latents_to_decode_full_f1, decoded_pixels_full_preview_f1, decoded_pixels_full_preview_f1_batched
+                        del latents_this_step_for_decode, pixels_this_step_decoded_cpu
                         clean_memory_on_device(device)
-                elif previewer is not None: # Standard latent previewer
+                elif previewer is not None: 
                     logger.info(f"Previewing latents at F1 section {section_index + 1}")
                     preview_latents_f1_for_pv = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
                     previewer.preview(preview_latents_f1_for_pv, section_index, preview_suffix=args.preview_suffix)
                     del preview_latents_f1_for_pv
                     clean_memory_on_device(gen_settings.device)
             
-            # Clean up GPU memory after each section
             del generated_latents_step, current_history_for_f1_clean, f1_clean_latents_combined
             del f1_clean_latents_1x, f1_clean_latents_2x, f1_clean_latents_4x, current_start_latent
             del llama_vec, llama_attention_mask, clip_l_pooler, image_encoder_last_hidden_state
             del llama_vec_n, llama_attention_mask_n, clip_l_pooler_n
             clean_memory_on_device(device)
 
-
-        # Final history processing - matches simpler script's F1 logic
         real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
         # No resizing needed as generation happened at target dimensions.
 
     # --- Standard Model Sampling Logic ---
     else: # Standard mode
         logger.info("Starting standard model sampling process.")
-        # Original history initialization (includes end latent space)
-        # `height`, `width` are already from args.video_size
         history_latents = torch.zeros((1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32, device='cpu')
-        if end_latent is not None: # No `and not f1_mode` check needed here, already in else block
+        if end_latent is not None: 
             logger.info(f"Using end image: {args.end_image_path}")
-            # Ensure end_latent matches history_latents spatial dims. It should due to prepare_i2v_inputs changes.
             history_latents[:, :, 0:1] = end_latent.cpu().float()
 
         total_generated_latent_frames = 0
+        
+        history_pixels_for_preview_std_cpu = None # Initialize pixel history
+        # For standard mode (backward generation), the first chunk generated is the "end" of the video.
+        # If end_latent is provided and previews are on, we should decode it to start the preview history.
+        if args.full_preview and args.preview_latent_every is not None and end_latent is not None:
+            if vae is None:
+                logger.error("VAE not available for initial Standard mode preview setup with end_latent.")
+            else:
+                logger.info("Standard Full Preview: Decoding initial end_latent for preview history.")
+                vae.to(device)
+                initial_latent_for_preview = end_latent.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
+                decoded_initial = hunyuan.vae_decode(initial_latent_for_preview, vae).cpu()
+                if decoded_initial.ndim == 4: # CTHW
+                    history_pixels_for_preview_std_cpu = decoded_initial.unsqueeze(0)
+                elif decoded_initial.ndim == 5: # BCTHW
+                    history_pixels_for_preview_std_cpu = decoded_initial
+                else:
+                    logger.error(f"Unexpected dimensions from initial VAE decode for end_latent: {decoded_initial.shape}")
+                vae.to("cpu")
+                clean_memory_on_device(device)
 
-        # Original latent padding logic
-        latent_paddings = list(reversed(range(total_latent_sections))) # Convert range iterator to list
+
+        latent_paddings = list(reversed(range(total_latent_sections))) 
         if total_latent_sections > 4:
             logger.info("Using F1-style latent padding heuristic for > 4 sections.")
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
@@ -1166,17 +1171,12 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
         for section_index_reverse, latent_padding in enumerate(latent_paddings):
             section_index = total_latent_sections - 1 - section_index_reverse
-            section_index_from_last = -(section_index_reverse + 1)  # -1, -2 ...
+            section_index_from_last = -(section_index_reverse + 1) 
             logger.info(f"--- Standard Section {section_index + 1} / {total_latent_sections} (Reverse Index {section_index_reverse}, Padding {latent_padding}) ---")
 
-
             is_last_section = latent_padding == 0
-            # is_first_section = section_index_reverse == 0 # Unused?
             latent_padding_size = latent_padding * latent_window_size
 
-            # logger.info(f"latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}")
-
-            # Select start latent based on section index (fallback to 0)
             apply_section_image = False
             if section_index_from_last in context_img:
                 image_index = section_index_from_last
@@ -1185,117 +1185,70 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                 image_index = section_index
                 if not is_last_section: apply_section_image = True
             else:
-                image_index = 0 # Fallback
+                image_index = 0 
 
-            start_latent_section = context_img[image_index]["start_latent"].to(device, dtype=torch.float32) # Move to device, ensure float32
+            start_latent_section = context_img[image_index]["start_latent"].to(device, dtype=torch.float32) 
             if apply_section_image:
                 latent_padding_size = 0
                 logger.info(f"Applying experimental section image, forcing latent_padding_size = 0")
 
-
-            # --- Define indices for standard model ---
-            # This structure seems specific to the standard model's conditioning requirements
-            # sum([1, 3, 9, 1, 2, 16]) = 32 - example sizes, needs dynamic padding_size
-            # Let's recalculate sizes dynamically based on latent_padding_size
             split_sizes_std = [1, latent_padding_size, latent_window_size, 1, 2, 16]
             indices_std = torch.arange(0, sum(split_sizes_std)).unsqueeze(0).to(device)
-
             (
-                clean_latent_indices_pre, # Index for start frame latent
-                blank_indices,            # Indices for padding based on latent_padding_size
-                latent_indices,           # Indices for latents being denoised
-                clean_latent_indices_post,# Index for the post clean frame (from history)
-                clean_latent_2x_indices,  # Indices for 2x history
-                clean_latent_4x_indices,  # Indices for 4x history
+                clean_latent_indices_pre, blank_indices, latent_indices, 
+                clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices,
             ) = indices_std.split(split_sizes_std, dim=1)
-
-            # Combine pre and post clean indices
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-            # Get clean latents from history (move relevant part to device)
-            # History shape is (B, C, T_hist_std, H, W) where T_hist_std = 1+2+16 = 19 initially
-            current_history_std = history_latents[:, :, :19].to(device, dtype=torch.float32) # Ensure float32
+            current_history_std = history_latents[:, :, :19].to(device, dtype=torch.float32) 
             clean_latents_post, clean_latents_2x, clean_latents_4x = current_history_std.split([1, 2, 16], dim=2)
             clean_latents = torch.cat([start_latent_section, clean_latents_post], dim=2)
 
-
-            # Select prompt based on section index (fallback to 0)
-            if section_index_from_last in context:
-                prompt_index = section_index_from_last
-            elif section_index in context:
-                prompt_index = section_index
-            else:
-                prompt_index = 0
-
+            if section_index_from_last in context: prompt_index = section_index_from_last
+            elif section_index in context: prompt_index = section_index
+            else: prompt_index = 0
             context_for_index = context[prompt_index]
             logger.info(f"Using prompt from section {prompt_index}: '{context_for_index['prompt'][:100]}...'")
 
-            # Prepare conditioning tensors for the current section, move to device
             llama_vec = context_for_index["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask = context_for_index["llama_attention_mask"].to(device)
             clip_l_pooler = context_for_index["clip_l_pooler"].to(device, dtype=compute_dtype)
-
             image_encoder_last_hidden_state = context_img[image_index]["image_encoder_last_hidden_state"].to(device, dtype=compute_dtype)
-
-            # Negative prompts (same for all sections)
             llama_vec_n = context_null["llama_vec"].to(device, dtype=compute_dtype)
             llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
             clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=compute_dtype)
 
-            # Use standard args for sampler/guidance
             sampler_to_use = args.sample_solver
             guidance_scale_to_use = args.guidance_scale
             embedded_cfg_scale_to_use = args.embedded_cfg_scale
             guidance_rescale_to_use = args.guidance_rescale
 
-            # Call sample_hunyuan with standard parameters and conditioning
-            generated_latents_step = sample_hunyuan(
-                transformer=model,
-                sampler=sampler_to_use,
-                width=width,
-                height=height,
-                frames=f1_frames_per_section, # Same frame count calculation
-                real_guidance_scale=guidance_scale_to_use,
-                distilled_guidance_scale=embedded_cfg_scale_to_use,
-                guidance_rescale=guidance_rescale_to_use,
-                num_inference_steps=args.infer_steps,
-                generator=seed_g, # Use CPU generator
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=device,
-                dtype=compute_dtype,
-                image_embeddings=image_encoder_last_hidden_state,
-                 # --- Pass Standard model specific conditioning ---
-                latent_indices=latent_indices,           # From standard split
-                clean_latents=clean_latents,             # From standard history prep
-                clean_latent_indices=clean_latent_indices, # From standard split
-                clean_latents_2x=clean_latents_2x,       # From standard history prep
-                clean_latent_2x_indices=clean_latent_2x_indices, # From standard split
-                clean_latents_4x=clean_latents_4x,       # From standard history prep
-                clean_latent_4x_indices=clean_latent_4x_indices, # From standard split
-                # Blank indices might be needed if sample_hunyuan uses them? Check its signature/kwargs.
-                # Assuming they are implicitly handled or not needed by sample_hunyuan itself.
-                # --- End Standard conditioning ---
-                # callback=callback, # Add callback support if needed
-            ) # .to('cpu') # Move generated latents immediately to CPU
+            # generated_latents_step is on GPU after sample_hunyuan
+            generated_latents_step_gpu = sample_hunyuan(
+                transformer=model, sampler=sampler_to_use, width=width, height=height,
+                frames=f1_frames_per_section, real_guidance_scale=guidance_scale_to_use,
+                distilled_guidance_scale=embedded_cfg_scale_to_use, guidance_rescale=guidance_rescale_to_use,
+                num_inference_steps=args.infer_steps, generator=seed_g, 
+                prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
+                negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
+                device=device, dtype=compute_dtype, image_embeddings=image_encoder_last_hidden_state,
+                latent_indices=latent_indices, clean_latents=clean_latents, clean_latent_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x, clean_latent_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x, clean_latent_4x_indices=clean_latent_4x_indices,
+            )
+            
+            # Move to CPU for history accumulation and potential preview decode
+            generated_latents_step = generated_latents_step_gpu.cpu().float()
 
-            # Apply start latent concatenation for the last section in standard mode
-            if is_last_section:
-                logger.info("Standard Mode: Last section, prepending start latent.")
-                # Make sure start_latent_section is on CPU and float32 for concat
-                generated_latents_step = torch.cat([start_latent_section.cpu().float(), generated_latents_step.cpu().float()], dim=2)
-            else:
-                 generated_latents_step = generated_latents_step.cpu().float() # Ensure CPU, float32
-
+            if is_last_section: # This is the first iteration in reverse, corresponds to earliest part of generated video
+                logger.info("Standard Mode: Last section (first in reverse loop), prepending start_latent_section for this chunk.")
+                generated_latents_step = torch.cat([start_latent_section.cpu().float(), generated_latents_step], dim=2)
+            
+            current_step_latents_cpu = generated_latents_step.clone() # This is what was generated/prepended in this step
 
             total_generated_latent_frames += int(generated_latents_step.shape[2])
-            history_latents = torch.cat([generated_latents_step, history_latents], dim=2)
+            history_latents = torch.cat([generated_latents_step, history_latents], dim=2) # Prepend to full latent history
 
-            # Get the portion of history containing actual generated data for preview/final output
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if args.preview_latent_every is not None and (section_index_reverse + 1) % args.preview_latent_every == 0:
@@ -1304,67 +1257,47 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                     if vae is None:
                         logger.error("VAE not available for full standard preview.")
                     else:
-                        preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
-
+                        preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index_reverse + 1}.mp4")
+                        
+                        latents_this_step_for_decode = current_step_latents_cpu.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
+                        
                         vae.to(device)
-                        num_sampling_sections_in_current_history = section_index_reverse + 1
-
-                        cloned_real_history_latents_for_preview = real_history_latents.clone() # Ensure we pass a copy
-                        decoded_pixels_full_preview_std = decode_latent(
-                            args.latent_window_size,
-                             num_sampling_sections_in_current_history, # This tells decode_latent how to interpret the structure
-                             False,  # Force non-bulk decode for preview
-                             vae,    # VAE model (already on device)
-                             cloned_real_history_latents_for_preview, # Pass the current history latents
-                             device
-                        ) # decode_latent returns pixels on CPU (CTHW)
+                        pixels_this_step_decoded_cpu = hunyuan.vae_decode(latents_this_step_for_decode, vae).cpu()
                         vae.to("cpu")
 
-                        # Add batch dimension before saving
-                        decoded_pixels_full_preview_std_batched = decoded_pixels_full_preview_std.unsqueeze(0) # CTHW -> BCTHW
-                        save_bcthw_as_mp4(decoded_pixels_full_preview_std_batched, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        if pixels_this_step_decoded_cpu.ndim == 4:
+                            pixels_this_step_decoded_cpu = pixels_this_step_decoded_cpu.unsqueeze(0)
+
+                        if history_pixels_for_preview_std_cpu is None:
+                            history_pixels_for_preview_std_cpu = pixels_this_step_decoded_cpu
+                        else:
+                            overlap_pixels = args.latent_window_size * 4 - 3
+                            # Standard mode prepends, so new pixels are first arg for soft_append
+                            history_pixels_for_preview_std_cpu = soft_append_bcthw(
+                                pixels_this_step_decoded_cpu, 
+                                history_pixels_for_preview_std_cpu,
+                                overlap=overlap_pixels
+                            )
+                        
+                        save_bcthw_as_mp4(history_pixels_for_preview_std_cpu, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
                         logger.info(f"Full standard preview saved to {preview_filename_full_std}")
-                        del decoded_pixels_full_preview_std, cloned_real_history_latents_for_preview, decoded_pixels_full_preview_std_batched
+                        del latents_this_step_for_decode, pixels_this_step_decoded_cpu
                         clean_memory_on_device(device)
-                elif previewer is not None: # Standard latent previewer
+                elif previewer is not None: 
                     logger.info(f"Previewing latents at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
-                    preview_latents_std_for_pv = real_history_latents.to(gen_settings.device) # Move to device for previewer
+                    preview_latents_std_for_pv = real_history_latents.to(gen_settings.device) 
                     previewer.preview(preview_latents_std_for_pv, section_index, preview_suffix=args.preview_suffix)
                     del preview_latents_std_for_pv
                     clean_memory_on_device(gen_settings.device)
 
             logger.info(f"Section {section_index + 1} finished. Total latent frames: {total_generated_latent_frames}. History shape: {history_latents.shape}")
 
-            # Clean up GPU memory after each section
             del generated_latents_step, current_history_std, clean_latents, clean_latents_post, clean_latents_2x, clean_latents_4x
             del llama_vec, llama_attention_mask, clip_l_pooler, image_encoder_last_hidden_state, start_latent_section
             del llama_vec_n, llama_attention_mask_n, clip_l_pooler_n
+            # Explicitly delete the GPU tensor if it was created
+            if 'generated_latents_step_gpu' in locals(): del generated_latents_step_gpu
             clean_memory_on_device(device)
-
-
-    # --- End of Sampling Logic ---
-
-    # Only clean up shared models if they were created within this function (indicated by shared_models being None initially)
-    # This logic seems flawed, cleanup should happen outside if models are truly shared.
-    # Let's remove the conditional cleanup based on shared_models being None.
-    # Cleanup should happen in the main loop IF models were loaded there.
-    # If using shared models, the caller is responsible for cleanup.
-
-    # Assuming models were loaded in this call if shared_models was None
-    # if shared_models is None:
-    #     logger.info("Cleaning up models loaded in this generation call.")
-    #     del model
-    #     # VAE is needed for decode, clean up later in main/save_output
-    #     # del vae
-    #     synchronize_device(device) # Ensure ops complete before releasing memory
-
-    # Ensure block swap finishes if enabled
-    #if args.blocks_to_swap > 0 and hasattr(model, 'offloader_double') and model.offloader_double is not None:
-    #    logger.info("Waiting for block swap operations to complete...")
-    #    model.offloader_double.wait_for_all_submitted_ops()
-    #    model.offloader_single.wait_for_all_submitted_ops()
-    #    logger.info("Block swap finished.")
-    #    time.sleep(1) # Short sleep just in case
 
     gc.collect()
     clean_memory_on_device(device)

@@ -1,5 +1,3 @@
-# --- START OF FILE framepack_video_endframe_cli_local.py ---
-
 import os
 import torch
 import traceback
@@ -18,10 +16,6 @@ import subprocess
 import sys
 
 from PIL import Image
-
-# --- Imports from fpack_generate_video.py's ecosystem (or similar paths) ---
-# Assuming these are available in the execution environment or PYTHONPATH
-# For a self-contained script, these might need to be vendored or adjusted.
 try:
     from frame_pack.hunyuan_video_packed import load_packed_model
     from frame_pack.framepack_utils import (
