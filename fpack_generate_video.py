@@ -1111,13 +1111,15 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                             vae,
                             latents_to_decode_full_f1, # The accumulated F1 latents
                             device
-                        ) # decode_latent returns pixels on CPU
+                        ) # decode_latent returns pixels on CPU (CTHW)
                         vae.to("cpu")
 
-                        save_bcthw_as_mp4(decoded_pixels_full_preview_f1, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        # Add batch dimension before saving
+                        decoded_pixels_full_preview_f1_batched = decoded_pixels_full_preview_f1.unsqueeze(0) # CTHW -> BCTHW
+                        save_bcthw_as_mp4(decoded_pixels_full_preview_f1_batched, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
                         logger.info(f"Full F1 preview saved to {preview_filename_full}")
                         
-                        del latents_to_decode_full_f1, decoded_pixels_full_preview_f1
+                        del latents_to_decode_full_f1, decoded_pixels_full_preview_f1, decoded_pixels_full_preview_f1_batched
                         clean_memory_on_device(device)
                 elif previewer is not None: # Standard latent previewer
                     logger.info(f"Previewing latents at F1 section {section_index + 1}")
@@ -1303,17 +1305,26 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                         logger.error("VAE not available for full standard preview.")
                     else:
                         preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
-                        # real_history_latents is already on CPU and is BCTHW
-                        latents_to_decode_full_std = real_history_latents.clone()
 
                         vae.to(device)
-                        decoded_pixels_full_preview_std = hunyuan.vae_decode(latents_to_decode_full_std.to(device), vae).cpu() # BCTHW
-                        vae.to("cpu")
-                        
-                        save_bcthw_as_mp4(decoded_pixels_full_preview_std, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
-                        logger.info(f"Full standard preview saved to {preview_filename_full_std}")
+                        num_sampling_sections_in_current_history = section_index_reverse + 1
 
-                        del latents_to_decode_full_std, decoded_pixels_full_preview_std
+                        cloned_real_history_latents_for_preview = real_history_latents.clone() # Ensure we pass a copy
+                        decoded_pixels_full_preview_std = decode_latent(
+                            args.latent_window_size,
+                             num_sampling_sections_in_current_history, # This tells decode_latent how to interpret the structure
+                             False,  # Force non-bulk decode for preview
+                             vae,    # VAE model (already on device)
+                             cloned_real_history_latents_for_preview, # Pass the current history latents
+                             device
+                        ) # decode_latent returns pixels on CPU (CTHW)
+                        vae.to("cpu")
+
+                        # Add batch dimension before saving
+                        decoded_pixels_full_preview_std_batched = decoded_pixels_full_preview_std.unsqueeze(0) # CTHW -> BCTHW
+                        save_bcthw_as_mp4(decoded_pixels_full_preview_std_batched, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        logger.info(f"Full standard preview saved to {preview_filename_full_std}")
+                        del decoded_pixels_full_preview_std, cloned_real_history_latents_for_preview, decoded_pixels_full_preview_std_batched
                         clean_memory_on_device(device)
                 elif previewer is not None: # Standard latent previewer
                     logger.info(f"Previewing latents at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
