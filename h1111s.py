@@ -5155,7 +5155,7 @@ with gr.Blocks(
                     with gr.Accordion("Optional Start Guidance Image (for F1 Model Extension)", open=False, visible=True) as fpe_start_guidance_accordion: # Initially hidden
                         fpe_start_guidance_image = gr.Image(label="Start Guidance Image for Extension", type="filepath")
                         fpe_start_guidance_image_clip_weight = gr.Slider(
-                            minimum=0.0, maximum=1.0, step=0.05, value=0.75, 
+                            minimum=0.0, maximum=5.0, step=0.05, value=0.75, 
                             label="Start Guidance Image CLIP Weight",
                             info="Blend weight for the guidance image's CLIP embedding with input video's first frame CLIP."
                         )
