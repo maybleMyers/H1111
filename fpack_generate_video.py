@@ -44,6 +44,7 @@ from blissful_tuner.blissful_args import add_blissful_args, parse_blissful_args
 from blissful_tuner.video_processing_common import save_videos_grid_advanced
 from blissful_tuner.latent_preview import LatentPreviewer
 import logging
+from diffusers_helper.utils import save_bcthw_as_mp4
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -198,6 +199,7 @@ def parse_args() -> argparse.Namespace:
     default=None,
     help="number of video sections, Default is None (auto calculate from video seconds). Overrides --video_seconds if set.",
     )
+    parser.add_argument("--full_preview", action="store_true", help="Save full intermediate video previews instead of latent previews.")
 
     parser = add_blissful_args(parser)
     args = parser.parse_args()
@@ -1010,8 +1012,10 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
 
         total_generated_latent_frames = 1 # Start with 1 frame (start_latent)
 
-        if args.preview_latent_every: # Keep previewer if desired
+        if args.preview_latent_every and not args.full_preview: # Keep previewer if desired and not doing full preview
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
+        else:
+            previewer = None
 
         for section_index in range(total_latent_sections): # Simpler script uses loop_index
             logger.info(f"--- F1 Section {section_index + 1} / {total_latent_sections} ---")
@@ -1083,13 +1087,34 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             history_latents = torch.cat([history_latents, generated_latents_step.cpu().float()], dim=2)
             total_generated_latent_frames += int(generated_latents_step.shape[2])
 
-            # Preview logic (using CPU history latents, no resizing needed here as latents are already target size)
+            # Preview logic
             if args.preview_latent_every is not None and (section_index + 1) % args.preview_latent_every == 0:
-                logger.info(f"Previewing latents at section {section_index + 1}")
-                preview_latents_f1 = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
-                previewer.preview(preview_latents_f1, section_index, preview_suffix=args.preview_suffix)
-                del preview_latents_f1
-                clean_memory_on_device(gen_settings.device)
+                if args.full_preview:
+                    logger.info(f"Saving full preview at F1 section {section_index + 1}")
+                    if vae is None:
+                        logger.error("VAE not available for full F1 preview.")
+                    else:
+                        preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
+                        latents_to_decode_full_f1 = history_latents[:, :, -total_generated_latent_frames:, :, :].clone() # BCTHW CPU
+
+                        vae.to(device)
+                        # vae_decode expects BCFHW or NCFHW, history_latents is BCTHW (B=1, C=16, T=frames, H=h/8, W=w/8)
+                        # Hunyuan VAE expects (B, C, F, H, W) where C is channels (e.g. 4 for latent, 3 for pixel)
+                        # history_latents is (1, 16, T, H_latent, W_latent). This is correct for vae_decode.
+                        decoded_pixels_full_preview_f1 = hunyuan.vae_decode(latents_to_decode_full_f1.to(device), vae).cpu() # BCTHW
+                        vae.to("cpu")
+
+                        save_bcthw_as_mp4(decoded_pixels_full_preview_f1, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        logger.info(f"Full F1 preview saved to {preview_filename_full}")
+                        
+                        del latents_to_decode_full_f1, decoded_pixels_full_preview_f1
+                        clean_memory_on_device(device)
+                elif previewer is not None: # Standard latent previewer
+                    logger.info(f"Previewing latents at F1 section {section_index + 1}")
+                    preview_latents_f1_for_pv = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
+                    previewer.preview(preview_latents_f1_for_pv, section_index, preview_suffix=args.preview_suffix)
+                    del preview_latents_f1_for_pv
+                    clean_memory_on_device(gen_settings.device)
             
             # Clean up GPU memory after each section
             del generated_latents_step, current_history_for_f1_clean, f1_clean_latents_combined
@@ -1122,8 +1147,10 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             logger.info("Using F1-style latent padding heuristic for > 4 sections.")
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-        if args.preview_latent_every:
+        if args.preview_latent_every and not args.full_preview:
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
+        else:
+            previewer = None
 
         for section_index_reverse, latent_padding in enumerate(latent_paddings):
             section_index = total_latent_sections - 1 - section_index_reverse
@@ -1260,12 +1287,30 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if args.preview_latent_every is not None and (section_index_reverse + 1) % args.preview_latent_every == 0:
-                logger.info(f"Previewing latents at section {section_index + 1} (Reverse Index {section_index_reverse})")
-                 # Move relevant part to device for previewer
-                preview_latents = real_history_latents.to(gen_settings.device)
-                previewer.preview(preview_latents, section_index, preview_suffix=args.preview_suffix)
-                del preview_latents # Free preview tensor
-                clean_memory_on_device(gen_settings.device)
+                if args.full_preview:
+                    logger.info(f"Saving full preview at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
+                    if vae is None:
+                        logger.error("VAE not available for full standard preview.")
+                    else:
+                        preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix}.mp4")
+                        # real_history_latents is already on CPU and is BCTHW
+                        latents_to_decode_full_std = real_history_latents.clone()
+
+                        vae.to(device)
+                        decoded_pixels_full_preview_std = hunyuan.vae_decode(latents_to_decode_full_std.to(device), vae).cpu() # BCTHW
+                        vae.to("cpu")
+                        
+                        save_bcthw_as_mp4(decoded_pixels_full_preview_std, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                        logger.info(f"Full standard preview saved to {preview_filename_full_std}")
+
+                        del latents_to_decode_full_std, decoded_pixels_full_preview_std
+                        clean_memory_on_device(device)
+                elif previewer is not None: # Standard latent previewer
+                    logger.info(f"Previewing latents at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
+                    preview_latents_std_for_pv = real_history_latents.to(gen_settings.device) # Move to device for previewer
+                    previewer.preview(preview_latents_std_for_pv, section_index, preview_suffix=args.preview_suffix)
+                    del preview_latents_std_for_pv
+                    clean_memory_on_device(gen_settings.device)
 
             logger.info(f"Section {section_index + 1} finished. Total latent frames: {total_generated_latent_frames}. History shape: {history_latents.shape}")
 

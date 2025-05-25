@@ -387,6 +387,7 @@ def process_framepack_video(
     lora_folder: str,
     enable_preview: bool,
     preview_every_n_sections: int,
+    use_full_video_preview: bool,
     is_f1: bool,
     use_random_folder: bool,
     input_folder_path: str,
@@ -669,7 +670,11 @@ def process_framepack_video(
         if enable_preview and preview_every_n_sections > 0:
             command.extend(["--preview_latent_every", str(preview_every_n_sections)])
             command.extend(["--preview_suffix", unique_preview_suffix])
-            print(f"DEBUG: Enabling preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
+            if use_full_video_preview: # Check if full preview is requested
+                command.append("--full_preview")
+                print(f"DEBUG: Enabling FULL VIDEO preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
+            else:
+                print(f"DEBUG: Enabling latent preview every {preview_every_n_sections} sections with suffix {unique_preview_suffix}.")
         if use_teacache:
             command.append("--use_teacache")
             command.extend(["--teacache_steps", str(teacache_steps)])
@@ -5010,6 +5015,8 @@ with gr.Blocks(
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
                         with gr.Row():
                             framepack_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                            framepack_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews (slower)", value=False)
+                        with gr.Row():
                             framepack_preview_every_n_sections = gr.Slider(
                                 minimum=1, maximum=50, step=1, value=1,
                                 label="Preview Every N Sections",
@@ -5154,7 +5161,7 @@ with gr.Blocks(
                     with gr.Accordion("Optional Start Guidance Image (for F1 Model Extension)", open=False, visible=True) as fpe_start_guidance_accordion: # Initially hidden
                         fpe_start_guidance_image = gr.Image(label="Start Guidance Image for Extension", type="filepath")
                         fpe_start_guidance_image_clip_weight = gr.Slider(
-                            minimum=0.0, maximum=1.0, step=0.05, value=0.75, 
+                            minimum=0.0, maximum=2.0, step=0.05, value=0.75, 
                             label="Start Guidance Image CLIP Weight",
                             info="Blend weight for the guidance image's CLIP embedding with input video's first frame CLIP."
                         )
@@ -6651,6 +6658,7 @@ with gr.Blocks(
             framepack_lora_folder,
             framepack_enable_preview,
             framepack_preview_every_n_sections,
+            framepack_use_full_video_preview,
             framepack_is_f1,
             framepack_use_random_folder,
             framepack_input_folder_path,

@@ -1,5 +1,3 @@
-# --- START OF FILE f1_video_cli_local_extension.py ---
-
 import os
 import torch
 import traceback
@@ -64,9 +62,6 @@ outputs_folder = './outputs/' # Default, can be overridden by --output_dir
 
 @torch.no_grad()
 def image_encode(image_np, target_width, target_height, vae_model, image_encoder_model, feature_extractor_model, device="cuda"):
-    """
-    Encode a single image into a latent and compute its CLIP vision embedding.
-    """
     global high_vram 
     print("Processing single image for encoding (e.g., start_guidance_image)...")
     try:
@@ -75,33 +70,32 @@ def image_encode(image_np, target_width, target_height, vae_model, image_encoder
         processed_image_np = resize_and_center_crop(image_np, target_width=target_width, target_height=target_height)
 
         image_pt = torch.from_numpy(processed_image_np).float() / 127.5 - 1.0
-        image_pt = image_pt.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # N C F H W (N=1, F=1)
+        image_pt = image_pt.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
         
         target_vae_device = device
-        # Assuming vae_model, image_encoder_model are the global models from f1_video_cli_local.py
         if not high_vram: load_model_as_complete(vae_model, target_device=target_vae_device)
         else: vae_model.to(target_vae_device)
         image_pt_device = image_pt.to(target_vae_device)
         
-        latent = vae_encode(image_pt_device, vae_model).cpu() # Encode and move to CPU
+        latent = vae_encode(image_pt_device, vae_model).cpu()
         print(f"Single image VAE output shape (latent): {latent.shape}")
 
-        if not high_vram: unload_complete_models(vae_model) # Offload VAE if low VRAM
+        if not high_vram: unload_complete_models(vae_model)
 
         target_img_enc_device = device
         if not high_vram: load_model_as_complete(image_encoder_model, target_device=target_img_enc_device)
         else: image_encoder_model.to(target_img_enc_device)
 
         clip_embedding_output = hf_clip_vision_encode(processed_image_np, feature_extractor_model, image_encoder_model)
-        clip_embedding = clip_embedding_output.last_hidden_state.cpu() # Encode and move to CPU
+        clip_embedding = clip_embedding_output.last_hidden_state.cpu()
         print(f"Single image CLIP embedding shape: {clip_embedding.shape}")
 
-        if not high_vram: unload_complete_models(image_encoder_model) # Offload image encoder if low VRAM
+        if not high_vram: unload_complete_models(image_encoder_model)
         
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        return latent, clip_embedding # We don't need processed_image_np back for this use case
+        return latent, clip_embedding
 
     except Exception as e:
         print(f"Error in image_encode: {str(e)}")
@@ -183,7 +177,7 @@ def video_encode(video_path, resolution, no_resize, vae_model, vae_batch_size=16
         frames_pt = frames_pt.unsqueeze(0).permute(0, 2, 1, 3, 4)
         print(f"Tensor shape for VAE: {frames_pt.shape}")
 
-        input_video_pixels_cpu = frames_pt.clone().cpu() # For returning raw pixels if needed
+        input_video_pixels_cpu = frames_pt.clone().cpu()
 
         print(f"Moving VAE and tensor to device: {device}")
         vae_model.to(device)
@@ -251,13 +245,13 @@ def set_mp4_comments_imageio_ffmpeg(input_file, comments):
 def do_extension_work(
     input_video_path, prompt, n_prompt, seed,
     resolution_max_dim,
-    additional_second_length, # Duration of the extension
+    additional_second_length, 
     latent_window_size, steps, cfg, gs, rs,
     gpu_memory_preservation, use_teacache, no_resize, mp4_crf,
     num_clean_frames, vae_batch_size,
     extension_only
 ):
-    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer, args # Added args here for clarity
+    global high_vram, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer, args
 
     print('--- Starting Video Extension Work (with optional Start Guidance Image) ---')
 
@@ -290,7 +284,6 @@ def do_extension_work(
 
         print('Encoding input video for extension base...')
         video_encode_device = str(gpu if torch.cuda.is_available() else cpu)
-        # Renamed last return value for clarity if we use it for concatenation (though f1 script decodes later)
         start_latent_input_video_cpu, input_image_np_for_clip, video_latents_history_cpu, fps, height, width, _ = video_encode(
             input_video_path, resolution_max_dim, no_resize, vae, vae_batch_size=vae_batch_size, device=video_encode_device
         )
@@ -300,17 +293,16 @@ def do_extension_work(
         guidance_latent_cpu = None
         guidance_clip_embedding_cpu = None
 
-        if args.start_guidance_image: # Accessing global args
+        if args.start_guidance_image: 
             print(f"Encoding provided start guidance image from: {args.start_guidance_image}")
             try:
                 guidance_pil = Image.open(args.start_guidance_image).convert("RGB")
                 guidance_np = np.array(guidance_pil)
                 
-                # image_encode handles its own model loading/unloading for vae & image_encoder
                 guidance_latent_cpu, guidance_clip_embedding_cpu = image_encode(
                     guidance_np, target_width=width, target_height=height, 
                     vae_model=vae, image_encoder_model=image_encoder, 
-                    feature_extractor_model=feature_extractor, device=video_encode_device # Use same temp device
+                    feature_extractor_model=feature_extractor, device=video_encode_device 
                 )
                 print("Start guidance image encoded successfully.")
             except Exception as e_img_enc:
@@ -320,13 +312,11 @@ def do_extension_work(
 
         print('CLIP Vision encoding for input video (first frame)...')
         target_img_enc_device = str(gpu if torch.cuda.is_available() else cpu)
-        # Manage image_encoder loading/unloading
-        # If guidance_clip_embedding_cpu is None, image_encoder might not have been loaded by image_encode
         image_encoder_was_already_on_gpu = False
         if image_encoder is not None and hasattr(image_encoder, 'device') and image_encoder.device.type == 'cuda':
             image_encoder_was_already_on_gpu = True
 
-        if not image_encoder_was_already_on_gpu: # Only load if not already on GPU (e.g., by image_encode)
+        if not image_encoder_was_already_on_gpu: 
             if not high_vram:
                 if image_encoder: load_model_as_complete(image_encoder, target_device=target_img_enc_device)
             else:
@@ -335,7 +325,6 @@ def do_extension_work(
         input_video_first_frame_clip_output = hf_clip_vision_encode(input_image_np_for_clip, feature_extractor, image_encoder)
         input_video_first_frame_clip_embedding_cpu = input_video_first_frame_clip_output.last_hidden_state.cpu()
 
-        # --- Determine final CLIP embedding for sampling loop  ---
         final_clip_embedding_for_sampling_cpu = input_video_first_frame_clip_embedding_cpu.clone()
         if guidance_clip_embedding_cpu is not None and args.start_guidance_image_clip_weight > 0:
             print(f"Blending input video's first frame CLIP with guidance image CLIP (weight: {args.start_guidance_image_clip_weight})")
@@ -347,10 +336,8 @@ def do_extension_work(
         else:
             print("Using input video's first frame CLIP embedding for image conditioning (no guidance image or weight is 0).")
 
-        # Unload image_encoder if it was loaded here and not by image_encode or high_vram
         if not image_encoder_was_already_on_gpu:
             if not high_vram and image_encoder: unload_complete_models(image_encoder)
-        # If it was loaded by image_encode, image_encode itself handled its offloading (if not high_vram)
 
 
         target_transformer_device = str(gpu if torch.cuda.is_available() else cpu)
@@ -371,7 +358,6 @@ def do_extension_work(
         
         image_embeddings_for_sampling_loop = final_clip_embedding_for_sampling_cpu.to(device=cond_device, dtype=cond_dtype)
         
-        # This is the first VAE latent of the input video, for conditioning if no guidance image latent is used
         start_latent_from_input_video_gpu = start_latent_input_video_cpu.to(device=cond_device, dtype=torch.float32)
 
 
@@ -414,6 +400,10 @@ def do_extension_work(
 
         total_current_pixel_frames_count = history_pixels_decoded_cpu.shape[2] if history_pixels_decoded_cpu is not None else 0
         previous_video_path_for_cleanup = None
+        
+        initial_guidance_clip_weight = args.start_guidance_image_clip_weight
+        num_guidance_fade_sections = min(3, total_extension_latent_sections)
+
 
         for section_index in range(total_extension_latent_sections):
             print(f"--- F1 Extension: Seed {seed}: Section {section_index + 1}/{total_extension_latent_sections} ---")
@@ -429,56 +419,89 @@ def do_extension_work(
             pixel_frames_to_generate_this_step = latent_window_size * 4 - 3
             adjusted_latent_frames_for_output = (pixel_frames_to_generate_this_step + 3) // 4 
 
-            effective_clean_frames_count = max(0, num_clean_frames -1) if num_clean_frames > 1 else 0
-            effective_clean_frames_count = min(effective_clean_frames_count, available_latents_count_cpu - 2) if available_latents_count_cpu > 2 else 0
+            base_effective_clean_frames = max(0, args.num_clean_frames -1) if args.num_clean_frames > 1 else 0
             
-            num_2x_frames_count = min(2, max(0, available_latents_count_cpu - effective_clean_frames_count -1)) if available_latents_count_cpu > effective_clean_frames_count +1 else 0
-            num_4x_frames_count = min(16, max(0, available_latents_count_cpu - effective_clean_frames_count - num_2x_frames_count)) if available_latents_count_cpu > effective_clean_frames_count + num_2x_frames_count else 0
-            
-            total_context_latents_count = num_4x_frames_count + num_2x_frames_count + effective_clean_frames_count
-            total_context_latents_count = min(total_context_latents_count, available_latents_count_cpu)
+            effective_clean_frames_count_section = base_effective_clean_frames
+            effective_clean_frames_count_section = min(effective_clean_frames_count_section, max(0, available_latents_count_cpu - 1 - (2 if available_latents_count_cpu > 3 else 0) ))
 
-            indices_tensor_gpu = torch.arange(0, sum([1, num_4x_frames_count, num_2x_frames_count, effective_clean_frames_count, adjusted_latent_frames_for_output])).unsqueeze(0).to(cond_device)
+            num_2x_frames_count_section = min(2, max(0, available_latents_count_cpu - effective_clean_frames_count_section -1))
+            num_4x_frames_count_section = min(16, max(0, available_latents_count_cpu - effective_clean_frames_count_section - num_2x_frames_count_section -1))
+
+            if section_index == 0 and args.use_guidance_image_as_first_latent and guidance_latent_cpu is not None:
+                print("First section with guidance VAE: Forcing 0 historical clean/2x/4x frames from input video.")
+                effective_clean_frames_count_section = 0 
+                num_2x_frames_count_section = 0
+                num_4x_frames_count_section = 0
+            
+            print(f"Section {section_index+1}: Effective Context Counts: 1x={effective_clean_frames_count_section}, 2x={num_2x_frames_count_section}, 4x={num_4x_frames_count_section}")
+
+            total_context_latents_count = num_4x_frames_count_section + num_2x_frames_count_section + effective_clean_frames_count_section
+            total_context_latents_count = min(total_context_latents_count, available_latents_count_cpu)
+            
+            indices_tensor_gpu = torch.arange(0, sum([
+                1, 
+                num_4x_frames_count_section,
+                num_2x_frames_count_section,
+                effective_clean_frames_count_section,
+                adjusted_latent_frames_for_output 
+            ])).unsqueeze(0).to(cond_device)
             
             clean_latent_indices_start_gpu, \
             clean_latent_4x_indices_gpu, \
             clean_latent_2x_indices_gpu, \
             clean_latent_1x_indices_gpu, \
             latent_indices_for_denoising_gpu = indices_tensor_gpu.split(
-                [1, num_4x_frames_count, num_2x_frames_count, effective_clean_frames_count, adjusted_latent_frames_for_output], dim=1
+                [1, num_4x_frames_count_section, num_2x_frames_count_section, effective_clean_frames_count_section, adjusted_latent_frames_for_output], dim=1
             )
             clean_latent_indices_combined_gpu = torch.cat([clean_latent_indices_start_gpu, clean_latent_1x_indices_gpu], dim=1)
 
-            context_latents_for_split_cpu = history_latents_combined_cpu[:, :, -total_context_latents_count:, :, :] if total_context_latents_count > 0 else history_latents_combined_cpu[:,:,:1,:,:].clone() 
+            context_latents_for_split_cpu = history_latents_combined_cpu[:, :, -total_context_latents_count:, :, :] if total_context_latents_count > 0 else torch.empty((1,history_latents_combined_cpu.shape[1],0,height//8,width//8), dtype=torch.float32)
 
-            clean_latents_4x_gpu = torch.empty((1,16,0,height//8,width//8), device=cond_device, dtype=torch.float32) 
-            clean_latents_2x_gpu = torch.empty((1,16,0,height//8,width//8), device=cond_device, dtype=torch.float32)
-            clean_latents_1x_gpu = torch.empty((1,16,0,height//8,width//8), device=cond_device, dtype=torch.float32)
+            clean_latents_4x_gpu_data = torch.empty((1,history_latents_combined_cpu.shape[1],0,height//8,width//8), device=cond_device, dtype=torch.float32)
+            clean_latents_2x_gpu_data = torch.empty((1,history_latents_combined_cpu.shape[1],0,height//8,width//8), device=cond_device, dtype=torch.float32)
+            clean_latents_1x_gpu_data = torch.empty((1,history_latents_combined_cpu.shape[1],0,height//8,width//8), device=cond_device, dtype=torch.float32)
 
             current_offset_in_context_cpu = 0
-            if num_4x_frames_count > 0 and total_context_latents_count > 0:
-                slice_end = min(current_offset_in_context_cpu + num_4x_frames_count, context_latents_for_split_cpu.shape[2])
-                clean_latents_4x_gpu = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
-                current_offset_in_context_cpu += clean_latents_4x_gpu.shape[2]
+            if num_4x_frames_count_section > 0 and total_context_latents_count > 0 and current_offset_in_context_cpu < context_latents_for_split_cpu.shape[2]:
+                slice_end = min(current_offset_in_context_cpu + num_4x_frames_count_section, context_latents_for_split_cpu.shape[2])
+                clean_latents_4x_gpu_data = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
+                current_offset_in_context_cpu += clean_latents_4x_gpu_data.shape[2]
             
-            if num_2x_frames_count > 0 and current_offset_in_context_cpu < context_latents_for_split_cpu.shape[2]:
-                slice_end = min(current_offset_in_context_cpu + num_2x_frames_count, context_latents_for_split_cpu.shape[2])
-                clean_latents_2x_gpu = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
-                current_offset_in_context_cpu += clean_latents_2x_gpu.shape[2]
+            if num_2x_frames_count_section > 0 and total_context_latents_count > 0 and current_offset_in_context_cpu < context_latents_for_split_cpu.shape[2]:
+                slice_end = min(current_offset_in_context_cpu + num_2x_frames_count_section, context_latents_for_split_cpu.shape[2])
+                clean_latents_2x_gpu_data = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
+                current_offset_in_context_cpu += clean_latents_2x_gpu_data.shape[2]
 
-            if effective_clean_frames_count > 0 and current_offset_in_context_cpu < context_latents_for_split_cpu.shape[2]:
-                slice_end = min(current_offset_in_context_cpu + effective_clean_frames_count, context_latents_for_split_cpu.shape[2])
-                clean_latents_1x_gpu = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
+            if effective_clean_frames_count_section > 0 and total_context_latents_count > 0 and current_offset_in_context_cpu < context_latents_for_split_cpu.shape[2]:
+                slice_end = min(current_offset_in_context_cpu + effective_clean_frames_count_section, context_latents_for_split_cpu.shape[2])
+                clean_latents_1x_gpu_data = context_latents_for_split_cpu[:, :, current_offset_in_context_cpu:slice_end].to(device=cond_device, dtype=torch.float32)
             
-            # --- Determine the actual start_latent for this sampling iteration's clean_latents (NEW) ---
-            actual_start_latent_for_clean_latents_gpu = start_latent_from_input_video_gpu
-            if section_index == 0 and args.use_guidance_image_as_first_latent and guidance_latent_cpu is not None: # Accessing global args
+            actual_start_latent_for_clean_latents_gpu = start_latent_from_input_video_gpu 
+            if section_index == 0 and args.use_guidance_image_as_first_latent and guidance_latent_cpu is not None: 
                 print("Using guidance image VAE latent as the start_latent for the first generated segment.")
                 actual_start_latent_for_clean_latents_gpu = guidance_latent_cpu.to(device=cond_device, dtype=torch.float32)
-            elif section_index == 0: # First segment but no guidance latent or not requested
+            elif section_index == 0: 
                  print("Using input video's first VAE latent as start_latent for first generated segment.")
-
-            clean_latents_for_sampler_gpu = torch.cat([actual_start_latent_for_clean_latents_gpu, clean_latents_1x_gpu], dim=2)
+            
+            clean_latents_for_sampler_gpu = torch.cat([actual_start_latent_for_clean_latents_gpu, clean_latents_1x_gpu_data], dim=2)
+            
+            current_guidance_clip_weight = 0.0
+            if guidance_clip_embedding_cpu is not None and initial_guidance_clip_weight > 0:
+                if section_index < num_guidance_fade_sections:
+                    current_guidance_clip_weight = initial_guidance_clip_weight * (1.0 - (section_index / float(num_guidance_fade_sections)))
+                    print(f"Section {section_index+1}: Current guidance CLIP weight: {current_guidance_clip_weight:.2f}")
+                else:
+                    current_guidance_clip_weight = 0.0 
+                    print(f"Section {section_index+1}: Guidance CLIP weight faded to 0.")
+            
+            if current_guidance_clip_weight > 0 and guidance_clip_embedding_cpu is not None :
+                current_image_embeddings_for_sampling_cpu = \
+                    (1.0 - current_guidance_clip_weight) * input_video_first_frame_clip_embedding_cpu + \
+                    current_guidance_clip_weight * guidance_clip_embedding_cpu
+            else:
+                current_image_embeddings_for_sampling_cpu = input_video_first_frame_clip_embedding_cpu.clone()
+            
+            current_image_embeddings_for_sampling_gpu = current_image_embeddings_for_sampling_cpu.to(device=cond_device, dtype=cond_dtype)
             
             generated_latents_gpu_step = sample_hunyuan( 
                 transformer=transformer, sampler='unipc', width=width, height=height,
@@ -488,16 +511,14 @@ def do_extension_work(
                 prompt_embeds=llama_vec, prompt_embeds_mask=llama_attention_mask, prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n, negative_prompt_embeds_mask=llama_attention_mask_n, negative_prompt_poolers=clip_l_pooler_n,
                 device=cond_device, dtype=cond_dtype, 
-                # MODIFIED: Use the potentially blended image embedding
-                image_embeddings=image_embeddings_for_sampling_loop,
+                image_embeddings=current_image_embeddings_for_sampling_gpu, 
                 latent_indices=latent_indices_for_denoising_gpu, 
-                # MODIFIED: Uses clean_latents_for_sampler_gpu which has the potentially overridden start latent
                 clean_latents=clean_latents_for_sampler_gpu, 
                 clean_latent_indices=clean_latent_indices_combined_gpu,
-                clean_latents_2x=clean_latents_2x_gpu, 
-                clean_latent_2x_indices=clean_latent_2x_indices_gpu,
-                clean_latents_4x=clean_latents_4x_gpu, 
-                clean_latent_4x_indices=clean_latent_4x_indices_gpu,
+                clean_latents_2x=clean_latents_2x_gpu_data if num_2x_frames_count_section > 0 else None, 
+                clean_latent_2x_indices=clean_latent_2x_indices_gpu if num_2x_frames_count_section > 0 else None,
+                clean_latents_4x=clean_latents_4x_gpu_data if num_4x_frames_count_section > 0 else None, 
+                clean_latent_4x_indices=clean_latent_4x_indices_gpu if num_4x_frames_count_section > 0 else None,
                 callback=sampler_callback_cli,
             ) 
             if progress_bar_sampler: progress_bar_sampler.close()
@@ -539,14 +560,13 @@ def do_extension_work(
 
             if not high_vram: 
                 if vae: unload_complete_models(vae) 
-                # Reload transformer for next iteration if not high vram (original logic)
-                if transformer and not (section_index == total_extension_latent_sections - 1): # Don't reload on last section
+                if transformer and not (section_index == total_extension_latent_sections - 1): 
                      move_model_to_device_with_memory_preservation(transformer, target_device=target_transformer_device, preserved_memory_gb=gpu_memory_preservation)
     
             current_output_filename = os.path.join(outputs_folder, f'{job_id}_part{section_index + 1}_totalframes{history_pixels_decoded_cpu.shape[2]}.mp4')
             save_bcthw_as_mp4(history_pixels_decoded_cpu, current_output_filename, fps=fps, crf=mp4_crf)
             print(f"MP4 Preview for section {section_index + 1} saved: {current_output_filename}")
-            set_mp4_comments_imageio_ffmpeg(current_output_filename, f"Prompt: {prompt} | Neg: {n_prompt} | Seed: {seed}"); # Add guidance image info if desired
+            set_mp4_comments_imageio_ffmpeg(current_output_filename, f"Prompt: {prompt} | Neg: {n_prompt} | Seed: {seed}"); 
     
             if previous_video_path_for_cleanup is not None and os.path.exists(previous_video_path_for_cleanup):
                 try:
@@ -631,7 +651,7 @@ if __name__ == '__main__':
     print(f"Outputting extensions to: {outputs_folder}")
 
     free_mem_gb = get_cuda_free_memory_gb(gpu if torch.cuda.is_available() else None)
-    high_vram = free_mem_gb > 60 
+    high_vram = free_mem_gb > 100 
     print(f'Free VRAM {free_mem_gb:.2f} GB. High-VRAM Mode: {high_vram}')
 
     if args.vae_batch_size == -1: 
