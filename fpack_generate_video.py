@@ -1007,25 +1007,27 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         history_latents = torch.cat([history_latents, start_latent_0.cpu().float()], dim=2)
         
         history_pixels_for_preview_f1_cpu = None
-        if args.full_preview and args.preview_latent_every is not None:
+        # Initialize history_pixels_for_preview_f1_cpu with the decoded start_latent_0
+        # if full_preview is enabled. This happens *before* the section loop.
+        if args.full_preview and args.preview_latent_every is not None: # No section_index check here
             if vae is None:
                 logger.error("VAE not available for initial F1 preview setup.")
             else:
                 logger.info("F1 Full Preview: Decoding initial start_latent for preview history.")
                 vae.to(device)
                 initial_latent_for_preview = start_latent_0.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
-                # Assuming vae_decode returns BCTHW or CTHW. Ensure BCTHW for history_pixels.
                 decoded_initial = hunyuan.vae_decode(initial_latent_for_preview, vae).cpu()
                 if decoded_initial.ndim == 4: # CTHW
-                    history_pixels_for_preview_f1_cpu = decoded_initial.unsqueeze(0)
+                    history_pixels_for_preview_f1_cpu = decoded_initial.unsqueeze(0) # BCTHW
                 elif decoded_initial.ndim == 5: # BCTHW
                     history_pixels_for_preview_f1_cpu = decoded_initial
                 else:
                     logger.error(f"Unexpected dimensions from initial VAE decode: {decoded_initial.shape}")
+                    history_pixels_for_preview_f1_cpu = None # Ensure it's None if decode failed
                 vae.to("cpu")
                 clean_memory_on_device(device)
 
-        total_generated_latent_frames = 1 # Account for the initial start_latent_0 in history_latents
+        total_generated_latent_frames = 1
 
         if args.preview_latent_every and not args.full_preview: 
             previewer = LatentPreviewer(args, vae, None, gen_settings.device, compute_dtype, model_type="framepack")
@@ -1081,39 +1083,79 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             total_generated_latent_frames += newly_generated_latent_frames_count_this_step
 
             if args.preview_latent_every is not None and (section_index + 1) % args.preview_latent_every == 0:
-                if args.full_preview:
+                if args.full_preview: # This is the block we are modifying
                     logger.info(f"Saving full F1 preview at section {section_index + 1}")
                     if vae is None:
                         logger.error("VAE not available for full F1 preview.")
                     else:
                         preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index + 1}.mp4")
                         
-                        latents_this_step_for_decode = generated_latents_step.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
-                        
-                        vae.to(device)
-                        pixels_this_step_decoded_cpu = hunyuan.vae_decode(latents_this_step_for_decode, vae).cpu()
-                        vae.to("cpu")
-                        
-                        if pixels_this_step_decoded_cpu.ndim == 4: 
-                            pixels_this_step_decoded_cpu = pixels_this_step_decoded_cpu.unsqueeze(0)
+                        # Mimic f1_video_cli_local.py: decode a tail segment of the *total accumulated latents*
+                        # `history_latents` is on CPU and accumulates all latents: start_image_latent + section1_latents + ...
+                        num_latents_for_stitch_decode_preview = args.latent_window_size * 2 
+                        num_latents_for_stitch_decode_preview = min(num_latents_for_stitch_decode_preview, history_latents.shape[2])
 
-                        if history_pixels_for_preview_f1_cpu is None: 
-                            history_pixels_for_preview_f1_cpu = pixels_this_step_decoded_cpu
-                        else:
-                            overlap_pixels = args.latent_window_size * 4 - 3
-                            history_pixels_for_preview_f1_cpu = soft_append_bcthw(
-                                history_pixels_for_preview_f1_cpu,
-                                pixels_this_step_decoded_cpu,
-                                overlap=overlap_pixels
+                        if num_latents_for_stitch_decode_preview > 0:
+                            # Select the tail from the *total accumulated* latents for decoding this preview part
+                            latents_for_preview_stitch_gpu = history_latents[:, :, -num_latents_for_stitch_decode_preview:].to(
+                                device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16
                             )
+                            
+                            vae.to(device)
+                            pixels_for_preview_stitch_cpu = hunyuan.vae_decode(latents_for_preview_stitch_gpu, vae).cpu()
+                            vae.to("cpu")
+
+                            if pixels_for_preview_stitch_cpu.ndim == 4: # Should be CTHW from vae_decode
+                                pixels_for_preview_stitch_cpu = pixels_for_preview_stitch_cpu.unsqueeze(0) # Make it BCTHW
+                            
+                            if history_pixels_for_preview_f1_cpu is None:
+                                # This case is for the very first preview update (e.g. after section 0 generation).
+                                # The `history_pixels_for_preview_f1_cpu` should have been initialized with the decoded start_image.
+                                # If it's None here, it means the initial start_image decode didn't happen or this is the first section *being previewed*.
+                                if section_index == 0 or (args.preview_latent_every == 1 and section_index == 0) : # Check if it's truly the first previewable section
+                                     history_pixels_for_preview_f1_cpu = pixels_for_preview_stitch_cpu
+                                else: 
+                                    # This is an unexpected state if initial history was set up.
+                                    logger.warning("history_pixels_for_preview_f1_cpu was None unexpectedly after section 0; re-initializing with current stitch.")
+                                    history_pixels_for_preview_f1_cpu = pixels_for_preview_stitch_cpu
+                                            
+                            elif pixels_for_preview_stitch_cpu.shape[2] > 0: # Ensure the new decoded part has frames
+                                # `pixels_for_preview_stitch_cpu` now contains the new segment *plus* the overlapping tail from history.
+                                # `history_pixels_for_preview_f1_cpu` is everything up to the start of that overlap.
+                                
+                                overlap_pixels_for_preview_blend = args.latent_window_size * 4 - 3 
+                                actual_blend_overlap = min(overlap_pixels_for_preview_blend, 
+                                                           history_pixels_for_preview_f1_cpu.shape[2], 
+                                                           pixels_for_preview_stitch_cpu.shape[2]) 
+                                
+                                if actual_blend_overlap > 0:
+                                    history_pixels_for_preview_f1_cpu = soft_append_bcthw(
+                                        history_pixels_for_preview_f1_cpu,
+                                        pixels_for_preview_stitch_cpu, # This 'current' now starts with the overlap
+                                        overlap=actual_blend_overlap
+                                    )
+                                else: # Fallback to simple concatenation if no valid overlap
+                                    history_pixels_for_preview_f1_cpu = torch.cat(
+                                        [history_pixels_for_preview_f1_cpu, pixels_for_preview_stitch_cpu], dim=2
+                                    )
+                            
+                            if history_pixels_for_preview_f1_cpu is not None and history_pixels_for_preview_f1_cpu.shape[2] > 0:
+                                save_bcthw_as_mp4(history_pixels_for_preview_f1_cpu, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                                logger.info(f"Full F1 preview saved to {preview_filename_full}")
+                            else:
+                                logger.warning(f"Skipping F1 preview save at section {section_index + 1} due to empty or invalid pixel history.")
+                            
+                            # Clean up tensors specific to this preview update step
+                            del latents_for_preview_stitch_gpu
+                            if 'pixels_for_preview_stitch_cpu' in locals(): del pixels_for_preview_stitch_cpu
+                        else:
+                            logger.warning(f"Not enough latents for stitch decode at F1 preview section {section_index + 1}. Current preview not updated.")
                         
-                        save_bcthw_as_mp4(history_pixels_for_preview_f1_cpu, preview_filename_full, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
-                        logger.info(f"Full F1 preview saved to {preview_filename_full}")
-                        
-                        del latents_this_step_for_decode, pixels_this_step_decoded_cpu
                         clean_memory_on_device(device)
                 elif previewer is not None: 
                     logger.info(f"Previewing latents at F1 section {section_index + 1}")
+                    # `history_latents` is the full accumulation on CPU.
+                    # `total_generated_latent_frames` should reflect the current length of the *meaningful* part of `history_latents`
                     preview_latents_f1_for_pv = history_latents[:, :, -total_generated_latent_frames:, :, :].to(gen_settings.device)
                     previewer.preview(preview_latents_f1_for_pv, section_index, preview_suffix=args.preview_suffix)
                     del preview_latents_f1_for_pv
@@ -1142,20 +1184,35 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         # For standard mode (backward generation), the first chunk generated is the "end" of the video.
         # If end_latent is provided and previews are on, we should decode it to start the preview history.
         if args.full_preview and args.preview_latent_every is not None and end_latent is not None:
+            logger.info(f"Saving full preview at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
             if vae is None:
-                logger.error("VAE not available for initial Standard mode preview setup with end_latent.")
+                logger.error("VAE not available for full standard preview.")
             else:
-                logger.info("Standard Full Preview: Decoding initial end_latent for preview history.")
+                preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index_reverse + 1}.mp4")
+                
+                # Decode ONLY the latents processed in THIS step for the preview update
+                latents_this_step_for_decode = current_step_latents_cpu.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
+                
                 vae.to(device)
-                initial_latent_for_preview = end_latent.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
-                decoded_initial = hunyuan.vae_decode(initial_latent_for_preview, vae).cpu()
-                if decoded_initial.ndim == 4: # CTHW
-                    history_pixels_for_preview_std_cpu = decoded_initial.unsqueeze(0)
-                elif decoded_initial.ndim == 5: # BCTHW
-                    history_pixels_for_preview_std_cpu = decoded_initial
-                else:
-                    logger.error(f"Unexpected dimensions from initial VAE decode for end_latent: {decoded_initial.shape}")
+                current_section_pixels_decoded_cpu = hunyuan.vae_decode(latents_this_step_for_decode, vae).cpu()
                 vae.to("cpu")
+                if current_section_pixels_decoded_cpu.ndim == 4:
+                    current_section_pixels_decoded_cpu = current_section_pixels_decoded_cpu.unsqueeze(0)
+                if history_pixels_for_preview_std_cpu is None:
+                    # This is the first chunk generated (chronologically latest part of the video, or end_image decode)
+                    history_pixels_for_preview_std_cpu = current_section_pixels_decoded_cpu
+                elif current_section_pixels_decoded_cpu.shape[2] > 0 :
+                    # Prepend the new (earlier in time) segment
+                    history_pixels_for_preview_std_cpu = torch.cat(
+                        [current_section_pixels_decoded_cpu, history_pixels_for_preview_std_cpu], dim=2
+                    )
+                
+                if history_pixels_for_preview_std_cpu is not None and history_pixels_for_preview_std_cpu.shape[2] > 0:
+                    save_bcthw_as_mp4(history_pixels_for_preview_std_cpu, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                    logger.info(f"Full standard preview saved to {preview_filename_full_std}")
+                else:
+                    logger.warning(f"Skipping Standard mode preview save at section {section_index + 1} due to empty pixel history.")
+                del latents_this_step_for_decode, current_section_pixels_decoded_cpu
                 clean_memory_on_device(device)
 
 
@@ -1250,7 +1307,6 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             history_latents = torch.cat([generated_latents_step, history_latents], dim=2) # Prepend to full latent history
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
-
             if args.preview_latent_every is not None and (section_index_reverse + 1) % args.preview_latent_every == 0:
                 if args.full_preview:
                     logger.info(f"Saving full preview at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
@@ -1259,29 +1315,56 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                     else:
                         preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index_reverse + 1}.mp4")
                         
-                        latents_this_step_for_decode = current_step_latents_cpu.to(device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16)
-                        
-                        vae.to(device)
-                        pixels_this_step_decoded_cpu = hunyuan.vae_decode(latents_this_step_for_decode, vae).cpu()
-                        vae.to("cpu")
+                        # Determine the number of latent frames to decode for this preview stitch
+                        # is_last_section corresponds to the chronologically earliest part of the video
+                        num_latents_to_decode_for_stitch = (args.latent_window_size * 2 + 1) if is_last_section else (args.latent_window_size * 2)
+                        num_latents_to_decode_for_stitch = min(num_latents_to_decode_for_stitch, real_history_latents.shape[2])
 
-                        if pixels_this_step_decoded_cpu.ndim == 4:
-                            pixels_this_step_decoded_cpu = pixels_this_step_decoded_cpu.unsqueeze(0)
-
-                        if history_pixels_for_preview_std_cpu is None:
-                            history_pixels_for_preview_std_cpu = pixels_this_step_decoded_cpu
-                        else:
-                            overlap_pixels = args.latent_window_size * 4 - 3
-                            # Standard mode prepends, so new pixels are first arg for soft_append
-                            history_pixels_for_preview_std_cpu = soft_append_bcthw(
-                                pixels_this_step_decoded_cpu, 
-                                history_pixels_for_preview_std_cpu,
-                                overlap=overlap_pixels
+                        if num_latents_to_decode_for_stitch > 0:
+                            # Decode the relevant segment from the *beginning* of real_history_latents (chronologically earliest)
+                            latents_for_preview_decode_gpu = real_history_latents[:, :, :num_latents_to_decode_for_stitch].to(
+                                device, dtype=vae.dtype if hasattr(vae, 'dtype') else torch.float16
                             )
-                        
-                        save_bcthw_as_mp4(history_pixels_for_preview_std_cpu, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
-                        logger.info(f"Full standard preview saved to {preview_filename_full_std}")
-                        del latents_this_step_for_decode, pixels_this_step_decoded_cpu
+                            
+                            vae.to(device)
+                            pixels_decoded_for_preview_cpu = hunyuan.vae_decode(latents_for_preview_decode_gpu, vae).cpu()
+                            vae.to("cpu")
+
+                            if pixels_decoded_for_preview_cpu.ndim == 4: # Should be CTHW from vae_decode
+                                pixels_decoded_for_preview_cpu = pixels_decoded_for_preview_cpu.unsqueeze(0) # Make it BCTHW
+                            
+                            if history_pixels_for_preview_std_cpu is None:
+                                history_pixels_for_preview_std_cpu = pixels_decoded_for_preview_cpu
+                            elif pixels_decoded_for_preview_cpu.shape[2] > 0:
+                                overlap_pixels_for_preview_blend = args.latent_window_size * 4 - 3
+                                
+                                # pixels_decoded_for_preview_cpu is the NEW (chronologically EARLIER) segment
+                                # history_pixels_for_preview_std_cpu is the OLD (chronologically LATER) segment
+                                actual_blend_overlap = min(overlap_pixels_for_preview_blend, 
+                                                           pixels_decoded_for_preview_cpu.shape[2], 
+                                                           history_pixels_for_preview_std_cpu.shape[2])
+                                
+                                if actual_blend_overlap > 0:
+                                    history_pixels_for_preview_std_cpu = soft_append_bcthw(
+                                        pixels_decoded_for_preview_cpu,      # History for soft_append (chronologically earlier)
+                                        history_pixels_for_preview_std_cpu,  # Current for soft_append (chronologically later)
+                                        overlap=actual_blend_overlap
+                                    )
+                                else: # Fallback to simple concatenation if no valid overlap
+                                    history_pixels_for_preview_std_cpu = torch.cat(
+                                        [pixels_decoded_for_preview_cpu, history_pixels_for_preview_std_cpu], dim=2
+                                    )
+                            
+                            if history_pixels_for_preview_std_cpu is not None and history_pixels_for_preview_std_cpu.shape[2] > 0:
+                                save_bcthw_as_mp4(history_pixels_for_preview_std_cpu, preview_filename_full_std, fps=args.fps, crf=getattr(args, 'mp4_crf', 16))
+                                logger.info(f"Full standard preview saved to {preview_filename_full_std}")
+                            else:
+                                logger.warning(f"Skipping Standard mode preview save at section {section_index + 1} due to empty or invalid pixel history.")
+                            
+                            del latents_for_preview_decode_gpu
+                            if 'pixels_decoded_for_preview_cpu' in locals(): del pixels_decoded_for_preview_cpu
+                        else:
+                             logger.warning(f"Not enough latents for stitch decode at Standard mode preview section {section_index + 1}. Current preview not updated.")
                         clean_memory_on_device(device)
                 elif previewer is not None: 
                     logger.info(f"Previewing latents at standard section {section_index + 1} (Reverse Index {section_index_reverse})")
