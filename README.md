@@ -68,7 +68,7 @@ Here is an example prompt for a 5 second video with 4 sections using sectional p
 
 0:A cinematic video showcases a cute blue penguin wearing sunglasses. The penguin runs quickly into mcdonalds.;;;1:The penguin runs quickly into mcdonalds and jumps up on a table and starts eating his food. The penguin's name is Piplup he is a famous Pokemon actor. The video is a fast action sequence animation showing the penguin running into a mcdonalds an jumping up onto a table.;;;2:The penguin is seated at a table and is enjoying his happy meal. The penguin's name is Piplup he is a famous Pokemon actor. The video is a fast action sequence animation showing the penguin running into a mcdonalds and jumping up onto a table.;;;3:The penguin is seated at a table and is happily enjoying his happy meal. The penguin's name is Piplup he is a famous Pokemon actor. The penguin flexes his huge arm muscles at the end of the video.  
 
-I have added support for 4 sectional images during inference. It works best when the images are close together. Refer to the screen shot for an example of a working 5 second video.  
+I have added support for 4 sectional images during inference. It works best when the images are close together. Refer to the images/sectional.png for an example of a working 5 second video.  
 
 For more details on using framepack with musubi go here https://github.com/kohya-ss/musubi-tuner/blob/main/docs/framepack.md   
 
