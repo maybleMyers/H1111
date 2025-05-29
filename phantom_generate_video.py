@@ -856,24 +856,98 @@ def load_dit_model(
         logger.info(f"Loading Phantom DiT for S2V task from: {args.phantom_ckpt}")
         # Ensure S2V config has vae_z_dim, or default for in_channels
         vae_z_dim_s2v = getattr(config, 'vae_z_dim', 16) # Default to 16 if not in config
+        
+        # Get patch_size from config or default
+        s2v_patch_size = getattr(config, 'patch_size', (1,2,2))
+        
+        # Determine model_type for S2V
+        # Since S2V concatenates VAE latents and uses text CFG, 't2v' model_type is appropriate
+        # as it will use WanT2VCrossAttention and not expect CLIP image features directly.
+        s2v_model_type = "t2v"
+
         model = WanModel(
-            dim=config.dim, ffn_dim=config.ffn_dim, freq_dim=config.freq_dim,
-            num_heads=config.num_heads, num_layers=config.num_layers,
-            window_size=config.window_size, qk_norm=config.qk_norm,
-            cross_attn_norm=config.cross_attn_norm, eps=config.eps,
-            in_channels=vae_z_dim_s2v, # Match VAE output channels
-            out_channels=vae_z_dim_s2v, # Typically DiT input/output channels are same for this type
-            patch_size_t=getattr(config, 'patch_size', (1,2,2))[0],
+            model_type=s2v_model_type, # Explicitly set model_type
+            dim=config.dim, 
+            ffn_dim=config.ffn_dim, 
+            freq_dim=config.freq_dim,
+            num_heads=config.num_heads, 
+            num_layers=config.num_layers,
+            window_size=config.window_size, 
+            qk_norm=config.qk_norm,
+            cross_attn_norm=config.cross_attn_norm, 
+            eps=config.eps,
+            in_dim=vae_z_dim_s2v, # Changed from in_channels
+            out_dim=vae_z_dim_s2v, # Changed from out_channels
+            patch_size=s2v_patch_size, # Changed from patch_size_t and provide full tuple
             text_dim=getattr(config, 'text_dim', 4096),
             attn_mode=args.attn_mode,
-            fp8=False # FP8 optimization handled later
+            # add_ref_conv and in_dim_ref_conv will be handled by load_wan_model if this path merged
+            # For direct S2V init, if phantom model could have ref_conv, this needs to be detected from ckpt
+            # Assuming current phantom S2V doesn't use ref_conv as per subject2video.py init
+            add_ref_conv=False, 
         )
         if args.phantom_ckpt.endswith('.pth'):
             state = torch.load(args.phantom_ckpt, map_location=loading_device)
+            # Remove "model.diffusion_model." prefix if present, common in some checkpoints
+            # Also, subject2video.py loads state directly without this prefix.
+            # And WanModel in model.py doesn't have "model.diffusion_model." in its keys.
+            # So, if state from .pth has it, it should be removed.
+            # However, the provided subject2video.py loads it directly, so assume it's not needed for pth.
+            # If loading a general .pth, this might be needed:
+            # new_state_dict = {}
+            # for k, v in state.items():
+            #     if k.startswith("model.diffusion_model."):
+            #         new_state_dict[k[len("model.diffusion_model."):]] = v
+            #     else:
+            #         new_state_dict[k] = v
+            # state = new_state_dict
             model.load_state_dict(state, strict=False)
         elif args.phantom_ckpt.endswith('.safetensors'):
-            state = st_load_file(args.phantom_ckpt, device=loading_device)
-            model.load_state_dict(state, strict=False)
+            # Check if it's a sharded model index or a single file
+            if os.path.exists(args.phantom_ckpt + ".index.json"): # Sharded model
+                 logger.info(f"Loading sharded Phantom-Wan DiT from directory of: {args.phantom_ckpt}")
+                 from safetensors.torch import load_file
+                 import json
+                 def load_custom_sharded_weights(model_dir, base_name, device="cpu"):
+                     index_path = os.path.join(model_dir, f"{base_name}.safetensors.index.json")
+                     if not os.path.exists(index_path): # Try to find index file if base_name is full path
+                        model_dir_abs, base_name_file = os.path.split(base_name)
+                        index_path_alt = os.path.join(model_dir_abs, f"{os.path.splitext(base_name_file)[0]}.index.json")
+                        if os.path.exists(index_path_alt):
+                            index_path = index_path_alt
+                            logger.info(f"Found sharded index at: {index_path}")
+                        else:
+                             raise FileNotFoundError(f"Sharded index file not found at {index_path} or {index_path_alt}")
+
+                     with open(index_path, "r") as f:
+                         index_data = json.load(f)
+                     weight_map = index_data["weight_map"]
+                     shard_files = set(weight_map.values())
+                     state_dict = {}
+                     actual_model_dir = os.path.dirname(index_path) # Directory where shards are located
+                     for shard_file in shard_files:
+                         shard_path = os.path.join(actual_model_dir, shard_file)
+                         shard_state = load_file(shard_path, device=loading_device) 
+                         state_dict.update(shard_state)
+                     return state_dict
+                 
+                 ckpt_dir = os.path.dirname(args.phantom_ckpt)
+                 ckpt_basename = os.path.basename(args.phantom_ckpt)
+                 # Pass the full path of the .safetensors file as base_name, load_custom_sharded_weights will parse it
+                 state = load_custom_sharded_weights(ckpt_dir, args.phantom_ckpt, device=loading_device)
+
+            else: # Single safetensors file
+                 state = st_load_file(args.phantom_ckpt, device=loading_device)
+
+            # Remove "model.diffusion_model." prefix (same logic as .pth, but less common for safetensors)
+            # new_state_dict = {}
+            # for k, v in state.items():
+            #     if k.startswith("model.diffusion_model."):
+            #         new_state_dict[k[len("model.diffusion_model."):]] = v
+            #     else:
+            #         new_state_dict[k] = v
+            # state = new_state_dict
+            model.load_state_dict(state, strict=False) # Use strict=False initially
         else:
             raise ValueError(f"Unsupported Phantom-Wan checkpoint format: {args.phantom_ckpt}. Must be .pth or .safetensors.")
         logger.info("Phantom DiT model loaded.")
@@ -1558,6 +1632,35 @@ def prepare_s2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 # ========================================================================= #
 
 # --- V2V Helper Functions ---
+# Helper function (copied from generate.py and adapted)
+def load_ref_images_for_s2v(paths_str: str, target_size_wh: Tuple[int, int]) -> List[Image.Image]:
+    """Load, resize, and pad reference images for S2V task."""
+    w, h = target_size_wh # target_size_wh is (width, height)
+    ref_paths = paths_str.split(",")
+    ref_images_pil = []
+    for image_path in ref_paths:
+        if not os.path.exists(image_path):
+            logger.error(f"Reference image path not found: {image_path}")
+            # Consider raising an error or skipping gracefully
+            raise FileNotFoundError(f"Reference image path not found: {image_path}")
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            img_ratio = img.width / img.height
+            target_ratio = w / h
+
+            if img_ratio > target_ratio:  # Image is wider than target
+                new_width = w; new_height = max(1, int(new_width / img_ratio))
+            else:  # Image is taller than target or same ratio
+                new_height = h; new_width = max(1, int(new_height * img_ratio))
+
+            img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            delta_w = w - img_resized.width
+            delta_h = h - img_resized.height
+            padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+            new_img = ImageOps.expand(img_resized, padding, fill=(255, 255, 255)) # White padding
+            ref_images_pil.append(new_img)
+    if not ref_images_pil: raise ValueError(f"No valid reference images loaded from: {paths_str}")
+    return ref_images_pil
 
 def load_video(video_path, start_frame=0, num_frames=None, bucket_reso=(256, 256)):
     """Load video frames and resize them to the target resolution for V2V.
@@ -2834,32 +2937,3 @@ if __name__ == "__main__":
     main()
 
 
-# Helper function (copied from generate.py and adapted)
-def load_ref_images_for_s2v(paths_str: str, target_size_wh: Tuple[int, int]) -> List[Image.Image]:
-    """Load, resize, and pad reference images for S2V task."""
-    w, h = target_size_wh # target_size_wh is (width, height)
-    ref_paths = paths_str.split(",")
-    ref_images_pil = []
-    for image_path in ref_paths:
-        if not os.path.exists(image_path):
-            logger.error(f"Reference image path not found: {image_path}")
-            # Consider raising an error or skipping gracefully
-            raise FileNotFoundError(f"Reference image path not found: {image_path}")
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            img_ratio = img.width / img.height
-            target_ratio = w / h
-
-            if img_ratio > target_ratio:  # Image is wider than target
-                new_width = w; new_height = max(1, int(new_width / img_ratio))
-            else:  # Image is taller than target or same ratio
-                new_height = h; new_width = max(1, int(new_height * img_ratio))
-
-            img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            delta_w = w - img_resized.width
-            delta_h = h - img_resized.height
-            padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
-            new_img = ImageOps.expand(img_resized, padding, fill=(255, 255, 255)) # White padding
-            ref_images_pil.append(new_img)
-    if not ref_images_pil: raise ValueError(f"No valid reference images loaded from: {paths_str}")
-    return ref_images_pil
