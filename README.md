@@ -2,7 +2,7 @@
 
 # Recent update
 5/30/2025
-    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab.  
+    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.  
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 5/24/2025  
@@ -167,7 +167,7 @@ ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog
 5/30/2025
-    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab.  
+    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.    
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 5/24/2025  
