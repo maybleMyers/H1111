@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+5/30/2025
+    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab.  
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 5/24/2025  
@@ -164,6 +166,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog
+5/30/2025
+    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab.  
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 5/24/2025  

@@ -23,6 +23,7 @@ logger = BlissfulLogger(__name__, "#8e00ed")
 class LatentPreviewer():
     @torch.inference_mode()
     def __init__(self, args, original_latents, timesteps, device, dtype, model_type="hunyuan"):
+        #print(f"DEBUG LATENT_PREVIEW.PY: LatentPreviewer __init__ called from file: {__file__}")
         self.mode = "latent2rgb" if not hasattr(args, 'preview_vae') or args.preview_vae is None else "taehv"
         ##logger.info(f"Initializing latent previewer with mode {self.mode}...")
         # Correctly handle framepack - it should subtract noise like others unless specifically told otherwise
@@ -62,45 +63,87 @@ class LatentPreviewer():
 
 
     @torch.inference_mode()
-    def preview(self, noisy_latents, current_step=None, preview_suffix=None):
-        if self.device == "cuda" or self.device == torch.device("cuda"):
-            torch.cuda.empty_cache()
-        if self.model_type == "wan":
-            noisy_latents = noisy_latents.unsqueeze(0)  # F, C, H, W -> B, F, C, H, W
-        elif self.model_type == "hunyuan" or self.model_type == "framepack": # Handle framepack like hunyuan
-            pass  # already B, F, C, H, W or expected format B, C, T, H, W
+    def write_preview(self, frames, width, height, preview_suffix=None):
+        suffix_str = f"_{preview_suffix}" if preview_suffix else ""
+        base_name = f"latent_preview{suffix_str}" # This is correct for the filename itself
+
+        preview_dir = os.path.join(self.args.save_path, "previews")
+        os.makedirs(preview_dir, exist_ok=True)
+
+        target = os.path.join(preview_dir, f"{base_name}.mp4")
+        target_img = os.path.join(preview_dir, f"{base_name}.png")
         
-        # Check dimensions for framepack - it might be B,C,T,H,W not B,F,C,H,W
-        if self.model_type == "framepack" and noisy_latents.ndim == 5: # B,C,T,H,W
-             # Ensure latent shape is B, F, C, H, W for consistent processing below if needed
-             # If decoder expects B,C,T,H,W, this permute might be wrong. Check decoder.
-             # Assuming decoder handles B,C,T,H,W for framepack's latent2rgb
-             pass # Keep as B, C, T, H, W if latent2rgb handles it
+        logger.info(f"LatentPreviewer.write_preview: Input frames shape: {frames.shape}, dtype: {frames.dtype}, device: {frames.device}")
+        logger.info(f"LatentPreviewer.write_preview: Target width={width}, height={height}, fps={self.fps}")
+
+
+        # Check if we only have a single frame.
+        if frames.shape[0] == 1:
+            logger.info(f"LatentPreviewer.write_preview: Saving single frame to {target_img}")
+            try:
+                # Clamp, scale, convert to byte and move to CPU
+                frame = frames[0].clamp(0, 1).mul(255).byte().cpu()
+                # Permute from (3, H, W) to (H, W, 3) for PIL.
+                frame_np = frame.permute(1, 2, 0).numpy()
+                Image.fromarray(frame_np).save(target_img)
+                logger.info(f"LatentPreviewer: Successfully saved single frame preview to {target_img}")
+            except Exception as e:
+                logger.error(f"LatentPreviewer: Error saving single frame preview to {target_img}: {e}", exc_info=True)
+            return
+
+        # Otherwise, write out as a video.
+        output_fps = max(1, self.fps)
+        logger.info(f"LatentPreviewer.write_preview: Attempting to write MP4 video to {target} at {output_fps} FPS with {frames.shape[0]} frames.")
         
-        # Apply subtraction only if enabled AND necessary inputs are available
-        if self.subtract_noise and hasattr(self, 'original_latents') and hasattr(self, 'timesteps_percent') and current_step is not None:
-             denoisy_latents = self.subtract_original_and_normalize(noisy_latents, current_step)
-        else:
-             # If not subtracting, maybe still normalize? Depends on desired preview quality.
-             # For now, just pass through if subtraction isn't happening.
-             denoisy_latents = noisy_latents
+        container = None # Initialize for finally block
+        try:
+            container = av.open(target, mode="w")
+            stream = container.add_stream("libx264", rate=output_fps) 
+            stream.pix_fmt = "yuv420p"
+            stream.width = width
+            stream.height = height
+            stream.options = {'crf': '23', 'preset': 'fast'} # Reasonable defaults
 
+            #logger.info(f"LatentPreviewer: AV container opened for {target}. Stream options: {stream.options}")
 
-        decoded = self.decoder(denoisy_latents)  # Expects F, C, H, W output from decoder
+            for frame_idx, frame_tensor in enumerate(frames): # Renamed 'frame' to 'frame_tensor'
+                #logger.debug(f"LatentPreviewer: Processing frame {frame_idx+1}/{frames.shape[0]}")
+                # Clamp to [0,1], scale, convert to byte and move to CPU.
+                frame_processed = frame_tensor.clamp(0, 1).mul(255).byte().cpu()
+                # Permute from (3, H, W) -> (H, W, 3) for AV.
+                frame_np = frame_processed.permute(1, 2, 0).numpy()
+                
+                if not frame_np.flags['C_CONTIGUOUS']: # Ensure C-contiguous
+                    frame_np = np.ascontiguousarray(frame_np)
 
-        # Upscale if we used latent2rgb so output is same size as expected
-        if self.scale_factor is not None:
-            upscaled = torch.nn.functional.interpolate(
-                decoded,
-                scale_factor=self.scale_factor,
-                mode="bicubic",
-                align_corners=False
-            )
-        else:
-            upscaled = decoded
+                try:
+                    video_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+                    for packet in stream.encode(video_frame):
+                        container.mux(packet)
+                except Exception as e_encode:
+                     logger.error(f"LatentPreviewer: Error encoding frame {frame_idx} for {target}: {e_encode}", exc_info=True)
+                     break # Stop trying to encode if one frame fails critically
 
-        _, _, h, w = upscaled.shape
-        self.write_preview(upscaled, w, h, preview_suffix=preview_suffix)
+            # Flush out any remaining packets and close.
+            #logger.info(f"LatentPreviewer: Flushing stream for {target}")
+            for packet in stream.encode(): # Flush stream
+                container.mux(packet)
+            
+            container.close() # Close container
+            container = None # Indicate successful close
+            logger.info(f"LatentPreviewer: Successfully finished writing preview video: {target}")
+            if not os.path.exists(target) or os.path.getsize(target) == 0:
+                logger.error(f"LatentPreviewer: Video file {target} was NOT created or is empty after closing.")
+
+        except Exception as e_container:
+            logger.error(f"LatentPreviewer: Error opening/writing MP4 container {target}: {e_container}", exc_info=True)
+        finally:
+            if container is not None: # If container was opened but not closed due to error
+                try:
+                    logger.warning(f"LatentPreviewer: Closing container for {target} in finally block due to earlier error.")
+                    container.close()
+                except Exception as e_close_finally:
+                    logger.error(f"LatentPreviewer: Error closing container in finally block for {target}: {e_close_finally}", exc_info=True)
 
     @torch.inference_mode()
     def subtract_original_and_normalize(self, noisy_latents, current_step):
@@ -119,63 +162,61 @@ class LatentPreviewer():
         return normalized_denoisy_latents
 
     @torch.inference_mode()
-    def write_preview(self, frames, width, height, preview_suffix=None):
-        suffix_str = f"_{preview_suffix}" if preview_suffix else ""
-        base_name = f"latent_preview{suffix_str}"
-        target = os.path.join(self.args.save_path, f"{base_name}.mp4")
-        target_img = os.path.join(self.args.save_path, f"{base_name}.png")
-        # Check if we only have a single frame.
-        if frames.shape[0] == 1:
-            # Clamp, scale, convert to byte and move to CPU
-            frame = frames[0].clamp(0, 1).mul(255).byte().cpu()
-            # Permute from (3, H, W) to (H, W, 3) for PIL.
-            frame_np = frame.permute(1, 2, 0).numpy()
-            Image.fromarray(frame_np).save(target_img)
-            #logger.info(f"Saved single frame preview to {target_img}") # Add log
-            return
+    def preview(self, noisy_latents, current_step=None, preview_suffix=None): # CORRECTED METHOD NAME
+        # noisy_latents is input [C, F_input, H, W]
+        # self.original_latents is stored [C, F_orig, H, W]
 
-        # Otherwise, write out as a video.
-        # Make sure fps is at least 1
-        output_fps = max(1, self.fps)
-        #logger.info(f"Writing preview video to {target} at {output_fps} FPS") # Add log
-        try:
-            container = av.open(target, mode="w")
-            stream = container.add_stream("libx264", rate=output_fps) # Use output_fps
-            stream.pix_fmt = "yuv420p"
-            stream.width = width
-            stream.height = height
-            # Add option for higher quality preview encoding if needed
-            # stream.options = {'crf': '18'} # Example: Lower CRF = higher quality
+        if self.device == "cuda" or self.device == torch.device("cuda"):
+            torch.cuda.empty_cache()
+        
+        processed_noisy_latents = noisy_latents # Placeholder for now, original logic was complex
+        # The complex logic from the previous attempt to unsqueeze/trim noisy_latents
+        # can be simplified or re-evaluated once this basic naming error is fixed.
+        # For now, let's assume noisy_latents arrives in the correct shape from run_sampling.
+        # The primary goal here is to fix the AttributeError.
 
-            # Loop through each frame.
-            for frame_idx, frame in enumerate(frames):
-                # Clamp to [0,1], scale, convert to byte and move to CPU.
-                frame = frame.clamp(0, 1).mul(255).byte().cpu()
-                # Permute from (3, H, W) -> (H, W, 3) for AV.
-                frame_np = frame.permute(1, 2, 0).numpy()
-                try:
-                    video_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
-                    for packet in stream.encode(video_frame):
-                        container.mux(packet)
-                except Exception as e:
-                     logger.error(f"Error encoding frame {frame_idx}: {e}")
-                     # Optionally break or continue if one frame fails
-                     break
+        if noisy_latents.ndim == 4: # Expecting [C,F,H,W] from run_sampling
+            processed_noisy_latents = noisy_latents.unsqueeze(0) # Add batch for subtract
+        elif noisy_latents.ndim == 5: # Already [B,C,F,H,W]
+            processed_noisy_latents = noisy_latents
+        else:
+            logger.error(f"LatentPreviewer.preview: noisy_latents has unexpected ndim {noisy_latents.ndim}.")
+            return # Don't proceed if shape is wrong
+
+        # Apply subtraction only if enabled AND necessary inputs are available
+        if self.subtract_noise and hasattr(self, 'original_latents') and hasattr(self, 'timesteps_percent') and current_step is not None:
+            # Defensive check for S2V-like temporal dimension mismatch before subtraction
+            if processed_noisy_latents.shape[2] > self.original_latents.shape[1] and \
+               self.model_type == "wan": 
+                num_extra_frames = processed_noisy_latents.shape[2] - self.original_latents.shape[1]
+                logger.warning(
+                    f"LatentPreviewer.preview: Trimming {num_extra_frames} frames from processed_noisy_latents (F={processed_noisy_latents.shape[2]}) "
+                    f"to match self.original_latents (F={self.original_latents.shape[1]}) for S2V-like preview."
+                )
+                processed_noisy_latents_for_sub = processed_noisy_latents[:, :, :-num_extra_frames, :, :]
+            else:
+                processed_noisy_latents_for_sub = processed_noisy_latents
+            
+            denoisy_latents = self.subtract_original_and_normalize(processed_noisy_latents_for_sub, current_step)
+        else:
+            denoisy_latents = processed_noisy_latents
 
 
-            # Flush out any remaining packets and close.
-            try:
-                for packet in stream.encode():
-                    container.mux(packet)
-                container.close()
-                #logger.info(f"Finished writing preview video: {target}") # Add log
-            except Exception as e:
-                 logger.error(f"Error finalizing preview video: {e}")
-                 # Clean up container if possible
-                 try: container.close()
-                 except: pass
-        except Exception as e:
-            logger.error(f"Error opening or writing to preview container {target}: {e}")
+        decoded = self.decoder(denoisy_latents)  # Expects F, C, H, W output from decoder
+
+        # Upscale if we used latent2rgb so output is same size as expected
+        if self.scale_factor is not None:
+            upscaled = torch.nn.functional.interpolate(
+                decoded,
+                scale_factor=self.scale_factor,
+                mode="bicubic",
+                align_corners=False
+            )
+        else:
+            upscaled = decoded
+
+        _, _, h, w = upscaled.shape # This gets H, W of the *pixel* space frames
+        self.write_preview(upscaled, w, h, preview_suffix=preview_suffix)
 
     @torch.inference_mode()
     def decode_taehv(self, latents):

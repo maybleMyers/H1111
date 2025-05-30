@@ -1088,10 +1088,9 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                     if vae is None:
                         logger.error("VAE not available for full F1 preview.")
                     else:
-                        preview_filename_full = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index + 1}.mp4")
-                        
-                        # Mimic f1_video_cli_local.py: decode a tail segment of the *total accumulated latents*
-                        # `history_latents` is on CPU and accumulates all latents: start_image_latent + section1_latents + ...
+                        preview_dir = os.path.join(args.save_path, "previews")
+                        os.makedirs(preview_dir, exist_ok=True)
+                        preview_filename_full = os.path.join(preview_dir, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index + 1}.mp4")                        
                         num_latents_for_stitch_decode_preview = args.latent_window_size * 2 
                         num_latents_for_stitch_decode_preview = min(num_latents_for_stitch_decode_preview, history_latents.shape[2])
 
@@ -1313,10 +1312,9 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
                     if vae is None:
                         logger.error("VAE not available for full standard preview.")
                     else:
-                        preview_filename_full_std = os.path.join(args.save_path, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index_reverse + 1}.mp4")
-                        
-                        # Determine the number of latent frames to decode for this preview stitch
-                        # is_last_section corresponds to the chronologically earliest part of the video
+                        preview_dir_std = os.path.join(args.save_path, "previews")
+                        os.makedirs(preview_dir_std, exist_ok=True)
+                        preview_filename_full_std = os.path.join(preview_dir_std, f"latent_preview_{args.preview_suffix if args.preview_suffix else section_index_reverse + 1}.mp4")
                         num_latents_to_decode_for_stitch = (args.latent_window_size * 2 + 1) if is_last_section else (args.latent_window_size * 2)
                         num_latents_to_decode_for_stitch = min(num_latents_to_decode_for_stitch, real_history_latents.shape[2])
 

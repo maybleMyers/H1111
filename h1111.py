@@ -43,6 +43,436 @@ def refresh_lora_dropdowns_simple(lora_folder: str) -> List[gr.update]:
             gr.update(value=1.0) # Reset multiplier
         ])
     return results
+def _extract_path_from_gallery_item(item: Any) -> Optional[str]:
+    """
+    Helper to extract a string file path from various Gradio component item formats.
+    Verifies that the extracted path exists.
+    """
+    path_to_check = None
+    if isinstance(item, str):
+        path_to_check = item
+    elif isinstance(item, Path):
+        path_to_check = str(item)
+    elif isinstance(item, tuple) and len(item) > 0:
+        path_obj_in_tuple = item[0]
+        if isinstance(path_obj_in_tuple, str):
+            path_to_check = path_obj_in_tuple
+        elif isinstance(path_obj_in_tuple, Path):
+            path_to_check = str(path_obj_in_tuple)
+    elif hasattr(item, 'name'): 
+        name_attr = getattr(item, 'name', None)
+        if isinstance(name_attr, str):
+            path_to_check = name_attr
+        elif isinstance(name_attr, Path):
+            path_to_check = str(name_attr)
+
+    if path_to_check and os.path.exists(path_to_check):
+        return os.path.abspath(path_to_check)
+    else:
+        print(f"DEBUG _extract_path_from_gallery_item: Could not get valid path from {repr(item)} or path '{path_to_check}' does not exist.")
+    return None
+
+def combine_image_sets(current_gallery_value: Optional[List[Any]],
+                       newly_uploaded_paths_from_button: Optional[List[str]]) -> List[str]:
+    all_valid_paths = []
+    if current_gallery_value:
+        for item in current_gallery_value:
+            path = _extract_path_from_gallery_item(item)
+            if path:
+                all_valid_paths.append(path)
+    if newly_uploaded_paths_from_button:
+        for path_str in newly_uploaded_paths_from_button:
+            if isinstance(path_str, str) and os.path.exists(path_str):
+                all_valid_paths.append(os.path.abspath(path_str))
+
+    unique_final_paths = []
+    seen_paths = set()
+    for path in all_valid_paths:
+        if path not in seen_paths:
+            unique_final_paths.append(path)
+            seen_paths.add(path)
+    return unique_final_paths
+
+def phantom_generate_video(
+    prompt_text: str,
+    negative_prompt_text: str,
+    input_images_list: List[str], # List of file paths
+    width_val: int,
+    height_val: int,
+    video_length_frames: int,
+    fps_val: int,
+    infer_steps_val: int,
+    flow_shift_val: float,
+    # S2V specific guidance scales for Phantom
+    guide_scale_img_val: float,
+    guide_scale_text_val: float,
+    # Main CFG scale (might not be used by S2V if its CFG is hardcoded or different)
+    cfg_scale_main_val: float,
+    seed_val: int,
+    task_str: str, # Should be an S2V task
+    dit_folder_str: str, # Folder for DiT
+    phantom_dit_model_path: str, # Specific Phantom DiT path (--phantom_ckpt in script)
+    vae_path_str: str,
+    t5_path_str: str,
+    # clip_path_str: str, # CLIP not directly used for S2V image features
+    save_path_str: str,
+    output_type_str: str,
+    sample_solver_str: str,
+    attn_mode_str: str,
+    block_swap_val: int,
+    fp8_val: bool,
+    fp8_scaled_val: bool,
+    fp8_t5_val: bool,
+    lora_folder_str: str,
+    slg_layers_str: str,
+    slg_start_val: float,
+    slg_end_val: float,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    enable_cfg_skip_val: bool,
+    cfg_skip_mode_str: str,
+    cfg_apply_ratio_val: float,
+    enable_preview_val: bool,
+    preview_steps_val: int
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    videos_gallery = []
+    previews_gallery = []
+    status_text_update = "Preparing Phantom generation..."
+    progress_text_update = ""
+    yield videos_gallery, previews_gallery, status_text_update, progress_text_update
+
+    if not input_images_list:
+        yield [], [], "Error: No input images provided for Phantom.", "Please select reference images."
+        return
+
+    ref_images_arg_str = ",".join(input_images_list) # Join paths with comma for --ref_images
+
+    current_seed = seed_val
+    if seed_val == -1:
+        current_seed = random.randint(0, 2**32 - 1)
+
+    # Construct path to the Phantom DiT model
+    # The `phantom_dit_model_path` is already the full path or filename from the dropdown
+    # If it's just a filename, `dit_folder_str` is used to prefix it.
+    actual_phantom_dit_path = os.path.join(dit_folder_str, phantom_dit_model_path) \
+        if not os.path.isabs(phantom_dit_model_path) and dit_folder_str \
+        else phantom_dit_model_path
+
+    if not os.path.exists(actual_phantom_dit_path):
+        yield [], [], f"Error: Phantom DiT model not found at {actual_phantom_dit_path}", ""
+        return
+
+
+    # Prepare environment and command
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    clear_cuda_cache()
+
+    run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    unique_preview_suffix = f"phantom_{run_id}"
+
+    command = [
+        sys.executable,
+        "phantom_generate_video.py", # We're using the multi-purpose script
+        "--task", str(task_str), # e.g., "s2v-14B"
+        "--prompt", str(prompt_text),
+        "--video_size", str(height_val), str(width_val),
+        "--video_length", str(video_length_frames),
+        "--fps", str(fps_val),
+        "--infer_steps", str(infer_steps_val),
+        "--save_path", str(save_path_str),
+        "--seed", str(current_seed),
+        "--flow_shift", str(flow_shift_val),
+        # S2V uses specific guidance scales
+        "--guide_scale_img", str(guide_scale_img_val),
+        "--guide_scale_text", str(guide_scale_text_val),
+        # Pass the main CFG scale (script might use it or S2V logic might override)
+        "--guidance_scale", str(cfg_scale_main_val),
+        "--output_type", str(output_type_str),
+        "--sample_solver", str(sample_solver_str),
+        "--attn_mode", str(attn_mode_str),
+        "--blocks_to_swap", str(block_swap_val),
+        # Model paths
+        "--phantom_ckpt", str(actual_phantom_dit_path), # Pass Phantom DiT here
+        "--vae", str(vae_path_str),
+        "--t5", str(t5_path_str),
+        # "--clip", str(clip_path_str), # CLIP not typically used for S2V image features
+        # Reference images for S2V
+        "--ref_images", ref_images_arg_str,
+    ]
+
+    if negative_prompt_text:
+        command.extend(["--negative_prompt", str(negative_prompt_text)])
+    if fp8_val: command.append("--fp8")
+    if fp8_scaled_val: command.append("--fp8_scaled")
+    if fp8_t5_val: command.append("--fp8_t5")
+
+    if slg_layers_str and str(slg_layers_str).strip() and str(slg_layers_str).lower() != "none":
+        command.extend(["--slg_layers", str(slg_layers_str).strip()])
+        if slg_start_val is not None: command.extend(["--slg_start", str(slg_start_val)])
+        if slg_end_val is not None: command.extend(["--slg_end", str(slg_end_val)])
+
+    # LoRAs
+    valid_loras_paths = []
+    valid_loras_mults_str = []
+    lora_inputs = [
+        (lora1_str, lora1_mult), (lora2_str, lora2_mult),
+        (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+    ]
+    if lora_folder_str and os.path.exists(lora_folder_str):
+        for name, mult in lora_inputs:
+            if name and name != "None":
+                path = os.path.join(lora_folder_str, name)
+                if os.path.exists(path):
+                    valid_loras_paths.append(path)
+                    valid_loras_mults_str.append(str(mult))
+                else:
+                    print(f"Warning: LoRA file not found: {path}")
+    if valid_loras_paths:
+        command.extend(["--lora_weight"] + valid_loras_paths)
+        command.extend(["--lora_multiplier"] + valid_loras_mults_str)
+
+    if enable_cfg_skip_val and cfg_skip_mode_str != "none":
+        command.extend(["--cfg_skip_mode", str(cfg_skip_mode_str)])
+        command.extend(["--cfg_apply_ratio", str(cfg_apply_ratio_val)])
+
+    if enable_preview_val and preview_steps_val > 0:
+        command.extend(["--preview", str(preview_steps_val)])
+        command.extend(["--preview_suffix", unique_preview_suffix])
+
+    command_str_list = [str(item) for item in command]
+    print(f"Running Phantom Command: {' '.join(command_str_list)}")
+
+    process = subprocess.Popen(
+        command_str_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, text=True, encoding='utf-8', errors='replace', bufsize=1
+    )
+
+    # --- Preview file paths based on unique_preview_suffix ---
+    preview_base_dir = os.path.join(save_path_str, "previews") # Script saves previews here
+    preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+    preview_png_glob_pattern = os.path.join(preview_base_dir, f"latent_preview_step_*_{unique_preview_suffix}.png")
+
+    last_preview_mtime = 0
+    current_preview_yield_list = [] # Store paths of previews to yield
+
+    current_video_file_for_item = None
+    status_text_update = f"Processing Phantom (Seed: {current_seed})"
+
+    for line in iter(process.stdout.readline, ''):
+        if stop_event.is_set():
+            try: process.terminate(); process.wait(timeout=5)
+            except: process.kill(); process.wait()
+            yield videos_gallery, [], "Generation stopped by user.", ""
+            return
+
+        line_strip = line.strip()
+        if not line_strip: continue
+        print(f"PHANTOM_SUBPROCESS: {line_strip}")
+        progress_text_update = line_strip
+
+        tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+        video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip) # Common save message
+
+        if tqdm_match:
+            percentage = tqdm_match.group(1)
+            steps_iter = tqdm_match.group(2)
+            time_elapsed = tqdm_match.group(3)
+            time_remaining = tqdm_match.group(4)
+            progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+            status_text_update = f"Phantom Denoising (Seed: {current_seed})"
+
+        elif video_saved_match:
+            found_path = video_saved_match.group(1).strip()
+            if os.path.exists(found_path):
+                current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text_update = f"Phantom Saved (Seed: {current_seed})"
+            else:
+                print(f"Warning: Video path from log not found: {found_path}")
+
+        # Preview handling (similar to WanX-i2v)
+        preview_updated_this_line = False
+        if enable_preview_val:
+            # Check MP4 (full video preview from script)
+            if os.path.exists(preview_mp4_gen_path):
+                current_mtime_mp4 = os.path.getmtime(preview_mp4_gen_path)
+                if current_mtime_mp4 > last_preview_mtime:
+                    current_preview_yield_list = [preview_mp4_gen_path] # Replace list with MP4
+                    last_preview_mtime = current_mtime_mp4
+                    preview_updated_this_line = True
+                    print(f"DEBUG Phantom: MP4 Preview updated - {preview_mp4_gen_path}")
+
+            # Check PNGs (step previews) - only if MP4 wasn't updated this line
+            if not preview_updated_this_line:
+                # This part is tricky because many PNGs can be generated.
+                # We want to show the *latest* set of step previews.
+                # A simpler approach for Gradio Gallery is to show the MP4 if available,
+                # or a single latest PNG. Let's stick to the MP4 from wan_generate_video.py for now
+                # as it's more straightforward. If the script only outputs PNGs, this needs rework.
+                # Assuming `--preview` in wan_generate_video.py generates an MP4.
+                # If it generates PNGs, we might need to glob and sort them.
+                # For now, `current_preview_yield_list` is primarily for the MP4.
+                pass
+
+        yield videos_gallery, current_preview_yield_list, status_text_update, progress_text_update
+
+    process.stdout.close()
+    return_code = process.wait()
+    clear_cuda_cache()
+
+    if return_code == 0 and current_video_file_for_item and os.path.exists(current_video_file_for_item):
+        videos_gallery.append((current_video_file_for_item, f"Phantom - Seed: {current_seed}"))
+        status_text_update = f"Phantom (Seed: {current_seed}) - Completed"
+        progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        # Metadata parameters
+        params_for_meta = {
+            "prompt": prompt_text, "negative_prompt": negative_prompt_text,
+            "ref_images": [os.path.basename(p) for p in input_images_list],
+            "width": width_val, "height": height_val, "video_length": video_length_frames, "fps": fps_val,
+            "infer_steps": infer_steps_val, "flow_shift": flow_shift_val,
+            "guide_scale_img": guide_scale_img_val, "guide_scale_text": guide_scale_text_val,
+            "cfg_scale_main": cfg_scale_main_val,
+            "seed": current_seed, "task": task_str, "dit_path": actual_phantom_dit_path,
+            "vae_path": vae_path_str, "t5_path": t5_path_str,
+            "save_path": save_path_str, "output_type": output_type_str, "sample_solver": sample_solver_str,
+            "attn_mode": attn_mode_str, "block_swap": block_swap_val,
+            "fp8": fp8_val, "fp8_scaled": fp8_scaled_val, "fp8_t5": fp8_t5_val,
+            "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
+            "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
+            "slg_layers": slg_layers_str, "slg_start": slg_start_val, "slg_end": slg_end_val,
+        }
+        try:
+            add_metadata_to_video(current_video_file_for_item, params_for_meta)
+        except Exception as meta_err:
+            print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+        yield videos_gallery.copy(), [], status_text_update, progress_text_update # Clear previews on success
+    else:
+        status_text_update = f"Phantom (Seed: {current_seed}) - Failed (Code: {return_code})"
+        progress_text_update = "Subprocess failed. Check console."
+        yield videos_gallery.copy(), [], status_text_update, progress_text_update
+
+def phantom_batch_handler(
+    prompt_text: str,
+    negative_prompt_text: str,
+    input_images_list_files: List[Any], # This is the value from phantom_input_images gallery
+    width_val: int,
+    height_val: int,
+    video_length_frames: int,
+    fps_val: int,
+    infer_steps_val: int,
+    flow_shift_val: float,
+    guide_scale_img_val: float,
+    guide_scale_text_val: float,
+    cfg_scale_main_val: float,
+    seed_val: int,
+    batch_size_val: int,
+    task_str: str,
+    dit_folder_str: str,
+    phantom_dit_model_path_str: str,
+    vae_path_str: str,
+    t5_path_str: str,
+    save_path_str: str,
+    output_type_str: str,
+    sample_solver_str: str,
+    attn_mode_str: str,
+    block_swap_val: int,
+    fp8_val: bool,
+    fp8_scaled_val: bool,
+    fp8_t5_val: bool,
+    lora_folder_str: str,
+    slg_layers_str: str,
+    slg_start_val: float,
+    slg_end_val: float,
+    enable_cfg_skip_val: bool,
+    cfg_skip_mode_str: str,
+    cfg_apply_ratio_val: float,
+    enable_preview_val: bool,
+    preview_steps_val: int,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float
+):
+    global stop_event
+    stop_event.clear()
+
+    actual_input_image_paths = []
+    if input_images_list_files:
+        # print(f"DEBUG phantom_batch_handler - Received input_images_list_files: {input_images_list_files}")
+        for item_data in input_images_list_files:
+            # Use the same robust extraction logic here
+            path_str = _extract_path_from_gallery_item(item_data)
+            if path_str:
+                actual_input_image_paths.append(path_str)
+            else:
+                # This is where your warning was originating
+                print(f"Warning: Could not resolve path for file data (in phantom_batch_handler): {item_data}")
+    
+    # print(f"DEBUG phantom_batch_handler - Extracted actual_input_image_paths: {actual_input_image_paths}")
+
+    if not actual_input_image_paths:
+        yield [], [], "Error: No valid input image paths provided for Phantom.", "Please ensure selected reference images exist on the server."
+        return
+
+    all_generated_videos = []
+    all_previews = []
+    status_text = "Preparing Phantom batch..."
+    progress_text = ""
+    yield all_generated_videos, all_previews, status_text, progress_text
+
+    for i in range(int(batch_size_val)):
+        if stop_event.is_set():
+            yield all_generated_videos, all_previews, "Phantom Batch stopped by user.", ""
+            return
+
+        current_seed_for_item = seed_val
+        if seed_val == -1:
+            current_seed_for_item = random.randint(0, 2**32 - 1)
+        elif int(batch_size_val) > 1:
+            current_seed_for_item = seed_val + i
+
+        status_text = f"Processing Phantom Item {i+1}/{batch_size_val} (Seed: {current_seed_for_item})"
+        yield all_generated_videos.copy(), [], status_text, "Starting item..."
+
+        item_videos = []
+        item_previews_temp = []
+        last_status_for_item = status_text
+        last_progress_for_item = "Generating..."
+
+        single_gen = phantom_generate_video(
+            prompt_text, negative_prompt_text, actual_input_image_paths, # Use the processed list
+            width_val, height_val, video_length_frames, fps_val, infer_steps_val,
+            flow_shift_val, guide_scale_img_val, guide_scale_text_val, cfg_scale_main_val,
+            current_seed_for_item, task_str, dit_folder_str, phantom_dit_model_path_str,
+            vae_path_str, t5_path_str, save_path_str, output_type_str,
+            sample_solver_str, attn_mode_str, block_swap_val,
+            fp8_val, fp8_scaled_val, fp8_t5_val, lora_folder_str,
+            slg_layers_str, slg_start_val, slg_end_val,
+            lora1_str, lora2_str, lora3_str, lora4_str,
+            lora1_mult, lora2_mult, lora3_mult, lora4_mult,
+            enable_cfg_skip_val, cfg_skip_mode_str, cfg_apply_ratio_val,
+            enable_preview_val, preview_steps_val
+        )
+
+        for videos_update, previews_update, status_upd, progress_upd in single_gen:
+            item_videos = videos_update
+            item_previews_temp = previews_update
+            last_status_for_item = f"Item {i+1}/{batch_size_val}: {status_upd}"
+            last_progress_for_item = progress_upd
+            yield all_generated_videos + ([item_videos[-1]] if item_videos and item_videos[-1] not in all_generated_videos else []), \
+                  item_previews_temp, last_status_for_item, last_progress_for_item
+
+        if item_videos and item_videos[-1] not in all_generated_videos:
+            all_generated_videos.append(item_videos[-1])
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, [], "Phantom Batch complete.", ""
 
 def process_framepack_extension_video(
     input_video: str,
@@ -530,9 +960,9 @@ def process_framepack_video(
 
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"fpack_{run_id}"
-        preview_base_path = os.path.join(save_path, f"latent_preview_{unique_preview_suffix}")
-        preview_mp4_path = preview_base_path + ".mp4"
-        preview_png_path = preview_base_path + ".png"
+        preview_base_dir = os.path.join(save_path, "previews") # Corrected: Look in 'previews' subdir
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4") # Corrected
+        preview_png_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.png")
 
         current_seed = seed
         if seed == -1: current_seed = random.randint(0, 2**32 - 1)
@@ -2880,6 +3310,14 @@ def get_dit_models(dit_folder: str) -> List[str]:
     models.sort(key=str.lower)
     return models if models else ["mp_rank_00_model_states.pt"]
 
+def update_dit_dropdown(dit_folder: str) -> Dict:
+    """Update DiT model dropdown choices."""
+    models = get_dit_models(dit_folder)
+    return gr.update(choices=models, value=models[0] if models else None)
+
+def change_to_tab_two():
+    return gr.Tabs(selected=2)
+
 def update_dit_and_lora_dropdowns(dit_folder: str, lora_folder: str, *current_values) -> List[gr.update]:
     """Update both DiT and LoRA dropdowns"""
     # Get model lists
@@ -3901,10 +4339,9 @@ def wanx_generate_video(
 
     run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
     unique_preview_suffix = f"wanx_{run_id}" # Add prefix for clarity
-    # --- Construct unique preview paths ---
-    preview_base_path = os.path.join(save_path, f"latent_preview_{unique_preview_suffix}")
-    preview_mp4_path = preview_base_path + ".mp4"
-    preview_png_path = preview_base_path + ".png"
+    preview_base_dir = os.path.join(save_path, "previews")
+    preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+    preview_png_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.png")
 
     # Check if this is a Fun-Control task
     is_fun_control = "-FC" in task and control_video is not None
@@ -4863,6 +5300,7 @@ with gr.Blocks(
     framepack_selected_index = gr.State(value=None)
     framepack_original_dims = gr.State(value="")
     fpe_selected_index = gr.State(value=None)
+    phantom_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
     () => {
         document.title = 'H1111';
@@ -5655,6 +6093,156 @@ with gr.Blocks(
                 skyreels_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
                 skyreels_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
+
+# Phantom Tab (Subject-to-Video style)
+        with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
+            with gr.Row():
+                with gr.Column(scale=4):
+                    phantom_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A cute kitty is preparing a spicy breakfast meal for her brother in law.",
+                        lines=5,
+                        info="Describe the scene and subject. Use a unique token for your subject if fine-tuned."
+                    )
+                    phantom_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="low quality, blurry, watermark, text, signature, ugly, deformed",
+                        lines=3,
+                    )
+
+                with gr.Column(scale=1):
+                    phantom_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    phantom_batch_size = gr.Number(label="Batch Count (Seed Variations)", value=1, minimum=1, step=1)
+
+                with gr.Column(scale=2):
+                    phantom_batch_progress = gr.Textbox(label="Status", interactive=False, value="", elem_id="phantom_batch_progress")
+                    phantom_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="phantom_progress_text")
+
+            with gr.Row():
+                phantom_generate_btn = gr.Button("Generate Phantom Video", elem_classes="green-btn")
+                phantom_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    phantom_input_images = gr.Gallery(
+                        label="Reference Images",
+                        type="filepath",  # CHANGED from "pil" to "filepath"
+                        show_label=True,
+                        columns=3,  # Adjusted for potentially more images
+                        rows="auto", # Let rows adjust
+                        object_fit="contain",
+                        height="auto",
+                        selected_index=0,
+                        interactive=True
+                    )
+                    phantom_add_more_images_btn = gr.UploadButton(
+                        "Upload/Add More Reference Images",
+                        file_types=["image"],
+                        file_count="multiple",
+                        type="filepath" # Ensures it provides file paths
+                    )
+                    # Simplified dimension inputs, no automatic aspect ratio from single image
+                    with gr.Row():
+                        phantom_width = gr.Number(label="Width", value=832, interactive=True, step=32, info="Should be divisible by 32")
+                        phantom_height = gr.Number(label="Height", value=480, interactive=True, step=32, info="Should be divisible by 32")
+                        phantom_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
+
+                    phantom_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                    phantom_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    phantom_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=50) # S2V default is 50
+                    phantom_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0,
+                                            info="Recommended: 3.0 for 480p, 5.0 for others. S2V default often 5.0 or 3.0.")
+                    # S2V has separate guidance scales for image and text
+                    phantom_guide_scale_img = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Image Guidance Scale", value=5.0)
+                    phantom_guide_scale_text = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Text Guidance Scale", value=7.5)
+                    # General guidance_scale (used by non-S2V CFG, but S2V has its own way)
+                    # For clarity, let's call the script's main --guidance_scale `phantom_cfg_scale_main`
+                    # S2V's internal CFG is driven by guide_scale_img and guide_scale_text
+                    phantom_cfg_scale_main = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Main CFG Scale (Script Default)", value=5.0, visible=False, info="Usually not directly used by S2V logic if task is S2V.")
+
+
+                with gr.Column():
+                    phantom_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_phantom", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        phantom_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        phantom_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps", info="Generates previews during the sampling loop.")
+                        phantom_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="phantom_preview_gallery"
+                        )
+                    phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
+                    phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
+
+                    phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    phantom_lora_weights_ui = []
+                    phantom_lora_multipliers_ui = []
+                    for i in range(4):
+                        with gr.Column():
+                            phantom_lora_weights_ui.append(gr.Dropdown(
+                                label=f"LoRA {i+1}", choices=get_lora_options(), value="None",
+                                allow_custom_value=True, interactive=True
+                            ))
+                            phantom_lora_multipliers_ui.append(gr.Slider(
+                                label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0
+                            ))
+
+            with gr.Row():
+                phantom_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                phantom_task = gr.Dropdown(
+                    label="Task (S2V variant)",
+                    choices=["s2v-14B-phantom", "s2v-1.3B-phantom"], # Example S2V tasks
+                    value="s2v-14B-phantom", # Default to an S2V task
+                    info="Select S2V model type. This task determines internal model configuration."
+                )
+                phantom_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
+                phantom_dit_path = gr.Dropdown( # This will be the --phantom_ckpt path
+                    label="Phantom DiT Model (.pth or .safetensors)",
+                    choices=get_dit_models("wan"), # User should place Phantom model here
+                    value="phantom14B.safetensors", # Example name
+                    allow_custom_value=True, interactive=True
+                )
+                phantom_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
+                phantom_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                # CLIP path is not typically used for S2V's image features, as VAE features are used.
+                # However, the WanModel `model_type="i2v"` might expect CLIP features if not careful.
+                # The `prepare_s2v_inputs` function in `wan_generate_video.py` does not use CLIP.
+                phantom_clip_path = gr.Textbox(label="CLIP Path (for text or non-S2V I2V)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=False)
+                phantom_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                phantom_save_path = gr.Textbox(label="Save Path", value="outputs/phantom")
+
+            with gr.Row():
+                phantom_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                phantom_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                phantom_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                phantom_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=26)
+
+                with gr.Column():
+                    phantom_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    phantom_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="For mixing fp16/bf16 and fp8 weights")
+                    phantom_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+            # SLG options can be kept as they are model-agnostic ways to modify CFG
+            with gr.Row():
+                phantom_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated, e.g. 1,5,10")
+                phantom_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0)
+                phantom_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0)
+
+            with gr.Row():
+                phantom_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip", value=False)
+                with gr.Column(visible=False) as phantom_cfg_skip_options:
+                    phantom_cfg_skip_mode = gr.Radio(
+                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
+                        label="CFG Skip Mode", value="none"
+                    )
+                    phantom_cfg_apply_ratio = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
+                    )
 
         # WanX Image to Video Tab
         with gr.Tab(id=4, label="WanX-i2v") as wanx_i2v_tab:
@@ -7838,11 +8426,6 @@ with gr.Blocks(
         except Exception as e:
             return f"Error: {str(e)}"
 
-    # Update DiT model dropdown
-    def update_dit_dropdown(dit_folder: str) -> Dict:
-        models = get_dit_models(dit_folder)
-        return gr.update(choices=models, value=models[0] if models else None)
-
     # Connect events
     merge_btn.click(
         fn=merge_models,
@@ -8846,6 +9429,98 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
+    # Phantom Tab Event Handlers
+    phantom_prompt.change(fn=count_prompt_tokens, inputs=phantom_prompt, outputs=phantom_token_counter)
+    phantom_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    phantom_recommend_flow_btn.click(
+        fn=recommend_wanx_flow_shift, # Reusing WanX logic as it's dimension-based
+        inputs=[phantom_width, phantom_height],
+        outputs=[phantom_flow_shift]
+    )
+
+    phantom_generate_btn.click(
+        fn=phantom_batch_handler,
+        inputs=[
+            phantom_prompt, phantom_negative_prompt, phantom_input_images,
+            phantom_width, phantom_height, phantom_video_length, phantom_fps, phantom_infer_steps,
+            phantom_flow_shift, phantom_guide_scale_img, phantom_guide_scale_text, phantom_cfg_scale_main,
+            phantom_seed, phantom_batch_size, phantom_task, phantom_dit_folder, phantom_dit_path,
+            phantom_vae_path, phantom_t5_path, phantom_save_path, phantom_output_type,
+            phantom_sample_solver, phantom_attn_mode, phantom_block_swap,
+            phantom_fp8, phantom_fp8_scaled, phantom_fp8_t5, phantom_lora_folder,
+            phantom_slg_layers, phantom_slg_start, phantom_slg_end,
+            phantom_enable_cfg_skip, phantom_cfg_skip_mode, phantom_cfg_apply_ratio,
+            phantom_enable_preview, phantom_preview_steps,
+            *phantom_lora_weights_ui, *phantom_lora_multipliers_ui
+        ],
+        outputs=[phantom_output, phantom_preview_output, phantom_batch_progress, phantom_progress_text],
+        queue=True
+    ).then(
+        fn=lambda b_size: 0 if int(b_size) == 1 else None,
+        inputs=[phantom_batch_size],
+        outputs=phantom_selected_index
+    )
+
+    phantom_refresh_outputs_list = [phantom_dit_path]
+    for i in range(len(phantom_lora_weights_ui)):
+        phantom_refresh_outputs_list.extend([phantom_lora_weights_ui[i], phantom_lora_multipliers_ui[i]])
+
+    phantom_refresh_btn.click(
+        fn=update_dit_and_lora_dropdowns,
+        inputs=[phantom_dit_folder, phantom_lora_folder, phantom_dit_path] + phantom_lora_weights_ui + phantom_lora_multipliers_ui,
+        outputs=phantom_refresh_outputs_list
+    )
+    phantom_dit_folder.change(fn=update_dit_dropdown, inputs=[phantom_dit_folder], outputs=[phantom_dit_path])
+
+
+    def handle_phantom_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+    phantom_output.select(fn=handle_phantom_gallery_select, outputs=phantom_selected_index)
+
+    phantom_send_to_hunyuan_v2v_btn.click(
+        fn=send_wanx_to_v2v, # Re-use existing send function logic for parameter transfer
+        inputs=[
+            phantom_output, phantom_prompt, phantom_selected_index,
+            phantom_width, phantom_height, phantom_video_length, phantom_fps, phantom_infer_steps,
+            phantom_seed, phantom_flow_shift, phantom_guide_scale_text, # Use text guide scale as primary for V2V prompt
+            phantom_negative_prompt
+        ],
+        outputs=[
+            v2v_input, v2v_prompt, v2v_width, v2v_height, v2v_video_length,
+            v2v_fps, v2v_infer_steps, v2v_seed, v2v_flow_shift, v2v_cfg_scale,
+            v2v_negative_prompt
+        ]
+    ).then(fn=change_to_tab_two, inputs=None, outputs=[tabs])
+
+    phantom_send_to_wanx_v2v_btn.click(
+        fn=send_wanx_v2v_to_hunyuan_v2v, # Re-use existing send function logic
+        inputs=[
+            phantom_output, phantom_prompt, phantom_selected_index,
+            phantom_width, phantom_height, phantom_video_length, phantom_fps, phantom_infer_steps,
+            phantom_seed, phantom_flow_shift, phantom_guide_scale_text, # Use text guide scale
+            phantom_negative_prompt
+        ],
+        outputs=[
+            wanx_v2v_input, wanx_v2v_prompt, wanx_v2v_width, wanx_v2v_height,
+            wanx_v2v_video_length, wanx_v2v_fps, wanx_v2v_infer_steps,
+            wanx_v2v_seed, wanx_v2v_flow_shift, wanx_v2v_guidance_scale, # wanx_v2v uses 'guidance_scale'
+            wanx_v2v_negative_prompt
+        ]
+    ).then(fn=change_to_wanx_v2v_tab, inputs=None, outputs=[tabs])
+
+    phantom_enable_cfg_skip.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[phantom_enable_cfg_skip],
+        outputs=[phantom_cfg_skip_options]
+    )
+    phantom_add_more_images_btn.upload(
+        fn=combine_image_sets,
+        inputs=[phantom_input_images, phantom_add_more_images_btn],
+        outputs=[phantom_input_images],
+        show_progress="hidden" # Can be "full" or "minimal" if you want progress for upload
+    )
+
 if __name__ == "__main__":
     # Make sure 'outputs' directory exists
     os.makedirs("outputs", exist_ok=True)

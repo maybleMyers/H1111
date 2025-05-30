@@ -9,6 +9,8 @@ from .shared_config import wan_shared_cfg
 from .wan_i2v_14B import i2v_14B
 from .wan_t2v_1_3B import t2v_1_3B
 from .wan_t2v_14B import t2v_14B
+# Import S2V base configs if they exist as separate files (like official repo)
+# For this integration, we define them directly here.
 
 # the config of t2i_14B is the same as t2v_14B
 t2i_14B = copy.deepcopy(t2v_14B)
@@ -64,6 +66,69 @@ i2v_1_3B_new.num_train_timesteps = 1000 # Standard diffusion timesteps
 
 # ================== END: Add New 1.3B I2V Model Config ==================
 
+# ================== START: Phantom S2V Model Configs ==================
+# --- Phantom S2V 1.3B ---
+s2v_1_3B_phantom = EasyDict(__name__="Config: Phantom-Wan S2V 1.3B")
+s2v_1_3B_phantom.update(wan_shared_cfg)
+s2v_1_3B_phantom.i2v = True # S2V behaves like I2V in terms of model input structure (processes image features)
+s2v_1_3B_phantom.is_fun_control = False
+# Core parameters from phantom_wan/configs/wan_s2v_1_3B.py
+s2v_1_3B_phantom.dim = 1536
+s2v_1_3B_phantom.ffn_dim = 8960
+s2v_1_3B_phantom.num_heads = 12
+s2v_1_3B_phantom.num_layers = 30
+s2v_1_3B_phantom.patch_size = (1, 2, 2)
+s2v_1_3B_phantom.window_size = (-1,-1)
+s2v_1_3B_phantom.qk_norm = True
+s2v_1_3B_phantom.cross_attn_norm = True
+s2v_1_3B_phantom.eps = 1e-6
+s2v_1_3B_phantom.freq_dim = 256 # Commonly 256
+s2v_1_3B_phantom.text_len = 512 # Common text length
+# DiT input/output channels for S2V should match VAE latent channels
+s2v_1_3B_phantom.vae_z_dim = getattr(wan_shared_cfg, 'vae_z_dim', 16) # Get from shared or default to 16
+s2v_1_3B_phantom.in_channels = s2v_1_3B_phantom.vae_z_dim
+s2v_1_3B_phantom.out_channels = s2v_1_3B_phantom.vae_z_dim
+# T5 (assuming standard, from shared_cfg or official s2v config)
+s2v_1_3B_phantom.t5_checkpoint = "models_t5_umt5-base-enc-bf16.pth" # From official s2v_1.3B
+s2v_1_3B_phantom.t5_tokenizer = "google/umt5-base"                # From official s2v_1.3B
+s2v_1_3B_phantom.t5_dtype = torch.bfloat16
+# VAE (assuming standard, from shared_cfg or official s2v config)
+s2v_1_3B_phantom.vae_checkpoint = "Wan2.1_VAE.pth"
+s2v_1_3B_phantom.vae_stride = (4, 8, 8)
+s2v_1_3B_phantom.sample_neg_prompt = "text, watermark, copyright, blurry, low quality, noisy"
+s2v_1_3B_phantom.num_train_timesteps = 1000
+
+# --- Phantom S2V 14B ---
+s2v_14B_phantom = EasyDict(__name__="Config: Phantom-Wan S2V 14B")
+s2v_14B_phantom.update(wan_shared_cfg)
+s2v_14B_phantom.i2v = True
+s2v_14B_phantom.is_fun_control = False
+# Core parameters from phantom_wan/configs/wan_s2v_14B.py
+s2v_14B_phantom.dim = 5120
+s2v_14B_phantom.ffn_dim = 13824
+s2v_14B_phantom.num_heads = 40
+s2v_14B_phantom.num_layers = 40
+s2v_14B_phantom.patch_size = (1, 2, 2)
+s2v_14B_phantom.window_size = (-1,-1)
+s2v_14B_phantom.qk_norm = True
+s2v_14B_phantom.cross_attn_norm = True
+s2v_14B_phantom.eps = 1e-6
+s2v_14B_phantom.freq_dim = 256
+s2v_14B_phantom.text_len = 512
+s2v_14B_phantom.vae_z_dim = getattr(wan_shared_cfg, 'vae_z_dim', 16)
+s2v_14B_phantom.in_channels = s2v_14B_phantom.vae_z_dim
+s2v_14B_phantom.out_channels = s2v_14B_phantom.vae_z_dim
+# T5 (assuming standard, from shared_cfg or official s2v config)
+s2v_14B_phantom.t5_checkpoint = "models_t5_umt5-xxl-enc-bf16.pth" # From official s2v_14B
+s2v_14B_phantom.t5_tokenizer = "google/umt5-xxl"                  # From official s2v_14B
+s2v_14B_phantom.t5_dtype = torch.bfloat16
+# VAE (assuming standard, from shared_cfg or official s2v config)
+s2v_14B_phantom.vae_checkpoint = "Wan2.1_VAE.pth"
+s2v_14B_phantom.vae_stride = (4, 8, 8)
+s2v_14B_phantom.sample_neg_prompt = "text, watermark, copyright, blurry, low quality, noisy"
+s2v_14B_phantom.num_train_timesteps = 1000
+# ================== END: Phantom S2V Model Configs ==================
+
 # support Fun models: deepcopy and change some configs. FC denotes Fun Control
 t2v_1_3B_FC = copy.deepcopy(t2v_1_3B)
 t2v_1_3B_FC.__name__ = "Config: Wan-Fun-Control T2V 1.3B"
@@ -81,10 +146,7 @@ i2v_14B_FC.is_fun_control = True
 
 i2v_14B_FC_1_1 = copy.deepcopy(i2v_14B_FC) # Copy the existing FunControl I2V 14B config
 i2v_14B_FC_1_1.__name__ = "Config: Wan-Fun-Control I2V 14B v1.1"
-# Explicitly add the flag for clarity, though loading logic will derive it
-# i2v_14B_FC_1_1.add_ref_conv = True # This flag isn't directly used by the Python config struct, but good for documentation
-# The key is that the loaded weights for this model WILL contain 'ref_conv.weight'
-# All other parameters are inherited from i2v_14B_FC (in_dim=48, is_fun_control=True, etc.)
+
 
 WAN_CONFIGS = {
     "t2v-14B": t2v_14B,
@@ -92,6 +154,9 @@ WAN_CONFIGS = {
     "i2v-14B": i2v_14B,
     "t2i-14B": t2i_14B,
     "i2v-1.3B-new": i2v_1_3B_new,
+    # Phantom S2V models
+    "s2v-1.3B-phantom": s2v_1_3B_phantom,
+    "s2v-14B-phantom": s2v_14B_phantom,
     # Fun Control models
     "t2v-1.3B-FC": t2v_1_3B_FC,
     "t2v-14B-FC": t2v_14B_FC,
@@ -105,39 +170,34 @@ SIZE_CONFIGS = {
     "480*832": (480, 832),
     "832*480": (832, 480),
     "1024*1024": (1024, 1024),
-    "512*512": (512, 512),     # <--- Example: Added 512x512 if used
-    "672*352": (672, 352),     # <--- Added from your command line example
-    "352*672": (352, 672),     # <--- Added from your command line example (vertical)
+    "512*512": (512, 512),
+    "672*352": (672, 352),
+    "352*672": (352, 672),
 }
-# --- ^^^ MODIFY THIS DICTIONARY ^^^ ---
 
-
-# --- vvv MODIFY THIS DICTIONARY vvv ---
 MAX_AREA_CONFIGS = {
     "720*1280": 720 * 1280,
     "1280*720": 1280 * 720,
     "480*832": 480 * 832,
     "832*480": 832 * 480,
     "1024*1024": 1024 * 1024,
-    "512*512": 512 * 512,         # <--- Added 512x512 if used
-    "672*352": 672 * 352,         # <--- Added from your command line example
-    "352*672": 352 * 672,         # <--- Added from your command line example (vertical)
+    "512*512": 512 * 512,
+    "672*352": 672 * 352,
+    "352*672": 352 * 672,
 }
-# --- ^^^ MODIFY THIS DICTIONARY ^^^ ---
 
-
-# --- vvv MODIFY THIS DICTIONARY vvv ---
 SUPPORTED_SIZES = {
     "t2v-14B": ("720*1280", "1280*720", "480*832", "832*480"),
     "t2v-1.3B": ("480*832", "832*480"),
     "i2v-14B": ("720*1280", "1280*720", "480*832", "832*480"),
     "t2i-14B": tuple(SIZE_CONFIGS.keys()),
+    "i2v-1.3B-new": ("480*832", "832*480", "512*512", "672*352", "352*672"),
+    # Phantom S2V models (from official phantom_wan repo)
+    "s2v-1.3B-phantom": ("832*480",),
+    "s2v-14B-phantom": ("832*480", "1280*720"),
     # Fun Control models
     "t2v-1.3B-FC": ("480*832", "832*480"),
     "t2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC-1.1": ("720*1280", "1280*720", "480*832", "832*480"),
-    # Add supported sizes for the new model
-    "i2v-1.3B-new": ("480*832", "832*480", "512*512", "672*352", "352*672"), 
-    
 }
