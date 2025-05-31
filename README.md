@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+5/31/2025  
+    Default button added to framepack tab to save current settings.  
 5/30/2025
     Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.  
 5/25/2025  
@@ -9,8 +11,6 @@
     Batch images from folder now available for framepack. Save only extension option and experimental start image for f1 in framepack extension tab.    
 5/23/2025  
     Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
-5/18/2025  
-    Add video extension tab. Currently only works with f1 model. Full credit to @pfqt and @chaojie for their amazing work!  
 
 # H1111
 

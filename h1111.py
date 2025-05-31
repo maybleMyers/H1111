@@ -27,10 +27,65 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 import time
 
 
+
 # Add global stop event
 stop_event = threading.Event()
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
+
+UI_CONFIGS_DIR = "ui_configs"
+FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
+
+def save_framepack_defaults(*values):
+    os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+    settings_to_save = {}
+    for i, key in enumerate(framepack_ui_default_keys):
+        settings_to_save[key] = values[i]
+
+    try:
+        with open(FRAMEPROK_DEFAULTS_FILE, 'w') as f:
+            json.dump(settings_to_save, f, indent=2)
+        return "FramePack defaults saved successfully."
+    except Exception as e:
+        return f"Error saving FramePack defaults: {e}"
+
+def load_framepack_defaults(request: gr.Request): # request can be used to see if it's initial load
+    if not os.path.exists(FRAMEPROK_DEFAULTS_FILE):
+        if request: # If it's not an initial load (i.e., button click)
+            return [gr.update()] * len(framepack_ui_default_keys) + ["No defaults file found."]
+        else: # Initial load, let Gradio use its defined values
+            return [gr.update()] * len(framepack_ui_default_keys) + [""]
+
+
+    try:
+        with open(FRAMEPROK_DEFAULTS_FILE, 'r') as f:
+            loaded_settings = json.load(f)
+    except Exception as e:
+        return [gr.update()] * len(framepack_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+    updates = []
+    for i, key in enumerate(framepack_ui_default_keys):
+        component = framepack_ui_default_components_ORDERED_LIST[i]
+        default_value_from_component = None
+        # Try to get the 'value' attribute from the component definition
+        if hasattr(component, 'value'):
+            default_value_from_component = component.value
+        elif isinstance(component, gr.State): # gr.State has value in its init
+             pass # For gr.State, default is often None or handled by its initial value
+
+        # Use loaded setting if available, otherwise the component's initial value
+        value_to_set = loaded_settings.get(key, default_value_from_component)
+
+        # Special handling for LoRA dropdowns to ensure 'None' is a valid choice
+        if "lora_weight" in key: # This covers framepack_lora_weight_1 to framepack_lora_weight_4
+            lora_choices = get_lora_options(loaded_settings.get("framepack_lora_folder", "lora"))
+            if value_to_set not in lora_choices:
+                value_to_set = "None" # Default to "None" if saved value is invalid
+            updates.append(gr.update(choices=lora_choices, value=value_to_set))
+        else:
+            updates.append(gr.update(value=value_to_set))
+
+    return updates + ["FramePack defaults loaded successfully."]
 
 def refresh_lora_dropdowns_simple(lora_folder: str) -> List[gr.update]:
     """Refreshes LoRA choices, always defaulting the selection to 'None'."""
@@ -5368,6 +5423,10 @@ with gr.Blocks(
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
                     framepack_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    with gr.Row():
+                        framepack_save_defaults_btn = gr.Button("Save Defaults")
+                        framepack_load_defaults_btn = gr.Button("Load Defaults")
+                        framepack_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)                    
             with gr.Row():
                 framepack_generate_btn = gr.Button("Generate FramePack Video", elem_classes="green-btn")
                 framepack_stop_btn = gr.Button("Stop Generation", variant="stop")
@@ -7224,6 +7283,140 @@ with gr.Blocks(
         outputs=[framepack_transformer_path]
     )    
 
+    framepack_ui_default_components_ORDERED_LIST = [
+        # Top section
+        framepack_prompt, framepack_negative_prompt, framepack_batch_size, framepack_is_f1,
+        # Input Image / Folder
+        framepack_input_image, # Path to image
+        framepack_use_random_folder, framepack_input_folder_path,
+        # End Frame
+        framepack_input_end_frame, # Path to image
+        framepack_end_frame_influence, framepack_end_frame_weight,
+        # Resolution
+        framepack_target_resolution, framepack_scale_slider, framepack_width, framepack_height,
+        framepack_original_dims, # This is a gr.State
+        # Video params
+        framepack_total_second_length, framepack_video_sections, framepack_fps, framepack_seed, framepack_steps,
+        # Generation params
+        framepack_distilled_guidance_scale, framepack_guidance_scale, framepack_guidance_rescale,
+        framepack_latent_window_size, framepack_sample_solver,
+        # LoRAs
+        framepack_lora_folder,
+        *framepack_lora_weights,  # This unpacks the list of 4 Dropdown components
+        *framepack_lora_multipliers, # This unpacks the list of 4 Slider components
+        # Advanced Section Control (Section definitions themselves - 4 sets)
+        *framepack_secs, # 4 Textbox components
+        *framepack_sec_prompts, # 4 Textbox components
+        *framepack_sec_images, # 4 Image components (paths)
+        # Performance / Memory
+        framepack_fp8, framepack_fp8_llm, framepack_fp8_scaled, framepack_blocks_to_swap,
+        framepack_bulk_decode, framepack_attn_mode, framepack_vae_chunk_size,
+        framepack_vae_spatial_tile_sample_min_size, framepack_device,
+        framepack_use_teacache, framepack_teacache_steps, framepack_teacache_thresh,
+        # Model Paths
+        framepack_transformer_path, framepack_vae_path, framepack_text_encoder_path,
+        framepack_text_encoder_2_path, framepack_image_encoder_path, framepack_save_path,
+        # Preview (only settings, not the output component itself)
+        framepack_enable_preview, framepack_use_full_video_preview, framepack_preview_every_n_sections,
+    ]
+    framepack_ui_default_keys = [
+        "framepack_prompt", "framepack_negative_prompt", "framepack_batch_size", "framepack_is_f1",
+        "framepack_input_image",
+        "framepack_use_random_folder", "framepack_input_folder_path",
+        "framepack_input_end_frame",
+        "framepack_end_frame_influence", "framepack_end_frame_weight",
+        "framepack_target_resolution", "framepack_scale_slider", "framepack_width", "framepack_height",
+        "framepack_original_dims_state", # Key for the gr.State
+        "framepack_total_second_length", "framepack_video_sections", "framepack_fps", "framepack_seed", "framepack_steps",
+        "framepack_distilled_guidance_scale", "framepack_guidance_scale", "framepack_guidance_rescale",
+        "framepack_latent_window_size", "framepack_sample_solver",
+        "framepack_lora_folder",
+        *[f"framepack_lora_weight_{i+1}" for i in range(4)],
+        *[f"framepack_lora_multiplier_{i+1}" for i in range(4)],
+        *[f"framepack_sec_{i+1}" for i in range(4)],
+        *[f"framepack_sec_prompt_{i+1}" for i in range(4)],
+        *[f"framepack_sec_image_{i+1}" for i in range(4)],
+        "framepack_fp8", "framepack_fp8_llm", "framepack_fp8_scaled", "framepack_blocks_to_swap",
+        "framepack_bulk_decode", "framepack_attn_mode", "framepack_vae_chunk_size",
+        "framepack_vae_spatial_tile_sample_min_size", "framepack_device",
+        "framepack_use_teacache", "framepack_teacache_steps", "framepack_teacache_thresh",
+        "framepack_transformer_path", "framepack_vae_path", "framepack_text_encoder_path",
+        "framepack_text_encoder_2_path", "framepack_image_encoder_path", "framepack_save_path",
+        "framepack_enable_preview", "framepack_use_full_video_preview", "framepack_preview_every_n_sections",
+    ]
+    # Ensure the lengths match, critical for zipping
+    if len(framepack_ui_default_components_ORDERED_LIST) != len(framepack_ui_default_keys):
+        raise ValueError(f"FramePack Mismatch: {len(framepack_ui_default_components_ORDERED_LIST)} components, {len(framepack_ui_default_keys)} keys. This is a developer error.")
+
+    def save_framepack_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(framepack_ui_default_keys):
+            settings_to_save[key] = values[i]
+
+        try:
+            with open(FRAMEPROK_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "FramePack defaults saved successfully."
+        except Exception as e:
+            return f"Error saving FramePack defaults: {e}"
+
+    def load_framepack_defaults(request: gr.Request): # request can be used to see if it's initial load
+        if not os.path.exists(FRAMEPROK_DEFAULTS_FILE):
+            if request: # If it's not an initial load (i.e., button click)
+                return [gr.update()] * len(framepack_ui_default_keys) + ["No defaults file found."]
+            else: # Initial load, let Gradio use its defined values
+                return [gr.update()] * len(framepack_ui_default_keys) + [""]
+
+
+        try:
+            with open(FRAMEPROK_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(framepack_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        updates = []
+        for i, key in enumerate(framepack_ui_default_keys):
+            component = framepack_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            # Try to get the 'value' attribute from the component definition
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+            elif isinstance(component, gr.State): # gr.State has value in its init
+                 pass # For gr.State, default is often None or handled by its initial value
+
+            # Use loaded setting if available, otherwise the component's initial value
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns to ensure 'None' is a valid choice
+            if "lora_weight" in key: # This covers framepack_lora_weight_1 to framepack_lora_weight_4
+                lora_choices = get_lora_options(loaded_settings.get("framepack_lora_folder", "lora"))
+                if value_to_set not in lora_choices:
+                    value_to_set = "None" # Default to "None" if saved value is invalid
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["FramePack defaults loaded successfully."]
+    framepack_save_defaults_btn.click(
+        fn=save_framepack_defaults,
+        inputs=framepack_ui_default_components_ORDERED_LIST, # Pass all components
+        outputs=[framepack_defaults_status]
+    )
+    framepack_load_defaults_btn.click(
+        fn=load_framepack_defaults,
+        inputs=None, # No direct inputs, reads from file
+        outputs=framepack_ui_default_components_ORDERED_LIST + [framepack_defaults_status]
+    )
+    def initial_load_framepack_defaults():
+        # Call load_framepack_defaults without the request, or handle None request inside
+        results_and_status = load_framepack_defaults(None) # Pass None for request
+        return results_and_status[:-1]
+    demo.load(
+        fn=initial_load_framepack_defaults,
+        inputs=None,
+        outputs=framepack_ui_default_components_ORDERED_LIST # Outputs for demo.load
+    )
     framepack_generate_btn.click(
         fn=process_framepack_video,
         inputs=[
