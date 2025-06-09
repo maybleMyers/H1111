@@ -40,10 +40,15 @@ If you are using a lora that you didn't train with musubi you need to drag it to
 
 If you need additional installation instructions or information create an issue and I will try to help. Also there are alot of settings notes on the musubi github linked above.  
 
-For torch 2.7.0 and windows installation try:  
+For torch 2.7.0 with cuda 12.8 and windows installation with the included prebuilt sage wheel in powershell:  
+navigate to your root h1111 directory ie c:/H1111/ then:   
+python3.10 -m venv env  
+env/scripts/activate  
 pip install typing-extensions  
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
 pip install -r requirementsTorch27.txt  
+pip install -U "triton-windows<3.4"  
+pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
 
 ## To Use FramePack
 
@@ -166,6 +171,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog
+5/31/2025  
+    Default button added to framepack tab to save current settings.  
 5/30/2025
     Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.    
 5/25/2025  
