@@ -40,9 +40,9 @@ If you are using a lora that you didn't train with musubi you need to drag it to
 
 If you need additional installation instructions or information create an issue and I will try to help. Also there are alot of settings notes on the musubi github linked above.  
 
-For torch 2.7.0 with cuda 12.8 and windows installation with the included prebuilt sage wheel in powershell:  
+For torch 2.7.0 with cuda 12.8, python 3.10 and windows installation with the included prebuilt sage wheel in powershell:  
 navigate to your root h1111 directory ie c:/H1111/ then:   
-python3.10 -m venv env  
+python -m venv env  
 env/scripts/activate  
 pip install typing-extensions  
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
