@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+6/21/2025  
+    Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
     Default button added to framepack tab to save current settings.  
 5/30/2025
@@ -8,9 +10,7 @@
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 5/24/2025  
-    Batch images from folder now available for framepack. Save only extension option and experimental start image for f1 in framepack extension tab.    
-5/23/2025  
-    Added ability to use the normal framepack model with endframe support in the framepack extension tab. Support additional bucket sizes.    
+    Batch images from folder now available for framepack. Save only extension option and experimental start image for f1 in framepack extension tab.      
 
 # H1111
 
@@ -171,6 +171,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog
+6/21/2025  
+    Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
     Default button added to framepack tab to save current settings.  
 5/30/2025
