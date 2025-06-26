@@ -45,6 +45,8 @@ from blissful_tuner.video_processing_common import save_videos_grid_advanced
 from blissful_tuner.latent_preview import LatentPreviewer
 import logging
 from diffusers_helper.utils import save_bcthw_as_mp4
+from webui_prompt_chunker import WebuiPromptChunker
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -480,7 +482,7 @@ def prepare_i2v_inputs(
     vae: AutoencoderKLCausal3D,
     encoded_context: Optional[Dict] = None,
     encoded_context_n: Optional[Dict] = None,
-) -> Tuple[int, int, float, dict, dict, dict, torch.Tensor]: # Adjusted return type annotation
+) -> Tuple[int, int, float, dict, dict, dict, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare inputs for I2V
 
     Args:
@@ -599,68 +601,87 @@ def prepare_i2v_inputs(
     n_prompt = args.negative_prompt if args.negative_prompt else ""
 
     if encoded_context is None or encoded_context_n is None: # Regenerate if either is missing
-        # parse section prompts
+
         section_prompts = parse_section_strings(args.prompt)
 
-        # load text encoder
-        # Assuming load_text_encoder1/2 are compatible
         tokenizer1, text_encoder1 = load_text_encoder1(args, args.fp8_llm, device)
         tokenizer2, text_encoder2 = load_text_encoder2(args)
         text_encoder2.to(device)
 
-        logger.info(f"Encoding prompts...")
+        # Instantiate the self-contained WebUI chunker
+        clip_chunker = WebuiPromptChunker(text_encoder2, tokenizer2)
+        logger.info(f"Encoding prompts with WebUI-style chunking for CLIP-L...")
+
         llama_vecs = {}
         llama_attention_masks = {}
         clip_l_poolers = {}
-        # Use a common dtype for text encoders if possible, respecting fp8 flag
-        text_encoder_dtype = torch.float8_e4m3fn if args.fp8_llm else torch.float16 # text_encoder1.dtype
+        text_encoder_dtype = torch.float8_e4m3fn if args.fp8_llm else torch.float16
         
-        # Pre-allocate negative prompt tensors only if needed
-        llama_vec_n, clip_l_pooler_n = None, None
-        llama_attention_mask_n = None
+        llama_vec_n, clip_l_pooler_n, llama_attention_mask_n = None, None, None
 
-        # Encode positive prompts first
-        with torch.autocast(device_type=device.type, dtype=text_encoder_dtype), torch.no_grad():
-             for index, prompt in section_prompts.items():
-                 # Ensure prompt is not empty before encoding
-                 current_prompt = prompt if prompt else "" # Use empty string if prompt is None or empty
-                 llama_vec, clip_l_pooler = hunyuan.encode_prompt_conds(current_prompt, text_encoder1, text_encoder2, tokenizer1, tokenizer2)
+        with torch.autocast(device_type=device.type, dtype=text_encoder_dtype, enabled=device.type != 'cpu'), torch.no_grad():
+            for index, prompt in section_prompts.items():
+                current_prompt = prompt if prompt else ""
+                
+                # The original `hunyuan.encode_prompt_conds` did two things. We now split them.
+                # 1. Encode with Llama (text_encoder1) - This logic is extracted from hunyuan.py
+                prompt_llama = [hunyuan.PROMPT_TEMPLATE["dit-llm-encode-video"]["template"].format(p) for p in [current_prompt]]
+                crop_start = hunyuan.PROMPT_TEMPLATE["dit-llm-encode-video"]["crop_start"]
+                llama_inputs = tokenizer1(
+                    prompt_llama, padding="max_length", max_length=256 + crop_start,
+                    truncation=True, return_tensors="pt", return_attention_mask=True,
+                )
+                llama_input_ids = llama_inputs.input_ids.to(text_encoder1.device)
+                llama_attention_mask_raw = llama_inputs.attention_mask.to(text_encoder1.device)
+                llama_attention_length = int(llama_attention_mask_raw.sum())
+                llama_outputs = text_encoder1(input_ids=llama_input_ids, attention_mask=llama_attention_mask_raw, output_hidden_states=True)
+                llama_vec_raw = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
+                
+                # 2. Encode with CLIP-L (text_encoder2) - This is now done by our new chunker
+                # The chunker returns (embeddings, pooled_output). We only need the pooled_output.
+                _, clip_l_pooler = clip_chunker.encode(current_prompt)
+                
+                # Pad/crop and store results
+                llama_vec_padded, llama_attention_mask = crop_or_pad_yield_mask(llama_vec_raw.cpu(), length=512)
+                llama_vecs[index] = llama_vec_padded
+                llama_attention_masks[index] = llama_attention_mask
+                clip_l_poolers[index] = clip_l_pooler.cpu()
 
-                 # Pad/crop and store
-                 llama_vec_padded, llama_attention_mask = crop_or_pad_yield_mask(llama_vec.cpu(), length=512) # Move to CPU before padding
+                if index == 0 and args.guidance_scale == 1.0:
+                    llama_vec_n = torch.zeros_like(llama_vec_padded)
+                    llama_attention_mask_n = torch.zeros_like(llama_attention_mask)
+                    clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0])
 
-                 llama_vecs[index] = llama_vec_padded
-                 llama_attention_masks[index] = llama_attention_mask
-                 clip_l_poolers[index] = clip_l_pooler.cpu() # Move to CPU
-
-                 # Use the encoding of section 0 as fallback for negative if needed
-                 if index == 0 and args.guidance_scale == 1.0:
-                     llama_vec_n = torch.zeros_like(llama_vec_padded)
-                     llama_attention_mask_n = torch.zeros_like(llama_attention_mask)
-                     clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0])
-
-        # Encode negative prompt if needed
         if args.guidance_scale != 1.0:
-             with torch.autocast(device_type=device.type, dtype=text_encoder_dtype), torch.no_grad():
-                 current_n_prompt = n_prompt if n_prompt else ""
-                 llama_vec_n_raw, clip_l_pooler_n_raw = hunyuan.encode_prompt_conds(
-                     current_n_prompt, text_encoder1, text_encoder2, tokenizer1, tokenizer2
-                 )
-                 llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n_raw.cpu(), length=512) # Move to CPU
-                 clip_l_pooler_n = clip_l_pooler_n_raw.cpu() # Move to CPU
+            with torch.autocast(device_type=device.type, dtype=text_encoder_dtype, enabled=device.type != 'cpu'), torch.no_grad():
+                current_n_prompt = n_prompt if n_prompt else ""
 
+                # Llama part for negative prompt
+                prompt_llama_n = [hunyuan.PROMPT_TEMPLATE["dit-llm-encode-video"]["template"].format(p) for p in [current_n_prompt]]
+                crop_start = hunyuan.PROMPT_TEMPLATE["dit-llm-encode-video"]["crop_start"]
+                llama_inputs_n = tokenizer1(
+                    prompt_llama_n, padding="max_length", max_length=256 + crop_start,
+                    truncation=True, return_tensors="pt", return_attention_mask=True,
+                )
+                llama_input_ids_n = llama_inputs_n.input_ids.to(text_encoder1.device)
+                llama_attention_mask_n_raw = llama_inputs_n.attention_mask.to(text_encoder1.device)
+                llama_attention_length_n = int(llama_attention_mask_n_raw.sum())
+                llama_outputs_n = text_encoder1(input_ids=llama_input_ids_n, attention_mask=llama_attention_mask_n_raw, output_hidden_states=True)
+                llama_vec_n_raw = llama_outputs_n.hidden_states[-3][:, crop_start:llama_attention_length_n]
+                
+                # CLIP-L part for negative prompt
+                _, clip_l_pooler_n_raw = clip_chunker.encode(current_n_prompt)
 
-        # Check if negative prompt was generated (handles guidance_scale=1.0 case)
+                llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n_raw.cpu(), length=512)
+                clip_l_pooler_n = clip_l_pooler_n_raw.cpu()
+        
         if llama_vec_n is None:
-             logger.warning("Negative prompt tensors not generated (likely guidance_scale=1.0). Using zeros.")
-             # Assuming section 0 exists and was processed
-             llama_vec_n = torch.zeros_like(llama_vecs[0])
-             llama_attention_mask_n = torch.zeros_like(llama_attention_masks[0])
-             clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0])
-
-
-        # free text encoder and clean memory
-        del text_encoder1, text_encoder2, tokenizer1, tokenizer2
+            logger.warning("Negative prompt tensors not generated. Using zeros.")
+            llama_vec_n = torch.zeros_like(llama_vecs[0])
+            llama_attention_mask_n = torch.zeros_like(llama_attention_masks[0])
+            clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0])
+            
+        del text_encoder1, text_encoder2, tokenizer1, tokenizer2, clip_chunker
         clean_memory_on_device(device)
 
         # load image encoder (Handles SigLIP via framepack_utils)
