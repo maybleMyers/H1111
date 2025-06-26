@@ -242,8 +242,8 @@ class TextConditionalModel(torch.nn.Module):
                     break_location = last_comma + 1
                     reloc_tokens = chunk.tokens[break_location:]
                     reloc_mults = chunk.multipliers[break_location:]
-                    chunk.tokens = chunk.tokens[:break_location]
-                    chunk.multipliers = chunk.multipliers[:break_location]
+                    chunk.tokens[:] = chunk.tokens[:break_location]
+                    chunk.multipliers[:] = chunk.multipliers[:break_location]
                     next_chunk()
                     chunk.tokens.extend(reloc_tokens)
                     chunk.multipliers.extend(reloc_mults)
