@@ -3044,6 +3044,7 @@ def enable_vram_management_recursively(
             )
     return total_num_param
 
+@contextmanager
 def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = False):
     old_register_parameter = torch.nn.Module.register_parameter
     if include_buffers:
