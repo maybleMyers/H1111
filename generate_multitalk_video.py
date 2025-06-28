@@ -91,12 +91,40 @@ except ModuleNotFoundError:
 from wan.modules.clip import AttentionBlock as clipAttentionBlock
 from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
+from networks import lora_wan
+from safetensors.torch import load_file
 
 __all__ = [
     'XLMRobertaCLIP',
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
+def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
+    """merge LoRA weights to the model"""
+    if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
+        return
+
+    for i, lora_weight_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+
+        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
+        
+        weights_sd = load_file(lora_weight_path, device="cpu")
+        
+        # create_arch_network_from_weights is from lora_wan.py
+        network = lora_wan.create_arch_network_from_weights(
+            multiplier=lora_multiplier,
+            weights_sd=weights_sd,
+            unet=model,
+            for_inference=True
+        )
+        
+        network.merge_to(text_encoder=None, unet=model, weights_sd=weights_sd, device=device)
+        logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+    
+    # Clean up
+    del network, weights_sd
+    torch_gc()
 
 #### CLASS DEFS ####
 class XLMRoberta(nn.Module):
@@ -685,6 +713,8 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
     )
+    parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path(s).")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier(s).")
     parser.add_argument(
         "--t5_tokenizer_path",
         type=str,
@@ -4005,6 +4035,7 @@ class MultiTalkPipeline:
         num_timesteps=1000,
         use_timestep_transform=True,
         t5_tokenizer_path_override=None,
+        args=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -4066,9 +4097,10 @@ class MultiTalkPipeline:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
+
+        if args and hasattr(args, 'lora_weight') and args.lora_weight:
+            merge_lora_weights(self.model, args, self.device)
         self.model.eval().requires_grad_(False)
-
-
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
         if use_usp:
@@ -5009,7 +5041,8 @@ def generate(args):
         dit_fsdp=args.dit_fsdp, 
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
         t5_cpu=args.t5_cpu,
-        t5_tokenizer_path_override=args.t5_tokenizer_path
+        t5_tokenizer_path_override=args.t5_tokenizer_path,
+        args=args,
     )
 
     if args.num_persistent_param_in_dit is not None:
