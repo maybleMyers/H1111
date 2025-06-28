@@ -676,6 +676,11 @@ def _parse_args():
         description="Generate a image or video from a text prompt or image using Wan"
     )
     parser.add_argument(
+        "--t5_tokenizer_path",
+        type=str,
+        default=None,
+        help="Override the path or Hub ID for the T5 tokenizer. E.g., 'google/umt5-xxl'")
+    parser.add_argument(
         "--task",
         type=str,
         default="multitalk-14B",
@@ -3945,7 +3950,8 @@ class MultiTalkPipeline:
         t5_cpu=False,
         init_on_cpu=True,
         num_timesteps=1000,
-        use_timestep_transform=True
+        use_timestep_transform=True,
+        t5_tokenizer_path_override=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -3978,14 +3984,17 @@ class MultiTalkPipeline:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
-
+        if t5_tokenizer_path_override:
+            final_tokenizer_path = t5_tokenizer_path_override
+        else:
+            final_tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            tokenizer_path=final_tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None,
         )
 
@@ -4917,7 +4926,8 @@ def generate(args):
         t5_fsdp=args.t5_fsdp,
         dit_fsdp=args.dit_fsdp, 
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
-        t5_cpu=args.t5_cpu
+        t5_cpu=args.t5_cpu,
+        t5_tokenizer_path_override=args.t5_tokenizer_path
     )
 
     if args.num_persistent_param_in_dit is not None:
