@@ -4909,7 +4909,7 @@ def generate(args):
             input_data['video_audio'] = sum_audio
 
     logging.info("Creating MultiTalk pipeline.")
-    wan_i2v = wan.MultiTalkPipeline(
+    wan_i2v = MultiTalkPipeline(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
         device_id=device,
