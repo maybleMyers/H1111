@@ -183,12 +183,10 @@ def multitalk_batch_handler(
             if not line_strip: continue
             print(f"MULTITALK_SUBPROCESS: {line_strip}")
             
-            # --- UPDATED PROGRESS PARSING ---
+            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
             clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
-            tqdm_match = re.search(r'(\d+)%|.* (\d+/\d+)\s*\[([^<]+)<([^,]+),', line_strip)
             saving_video_match = re.search(r'Saving video:.*', line_strip)
-            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
-
+            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)          
             if final_save_match:
                 found_path = final_save_match.group(1).strip()
                 if os.path.exists(found_path):
@@ -201,12 +199,24 @@ def multitalk_batch_handler(
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
                 progress_text_update = "Starting new clip generation..."
             elif tqdm_match:
-                percentage = tqdm_match.group(1) or "N/A"
+                percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
-                time_elapsed = tqdm_match.group(3).strip()
-                time_remaining = tqdm_match.group(4).strip()
+                time_details = tqdm_match.group(3) # e.g., "00:01<00:09, 1.05it/s" or "00:00<?, ?it/s"
+
+                time_elapsed = "??"
+                time_remaining = "??"
+                
+                time_split = time_details.split('<')
+                if len(time_split) > 1:
+                    time_elapsed = time_split[0].strip()
+                    remaining_part = time_split[1]
+                    time_remaining = remaining_part.split(',')[0].strip()
+                else:
+                    time_elapsed = time_details.split(',')[0].strip().replace('?','')
+                
                 if "Clip" not in status_text: # Update status if not already showing clip info
                      status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                
                 progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
             else:
                  progress_text_update = line_strip
