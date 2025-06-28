@@ -39,6 +39,7 @@ FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json"
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
+    negative_prompt: str,
     cond_image: str,
     audio_person1: Optional[str],
     audio_person2: Optional[str],
@@ -111,6 +112,7 @@ def multitalk_batch_handler(
             "--wav2vec_dir", str(wav2vec_dir),
             "--t5_tokenizer_path", str(t5_tokenizer_path),
             "--prompt", str(prompt),
+            "--n_prompt", str(negative_prompt),
             "--cond_image", str(cond_image),
             "--cond_audio_person1", str(audio_person1),
             "--base_seed", str(current_seed),
@@ -181,8 +183,9 @@ def multitalk_batch_handler(
             if not line_strip: continue
             print(f"MULTITALK_SUBPROCESS: {line_strip}")
             
-            # TQDM parsing
-            tqdm_match = re.search(r'(\d+/\d+)\s*\[([^<]+)<([^,]+),', line_strip)
+            # --- UPDATED PROGRESS PARSING ---
+            clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
+            tqdm_match = re.search(r'(\d+)%|.* (\d+/\d+)\s*\[([^<]+)<([^,]+),', line_strip)
             saving_video_match = re.search(r'Saving video:.*', line_strip)
             final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
 
@@ -194,10 +197,17 @@ def multitalk_batch_handler(
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
             elif saving_video_match:
                 progress_text_update = "Saving final video..."
+            elif clip_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
+                progress_text_update = "Starting new clip generation..."
             elif tqdm_match:
-                steps_iter = tqdm_match.group(1)
-                time_remaining = tqdm_match.group(3).strip()
-                progress_text_update = f"Denoising Step {steps_iter} | ETA: {time_remaining}"
+                percentage = tqdm_match.group(1) or "N/A"
+                steps_iter = tqdm_match.group(2)
+                time_elapsed = tqdm_match.group(3).strip()
+                time_remaining = tqdm_match.group(4).strip()
+                if "Clip" not in status_text: # Update status if not already showing clip info
+                     status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
             else:
                  progress_text_update = line_strip
 
@@ -213,6 +223,46 @@ def multitalk_batch_handler(
 
         # After subprocess finishes for one item
         if return_code == 0 and current_video_file_for_item:
+            # --- START METADATA SAVING ---
+            params_for_meta = {
+                "model_type": "MultiTalk",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "cond_image": os.path.basename(cond_image) if cond_image else None,
+                "audio_person1": os.path.basename(audio_person1) if audio_person1 else None,
+                "audio_person2": os.path.basename(audio_person2) if audio_person2 else None,
+                "batch_size": batch_size,
+                "seed": current_seed,
+                "size": size,
+                "mode": mode,
+                "frame_num": frame_num,
+                "motion_frame": motion_frame,
+                "sample_steps": sample_steps,
+                "sample_shift": sample_shift,
+                "text_guide_scale": text_guide_scale,
+                "audio_guide_scale": audio_guide_scale,
+                "audio_type": audio_type,
+                "num_persistent_param_in_dit": num_persistent,
+                "use_teacache": use_teacache,
+                "teacache_thresh": teacache_thresh,
+                "use_apg": use_apg,
+                "apg_momentum": apg_momentum,
+                "apg_norm_thresh": apg_norm_thresh,
+                "ckpt_dir": ckpt_dir,
+                "wav2vec_dir": wav2vec_dir,
+                "t5_tokenizer_path": t5_tokenizer_path,
+                "save_path": save_path,
+                "lora_folder": lora_folder,
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+                print(f"Added metadata to {current_video_file_for_item}")
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+            # --- END METADATA SAVING ---
+            
             all_generated_videos.append((current_video_file_for_item, f"MultiTalk - Seed: {current_seed}"))
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
             progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
@@ -5941,6 +5991,11 @@ with gr.Blocks(
                         value="A conversation between two female bunny anchors in a studio in Ghangzhou.",
                         lines=5,
                     )
+                    multitalk_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        lines=3,
+                        placeholder="bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."
+                    )                    
                 with gr.Column(scale=1):
                     multitalk_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
@@ -7258,6 +7313,7 @@ with gr.Blocks(
         fn=multitalk_batch_handler,
         inputs=[
             multitalk_prompt,
+            multitalk_negative_prompt,
             multitalk_cond_image,
             multitalk_audio_person1,
             multitalk_audio_person2,

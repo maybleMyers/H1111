@@ -908,6 +908,12 @@ def _parse_args():
         default=55,
         help="Norm threshold used in adaptive projected guidance (APG)."
     )
+    parser.add_argument(
+        "--n_prompt",
+        type=str,
+        default="",
+        help="The negative text prompt for video generation."
+    )
 
     
     args = parser.parse_args()
@@ -4312,7 +4318,29 @@ class MultiTalkPipeline:
             full_audio_embs.append(full_audio_emb) 
         
         assert len(full_audio_embs) == HUMAN_NUMBER, f"Aduio file not exists or length not satisfies frame nums."
+        # Calculate total number of clips for progress bar
+        _total_audio_frames = 0
+        if len(full_audio_embs) > 0:
+            # The loop terminates based on the length of the first person's audio
+            _total_audio_frames = min(max_frames_num, len(full_audio_embs[0]))
 
+        if _total_audio_frames > frame_num:
+            _audio_start_idx = 0
+            _clip_count = 0
+            _clip_length = frame_num
+            while True:
+                _clip_count += 1
+                _audio_end_idx = _audio_start_idx + _clip_length
+                if _audio_end_idx >= _total_audio_frames:
+                    break
+                # This logic mirrors the update at the end of the main generation loop
+                _audio_start_idx += (frame_num - motion_frame)
+            total_clips = _clip_count
+        else:
+            total_clips = 1 if _total_audio_frames > 0 else 0
+        
+        total_sampling_steps = total_clips * sampling_steps
+        pbar = tqdm(total=total_sampling_steps, disable=not progress, dynamic_ncols=True)
         # preprocess text embedding
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -4334,6 +4362,7 @@ class MultiTalkPipeline:
         is_first_clip = True
         arrive_last_frame = False
         cur_motion_frames_num = 1
+        clip_count = 0
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
@@ -4349,6 +4378,8 @@ class MultiTalkPipeline:
 
         # start video generation iteratively
         while True:
+            clip_count += 1
+            pbar.set_description(f"Generating clip {clip_count}/{total_clips}")            
             audio_embs = []
             # split audio with window size
             for human_idx in range(HUMAN_NUMBER):   
@@ -4525,7 +4556,7 @@ class MultiTalkPipeline:
 
 
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
-                for i in progress_wrap(range(len(timesteps)-1)):
+                for i in range(len(timesteps)-1):
                     timestep = timesteps[i]
                     latent_model_input = [latent.to(self.device)]
 
@@ -4573,6 +4604,7 @@ class MultiTalkPipeline:
                         latent[:, :T_m] = add_latent
 
                     x0 = [latent.to(self.device)] 
+                    pbar.update(1)
                     del latent_model_input, timestep
                 
                 if offload_model: 
@@ -4590,7 +4622,12 @@ class MultiTalkPipeline:
                 gen_video_list.append(videos[:, :, cur_motion_frames_num:])
 
             # decide whether is done
-            if arrive_last_frame: break
+            if arrive_last_frame:
+                # The pbar might not be full if the last clip is shorter.
+                remaining_steps = pbar.total - pbar.n
+                if remaining_steps > 0:
+                    pbar.update(remaining_steps)
+                break
 
             # update next condition frames
             is_first_clip = False
@@ -4623,7 +4660,7 @@ class MultiTalkPipeline:
                 torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
-        
+        pbar.close()
         gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
         gen_video_samples = gen_video_samples.to(torch.float32)
         if max_frames_num > frame_num and sum(miss_lengths) > 0:
@@ -5061,6 +5098,7 @@ def generate(args):
         sampling_steps=args.sample_steps,
         text_guide_scale=args.sample_text_guide_scale,
         audio_guide_scale=args.sample_audio_guide_scale,
+        n_prompt=args.n_prompt,
         seed=args.base_seed,
         offload_model=args.offload_model,
         max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
