@@ -197,7 +197,23 @@ def multitalk_batch_handler(
                 progress_text_update = "Saving final video..."
             elif clip_progress_match:
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
-                progress_text_update = "Starting new clip generation..."
+                tqdm_match_on_clip_line = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+                if tqdm_match_on_clip_line:
+                    percentage = tqdm_match_on_clip_line.group(1)
+                    steps_iter = tqdm_match_on_clip_line.group(2)
+                    time_details = tqdm_match_on_clip_line.group(3)
+                    time_elapsed = "??"
+                    time_remaining = "??"
+                    time_split = time_details.split('<')
+                    if len(time_split) > 1:
+                        time_elapsed = time_split[0].strip()
+                        remaining_part = time_split[1]
+                        time_remaining = remaining_part.split(',')[0].strip()
+                    else:
+                        time_elapsed = time_details.split(',')[0].strip().replace('?','')
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
+                else:
+                    progress_text_update = "Starting new clip generation..."
             elif tqdm_match:
                 percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
