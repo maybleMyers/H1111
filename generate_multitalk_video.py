@@ -671,6 +671,15 @@ def _validate_args(args):
         args.
         task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
+    if args.input_json is None:
+        assert args.prompt is not None, "Please provide a --prompt."
+        assert args.cond_image is not None, "Please provide a --cond_image path."
+        assert os.path.exists(args.cond_image), f"Condition image not found at {args.cond_image}"
+        assert args.cond_audio_person1 is not None, "Please provide --cond_audio_person1."
+        assert os.path.exists(args.cond_audio_person1), f"Audio for person 1 not found at {args.cond_audio_person1}"
+        if args.cond_audio_person2:
+            assert os.path.exists(args.cond_audio_person2), f"Audio for person 2 not found at {args.cond_audio_person2}"
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(
@@ -759,8 +768,51 @@ def _parse_args():
     parser.add_argument(
         "--input_json",
         type=str,
-        default='examples.json',
+        default=None,
         help="[meta file] The condition path to generate the video.")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="The text prompt for video generation."
+    )
+    parser.add_argument(
+        "--cond_image",
+        type=str,
+        default=None,
+        help="Path to the condition image."
+    )
+    parser.add_argument(
+        "--cond_audio_person1",
+        type=str,
+        default=None,
+        help="Path to the audio file for person 1."
+    )
+    parser.add_argument(
+        "--cond_audio_person2",
+        type=str,
+        default=None,
+        help="Path to the audio file for person 2 (optional)."
+    )
+    parser.add_argument(
+        "--audio_type",
+        type=str,
+        default='para',
+        choices=['para', 'add'],
+        help="Audio mixing type for multi-person audio ('para' or 'add')."
+    )
+    parser.add_argument(
+        "--bbox_person1",
+        type=str,
+        default=None,
+        help="Bounding box for person 1 in 'x_min,y_min,x_max,y_max' format (optional)."
+    )
+    parser.add_argument(
+        "--bbox_person2",
+        type=str,
+        default=None,
+        help="Bounding box for person 2 in 'x_min,y_min,x_max,y_max' format (optional)."
+    )    
     parser.add_argument(
         "--motion_frame",
         type=int,
@@ -4886,37 +4938,66 @@ def generate(args):
 
     # read input files
 
-    
+    if args.input_json:
+        logging.info(f"Loading generation data from {args.input_json}")
+        with open(args.input_json, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
+    else:
+        logging.info("Constructing generation data from command-line arguments")
+        input_data = {
+            'prompt': args.prompt,
+            'cond_image': args.cond_image,
+            'cond_audio': {},
+            'audio_type': args.audio_type
+        }
+        if args.cond_audio_person1:
+            input_data['cond_audio']['person1'] = args.cond_audio_person1
+        if args.cond_audio_person2:
+            input_data['cond_audio']['person2'] = args.cond_audio_person2
 
-    with open(args.input_json, 'r', encoding='utf-8') as f:
-        input_data = json.load(f)
-        
-        wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
-        args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
-        os.makedirs(args.audio_save_dir,exist_ok=True)
-        
-        if len(input_data['cond_audio'])==2:
-            new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
-            audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-            audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
-            emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-            emb2_path = os.path.join(args.audio_save_dir, '2.pt')
-            sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-            sf.write(sum_audio, sum_human_speechs, 16000)
-            torch.save(audio_embedding_1, emb1_path)
-            torch.save(audio_embedding_2, emb2_path)
-            input_data['cond_audio']['person1'] = emb1_path
-            input_data['cond_audio']['person2'] = emb2_path
-            input_data['video_audio'] = sum_audio
-        elif len(input_data['cond_audio'])==1:
-            human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
-            audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
-            emb_path = os.path.join(args.audio_save_dir, '1.pt')
-            sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-            sf.write(sum_audio, human_speech, 16000)
-            torch.save(audio_embedding, emb_path)
-            input_data['cond_audio']['person1'] = emb_path
-            input_data['video_audio'] = sum_audio
+        if args.bbox_person1 or args.bbox_person2:
+            input_data['bbox'] = {}
+            if args.bbox_person1:
+                try:
+                    bbox_values = [float(x) for x in args.bbox_person1.split(',')]
+                    assert len(bbox_values) == 4
+                    input_data['bbox']['person1'] = bbox_values
+                except (ValueError, AssertionError):
+                    raise argparse.ArgumentTypeError("bbox_person1 must be in 'x_min,y_min,x_max,y_max' format with 4 numbers.")
+            if args.bbox_person2:
+                try:
+                    bbox_values = [float(x) for x in args.bbox_person2.split(',')]
+                    assert len(bbox_values) == 4
+                    input_data['bbox']['person2'] = bbox_values
+                except (ValueError, AssertionError):
+                     raise argparse.ArgumentTypeError("bbox_person2 must be in 'x_min,y_min,x_max,y_max' format with 4 numbers.")
+
+    wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
+    args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
+    os.makedirs(args.audio_save_dir,exist_ok=True)
+    
+    if len(input_data['cond_audio'])==2:
+        new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
+        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+        audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+        emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+        emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+        sf.write(sum_audio, sum_human_speechs, 16000)
+        torch.save(audio_embedding_1, emb1_path)
+        torch.save(audio_embedding_2, emb2_path)
+        input_data['cond_audio']['person1'] = emb1_path
+        input_data['cond_audio']['person2'] = emb2_path
+        input_data['video_audio'] = sum_audio
+    elif len(input_data['cond_audio'])==1:
+        human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
+        audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+        emb_path = os.path.join(args.audio_save_dir, '1.pt')
+        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+        sf.write(sum_audio, human_speech, 16000)
+        torch.save(audio_embedding, emb_path)
+        input_data['cond_audio']['person1'] = emb_path
+        input_data['video_audio'] = sum_audio
 
     logging.info("Creating MultiTalk pipeline.")
     wan_i2v = MultiTalkPipeline(
