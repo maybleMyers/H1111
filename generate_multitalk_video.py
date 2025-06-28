@@ -88,7 +88,8 @@ try:
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
-
+from wan.modules.clip import AttentionBlock as clipAttentionBlock
+from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
 
 __all__ = [
@@ -133,7 +134,7 @@ class XLMRoberta(nn.Module):
 
         # blocks
         self.blocks = nn.ModuleList([
-            AttentionBlock(dim, num_heads, post_norm, dropout, eps)
+            robertaAttentionBlock(dim, num_heads, post_norm, dropout, eps)
             for _ in range(num_layers)
         ])
 
@@ -503,7 +504,7 @@ class VisionTransformer(nn.Module):
         # transformer
         self.pre_norm = LayerNorm(dim, eps=norm_eps) if pre_norm else None
         self.transformer = nn.Sequential(*[
-            AttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
+            clipAttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
                            activation, attn_dropout, proj_dropout, norm_eps)
             for _ in range(num_layers)
         ])
