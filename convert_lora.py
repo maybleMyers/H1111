@@ -3,7 +3,7 @@ import argparse
 import torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
-from musubi_tuner.utils import model_utils  # Using the updated import path
+from utils import model_utils  # Using the updated import path
 
 import logging
 
