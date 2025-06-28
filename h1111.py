@@ -182,7 +182,7 @@ def multitalk_batch_handler(
             line_strip = line.strip()
             if not line_strip: continue
             print(f"MULTITALK_SUBPROCESS: {line_strip}")
-            
+
             tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
             clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
             saving_video_match = re.search(r'Saving video:.*', line_strip)
