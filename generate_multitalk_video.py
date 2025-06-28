@@ -102,7 +102,7 @@ class XLMRoberta(nn.Module):
     """
     XLMRobertaModel with no pooler and no LM head.
     """
-
+    
     def __init__(self,
                  vocab_size=250002,
                  max_seq_len=514,
@@ -2200,8 +2200,7 @@ class ResidualBlock(nn.Module):
                 x = layer(x)
         return x + h
 
-
-class AttentionBlock(nn.Module):
+class VAEAttentionBlock(nn.Module):
     """
     Causal self-attention with a single head.
     """
@@ -2275,7 +2274,7 @@ class Encoder3d(nn.Module):
             for _ in range(num_res_blocks):
                 downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    downsamples.append(AttentionBlock(out_dim))
+                    downsamples.append(VAEAttentionBlock(out_dim))
                 in_dim = out_dim
 
             # downsample block
@@ -2288,7 +2287,7 @@ class Encoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
+            ResidualBlock(out_dim, out_dim, dropout), VAEAttentionBlock(out_dim),
             ResidualBlock(out_dim, out_dim, dropout))
 
         # output blocks
@@ -2374,7 +2373,7 @@ class Decoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout), AttentionBlock(dims[0]),
+            ResidualBlock(dims[0], dims[0], dropout), VAEAttentionBlock(dims[0]),
             ResidualBlock(dims[0], dims[0], dropout))
 
         # upsample blocks
@@ -2386,7 +2385,7 @@ class Decoder3d(nn.Module):
             for _ in range(num_res_blocks + 1):
                 upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    upsamples.append(AttentionBlock(out_dim))
+                    upsamples.append(VAEAttentionBlock(out_dim))
                 in_dim = out_dim
 
             # upsample block
