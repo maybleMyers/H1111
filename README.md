@@ -102,14 +102,7 @@ Set the  Low VRAM (Persistent Params) for your vram, 5500000000 is good for 24gb
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
 
 Thanks to Meigen-AI for their awesome work on this model xD.  
-```bibtex
-@article{kong2025let,
-  title={Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation},
-  author={Kong, Zhe and Gao, Feng and Zhang, Yong and Kang, Zhuoliang and Wei, Xiaoming and Cai, Xunliang and Chen, Guanying and Luo, Wenhan},
-  journal={arXiv preprint arXiv:2505.22647},
-  year={2025}
-}
-```
+Kong, Z., Gao, F., Zhang, Y., Kang, Z., Wei, X., Cai, X., Chen, G., & Luo, W. (2025). [Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation](https://arxiv.org/abs/2505.22647). *arXiv preprint arXiv:2505.22647*.
 
 ## To Use the new Skyreels-V2 models
 
