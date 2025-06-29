@@ -85,6 +85,7 @@ Framepack Extension tab is still a work in progress.
 Thanks to @pftq https://github.com/pftq and @chaojie https://github.com/chaojie for their work on the extension logics.  
 
 ### To Use with the MultiTalk model
+I have only tested this on linux, windows will require a bit more complex of an install.  
 
 Download https://huggingface.co/maybleMyers/wan_files_for_h1111/resolve/main/wan2.1_i2v_480p_14B_fp16.safetensors and place it in the wan subfolder, it needs to be named exactly "wan2.1_i2v_480p_14B_fp16.safetensors" or it will not work.  
 Download https://huggingface.co/MeiGen-AI/MeiGen-MultiTalk/resolve/main/multitalk.safetensors?download=true and place it in the wan subfolder also.  
@@ -101,7 +102,7 @@ pip install -r requirementsMulti.txt
 Set the  Low VRAM (Persistent Params) for your vram, 5500000000 is good for 24gb gpu, 20000000000 works well with a 48gb gpu.  
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
 
-Thanks to Meigen-AI for their awesome work on this model xD.  
+Thanks to Meigen-AI for their awesome work on this model xD. https://github.com/MeiGen-AI/MultiTalk  
 Kong, Z., Gao, F., Zhang, Y., Kang, Z., Wei, X., Cai, X., Chen, G., & Luo, W. (2025). [Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation](https://arxiv.org/abs/2505.22647). *arXiv preprint arXiv:2505.22647*.
 
 ## To Use the new Skyreels-V2 models
