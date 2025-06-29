@@ -2,7 +2,7 @@
 
 # Recent update
 6/29/2025  
-    Support for MultiTalk model. Works very well but takes a while.  
+    Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
 6/21/2025  
     Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
@@ -191,6 +191,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog
+6/29/2025  
+    Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
 6/21/2025  
     Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
