@@ -4429,20 +4429,23 @@ class MultiTalkPipeline:
             if LatentPreviewer is not None and extra_args.preview is not None and extra_args.preview > 0 and self.rank == 0:
                 logging.info(f"Initializing latent previewer for clip {clip_count+1} (every {extra_args.preview} steps)...")
                 try:
-                    if extra_args.save_file:
-                        extra_args.save_path = os.path.dirname(extra_args.save_file)
-                    else: # Fallback if no save_file is provided
-                        extra_args.save_path = "multitalk_previews_output"
-
                     preview_timesteps = np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
 
+                    class PreviewArgs:
+                        pass
+                    
+                    preview_args = PreviewArgs()
+                    preview_args.save_path = os.path.dirname(extra_args.save_file)
+                    preview_args.fps = 25 
+                    preview_args.preview_vae = None 
+                    
                     previewer = LatentPreviewer(
-                        args=extra_args,
+                        args=preview_args, # Pass the mock args object
                         original_latents=noise.clone(),
                         timesteps=preview_timesteps,
                         device=self.device,
                         dtype=self.param_dtype,
-                        model_type="wan", # Crucial for using the correct latent2rgb matrix
+                        model_type="wan",
                     )
                     logging.info("Latent Previewer initialized successfully.")
                 except Exception as e:
@@ -4640,7 +4643,7 @@ class MultiTalkPipeline:
                         add_latent = self.add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
-                        
+
                     if previewer is not None and (i + 1) % extra_args.preview == 0 and (i + 1) < len(timesteps) - 1:
                         try:
                             logging.debug(f"Generating preview for step {i + 1}")
