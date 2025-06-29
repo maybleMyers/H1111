@@ -6070,7 +6070,7 @@ with gr.Blocks(
                     
                     with gr.Accordion("Advanced & Performance", open=False):
                         multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
-                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5500000000, info="Set to 0 for very low VRAM, will be slower.")
+                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
                         with gr.Row():
                             multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
                             multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
