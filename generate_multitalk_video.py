@@ -4429,7 +4429,9 @@ class MultiTalkPipeline:
             if LatentPreviewer is not None and extra_args.preview is not None and extra_args.preview > 0 and self.rank == 0:
                 logging.info(f"Initializing latent previewer for clip {clip_count+1} (every {extra_args.preview} steps)...")
                 try:
-                    preview_timesteps = np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
+                    preview_timesteps_tensor = torch.from_numpy(
+                        np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
+                    ).to(self.device)
 
                     class PreviewArgs:
                         pass
@@ -4442,7 +4444,7 @@ class MultiTalkPipeline:
                     previewer = LatentPreviewer(
                         args=preview_args, # Pass the mock args object
                         original_latents=noise.clone(),
-                        timesteps=preview_timesteps,
+                        timesteps=preview_timesteps_tensor,
                         device=self.device,
                         dtype=self.param_dtype,
                         model_type="wan",
