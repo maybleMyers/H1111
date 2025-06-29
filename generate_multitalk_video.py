@@ -88,21 +88,50 @@ try:
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
-
+from wan.modules.clip import AttentionBlock as clipAttentionBlock
+from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
+from networks import lora_wan
+from safetensors.torch import load_file
 
 __all__ = [
     'XLMRobertaCLIP',
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
+def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
+    """merge LoRA weights to the model"""
+    if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
+        return
+
+    for i, lora_weight_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+
+        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
+        
+        weights_sd = load_file(lora_weight_path, device="cpu")
+        
+        # create_arch_network_from_weights is from lora_wan.py
+        network = lora_wan.create_arch_network_from_weights(
+            multiplier=lora_multiplier,
+            weights_sd=weights_sd,
+            unet=model,
+            for_inference=True
+        )
+        
+        network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+        logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+    
+    # Clean up
+    del network, weights_sd
+    torch_gc()
 
 #### CLASS DEFS ####
 class XLMRoberta(nn.Module):
     """
     XLMRobertaModel with no pooler and no LM head.
     """
-
+    
     def __init__(self,
                  vocab_size=250002,
                  max_seq_len=514,
@@ -133,7 +162,7 @@ class XLMRoberta(nn.Module):
 
         # blocks
         self.blocks = nn.ModuleList([
-            AttentionBlock(dim, num_heads, post_norm, dropout, eps)
+            robertaAttentionBlock(dim, num_heads, post_norm, dropout, eps)
             for _ in range(num_layers)
         ])
 
@@ -503,7 +532,7 @@ class VisionTransformer(nn.Module):
         # transformer
         self.pre_norm = LayerNorm(dim, eps=norm_eps) if pre_norm else None
         self.transformer = nn.Sequential(*[
-            AttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
+            clipAttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
                            activation, attn_dropout, proj_dropout, norm_eps)
             for _ in range(num_layers)
         ])
@@ -670,11 +699,27 @@ def _validate_args(args):
         args.
         task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
+    if args.input_json is None:
+        assert args.prompt is not None, "Please provide a --prompt."
+        assert args.cond_image is not None, "Please provide a --cond_image path."
+        assert os.path.exists(args.cond_image), f"Condition image not found at {args.cond_image}"
+        assert args.cond_audio_person1 is not None, "Please provide --cond_audio_person1."
+        assert os.path.exists(args.cond_audio_person1), f"Audio for person 1 not found at {args.cond_audio_person1}"
+        if args.cond_audio_person2:
+            assert os.path.exists(args.cond_audio_person2), f"Audio for person 2 not found at {args.cond_audio_person2}"
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
     )
+    parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path(s).")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier(s).")
+    parser.add_argument(
+        "--t5_tokenizer_path",
+        type=str,
+        default=None,
+        help="Override the path or Hub ID for the T5 tokenizer. E.g., 'google/umt5-xxl'")
     parser.add_argument(
         "--task",
         type=str,
@@ -753,8 +798,51 @@ def _parse_args():
     parser.add_argument(
         "--input_json",
         type=str,
-        default='examples.json',
+        default=None,
         help="[meta file] The condition path to generate the video.")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="The text prompt for video generation."
+    )
+    parser.add_argument(
+        "--cond_image",
+        type=str,
+        default=None,
+        help="Path to the condition image."
+    )
+    parser.add_argument(
+        "--cond_audio_person1",
+        type=str,
+        default=None,
+        help="Path to the audio file for person 1."
+    )
+    parser.add_argument(
+        "--cond_audio_person2",
+        type=str,
+        default=None,
+        help="Path to the audio file for person 2 (optional)."
+    )
+    parser.add_argument(
+        "--audio_type",
+        type=str,
+        default='para',
+        choices=['para', 'add'],
+        help="Audio mixing type for multi-person audio ('para' or 'add')."
+    )
+    parser.add_argument(
+        "--bbox_person1",
+        type=str,
+        default=None,
+        help="Bounding box for person 1 in 'x_min,y_min,x_max,y_max' format (optional)."
+    )
+    parser.add_argument(
+        "--bbox_person2",
+        type=str,
+        default=None,
+        help="Bounding box for person 2 in 'x_min,y_min,x_max,y_max' format (optional)."
+    )    
     parser.add_argument(
         "--motion_frame",
         type=int,
@@ -819,6 +907,12 @@ def _parse_args():
         type=float,
         default=55,
         help="Norm threshold used in adaptive projected guidance (APG)."
+    )
+    parser.add_argument(
+        "--n_prompt",
+        type=str,
+        default="",
+        help="The negative text prompt for video generation."
     )
 
     
@@ -2195,8 +2289,7 @@ class ResidualBlock(nn.Module):
                 x = layer(x)
         return x + h
 
-
-class AttentionBlock(nn.Module):
+class VAEAttentionBlock(nn.Module):
     """
     Causal self-attention with a single head.
     """
@@ -2270,7 +2363,7 @@ class Encoder3d(nn.Module):
             for _ in range(num_res_blocks):
                 downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    downsamples.append(AttentionBlock(out_dim))
+                    downsamples.append(VAEAttentionBlock(out_dim))
                 in_dim = out_dim
 
             # downsample block
@@ -2283,7 +2376,7 @@ class Encoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
+            ResidualBlock(out_dim, out_dim, dropout), VAEAttentionBlock(out_dim),
             ResidualBlock(out_dim, out_dim, dropout))
 
         # output blocks
@@ -2369,7 +2462,7 @@ class Decoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout), AttentionBlock(dims[0]),
+            ResidualBlock(dims[0], dims[0], dropout), VAEAttentionBlock(dims[0]),
             ResidualBlock(dims[0], dims[0], dropout))
 
         # upsample blocks
@@ -2381,7 +2474,7 @@ class Decoder3d(nn.Module):
             for _ in range(num_res_blocks + 1):
                 upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    upsamples.append(AttentionBlock(out_dim))
+                    upsamples.append(VAEAttentionBlock(out_dim))
                 in_dim = out_dim
 
             # upsample block
@@ -3039,6 +3132,7 @@ def enable_vram_management_recursively(
             )
     return total_num_param
 
+@contextmanager
 def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = False):
     old_register_parameter = torch.nn.Module.register_parameter
     if include_buffers:
@@ -3945,7 +4039,9 @@ class MultiTalkPipeline:
         t5_cpu=False,
         init_on_cpu=True,
         num_timesteps=1000,
-        use_timestep_transform=True
+        use_timestep_transform=True,
+        t5_tokenizer_path_override=None,
+        args=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -3978,14 +4074,17 @@ class MultiTalkPipeline:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
-
+        if t5_tokenizer_path_override:
+            final_tokenizer_path = t5_tokenizer_path_override
+        else:
+            final_tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            tokenizer_path=final_tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None,
         )
 
@@ -4004,9 +4103,10 @@ class MultiTalkPipeline:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
+
+        if args and hasattr(args, 'lora_weight') and args.lora_weight:
+            merge_lora_weights(self.model, args, self.device)
         self.model.eval().requires_grad_(False)
-
-
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
         if use_usp:
@@ -4218,7 +4318,29 @@ class MultiTalkPipeline:
             full_audio_embs.append(full_audio_emb) 
         
         assert len(full_audio_embs) == HUMAN_NUMBER, f"Aduio file not exists or length not satisfies frame nums."
+        # Calculate total number of clips for progress bar
+        _total_audio_frames = 0
+        if len(full_audio_embs) > 0:
+            # The loop terminates based on the length of the first person's audio
+            _total_audio_frames = min(max_frames_num, len(full_audio_embs[0]))
 
+        if _total_audio_frames > frame_num:
+            _audio_start_idx = 0
+            _clip_count = 0
+            _clip_length = frame_num
+            while True:
+                _clip_count += 1
+                _audio_end_idx = _audio_start_idx + _clip_length
+                if _audio_end_idx >= _total_audio_frames:
+                    break
+                # This logic mirrors the update at the end of the main generation loop
+                _audio_start_idx += (frame_num - motion_frame)
+            total_clips = _clip_count
+        else:
+            total_clips = 1 if _total_audio_frames > 0 else 0
+        
+        total_sampling_steps = total_clips * sampling_steps
+        pbar = tqdm(total=total_sampling_steps, disable=not progress, dynamic_ncols=True)
         # preprocess text embedding
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -4240,6 +4362,7 @@ class MultiTalkPipeline:
         is_first_clip = True
         arrive_last_frame = False
         cur_motion_frames_num = 1
+        clip_count = 0
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
@@ -4255,6 +4378,8 @@ class MultiTalkPipeline:
 
         # start video generation iteratively
         while True:
+            clip_count += 1
+            pbar.set_description(f"Generating clip {clip_count}/{total_clips}")            
             audio_embs = []
             # split audio with window size
             for human_idx in range(HUMAN_NUMBER):   
@@ -4431,7 +4556,7 @@ class MultiTalkPipeline:
 
 
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
-                for i in progress_wrap(range(len(timesteps)-1)):
+                for i in range(len(timesteps)-1):
                     timestep = timesteps[i]
                     latent_model_input = [latent.to(self.device)]
 
@@ -4479,6 +4604,7 @@ class MultiTalkPipeline:
                         latent[:, :T_m] = add_latent
 
                     x0 = [latent.to(self.device)] 
+                    pbar.update(1)
                     del latent_model_input, timestep
                 
                 if offload_model: 
@@ -4496,7 +4622,12 @@ class MultiTalkPipeline:
                 gen_video_list.append(videos[:, :, cur_motion_frames_num:])
 
             # decide whether is done
-            if arrive_last_frame: break
+            if arrive_last_frame:
+                # The pbar might not be full if the last clip is shorter.
+                remaining_steps = pbar.total - pbar.n
+                if remaining_steps > 0:
+                    pbar.update(remaining_steps)
+                break
 
             # update next condition frames
             is_first_clip = False
@@ -4529,7 +4660,7 @@ class MultiTalkPipeline:
                 torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
-        
+        pbar.close()
         gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
         gen_video_samples = gen_video_samples.to(torch.float32)
         if max_frames_num > frame_num and sum(miss_lengths) > 0:
@@ -4876,40 +5007,69 @@ def generate(args):
 
     # read input files
 
-    
+    if args.input_json:
+        logging.info(f"Loading generation data from {args.input_json}")
+        with open(args.input_json, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
+    else:
+        logging.info("Constructing generation data from command-line arguments")
+        input_data = {
+            'prompt': args.prompt,
+            'cond_image': args.cond_image,
+            'cond_audio': {},
+            'audio_type': args.audio_type
+        }
+        if args.cond_audio_person1:
+            input_data['cond_audio']['person1'] = args.cond_audio_person1
+        if args.cond_audio_person2:
+            input_data['cond_audio']['person2'] = args.cond_audio_person2
 
-    with open(args.input_json, 'r', encoding='utf-8') as f:
-        input_data = json.load(f)
-        
-        wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
-        args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
-        os.makedirs(args.audio_save_dir,exist_ok=True)
-        
-        if len(input_data['cond_audio'])==2:
-            new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
-            audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-            audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
-            emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-            emb2_path = os.path.join(args.audio_save_dir, '2.pt')
-            sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-            sf.write(sum_audio, sum_human_speechs, 16000)
-            torch.save(audio_embedding_1, emb1_path)
-            torch.save(audio_embedding_2, emb2_path)
-            input_data['cond_audio']['person1'] = emb1_path
-            input_data['cond_audio']['person2'] = emb2_path
-            input_data['video_audio'] = sum_audio
-        elif len(input_data['cond_audio'])==1:
-            human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
-            audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
-            emb_path = os.path.join(args.audio_save_dir, '1.pt')
-            sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-            sf.write(sum_audio, human_speech, 16000)
-            torch.save(audio_embedding, emb_path)
-            input_data['cond_audio']['person1'] = emb_path
-            input_data['video_audio'] = sum_audio
+        if args.bbox_person1 or args.bbox_person2:
+            input_data['bbox'] = {}
+            if args.bbox_person1:
+                try:
+                    bbox_values = [float(x) for x in args.bbox_person1.split(',')]
+                    assert len(bbox_values) == 4
+                    input_data['bbox']['person1'] = bbox_values
+                except (ValueError, AssertionError):
+                    raise argparse.ArgumentTypeError("bbox_person1 must be in 'x_min,y_min,x_max,y_max' format with 4 numbers.")
+            if args.bbox_person2:
+                try:
+                    bbox_values = [float(x) for x in args.bbox_person2.split(',')]
+                    assert len(bbox_values) == 4
+                    input_data['bbox']['person2'] = bbox_values
+                except (ValueError, AssertionError):
+                     raise argparse.ArgumentTypeError("bbox_person2 must be in 'x_min,y_min,x_max,y_max' format with 4 numbers.")
+
+    wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
+    args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
+    os.makedirs(args.audio_save_dir,exist_ok=True)
+    
+    if len(input_data['cond_audio'])==2:
+        new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
+        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+        audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+        emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+        emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+        sf.write(sum_audio, sum_human_speechs, 16000)
+        torch.save(audio_embedding_1, emb1_path)
+        torch.save(audio_embedding_2, emb2_path)
+        input_data['cond_audio']['person1'] = emb1_path
+        input_data['cond_audio']['person2'] = emb2_path
+        input_data['video_audio'] = sum_audio
+    elif len(input_data['cond_audio'])==1:
+        human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
+        audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+        emb_path = os.path.join(args.audio_save_dir, '1.pt')
+        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+        sf.write(sum_audio, human_speech, 16000)
+        torch.save(audio_embedding, emb_path)
+        input_data['cond_audio']['person1'] = emb_path
+        input_data['video_audio'] = sum_audio
 
     logging.info("Creating MultiTalk pipeline.")
-    wan_i2v = wan.MultiTalkPipeline(
+    wan_i2v = MultiTalkPipeline(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
         device_id=device,
@@ -4917,7 +5077,9 @@ def generate(args):
         t5_fsdp=args.t5_fsdp,
         dit_fsdp=args.dit_fsdp, 
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
-        t5_cpu=args.t5_cpu
+        t5_cpu=args.t5_cpu,
+        t5_tokenizer_path_override=args.t5_tokenizer_path,
+        args=args,
     )
 
     if args.num_persistent_param_in_dit is not None:
@@ -4936,6 +5098,7 @@ def generate(args):
         sampling_steps=args.sample_steps,
         text_guide_scale=args.sample_text_guide_scale,
         audio_guide_scale=args.sample_audio_guide_scale,
+        n_prompt=args.n_prompt,
         seed=args.base_seed,
         offload_model=args.offload_model,
         max_frames_num=args.frame_num if args.mode == 'clip' else 1000,

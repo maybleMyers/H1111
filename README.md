@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+6/29/2025  
+    Support for MultiTalk model. Works very well but takes a while.  
 6/21/2025  
     Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
@@ -9,8 +11,6 @@
     Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.  
 5/25/2025  
     Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
-5/24/2025  
-    Batch images from folder now available for framepack. Save only extension option and experimental start image for f1 in framepack extension tab.      
 
 # H1111
 
@@ -84,6 +84,23 @@ Fastest speed will be achieved with fp8 and fp8 scaled, then you can reduce bloc
 Framepack Extension tab is still a work in progress.  
 Thanks to @pftq https://github.com/pftq and @chaojie https://github.com/chaojie for their work on the extension logics.  
 
+### To Use with the MultiTalk model
+
+Download https://huggingface.co/maybleMyers/wan_files_for_h1111/resolve/main/wan2.1_i2v_480p_14B_fp16.safetensors and place it in the wan subfolder, it needs to be named exactly "wan2.1_i2v_480p_14B_fp16.safetensors" or it will not work.  
+Download https://huggingface.co/MeiGen-AI/MeiGen-MultiTalk/resolve/main/multitalk.safetensors?download=true and place it in the wan subfolder also.  
+Download this folder https://huggingface.co/maybleMyers/wan_files_for_h1111/tree/main/chinese-wav2vec2-base and place it in the wan subfolder also, you can download the folder with huggingface-cli with this command and it will place it in the correct folder if you are in this repositories root directory:  
+huggingface-cli download \  
+  maybleMyers/wan_files_for_h1111 \  
+  --repo-type model \  
+  --include "chinese-wav2vec2-base/*" \  
+  --local-dir ./wan/  
+
+Install new requirements for MultiTalk. It might help to install xformers and flash first (pip install xformers==0.0.29.post1 pip install flash-attn --no-build-isolation), sometimes it messes up the torch version. I have only verified with torch 2.5.1, python 3.10 and linux.  
+pip install -r requirementsMulti.txt  
+
+Set the  Low VRAM (Persistent Params) for your vram, 5500000000 is good for 24gb gpu, 20000000000 works well with a 48gb gpu.  
+Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
+
 ## To Use the new Skyreels-V2 models
 
 I have provided these 2 at https://huggingface.co/maybleMyers/wan_files_for_h1111  
@@ -92,14 +109,14 @@ I have provided these 2 at https://huggingface.co/maybleMyers/wan_files_for_h111
  SkyReels-V2-I2V-14B-540P-FP16.safetensors  
 
 You can just drop them into the wan folder and use them in the WanX-i2v tab. Skyreels-V2 is a fine tune from Wan2.1.  
-If you have download the kijai variants the will not work because he added extra keys to the model.  
+If you have download the kijai variants they will not work because he added extra keys to the model.  
 
 ## To Use WanX
 
 To use wanX download these and toss them in the wan subfolder:
 Download the T5 `models_t5_umt5-xxl-enc-bf16.pth`, vae `Wan2.1_VAE.pth` and CLIP `models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` from the following page: https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/tree/main    
 
-Download the DiT weights from the following page: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models  
+Download the DiT weights from the following page: https://huggingface.co/maybleMyers/wan_files_for_h1111 or https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models  
 ie : wan2.1_i2v_720p_14B_fp16.safetensors  
 
 For the fun control option in WanX-i2v I recommend the fp16 weights here: https://huggingface.co/maybleMyers/wan_files_for_h1111/tree/main  

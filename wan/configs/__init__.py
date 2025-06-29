@@ -9,6 +9,7 @@ from .shared_config import wan_shared_cfg
 from .wan_i2v_14B import i2v_14B
 from .wan_t2v_1_3B import t2v_1_3B
 from .wan_t2v_14B import t2v_14B
+from .wan_multitalk_14B import multitalk_14B
 # Import S2V base configs if they exist as separate files (like official repo)
 # For this integration, we define them directly here.
 
@@ -162,6 +163,7 @@ WAN_CONFIGS = {
     "t2v-14B-FC": t2v_14B_FC,
     "i2v-14B-FC": i2v_14B_FC,
     "i2v-14B-FC-1.1": i2v_14B_FC_1_1,
+    'multitalk-14B': multitalk_14B,
 }
 
 SIZE_CONFIGS = {
@@ -173,6 +175,8 @@ SIZE_CONFIGS = {
     "512*512": (512, 512),
     "672*352": (672, 352),
     "352*672": (352, 672),
+    'multitalk-480': (640, 640),
+    'multitalk-720': (960, 960),    
 }
 
 MAX_AREA_CONFIGS = {
@@ -192,12 +196,11 @@ SUPPORTED_SIZES = {
     "i2v-14B": ("720*1280", "1280*720", "480*832", "832*480"),
     "t2i-14B": tuple(SIZE_CONFIGS.keys()),
     "i2v-1.3B-new": ("480*832", "832*480", "512*512", "672*352", "352*672"),
-    # Phantom S2V models (from official phantom_wan repo)
     "s2v-1.3B-phantom": ("832*480",),
     "s2v-14B-phantom": ("832*480", "1280*720"),
-    # Fun Control models
     "t2v-1.3B-FC": ("480*832", "832*480"),
     "t2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC-1.1": ("720*1280", "1280*720", "480*832", "832*480"),
+    'multitalk-14B': ('multitalk-480', 'multitalk-720'),
 }

@@ -36,6 +36,273 @@ logger = logging.getLogger(__name__)
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 
+### Multitalk
+def multitalk_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    cond_image: str,
+    audio_person1: Optional[str],
+    audio_person2: Optional[str],
+    batch_size: int,
+    # Generation params
+    size: str,
+    mode: str,
+    frame_num: int,
+    motion_frame: int,
+    sample_steps: int,
+    sample_shift: float,
+    text_guide_scale: float,
+    audio_guide_scale: float,
+    seed: int,
+    # Advanced & Performance
+    audio_type: str,
+    num_persistent: int,
+    use_teacache: bool,
+    teacache_thresh: float,
+    use_apg: bool,
+    apg_momentum: float,
+    apg_norm_thresh: float,
+    # Paths
+    ckpt_dir: str,
+    wav2vec_dir: str,
+    t5_tokenizer_path: str,
+    save_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    if not cond_image or not os.path.exists(cond_image):
+        yield [], "Error: Reference Image not found.", ""
+        return
+    if not audio_person1 or not os.path.exists(audio_person1):
+        yield [], "Error: Audio for Person 1 not found.", ""
+        return
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+    
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        save_file_prefix = os.path.join(save_path, f"multitalk_{run_id}_s{current_seed}")
+        
+        command = [
+            sys.executable,
+            "generate_multitalk_video.py",
+            "--ckpt_dir", str(ckpt_dir),
+            "--wav2vec_dir", str(wav2vec_dir),
+            "--t5_tokenizer_path", str(t5_tokenizer_path),
+            "--prompt", str(prompt),
+            "--n_prompt", str(negative_prompt),
+            "--cond_image", str(cond_image),
+            "--cond_audio_person1", str(audio_person1),
+            "--base_seed", str(current_seed),
+            "--save_file", save_file_prefix,
+            "--size", str(size),
+            "--mode", str(mode),
+            "--frame_num", str(frame_num),
+            "--motion_frame", str(motion_frame),
+            "--sample_steps", str(sample_steps),
+            "--sample_shift", str(sample_shift),
+            "--sample_text_guide_scale", str(text_guide_scale),
+            "--sample_audio_guide_scale", str(audio_guide_scale),
+            "--audio_type", str(audio_type),
+            "--num_persistent_param_in_dit", str(int(num_persistent)),
+        ]
+        
+        if audio_person2 and os.path.exists(audio_person2):
+            command.extend(["--cond_audio_person2", str(audio_person2)])
+            
+        if use_teacache:
+            command.append("--use_teacache")
+            command.extend(["--teacache_thresh", str(teacache_thresh)])
+
+        if use_apg:
+            command.append("--use_apg")
+            command.extend(["--apg_momentum", str(apg_momentum)])
+            command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
+
+        # LoRA Handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult), (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+            
+        # --- Execute Subprocess ---
+        print(f"Running MultiTalk Command: {' '.join(command)}")
+        
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+        
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"MULTITALK_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+            clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
+            saving_video_match = re.search(r'Saving video:.*', line_strip)
+            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)          
+            if final_save_match:
+                found_path = final_save_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif saving_video_match:
+                progress_text_update = "Saving final video..."
+            elif clip_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
+                tqdm_match_on_clip_line = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+                if tqdm_match_on_clip_line:
+                    percentage = tqdm_match_on_clip_line.group(1)
+                    steps_iter = tqdm_match_on_clip_line.group(2)
+                    time_details = tqdm_match_on_clip_line.group(3)
+                    time_elapsed = "??"
+                    time_remaining = "??"
+                    time_split = time_details.split('<')
+                    if len(time_split) > 1:
+                        time_elapsed = time_split[0].strip()
+                        remaining_part = time_split[1]
+                        time_remaining = remaining_part.split(',')[0].strip()
+                    else:
+                        time_elapsed = time_details.split(',')[0].strip().replace('?','')
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
+                else:
+                    progress_text_update = "Starting new clip generation..."
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_details = tqdm_match.group(3) # e.g., "00:01<00:09, 1.05it/s" or "00:00<?, ?it/s"
+
+                time_elapsed = "??"
+                time_remaining = "??"
+                
+                time_split = time_details.split('<')
+                if len(time_split) > 1:
+                    time_elapsed = time_split[0].strip()
+                    remaining_part = time_split[1]
+                    time_remaining = remaining_part.split(',')[0].strip()
+                else:
+                    time_elapsed = time_details.split(',')[0].strip().replace('?','')
+                
+                if "Clip" not in status_text: # Update status if not already showing clip info
+                     status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
+            else:
+                 progress_text_update = line_strip
+
+            yield all_generated_videos.copy(), status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+        
+        # Check for the video file again after process completion
+        final_video_path = save_file_prefix + ".mp4"
+        if os.path.exists(final_video_path):
+            current_video_file_for_item = final_video_path
+
+        # After subprocess finishes for one item
+        if return_code == 0 and current_video_file_for_item:
+            # --- START METADATA SAVING ---
+            params_for_meta = {
+                "model_type": "MultiTalk",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "cond_image": os.path.basename(cond_image) if cond_image else None,
+                "audio_person1": os.path.basename(audio_person1) if audio_person1 else None,
+                "audio_person2": os.path.basename(audio_person2) if audio_person2 else None,
+                "batch_size": batch_size,
+                "seed": current_seed,
+                "size": size,
+                "mode": mode,
+                "frame_num": frame_num,
+                "motion_frame": motion_frame,
+                "sample_steps": sample_steps,
+                "sample_shift": sample_shift,
+                "text_guide_scale": text_guide_scale,
+                "audio_guide_scale": audio_guide_scale,
+                "audio_type": audio_type,
+                "num_persistent_param_in_dit": num_persistent,
+                "use_teacache": use_teacache,
+                "teacache_thresh": teacache_thresh,
+                "use_apg": use_apg,
+                "apg_momentum": apg_momentum,
+                "apg_norm_thresh": apg_norm_thresh,
+                "ckpt_dir": ckpt_dir,
+                "wav2vec_dir": wav2vec_dir,
+                "t5_tokenizer_path": t5_tokenizer_path,
+                "save_path": save_path,
+                "lora_folder": lora_folder,
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+                print(f"Added metadata to {current_video_file_for_item}")
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+            # --- END METADATA SAVING ---
+            
+            all_generated_videos.append((current_video_file_for_item, f"MultiTalk - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+        
+        yield all_generated_videos.copy(), status_text, progress_text_update
+        
+        clear_cuda_cache()
+        time.sleep(0.2)
+        
+    yield all_generated_videos, "MultiTalk Batch complete.", ""
+
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
     settings_to_save = {}
@@ -5740,6 +6007,100 @@ with gr.Blocks(
                     fpe_image_encoder_path = gr.Textbox(label="Image Encoder (SigLIP)", value="hunyuan/model.safetensors")
                     fpe_save_path = gr.Textbox(label="Save Path (Output Directory)", value="outputs/framepack_extensions")
 
+
+### MultiTalk Tab
+        with gr.Tab(id=8, label="MultiTalk") as multitalk_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    multitalk_prompt = gr.Textbox(
+                        label="Prompt",
+                        value="A conversation between two female bunny anchors in a studio in Ghangzhou.",
+                        lines=5,
+                    )
+                    multitalk_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        lines=3,
+                        value="bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."
+                    )                    
+                with gr.Column(scale=1):
+                    multitalk_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    multitalk_status = gr.Textbox(label="Status", interactive=False, value="")
+                    multitalk_progress = gr.Textbox(label="Progress", interactive=False, value="", elem_id="multitalk_progress_text")
+
+            with gr.Row():
+                multitalk_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                multitalk_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                # Left Column for inputs and core settings
+                with gr.Column():
+                    multitalk_cond_image = gr.Image(label="Reference Image (required)", type="filepath")
+                    with gr.Row():
+                        multitalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
+                        multitalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
+                    
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        multitalk_size = gr.Dropdown(label="Resolution", choices=["multitalk-480", "multitalk-720"], value="multitalk-480")
+                    with gr.Row():
+                        multitalk_mode = gr.Dropdown(label="Mode", choices=["clip", "streaming"], value="streaming", info="'streaming' for long video, 'clip' for a single chunk.")
+                        multitalk_frame_num = gr.Slider(label="Frames per Chunk", minimum=41, maximum=201, value=81, step=4, info="Must be 4n+1. Default is 81.")
+                        multitalk_motion_frame = gr.Slider(label="Motion Frame (for streaming)", minimum=1, maximum=40, value=25, step=1, info="Frames from previous chunk to condition the next.")
+                    
+                    with gr.Row():
+                        multitalk_sample_steps = gr.Slider(label="Sampling Steps", minimum=10, maximum=100, value=40, step=1)
+                        multitalk_sample_shift = gr.Slider(label="Sample Shift", minimum=1.0, maximum=20.0, value=7.0, step=0.1)
+                    
+                    with gr.Row():
+                        multitalk_text_guide_scale = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=10.0, value=5.0, step=0.1)
+                        multitalk_audio_guide_scale = gr.Slider(label="Audio Guidance Scale", minimum=1.0, maximum=10.0, value=4.0, step=0.1)
+
+                    with gr.Row():
+                        multitalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        multitalk_random_seed_btn = gr.Button("🎲️")
+
+                # Right column for outputs and advanced settings
+                with gr.Column():
+                    multitalk_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[1], rows=[1], object_fit="contain", height=480,
+                        allow_preview=True, preview=True
+                    )
+                    
+                    with gr.Accordion("Advanced & Performance", open=False):
+                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=6000000000, info="Set to 0 for very low VRAM, will be slower.")
+                        with gr.Row():
+                            multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
+                            multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
+                        with gr.Row():
+                            multitalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
+                            multitalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
+                            multitalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
+                    
+                    with gr.Accordion("Model & LoRA Paths", open=False):
+                        multitalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
+                        multitalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
+                        multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
+                        multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
+                        
+                        with gr.Row():
+                            multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        
+                        multitalk_lora_weights_ui = []
+                        multitalk_lora_multipliers_ui = []
+                        for i in range(4):
+                            with gr.Row():
+                                multitalk_lora_weights_ui.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                multitalk_lora_multipliers_ui.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
@@ -6029,7 +6390,7 @@ with gr.Blocks(
 
 ### SKYREELS
 
-        with gr.Tab(label="SkyReels-i2v") as skyreels_tab:
+        with gr.Tab(label="SkyReels-i2v", visible=False) as skyreels_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     skyreels_prompt = gr.Textbox(
@@ -6970,7 +7331,56 @@ with gr.Blocks(
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
     #Event handlers etc
+#multitalk event handlers
+    multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
 
+    multitalk_generate_btn.click(
+        fn=multitalk_batch_handler,
+        inputs=[
+            multitalk_prompt,
+            multitalk_negative_prompt,
+            multitalk_cond_image,
+            multitalk_audio_person1,
+            multitalk_audio_person2,
+            multitalk_batch_size,
+            multitalk_size,
+            multitalk_mode,
+            multitalk_frame_num,
+            multitalk_motion_frame,
+            multitalk_sample_steps,
+            multitalk_sample_shift,
+            multitalk_text_guide_scale,
+            multitalk_audio_guide_scale,
+            multitalk_seed,
+            multitalk_audio_type,
+            multitalk_num_persistent,
+            multitalk_use_teacache,
+            multitalk_teacache_thresh,
+            multitalk_use_apg,
+            multitalk_apg_momentum,
+            multitalk_apg_norm_thresh,
+            multitalk_ckpt_dir,
+            multitalk_wav2vec_dir,
+            multitalk_t5_tokenizer_path,
+            multitalk_save_path,
+            multitalk_lora_folder,
+            *multitalk_lora_weights_ui,
+            *multitalk_lora_multipliers_ui
+        ],
+        outputs=[multitalk_output, multitalk_status, multitalk_progress],
+        queue=True
+    )
+
+    multitalk_lora_refresh_outputs_list = []
+    for i in range(len(multitalk_lora_weights_ui)):
+        multitalk_lora_refresh_outputs_list.extend([multitalk_lora_weights_ui[i], multitalk_lora_multipliers_ui[i]])
+    
+    multitalk_lora_refresh_btn.click(
+        fn=refresh_lora_dropdowns_simple,
+        inputs=[multitalk_lora_folder],
+        outputs=multitalk_lora_refresh_outputs_list
+    )
 # Toggle visibility of End Frame controls and DiT path based on fpe_use_normal_framepack
     def toggle_fpe_normal_framepack_options(use_normal_fp):
         f1_dit_path = "hunyuan/FramePack_F1_I2V_HY_20250503.safetensors"
