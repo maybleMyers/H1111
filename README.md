@@ -101,6 +101,16 @@ pip install -r requirementsMulti.txt
 Set the  Low VRAM (Persistent Params) for your vram, 5500000000 is good for 24gb gpu, 20000000000 works well with a 48gb gpu.  
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
 
+Thanks to Meigen-AI for their awesome work on this model xD.  
+```bibtex
+@article{kong2025let,
+  title={Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation},
+  author={Kong, Zhe and Gao, Feng and Zhang, Yong and Kang, Zhuoliang and Wei, Xiaoming and Cai, Xunliang and Chen, Guanying and Luo, Wenhan},
+  journal={arXiv preprint arXiv:2505.22647},
+  year={2025}
+}
+```
+
 ## To Use the new Skyreels-V2 models
 
 I have provided these 2 at https://huggingface.co/maybleMyers/wan_files_for_h1111  
