@@ -93,6 +93,7 @@ from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
 from networks import lora_wan
 from safetensors.torch import load_file
+from blissful_tuner.latent_preview import LatentPreviewer
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -712,6 +713,19 @@ def _validate_args(args):
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
+    )
+    parser.add_argument(
+        "--preview",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory."
+    )
+    parser.add_argument(
+        "--preview_suffix",
+        type=str,
+        default=None,
+        help="Unique suffix for preview files to avoid conflicts in concurrent runs."
     )
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path(s).")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier(s).")
@@ -4410,6 +4424,30 @@ class MultiTalkPipeline:
                 lat_w,
                 dtype=torch.float32,
                 device=self.device) 
+            
+            previewer = None
+            if LatentPreviewer is not None and extra_args.preview is not None and extra_args.preview > 0 and self.rank == 0:
+                logging.info(f"Initializing latent previewer for clip {clip_count+1} (every {extra_args.preview} steps)...")
+                try:
+                    if extra_args.save_file:
+                        extra_args.save_path = os.path.dirname(extra_args.save_file)
+                    else: # Fallback if no save_file is provided
+                        extra_args.save_path = "multitalk_previews_output"
+
+                    preview_timesteps = np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
+
+                    previewer = LatentPreviewer(
+                        args=extra_args,
+                        original_latents=noise.clone(),
+                        timesteps=preview_timesteps,
+                        device=self.device,
+                        dtype=self.param_dtype,
+                        model_type="wan", # Crucial for using the correct latent2rgb matrix
+                    )
+                    logging.info("Latent Previewer initialized successfully.")
+                except Exception as e:
+                    logging.error(f"Failed to initialize Latent Previewer: {e}", exc_info=True)
+                    previewer = None
 
             # get mask
             msk = torch.ones(1, frame_num, lat_h, lat_w, device=self.device)
@@ -4602,6 +4640,14 @@ class MultiTalkPipeline:
                         add_latent = self.add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
+                        
+                    if previewer is not None and (i + 1) % extra_args.preview == 0 and (i + 1) < len(timesteps) - 1:
+                        try:
+                            logging.debug(f"Generating preview for step {i + 1}")
+                            # The latent is shape [C, F, H, W], which preview() expects
+                            previewer.preview(latent.clone(), i, preview_suffix=extra_args.preview_suffix)
+                        except Exception as e:
+                            logging.error(f"Error during latent preview at step {i + 1}: {e}", exc_info=True)
 
                     x0 = [latent.to(self.device)] 
                     pbar.update(1)

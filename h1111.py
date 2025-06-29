@@ -62,6 +62,8 @@ def multitalk_batch_handler(
     use_apg: bool,
     apg_momentum: float,
     apg_norm_thresh: float,
+    enable_preview: bool,
+    preview_steps: int,
     # Paths
     ckpt_dir: str,
     wav2vec_dir: str,
@@ -71,7 +73,7 @@ def multitalk_batch_handler(
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
     lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
-) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
 
@@ -103,6 +105,7 @@ def multitalk_batch_handler(
         # --- Prepare command for a single generation ---
         
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"multitalk_{run_id}"
         save_file_prefix = os.path.join(save_path, f"multitalk_{run_id}_s{current_seed}")
         
         command = [
@@ -141,6 +144,9 @@ def multitalk_batch_handler(
             command.extend(["--apg_momentum", str(apg_momentum)])
             command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
 
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
         # LoRA Handling
         lora_weights_paths = []
         lora_multipliers_values = []
@@ -168,7 +174,13 @@ def multitalk_batch_handler(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding='utf-8', errors='replace', bufsize=1
         )
-        
+
+        current_previews_for_item = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+        preview_png_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.png") 
+
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
 
@@ -237,7 +249,23 @@ def multitalk_batch_handler(
             else:
                  progress_text_update = line_strip
 
-            yield all_generated_videos.copy(), status_text, progress_text_update
+            if enable_preview:
+                found_preview_path = None
+                current_mtime = 0
+
+                # Check for MP4 or PNG preview file
+                if os.path.exists(preview_mp4_gen_path):
+                    current_mtime = os.path.getmtime(preview_mp4_gen_path)
+                    found_preview_path = preview_mp4_gen_path
+                elif os.path.exists(preview_png_gen_path):
+                    current_mtime = os.path.getmtime(preview_png_gen_path)
+                    found_preview_path = preview_png_gen_path
+
+                if found_preview_path and current_mtime > last_preview_mtime:
+                    current_previews_for_item = [(found_preview_path, "Preview")]
+                    last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_previews_for_item, status_text, progress_text_update
 
         process.stdout.close()
         return_code = process.wait()
@@ -296,12 +324,12 @@ def multitalk_batch_handler(
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
         
-        yield all_generated_videos.copy(), status_text, progress_text_update
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
         
         clear_cuda_cache()
         time.sleep(0.2)
         
-    yield all_generated_videos, "MultiTalk Batch complete.", ""
+    yield all_generated_videos, [], "MultiTalk Batch complete.", ""
 
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
@@ -6067,8 +6095,18 @@ with gr.Blocks(
                         columns=[1], rows=[1], object_fit="contain", height=480,
                         allow_preview=True, preview=True
                     )
-                    
-                    with gr.Accordion("Advanced & Performance", open=False):
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        multitalk_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        multitalk_preview_steps = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps",
+                            info="Generates previews during the sampling loop."
+                        )
+                        multitalk_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=2, rows=1, object_fit="contain", height="auto",
+                            allow_preview=True, preview=True, show_label=True, elem_id="multitalk_preview_gallery"
+                        )
+                    with gr.Accordion("Advanced & Performance", open=True):
                         multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
                         multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
                         with gr.Row():
@@ -7361,6 +7399,8 @@ with gr.Blocks(
             multitalk_use_apg,
             multitalk_apg_momentum,
             multitalk_apg_norm_thresh,
+            multitalk_enable_preview,
+            multitalk_preview_steps,
             multitalk_ckpt_dir,
             multitalk_wav2vec_dir,
             multitalk_t5_tokenizer_path,
@@ -7369,7 +7409,7 @@ with gr.Blocks(
             *multitalk_lora_weights_ui,
             *multitalk_lora_multipliers_ui
         ],
-        outputs=[multitalk_output, multitalk_status, multitalk_progress],
+        outputs=[multitalk_output, multitalk_preview_output, multitalk_status, multitalk_progress],
         queue=True
     )
 
@@ -8278,7 +8318,7 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
-    
+
     #Video Extension
     wanx_send_last_frame_btn.click(
         fn=send_last_frame_handler,
