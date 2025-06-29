@@ -79,10 +79,10 @@ def multitalk_batch_handler(
 
     # --- Initial Checks ---
     if not cond_image or not os.path.exists(cond_image):
-        yield [], "Error: Reference Image not found.", ""
+        yield [], [], "Error: Reference Image not found.", ""
         return
     if not audio_person1 or not os.path.exists(audio_person1):
-        yield [], "Error: Audio for Person 1 not found.", ""
+        yield [], [], "Error: Audio for Person 1 not found.", ""
         return
     os.makedirs(save_path, exist_ok=True)
 
@@ -90,7 +90,7 @@ def multitalk_batch_handler(
     
     for i in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, "Generation stopped by user.", ""
+            yield all_generated_videos, [], "Generation stopped by user.", ""
             return
 
         current_seed = seed
@@ -100,7 +100,7 @@ def multitalk_batch_handler(
             current_seed = seed + i
 
         status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), status_text, "Starting item..."
+        yield all_generated_videos.copy(), [], status_text, "Starting item..."
 
         # --- Prepare command for a single generation ---
         
