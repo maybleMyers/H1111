@@ -188,7 +188,7 @@ def multitalk_batch_handler(
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
                 except: process.kill(); process.wait()
-                yield all_generated_videos, "Generation stopped by user.", ""
+                yield all_generated_videos, [], "Generation stopped by user.", ""
                 return
 
             line_strip = line.strip()
