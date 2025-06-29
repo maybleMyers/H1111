@@ -7171,6 +7171,7 @@ with gr.Blocks(
                 send_to_fpe_btn = gr.Button("Send to FramePack-Extension", variant="primary")                
                 send_to_t2v_btn = gr.Button("Send to Text2Video", variant="primary")
                 send_to_v2v_btn = gr.Button("Send to Video2Video", variant="primary")
+                send_to_multitalk_btn = gr.Button("Send to MultiTalk", variant="primary")
             with gr.Row():
                 send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
@@ -8240,6 +8241,44 @@ with gr.Blocks(
         fn=change_to_wanx_v2v_tab, inputs=None, outputs=[tabs]
     )
 
+
+    def change_to_multitalk_tab():
+        return gr.Tabs(selected=8) # MultiTalk tab has id=8
+
+    send_to_multitalk_btn.click(
+        fn=lambda m: ("Parameters ready for MultiTalk", m),
+        inputs=[metadata_output],
+        outputs=[status, params_state]
+    ).then(
+        lambda params: (
+            (
+                # LoRA handling
+                (weights_from_meta := params.get("lora_weights", [])),
+                (mults_from_meta := params.get("lora_multipliers", [])),
+                (padded_weights := (weights_from_meta + ["None"] * 4)[:4]),
+                (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 4)[:4]),
+
+                [
+                    params.get("prompt", "A conversation between two female bunny anchors in a studio in Ghangzhou."),
+                    params.get("negative_prompt", "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."),
+                    *padded_weights,
+                    *padded_mults,
+                ]
+            )[-1] # Return the list of values
+        ) if params else [gr.update()] * 10, # 2 prompts + 4 loras + 4 mults
+        inputs=params_state,
+        outputs=[
+            multitalk_prompt,
+            multitalk_negative_prompt,
+            *multitalk_lora_weights_ui,
+            *multitalk_lora_multipliers_ui
+        ]
+    ).then(
+        fn=change_to_multitalk_tab,
+        inputs=None,
+        outputs=[tabs]
+    )
+    
     #Video Extension
     wanx_send_last_frame_btn.click(
         fn=send_last_frame_handler,
