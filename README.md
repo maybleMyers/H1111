@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/2/2025  
+    Add previews to multitalk model, some bug fixes, change layout.  
 6/29/2025  
     Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
 6/21/2025  
@@ -9,8 +11,6 @@
     Default button added to framepack tab to save current settings.  
 5/30/2025
     Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.  
-5/25/2025  
-    Enable full intermediate previews for framepack tab, some change to framepack extension with image input logic.  
 
 # H1111
 
@@ -99,8 +99,9 @@ huggingface-cli download \
 Install new requirements for MultiTalk. It might help to install xformers and flash first (pip install xformers==0.0.29.post1 pip install flash-attn --no-build-isolation), sometimes it messes up the torch version. I have only verified with torch 2.5.1, python 3.10 and linux.  
 pip install -r requirementsMulti.txt  
 
-Set the  Low VRAM (Persistent Params) for your vram, 5500000000 is good for 24gb gpu, 20000000000 works well with a 48gb gpu.  
+Set the  Low VRAM (Persistent Params) for your vram, 5 is good for 24gb gpu, 20 works well with a 48gb gpu.  
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
+720p does not work on a 24gb gpu.  
 
 Thanks to Meigen-AI for their awesome work on this model xD. https://github.com/MeiGen-AI/MultiTalk  
 Kong, Z., Gao, F., Zhang, Y., Kang, Z., Wei, X., Cai, X., Chen, G., & Luo, W. (2025). [Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation](https://arxiv.org/abs/2505.22647). *arXiv preprint arXiv:2505.22647*.
@@ -191,7 +192,9 @@ open 127.0.0.1:7860 in a browser
 You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a separate terminal to run unlimited copies at once if you have another gpu.  
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
-## full changlog
+## full changlog  
+7/2/2025  
+    Add previews to multitalk model, some bug fixes, change layout.  
 6/29/2025  
     Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
 6/21/2025  

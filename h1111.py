@@ -56,12 +56,15 @@ def multitalk_batch_handler(
     seed: int,
     # Advanced & Performance
     audio_type: str,
-    num_persistent: int,
+    num_persistent: float,
     use_teacache: bool,
     teacache_thresh: float,
     use_apg: bool,
     apg_momentum: float,
     apg_norm_thresh: float,
+    enable_preview: bool,
+    preview_steps: int,
+    use_full_video_preview: bool,
     # Paths
     ckpt_dir: str,
     wav2vec_dir: str,
@@ -71,16 +74,16 @@ def multitalk_batch_handler(
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
     lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
-) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
 
     # --- Initial Checks ---
     if not cond_image or not os.path.exists(cond_image):
-        yield [], "Error: Reference Image not found.", ""
+        yield [], None, "Error: Reference Image not found.", ""
         return
     if not audio_person1 or not os.path.exists(audio_person1):
-        yield [], "Error: Audio for Person 1 not found.", ""
+        yield [], None, "Error: Audio for Person 1 not found.", ""
         return
     os.makedirs(save_path, exist_ok=True)
 
@@ -88,7 +91,7 @@ def multitalk_batch_handler(
     
     for i in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, "Generation stopped by user.", ""
+            yield all_generated_videos, None, "Generation stopped by user.", ""
             return
 
         current_seed = seed
@@ -98,13 +101,15 @@ def multitalk_batch_handler(
             current_seed = seed + i
 
         status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), status_text, "Starting item..."
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
 
         # --- Prepare command for a single generation ---
         
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"multitalk_{run_id}"
         save_file_prefix = os.path.join(save_path, f"multitalk_{run_id}_s{current_seed}")
-        
+        num_persistent_backend = int(num_persistent * 1_000_000_000)
+
         command = [
             sys.executable,
             "generate_multitalk_video.py",
@@ -126,7 +131,7 @@ def multitalk_batch_handler(
             "--sample_text_guide_scale", str(text_guide_scale),
             "--sample_audio_guide_scale", str(audio_guide_scale),
             "--audio_type", str(audio_type),
-            "--num_persistent_param_in_dit", str(int(num_persistent)),
+            "--num_persistent_param_in_dit", str(num_persistent_backend),
         ]
         
         if audio_person2 and os.path.exists(audio_person2):
@@ -141,6 +146,11 @@ def multitalk_batch_handler(
             command.extend(["--apg_momentum", str(apg_momentum)])
             command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
 
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+            if use_full_video_preview:
+                command.append("--full_preview")
         # LoRA Handling
         lora_weights_paths = []
         lora_multipliers_values = []
@@ -168,7 +178,12 @@ def multitalk_batch_handler(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding='utf-8', errors='replace', bufsize=1
         )
-        
+
+        current_preview_yield_path = None
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
 
@@ -176,7 +191,7 @@ def multitalk_batch_handler(
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
                 except: process.kill(); process.wait()
-                yield all_generated_videos, "Generation stopped by user.", ""
+                yield all_generated_videos, None, "Generation stopped by user.", ""
                 return
 
             line_strip = line.strip()
@@ -237,7 +252,16 @@ def multitalk_batch_handler(
             else:
                  progress_text_update = line_strip
 
-            yield all_generated_videos.copy(), status_text, progress_text_update
+            if enable_preview:
+                found_preview_path = None
+
+                if os.path.exists(preview_mp4_gen_path):
+                    current_mtime = os.path.getmtime(preview_mp4_gen_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_path, status_text, progress_text_update
 
         process.stdout.close()
         return_code = process.wait()
@@ -296,12 +320,12 @@ def multitalk_batch_handler(
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
         
-        yield all_generated_videos.copy(), status_text, progress_text_update
+        yield all_generated_videos.copy(), None, status_text, progress_text_update
         
         clear_cuda_cache()
         time.sleep(0.2)
         
-    yield all_generated_videos, "MultiTalk Batch complete.", ""
+    yield all_generated_videos, None, "MultiTalk Batch complete.", ""
 
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
@@ -5624,50 +5648,47 @@ with gr.Blocks(
     fpe_selected_index = gr.State(value=None)
     phantom_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
-    () => {
-        document.title = 'H1111';
+        () => {
+            document.title = 'H1111';
 
-        function updateTitle(text) {
-            if (text && text.trim()) {
-                // Regex for the FramePack format: "Item ... (...)% | ... Remaining: HH:MM"
-                const framepackMatch = text.match(/.*?\((\d+)%\).*?Remaining:\s*(\d{2}:\d{2})/);
-                // Regex for standard tqdm format (like WanX uses)
-                const tqdmMatch = text.match(/(\d+)%\|.*\[.*<(\d{2}:\d{2})/); // Adjusted slightly for robustness
+            function updateTitle(text) {
+                if (text && text.trim()) {
+                    // This single regex handles both raw TQDM and custom formatted progress strings.
+                    // It looks for a percentage, then finds a time string (HH:MM:SS) after it.
+                    // Group 1: Percentage from custom format like "(XX%)"
+                    // Group 2: Time from custom format like "ETA: HH:MM:SS"
+                    // Group 3: Percentage from raw TQDM format like "XX%|"
+                    // Group 4: Time from raw TQDM format like "<HH:MM:SS"
+                    const pattern = /(?:.*?\((\d+)%\).*?(?:ETA|Remaining):\s*([\d:]+))|(?:(\d+)%\|.*\[.*<([\d:?]+))/;
+                    const match = text.match(pattern);
 
-                if (framepackMatch) {
-                    // Handle FramePack format
-                    const percentage = framepackMatch[1];
-                    const timeRemaining = framepackMatch[2];
-                    document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
-                } else if (tqdmMatch) { // <<< ADDED ELSE IF for standard tqdm
-                    // Handle standard tqdm format
-                    const percentage = tqdmMatch[1];
-                    const timeRemaining = tqdmMatch[2];
-                    document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
-                } else {
-                    // Optional: Reset title if neither format matches?
-                    // document.title = 'H1111';
+                    if (match) {
+                        const percentage = match[1] || match[3];
+                        const time = match[2] || match[4];
+                        if (percentage && time) {
+                             document.title = `[${percentage}% ETA: ${time}] - H1111`;
+                        }
+                    }
                 }
             }
-        }
 
-        setTimeout(() => {
-            // This selector should still find all relevant progress textareas
-            const progressElements = document.querySelectorAll('textarea.scroll-hide');
-            progressElements.forEach(element => {
-                if (element) {
-                    new MutationObserver(() => {
-                        updateTitle(element.value);
-                    }).observe(element, {
-                        attributes: true,
-                        childList: true,
-                        characterData: true
-                    });
-                }
-            });
-        }, 1000);
-    }
-    """)
+            setTimeout(() => {
+                const progressElements = document.querySelectorAll('textarea.scroll-hide');
+                progressElements.forEach(element => {
+                    if (element) {
+                        new MutationObserver(() => {
+                            updateTitle(element.value);
+                        }).observe(element, {
+                            attributes: true,
+                            childList: true,
+                            characterData: true,
+                            subtree: true
+                        });
+                    }
+                });
+            }, 1000);
+        }
+        """)
         
     with gr.Tabs() as tabs:
 
@@ -6059,6 +6080,23 @@ with gr.Blocks(
                     with gr.Row():
                         multitalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         multitalk_random_seed_btn = gr.Button("🎲️")
+                    with gr.Accordion("Advanced & Performance", open=True):
+                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        multitalk_num_persistent = gr.Slider(
+                            minimum=0, 
+                            maximum=26, 
+                            step=0.01, 
+                            value=5.0, 
+                            label="Low VRAM (Persistent Params in Billions)", 
+                            info="Slider value in billions. 0=very low VRAM (slower), 5=default(24gb vram)."
+                        )
+                        with gr.Row():
+                            multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
+                            multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
+                        with gr.Row():
+                            multitalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
+                            multitalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
+                            multitalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
 
                 # Right column for outputs and advanced settings
                 with gr.Column():
@@ -6067,24 +6105,20 @@ with gr.Blocks(
                         columns=[1], rows=[1], object_fit="contain", height=480,
                         allow_preview=True, preview=True
                     )
+                    with gr.Accordion("Live Preview (During Generation)", open=True):
+                        multitalk_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        multitalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews (slower)", value=True)
+                        multitalk_preview_steps = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps",
+                            info="Generates previews during the sampling loop."
+                        )
+                        multitalk_preview_output = gr.Video(
+                            label="Latest Preview", height=300,
+                            interactive=False, elem_id="multitalk_preview_video"
+                        )
                     
-                    with gr.Accordion("Advanced & Performance", open=False):
-                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
-                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
-                        with gr.Row():
-                            multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
-                            multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
-                        with gr.Row():
-                            multitalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
-                            multitalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
-                            multitalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
-                    
-                    with gr.Accordion("Model & LoRA Paths", open=False):
-                        multitalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
-                        multitalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
-                        multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
-                        multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
-                        
+                    with gr.Accordion("LoRA", open=True):                        
                         with gr.Row():
                             multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                             multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
@@ -6100,6 +6134,11 @@ with gr.Blocks(
                                 multitalk_lora_multipliers_ui.append(gr.Slider(
                                     label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
                                 ))
+            with gr.Row():
+                multitalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
+                multitalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
+                multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
+                multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
 
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
@@ -7361,6 +7400,9 @@ with gr.Blocks(
             multitalk_use_apg,
             multitalk_apg_momentum,
             multitalk_apg_norm_thresh,
+            multitalk_enable_preview,
+            multitalk_preview_steps,
+            multitalk_use_full_video_preview,
             multitalk_ckpt_dir,
             multitalk_wav2vec_dir,
             multitalk_t5_tokenizer_path,
@@ -7369,7 +7411,7 @@ with gr.Blocks(
             *multitalk_lora_weights_ui,
             *multitalk_lora_multipliers_ui
         ],
-        outputs=[multitalk_output, multitalk_status, multitalk_progress],
+        outputs=[multitalk_output, multitalk_preview_output, multitalk_status, multitalk_progress],
         queue=True
     )
 
@@ -8278,7 +8320,7 @@ with gr.Blocks(
         inputs=None,
         outputs=[tabs]
     )
-    
+
     #Video Extension
     wanx_send_last_frame_btn.click(
         fn=send_last_frame_handler,
