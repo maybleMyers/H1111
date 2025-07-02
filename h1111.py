@@ -56,7 +56,7 @@ def multitalk_batch_handler(
     seed: int,
     # Advanced & Performance
     audio_type: str,
-    num_persistent: int,
+    num_persistent: float,
     use_teacache: bool,
     teacache_thresh: float,
     use_apg: bool,
@@ -108,7 +108,8 @@ def multitalk_batch_handler(
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"multitalk_{run_id}"
         save_file_prefix = os.path.join(save_path, f"multitalk_{run_id}_s{current_seed}")
-        
+        num_persistent_backend = int(num_persistent * 1_000_000_000)
+
         command = [
             sys.executable,
             "generate_multitalk_video.py",
@@ -130,7 +131,7 @@ def multitalk_batch_handler(
             "--sample_text_guide_scale", str(text_guide_scale),
             "--sample_audio_guide_scale", str(audio_guide_scale),
             "--audio_type", str(audio_type),
-            "--num_persistent_param_in_dit", str(int(num_persistent)),
+            "--num_persistent_param_in_dit", str(num_persistent_backend),
         ]
         
         if audio_person2 and os.path.exists(audio_person2):
@@ -6081,7 +6082,14 @@ with gr.Blocks(
                         multitalk_random_seed_btn = gr.Button("🎲️")
                     with gr.Accordion("Advanced & Performance", open=True):
                         multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
-                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
+                        multitalk_num_persistent = gr.Slider(
+                            minimum=0, 
+                            maximum=26, 
+                            step=0.01, 
+                            value=5.0, 
+                            label="Low VRAM (Persistent Params in Billions)", 
+                            info="Slider value in billions. 0=very low VRAM (slower), 5=default(24gb vram)."
+                        )
                         with gr.Row():
                             multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
                             multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
