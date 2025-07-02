@@ -727,6 +727,12 @@ def _parse_args():
         default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs."
     )
+    parser.add_argument(
+        "--full_preview",
+        action="store_true",
+        default=None,
+        help="Unique suffix for preview files to avoid conflicts in concurrent runs."
+    )
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path(s).")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier(s).")
     parser.add_argument(
@@ -2913,6 +2919,21 @@ class RotaryPositionalEmbedding1D(nn.Module):
 
         return x_.type_as(x)
     
+def save_video_without_audio(frames_tensor, save_path, fps=25, quality=8):
+    """Saves a CTHW tensor as an MP4 video without audio."""
+    # Normalize from [-1, 1] to [0, 1] and then to [0, 255]
+    video_to_save = ((frames_tensor.clamp(-1, 1) + 1) / 2 * 255).byte()
+    # Permute from C, T, H, W to T, H, W, C for imageio
+    video_to_save = video_to_save.permute(1, 2, 3, 0).cpu().numpy()
+    
+    try:
+        writer = imageio.get_writer(save_path, fps=fps, quality=quality, codec='libx264', macro_block_size=1)
+        for frame in video_to_save:
+            writer.append_data(frame)
+        writer.close()
+        logging.info(f"Saved full preview to {save_path}")
+    except Exception as e:
+        logging.error(f"Failed to save full preview video to {save_path}: {e}")
 
 def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, quality=5):
     
@@ -4385,6 +4406,7 @@ class MultiTalkPipeline:
         # set random seed and init noise
         seed = seed if seed >= 0 else random.randint(0, 99999999)
         torch.manual_seed(seed)
+        preview_video_list = []
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
         random.seed(seed)
@@ -4648,9 +4670,10 @@ class MultiTalkPipeline:
 
                     if previewer is not None and (i + 1) % extra_args.preview == 0 and (i + 1) < len(timesteps) - 1:
                         try:
-                            logging.debug(f"Generating preview for step {i + 1}")
-                            # The latent is shape [C, F, H, W], which preview() expects
-                            previewer.preview(latent.clone(), i, preview_suffix=extra_args.preview_suffix)
+                            if not extra_args.full_preview:
+                                logging.debug(f"Generating preview for step {i + 1}")
+                                # The latent is shape [C, F, H, W], which preview() expects
+                                previewer.preview(latent.clone(), i, preview_suffix=extra_args.preview_suffix)
                         except Exception as e:
                             logging.error(f"Error during latent preview at step {i + 1}: {e}", exc_info=True)
 
@@ -4664,6 +4687,27 @@ class MultiTalkPipeline:
                 torch_gc()
 
                 videos = self.vae.decode(x0) 
+
+            if extra_args.preview is not None and extra_args.full_preview:
+                # We have a new decoded clip in `videos` (shape B C T H W)
+                current_clip_pixels = videos[0] # Take first from batch, shape C T H W
+                
+                if is_first_clip:
+                    preview_video_list.append(current_clip_pixels)
+                else:
+                    # Append only the new part, excluding motion frames overlap
+                    new_part = current_clip_pixels[:, cur_motion_frames_num:, :, :]
+                    preview_video_list.append(new_part)
+                    
+                # Stitch all clips so far
+                if preview_video_list:
+                    stitched_preview_video = torch.cat(preview_video_list, dim=1) # dim=1 is time
+                    
+                    # Define preview path and save
+                    preview_dir = os.path.join(os.path.dirname(extra_args.save_file), "previews")
+                    os.makedirs(preview_dir, exist_ok=True)
+                    preview_path = os.path.join(preview_dir, f"latent_preview_{extra_args.preview_suffix}.mp4")
+                    save_video_without_audio(stitched_preview_video, preview_path, fps=25)
             
             # cache generated samples
             videos = torch.stack(videos).cpu() # B C T H W

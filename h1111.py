@@ -64,6 +64,7 @@ def multitalk_batch_handler(
     apg_norm_thresh: float,
     enable_preview: bool,
     preview_steps: int,
+    use_full_video_preview: bool,
     # Paths
     ckpt_dir: str,
     wav2vec_dir: str,
@@ -147,6 +148,8 @@ def multitalk_batch_handler(
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
+            if use_full_video_preview:
+                command.append("--full_preview")
         # LoRA Handling
         lora_weights_paths = []
         lora_multipliers_values = []
@@ -175,11 +178,10 @@ def multitalk_batch_handler(
             text=True, encoding='utf-8', errors='replace', bufsize=1
         )
 
-        current_previews_for_item = []
+        current_preview_yield_path = None
         last_preview_mtime = 0
         preview_base_dir = os.path.join(save_path, "previews")
         preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
-        preview_png_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.png") 
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
@@ -251,21 +253,14 @@ def multitalk_batch_handler(
 
             if enable_preview:
                 found_preview_path = None
-                current_mtime = 0
 
-                # Check for MP4 or PNG preview file
                 if os.path.exists(preview_mp4_gen_path):
                     current_mtime = os.path.getmtime(preview_mp4_gen_path)
-                    found_preview_path = preview_mp4_gen_path
-                elif os.path.exists(preview_png_gen_path):
-                    current_mtime = os.path.getmtime(preview_png_gen_path)
-                    found_preview_path = preview_png_gen_path
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path
+                        last_preview_mtime = current_mtime
 
-                if found_preview_path and current_mtime > last_preview_mtime:
-                    current_previews_for_item = [(found_preview_path, "Preview")]
-                    last_preview_mtime = current_mtime
-
-            yield all_generated_videos.copy(), current_previews_for_item, status_text, progress_text_update
+            yield all_generated_videos.copy(), current_preview_yield_path, status_text, progress_text_update
 
         process.stdout.close()
         return_code = process.wait()
@@ -324,12 +319,12 @@ def multitalk_batch_handler(
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
         
-        yield all_generated_videos.copy(), [], status_text, progress_text_update
+        yield all_generated_videos.copy(), None, status_text, progress_text_update
         
         clear_cuda_cache()
         time.sleep(0.2)
         
-    yield all_generated_videos, [], "MultiTalk Batch complete.", ""
+    yield all_generated_videos, None, "MultiTalk Batch complete.", ""
 
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
@@ -5657,26 +5652,24 @@ with gr.Blocks(
 
         function updateTitle(text) {
             if (text && text.trim()) {
-                // Regex for the FramePack format: "Item ... (...)% | ... Remaining: HH:MM"
-                const framepackMatch = text.match(/.*?\((\d+)%\).*?Remaining:\s*(\d{2}:\d{2})/);
-                // Regex for standard tqdm format (like WanX uses)
-                const tqdmMatch = text.match(/(\d+)%\|.*\[.*<(\d{2}:\d{2})/); // Adjusted slightly for robustness
+                // Regex for formatted progress like "... (X%) | ... ETA: HH:MM:SS" or "... Remaining: HH:MM:SS"
+                // This covers FramePack, WanX, and MultiTalk formatted progress strings.
+                const formattedMatch = text.match(/.*?\((\d+)%\).*?(?:ETA|Remaining):\s*([\d:]+)/);
+                
+                // Regex for raw tqdm format (fallback for any unformatted progress)
+                const tqdmMatch = text.match(/(\d+)%\|.*\[.*<([\d:]+)/);
 
-                if (framepackMatch) {
-                    // Handle FramePack format
-                    const percentage = framepackMatch[1];
-                    const timeRemaining = framepackMatch[2];
+                if (formattedMatch) {
+                    const percentage = formattedMatch[1];
+                    const timeRemaining = formattedMatch[2];
                     document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
-                } else if (tqdmMatch) { // <<< ADDED ELSE IF for standard tqdm
-                    // Handle standard tqdm format
+                } else if (tqdmMatch) {
                     const percentage = tqdmMatch[1];
                     const timeRemaining = tqdmMatch[2];
                     document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
-                } else {
-                    // Optional: Reset title if neither format matches?
-                    // document.title = 'H1111';
                 }
             }
+        }
         }
 
         setTimeout(() => {
@@ -6095,16 +6088,17 @@ with gr.Blocks(
                         columns=[1], rows=[1], object_fit="contain", height=480,
                         allow_preview=True, preview=True
                     )
-                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                    with gr.Accordion("Live Preview (During Generation)", open=True):
                         multitalk_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        multitalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews (slower)", value=True)
                         multitalk_preview_steps = gr.Slider(
                             minimum=1, maximum=50, step=1, value=5,
                             label="Preview Every N Steps",
                             info="Generates previews during the sampling loop."
                         )
-                        multitalk_preview_output = gr.Gallery(
-                            label="Latent Previews", columns=2, rows=1, object_fit="contain", height="auto",
-                            allow_preview=True, preview=True, show_label=True, elem_id="multitalk_preview_gallery"
+                        multitalk_preview_output = gr.Video(
+                            label="Latest Preview", height=300,
+                            interactive=False, elem_id="multitalk_preview_video"
                         )
                     with gr.Accordion("Advanced & Performance", open=True):
                         multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
@@ -7401,6 +7395,7 @@ with gr.Blocks(
             multitalk_apg_norm_thresh,
             multitalk_enable_preview,
             multitalk_preview_steps,
+            multitalk_use_full_video_preview,
             multitalk_ckpt_dir,
             multitalk_wav2vec_dir,
             multitalk_t5_tokenizer_path,
