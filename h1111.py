@@ -5647,48 +5647,47 @@ with gr.Blocks(
     fpe_selected_index = gr.State(value=None)
     phantom_selected_index = gr.State(value=None)
     demo.load(None, None, None, js="""
-    () => {
-        document.title = 'H1111';
+        () => {
+            document.title = 'H1111';
 
-        function updateTitle(text) {
-            if (text && text.trim()) {
-                // Regex for formatted progress like "... (X%) | ... ETA: HH:MM:SS" or "... Remaining: HH:MM:SS"
-                // This covers FramePack, WanX, and MultiTalk formatted progress strings.
-                const formattedMatch = text.match(/.*?\((\d+)%\).*?(?:ETA|Remaining):\s*([\d:]+)/);
-                
-                // Regex for raw tqdm format (fallback for any unformatted progress)
-                const tqdmMatch = text.match(/(\d+)%\|.*\[.*<([\d:]+)/);
+            function updateTitle(text) {
+                if (text && text.trim()) {
+                    // This single regex handles both raw TQDM and custom formatted progress strings.
+                    // It looks for a percentage, then finds a time string (HH:MM:SS) after it.
+                    // Group 1: Percentage from custom format like "(XX%)"
+                    // Group 2: Time from custom format like "ETA: HH:MM:SS"
+                    // Group 3: Percentage from raw TQDM format like "XX%|"
+                    // Group 4: Time from raw TQDM format like "<HH:MM:SS"
+                    const pattern = /(?:.*?\((\d+)%\).*?(?:ETA|Remaining):\s*([\d:]+))|(?:(\d+)%\|.*\[.*<([\d:?]+))/;
+                    const match = text.match(pattern);
 
-                if (formattedMatch) {
-                    const percentage = formattedMatch[1];
-                    const timeRemaining = formattedMatch[2];
-                    document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
-                } else if (tqdmMatch) {
-                    const percentage = tqdmMatch[1];
-                    const timeRemaining = tqdmMatch[2];
-                    document.title = `[${percentage}% ETA: ${timeRemaining}] - H1111`;
+                    if (match) {
+                        const percentage = match[1] || match[3];
+                        const time = match[2] || match[4];
+                        if (percentage && time) {
+                             document.title = `[${percentage}% ETA: ${time}] - H1111`;
+                        }
+                    }
                 }
             }
-        }
-        }
 
-        setTimeout(() => {
-            // This selector should still find all relevant progress textareas
-            const progressElements = document.querySelectorAll('textarea.scroll-hide');
-            progressElements.forEach(element => {
-                if (element) {
-                    new MutationObserver(() => {
-                        updateTitle(element.value);
-                    }).observe(element, {
-                        attributes: true,
-                        childList: true,
-                        characterData: true
-                    });
-                }
-            });
-        }, 1000);
-    }
-    """)
+            setTimeout(() => {
+                const progressElements = document.querySelectorAll('textarea.scroll-hide');
+                progressElements.forEach(element => {
+                    if (element) {
+                        new MutationObserver(() => {
+                            updateTitle(element.value);
+                        }).observe(element, {
+                            attributes: true,
+                            childList: true,
+                            characterData: true,
+                            subtree: true
+                        });
+                    }
+                });
+            }, 1000);
+        }
+        """)
         
     with gr.Tabs() as tabs:
 
@@ -6080,6 +6079,16 @@ with gr.Blocks(
                     with gr.Row():
                         multitalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         multitalk_random_seed_btn = gr.Button("🎲️")
+                    with gr.Accordion("Advanced & Performance", open=True):
+                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
+                        with gr.Row():
+                            multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
+                            multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
+                        with gr.Row():
+                            multitalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
+                            multitalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
+                            multitalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
 
                 # Right column for outputs and advanced settings
                 with gr.Column():
@@ -6100,23 +6109,8 @@ with gr.Blocks(
                             label="Latest Preview", height=300,
                             interactive=False, elem_id="multitalk_preview_video"
                         )
-                    with gr.Accordion("Advanced & Performance", open=True):
-                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
-                        multitalk_num_persistent = gr.Number(label="Low VRAM (Persistent Params)", value=5000000000, info="Set to 0 for very low VRAM, will be slower.")
-                        with gr.Row():
-                            multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
-                            multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
-                        with gr.Row():
-                            multitalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
-                            multitalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
-                            multitalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
                     
-                    with gr.Accordion("Model & LoRA Paths", open=False):
-                        multitalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
-                        multitalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
-                        multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
-                        multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
-                        
+                    with gr.Accordion("LoRA", open=True):                        
                         with gr.Row():
                             multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                             multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
@@ -6132,6 +6126,11 @@ with gr.Blocks(
                                 multitalk_lora_multipliers_ui.append(gr.Slider(
                                     label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
                                 ))
+            with gr.Row():
+                multitalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
+                multitalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
+                multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
+                multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
 
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
