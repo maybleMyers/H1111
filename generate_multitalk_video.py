@@ -4203,24 +4203,32 @@ class MultiTalkPipeline:
         self.model.eval().requires_grad_(False)
         self.model.to(self.param_dtype) # Cast dtype first for all paths
 
+        if use_usp:
+            for block in self.model.blocks:
+                block.self_attn.forward = types.MethodType(
+                    usp_attn_forward_multitalk, block.self_attn)
+                block.audio_cross_attn.forward = types.MethodType(
+                    usp_crossattn_multi_forward_multitalk, block.audio_cross_attn)
+            self.model.forward = types.MethodType(usp_dit_forward_multitalk, self.model)
+            self.sp_size = get_sequence_parallel_world_size()
+        else:
+            self.sp_size = 1
+
         if args and hasattr(args, 'blocks_to_swap') and args.blocks_to_swap > 0:
             logging.info(f"Enabling block swapping for {args.blocks_to_swap} blocks.")
             self.model.enable_block_swap(args.blocks_to_swap, self.device, supports_backward=False)
             self.model.move_to_device_except_swap_blocks(self.device)
         else:
-            # Original device placement logic for non-swapping mode
             if t5_fsdp or dit_fsdp or use_usp:
                 init_on_cpu = False
-            if use_usp:
-                for block in self.model.blocks:
-                    block.self_attn.forward = types.MethodType(
-                        usp_attn_forward_multitalk, block.self_attn)
-                    block.audio_cross_attn.forward = types.MethodType(
-                        usp_crossattn_multi_forward_multitalk, block.audio_cross_attn)
-                self.model.forward = types.MethodType(usp_dit_forward_multitalk, self.model)
-                self.sp_size = get_sequence_parallel_world_size()
+
+            if dist.is_initialized():
+                dist.barrier()
+            if dit_fsdp:
+                self.model = shard_fn(self.model)
             else:
-                self.sp_size = 1
+                if not init_on_cpu:
+                    self.model.to(self.device)
 
             if dist.is_initialized():
                 dist.barrier()
