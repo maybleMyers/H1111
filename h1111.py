@@ -62,6 +62,7 @@ def multitalk_batch_handler(
     use_apg: bool,
     apg_momentum: float,
     apg_norm_thresh: float,
+    blocks_to_swap: int,
     enable_preview: bool,
     preview_steps: int,
     use_full_video_preview: bool,
@@ -133,7 +134,8 @@ def multitalk_batch_handler(
             "--audio_type", str(audio_type),
             "--num_persistent_param_in_dit", str(num_persistent_backend),
         ]
-        
+        if blocks_to_swap > 0:
+            command.extend(["--blocks_to_swap", str(blocks_to_swap)])
         if audio_person2 and os.path.exists(audio_person2):
             command.extend(["--cond_audio_person2", str(audio_person2)])
             
@@ -6090,6 +6092,11 @@ with gr.Blocks(
                             label="Low VRAM (Persistent Params in Billions)", 
                             info="Slider value in billions. 0=very low VRAM (slower), 5=default(24gb vram)."
                         )
+                        multitalk_blocks_to_swap = gr.Slider(
+                            minimum=0, maximum=61, step=1, value=0,
+                            label="Blocks to Swap (to Save VRAM, 0=disable)",
+                            info="Swaps DiT blocks to CPU to save VRAM. 0=disable. Slower generation."
+                        )
                         with gr.Row():
                             multitalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
                             multitalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
@@ -7400,6 +7407,7 @@ with gr.Blocks(
             multitalk_use_apg,
             multitalk_apg_momentum,
             multitalk_apg_norm_thresh,
+            multitalk_blocks_to_swap,
             multitalk_enable_preview,
             multitalk_preview_steps,
             multitalk_use_full_video_preview,

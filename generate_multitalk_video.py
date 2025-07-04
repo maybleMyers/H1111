@@ -94,6 +94,8 @@ import warnings
 from networks import lora_wan
 from safetensors.torch import load_file
 from blissful_tuner.latent_preview import LatentPreviewer
+from utils.device_utils import clean_memory_on_device
+from modules.custom_offloading_utils import ModelOffloader
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -934,7 +936,12 @@ def _parse_args():
         default="",
         help="The negative text prompt for video generation."
     )
-
+    parser.add_argument(
+        "--blocks_to_swap",
+        type=int,
+        default=0,
+        help="Number of blocks to swap to CPU during inference to save VRAM."
+    )
     
     args = parser.parse_args()
 
@@ -3418,7 +3425,63 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # initialize weights
         self.init_weights()
+        self.gradient_checkpointing = False
 
+        # offloading
+        self.blocks_to_swap = None
+        self.offloader = None
+    @property
+    def dtype(self):
+        return next(iter(self.parameters())).dtype
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+    
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+        self.blocks_to_swap = blocks_to_swap
+        self.num_blocks = len(self.blocks)
+
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 1
+        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+
+        self.offloader = ModelOffloader(
+            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
+        )
+        print(
+            f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
+        )
+    
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_blocks = self.blocks
+            self.blocks = None
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.blocks = save_blocks
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    def _run_blocks_with_swap(self, x, **kwargs):
+        if self.blocks_to_swap:
+            clean_memory_on_device(x.device)
+
+        for block_idx, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_idx)
+            
+            x = block(x, **kwargs)
+
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+        return x
     def teacache_init(
         self,
         use_ret_steps=True,
@@ -3603,28 +3666,24 @@ class WanModel(ModelMixin, ConfigMixin):
                     x +=  self.previous_residual_cond
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks_with_swap(x, **kwargs)
                     self.previous_residual_cond = x - ori_x
             elif self.cnt%3==1:
                 if not should_calc_drop_text:
                     x +=  self.previous_residual_drop_text
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks_with_swap(x, **kwargs)
                     self.previous_residual_drop_text = x - ori_x
             else:
                 if not should_calc_uncond:
                     x +=  self.previous_residual_uncond
                 else:
                     ori_x = x.clone()
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
+                    x = self._run_blocks_with_swap(x, **kwargs)
                     self.previous_residual_uncond = x - ori_x
         else:
-            for block in self.blocks:
-                x = block(x, **kwargs)
+            x = self._run_blocks_with_swap(x, **kwargs)
 
         # head
         x = self.head(x, e)
@@ -4142,28 +4201,34 @@ class MultiTalkPipeline:
         if args and hasattr(args, 'lora_weight') and args.lora_weight:
             merge_lora_weights(self.model, args, self.device)
         self.model.eval().requires_grad_(False)
-        if t5_fsdp or dit_fsdp or use_usp:
-            init_on_cpu = False
-        if use_usp:
-            for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward_multitalk, block.self_attn)
-                block.audio_cross_attn.forward = types.MethodType(
-                    usp_crossattn_multi_forward_multitalk, block.audio_cross_attn)
-            self.model.forward = types.MethodType(usp_dit_forward_multitalk, self.model)
-            self.sp_size = get_sequence_parallel_world_size()
-        else:
-            self.sp_size = 1
+        self.model.to(self.param_dtype) # Cast dtype first for all paths
 
-        self.model.to(self.param_dtype)
-
-        if dist.is_initialized():
-            dist.barrier()
-        if dit_fsdp:
-            self.model = shard_fn(self.model)
+        if args and hasattr(args, 'blocks_to_swap') and args.blocks_to_swap > 0:
+            logging.info(f"Enabling block swapping for {args.blocks_to_swap} blocks.")
+            self.model.enable_block_swap(args.blocks_to_swap, self.device, supports_backward=False)
+            self.model.move_to_device_except_swap_blocks(self.device)
         else:
-            if not init_on_cpu:
-                self.model.to(self.device)
+            # Original device placement logic for non-swapping mode
+            if t5_fsdp or dit_fsdp or use_usp:
+                init_on_cpu = False
+            if use_usp:
+                for block in self.model.blocks:
+                    block.self_attn.forward = types.MethodType(
+                        usp_attn_forward_multitalk, block.self_attn)
+                    block.audio_cross_attn.forward = types.MethodType(
+                        usp_crossattn_multi_forward_multitalk, block.audio_cross_attn)
+                self.model.forward = types.MethodType(usp_dit_forward_multitalk, self.model)
+                self.sp_size = get_sequence_parallel_world_size()
+            else:
+                self.sp_size = 1
+
+            if dist.is_initialized():
+                dist.barrier()
+            if dit_fsdp:
+                self.model = shard_fn(self.model)
+            else:
+                if not init_on_cpu:
+                    self.model.to(self.device)
         
         self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
@@ -4401,6 +4466,9 @@ class MultiTalkPipeline:
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
+        if self.model.blocks_to_swap:
+            logging.info("Preparing model for block swapping before inference loop.")
+            self.model.prepare_block_swap_before_forward()
         torch_gc()
 
         # set random seed and init noise
