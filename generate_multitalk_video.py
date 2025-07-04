@@ -4838,11 +4838,7 @@ class MultiTalkPipeline:
             if dist.is_initialized():
                 dist.barrier()
         pbar.close()
-        logging.info("Cleaning up GPU memory before final video concatenation...")
-        if 'x0' in locals(): del x0
-        if 'videos' in locals(): del videos
-        if 'latent' in locals(): del latent
-        torch_gc()
+
         gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
         gen_video_samples = gen_video_samples.to(torch.float32)
         if max_frames_num > frame_num and sum(miss_lengths) > 0:
