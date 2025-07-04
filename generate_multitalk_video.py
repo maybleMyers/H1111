@@ -4573,7 +4573,10 @@ class MultiTalkPipeline:
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
                 padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
+                self.vae.model.to(self.device)
                 y = self.vae.encode(padding_frames_pixels_values) 
+                if offload_model:
+                    self.vae.model.cpu()
                 y = torch.stack(y).to(self.param_dtype) # B C T H W
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
                 latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
@@ -4762,7 +4765,10 @@ class MultiTalkPipeline:
                         self.model.cpu()
                 torch_gc()
 
-                videos = self.vae.decode(x0) 
+                self.vae.model.to(self.device)
+                videos = self.vae.decode(x0)
+                if offload_model:
+                    self.vae.model.cpu()
 
             if extra_args.preview is not None and extra_args.full_preview:
                 # We have a new decoded clip in `videos` (shape B C T H W)
