@@ -4539,6 +4539,12 @@ class MultiTalkPipeline:
             logging.info("--- END VRAM DIAGNOSTICS ---")
         # start video generation iteratively
         while True:
+            if not is_first_clip:
+                if self.model.blocks_to_swap and offload_model:
+                    logging.info(f"Resetting model and offloader state for clip {clip_count + 1}")
+                    self.model.move_to_device_except_swap_blocks(self.device)
+                    self.model.prepare_block_swap_before_forward()
+                    torch_gc()
             self.vae.model.clear_cache()
             clip_count += 1
             pbar.set_description(f"Generating clip {clip_count}/{total_clips}")            
