@@ -4721,10 +4721,11 @@ class MultiTalkPipeline:
                 }
 
                 torch_gc()
-                if not self.vram_management:
-                    self.model.to(self.device)
-                else:
-                    self.load_models_to_device(["model"])
+                if self.model.blocks_to_swap is None or self.model.blocks_to_swap == 0:
+                    if not self.vram_management:
+                        self.model.to(self.device)
+                    else:
+                        self.load_models_to_device(["model"])
                 
                 # injecting motion frames
                 if not is_first_clip:
