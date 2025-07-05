@@ -4807,18 +4807,21 @@ class MultiTalkPipeline:
                     x0 = [latent.to(self.device)] 
                     pbar.update(1)
                     del latent_model_input, timestep
+                del latent_model_input, timestep
+                del noise_pred_cond, noise_pred_drop_text, noise_pred_uncond, noise_pred
                 del arg_c, arg_null_text, arg_null
                 del clip_context, y, audio_embs, ref_target_masks
-                torch_gc()
-                
-                if offload_model: 
+                torch_gc() 
+                if offload_model:
                     if not self.vram_management:
                         self.model.cpu()
-                torch_gc()
-
+                    torch_gc() 
+                
+                logging.info("Decoding final latents with VAE...")
                 self.vae.model.to(self.device)
-                videos = self.vae.decode(x0)
-                videos = [v.cpu() for v in videos]
+                
+                # We will replace this line in the next step
+                videos = self.vae.decode(x0) 
                 if offload_model:
                     self.vae.model.cpu()
 
