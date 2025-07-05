@@ -4532,6 +4532,7 @@ class MultiTalkPipeline:
             logging.info("--- END VRAM DIAGNOSTICS ---")
         # start video generation iteratively
         while True:
+            self.vae.model.clear_cache()
             clip_count += 1
             pbar.set_description(f"Generating clip {clip_count}/{total_clips}")            
             audio_embs = []
