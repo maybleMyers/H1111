@@ -4807,6 +4807,9 @@ class MultiTalkPipeline:
                     x0 = [latent.to(self.device)] 
                     pbar.update(1)
                     del latent_model_input, timestep
+                del arg_c, arg_null_text, arg_null
+                del clip_context, y, audio_embs, ref_target_masks
+                torch_gc()
                 
                 if offload_model: 
                     if not self.vram_management:
