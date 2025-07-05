@@ -102,6 +102,13 @@ __all__ = [
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
+### TEMP DEBUG
+def print_vram_summary(context_msg):
+    logging.info(f"--- VRAM SUMMARY ({context_msg}) ---")
+    logging.info(torch.cuda.memory_summary(device=None, abbreviated=False))
+    logging.info("--- END VRAM SUMMARY ---")
+
+###
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """merge LoRA weights to the model"""
     if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
@@ -4807,6 +4814,7 @@ class MultiTalkPipeline:
                     x0 = [latent.to(self.device)] 
                     pbar.update(1)
                     del latent_model_input, timestep
+                print_vram_summary("After diffusion loop")
                 del latent_model_input, timestep
                 del noise_pred_cond, noise_pred_drop_text, noise_pred_uncond, noise_pred
                 del arg_c, arg_null_text, arg_null
@@ -4816,12 +4824,37 @@ class MultiTalkPipeline:
                     if not self.vram_management:
                         self.model.cpu()
                     torch_gc() 
-                
+                print_vram_summary("After main model offload")
                 logging.info("Decoding final latents with VAE...")
                 self.vae.model.to(self.device)
+                print_vram_summary("After VAE loaded to GPU")
+
+                # --- START: Tiled VAE Decoding ---
+                latent_tensor = x0[0] # Shape [C, T, H, W]
+                video_chunks = []
+                # You can adjust chunk_size based on your VRAM.
+                # Lower value = less VRAM, slightly slower. 8 is a safe start.
+                chunk_size = 8
                 
-                # We will replace this line in the next step
-                videos = self.vae.decode(x0) 
+                logging.info(f"Decoding latents in chunks of {chunk_size} frames to save VRAM...")
+                
+                for i in tqdm(range(0, latent_tensor.shape[1], chunk_size), desc="VAE Decoding Chunks"):
+                    print_vram_summary(f"Start of VAE chunk {i//chunk_size}")
+                    chunk = [latent_tensor[:, i:i + chunk_size]] # Needs to be a list of tensors
+                    
+                    # Decode the small chunk
+                    decoded_chunk = self.vae.decode(chunk)[0] # Get the tensor from the list
+                    video_chunks.append(decoded_chunk.cpu())
+                    
+                    # This is CRITICAL. It resets the VAE's internal state.
+                    self.vae.model.clear_cache()
+                    torch_gc()
+
+                # Combine the decoded chunks back into a single video tensor
+                videos = [torch.cat(video_chunks, dim=1)]
+                # --- END: Tiled VAE Decoding ---
+
+                videos = [v.cpu() for v in videos]
                 if offload_model:
                     self.vae.model.cpu()
 
