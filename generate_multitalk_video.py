@@ -4818,6 +4818,7 @@ class MultiTalkPipeline:
 
                 self.vae.model.to(self.device)
                 videos = self.vae.decode(x0)
+                videos = [v.cpu() for v in videos]
                 if offload_model:
                     self.vae.model.cpu()
 
