@@ -4242,6 +4242,8 @@ class MultiTalkPipeline:
 
         if args and hasattr(args, 'blocks_to_swap') and args.blocks_to_swap > 0:
             logging.info(f"Enabling block swapping for {args.blocks_to_swap} blocks.")
+            self.vram_management = True
+            self.enable_cpu_offload()
             self.model.enable_block_swap(args.blocks_to_swap, self.device, supports_backward=False)
             self.model.move_to_device_except_swap_blocks(self.device)
         else:
