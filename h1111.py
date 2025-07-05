@@ -132,10 +132,11 @@ def multitalk_batch_handler(
             "--sample_text_guide_scale", str(text_guide_scale),
             "--sample_audio_guide_scale", str(audio_guide_scale),
             "--audio_type", str(audio_type),
-            "--num_persistent_param_in_dit", str(num_persistent_backend),
         ]
         if blocks_to_swap > 0:
             command.extend(["--blocks_to_swap", str(blocks_to_swap)])
+        else:
+            command.extend(["--num_persistent_param_in_dit", str(num_persistent_backend)])
         if audio_person2 and os.path.exists(audio_person2):
             command.extend(["--cond_audio_person2", str(audio_person2)])
             
