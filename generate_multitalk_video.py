@@ -4815,7 +4815,6 @@ class MultiTalkPipeline:
                     pbar.update(1)
                     del latent_model_input, timestep
                 print_vram_summary("After diffusion loop")
-                del latent_model_input, timestep
                 del noise_pred_cond, noise_pred_drop_text, noise_pred_uncond, noise_pred
                 del arg_c, arg_null_text, arg_null
                 del clip_context, y, audio_embs, ref_target_masks
