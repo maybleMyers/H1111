@@ -2812,45 +2812,77 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
     return scaled
 
 
-@torch.compile
-def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
-    
+def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None, q_chunk_size=4096):
+    """
+    Calculates attention map by processing the query tensor in chunks to avoid allocating
+    the full attention matrix, thus saving significant VRAM.
+
+    Args:
+        visual_q (torch.Tensor): The query tensor, shape (B, H, S, K).
+        ref_k (torch.Tensor): The key tensor, shape (B, H, R, K).
+        ref_target_masks (torch.Tensor): Masks for different classes, shape (class_num, R).
+        mode (str): Aggregation mode over heads ('mean' or 'max').
+        attn_bias (torch.Tensor, optional): Attention bias.
+        q_chunk_size (int): The number of query tokens (dim S) to process at once.
+                            A smaller value reduces VRAM usage at the cost of performance.
+    """
     ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
     scale = 1.0 / visual_q.shape[-1] ** 0.5
     visual_q = visual_q * scale
-    visual_q = visual_q.transpose(1, 2)
-    ref_k = ref_k.transpose(1, 2)
-    attn = visual_q @ ref_k.transpose(-2, -1)
 
-    if attn_bias is not None:
-        attn = attn + attn_bias
+    # Original shapes: visual_q (B, H, S, K), ref_k (B, H, R, K)
+    # Goal: compute attention map of shape (B, H, S, R) without materializing it all at once.
+    B, H, S, K = visual_q.shape
+    _B, _H, R, _K = ref_k.shape
 
-    x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
-
+    # Pre-transpose k for efficiency inside the loop
+    ref_k_T = ref_k.transpose(-2, -1)  # Shape: B, H, K, R
 
     x_ref_attn_maps = []
-    ref_target_masks = ref_target_masks.to(visual_q.dtype)
-    x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
+    ref_target_masks = ref_target_masks.to(visual_q.dtype)  # class_num, R
 
     for class_idx, ref_target_mask in enumerate(ref_target_masks):
-        torch_gc()
-        ref_target_mask = ref_target_mask[None, None, None, ...]
-        x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
-        x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
-        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
-       
-        if mode == 'mean':
-            x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
-        elif mode == 'max':
-            x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
-        
-        x_ref_attn_maps.append(x_ref_attnmap)
-    
-    del attn
-    del x_ref_attn_map_source
+        # We will build the final map for this class chunk by chunk.
+        # It has shape (B, S) after aggregation over heads and batch.
+        final_class_map = torch.zeros(B, S, device=visual_q.device, dtype=visual_q.dtype)
+
+        # Iterate over the large sequence dimension 'S' in chunks
+        for i in range(0, S, q_chunk_size):
+            end = min(i + q_chunk_size, S)
+            q_chunk = visual_q[:, :, i:end, :]  # Shape: B, H, chunk_size, K
+
+            # This is the memory-intensive step, now computed on a smaller chunk.
+            # attn_chunk shape: (B, H, chunk_size, R)
+            attn_chunk = torch.matmul(q_chunk, ref_k_T)
+
+            if attn_bias is not None:
+                # Slice the bias if it's not broadcastable
+                if attn_bias.shape[2] == S:
+                    attn_chunk = attn_chunk + attn_bias[:, :, i:end, :]
+                else:
+                    attn_chunk = attn_chunk + attn_bias
+
+            x_ref_attn_map_source_chunk = attn_chunk.softmax(-1)  # Shape: B, H, chunk_size, R
+
+            # Mask and sum for the current class
+            ref_target_mask_b = ref_target_mask[None, None, None, :]  # Shape: 1, 1, 1, R
+            x_ref_attnmap = x_ref_attn_map_source_chunk * ref_target_mask_b
+            x_ref_attnmap = x_ref_attnmap.sum(-1) / (ref_target_mask.sum() + 1e-6)  # Shape: B, H, chunk_size
+
+            # Aggregate over heads
+            if mode == 'mean':
+                x_ref_attnmap = x_ref_attnmap.mean(1)  # Shape: B, chunk_size
+            elif mode == 'max':
+                x_ref_attnmap = x_ref_attnmap.max(1).values  # Shape: B, chunk_size
+
+            final_class_map[:, i:end] = x_ref_attnmap
+
+        x_ref_attn_maps.append(final_class_map)
+
     torch_gc()
 
-    return torch.concat(x_ref_attn_maps, dim=0)
+    # The result has one map per class, concatenated along the first dimension.
+    return torch.cat(x_ref_attn_maps, dim=0) # Shape: (class_num * B), S
 
 
 def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
@@ -4487,7 +4519,21 @@ class MultiTalkPipeline:
         np.random.seed(seed)
         random.seed(seed)
         torch.backends.cudnn.deterministic = True
-
+        if self.rank == 0:
+            logging.info("--- VRAM DIAGNOSTICS: MODEL LOCATIONS BEFORE GENERATION ---")
+            try:
+                logging.info(f"VAE model device: {next(self.vae.model.parameters()).device}")
+            except Exception:
+                logging.info("VAE model is not on a specific device (likely CPU offloaded or meta).")
+            try:
+                logging.info(f"CLIP model device: {next(self.clip.model.parameters()).device}")
+            except Exception:
+                logging.info("CLIP model is not on a specific device (likely CPU offloaded or meta).")
+            try:
+                logging.info(f"T5 Encoder model device: {next(self.text_encoder.model.parameters()).device}")
+            except Exception:
+                logging.info("T5 Encoder model is not on a specific device (likely CPU offloaded or meta).")
+            logging.info("--- END VRAM DIAGNOSTICS ---")
         # start video generation iteratively
         while True:
             clip_count += 1
@@ -4701,6 +4747,10 @@ class MultiTalkPipeline:
 
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
                 for i in range(len(timesteps)-1):
+                    if i == 0 and self.rank == 0 and clip_count == 1:
+                        logging.info("--- VRAM DIAGNOSTICS: MEMORY SUMMARY BEFORE FIRST FORWARD PASS ---")
+                        logging.info(torch.cuda.memory_summary(device=self.device))
+                        logging.info("--- END VRAM DIAGNOSTICS ---")                    
                     timestep = timesteps[i]
                     latent_model_input = [latent.to(self.device)]
 
