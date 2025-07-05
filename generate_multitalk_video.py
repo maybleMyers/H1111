@@ -4829,27 +4829,31 @@ class MultiTalkPipeline:
                 print_vram_summary("After VAE loaded to GPU")
 
                 # --- START: Tiled VAE Decoding ---
-                latent_tensor = x0[0] # Shape [C, T, H, W]
+                latent_tensor = x0[0]  # Shape [C, T, H, W]
                 video_chunks = []
-                # You can adjust chunk_size based on your VRAM.
-                # Lower value = less VRAM, slightly slower. 8 is a safe start.
-                chunk_size = 8
                 
-                logging.info(f"Decoding latents in chunks of {chunk_size} frames to save VRAM...")
+                logging.info("Decoding latents one frame at a time to minimize VRAM usage...")
                 
-                for i in tqdm(range(0, latent_tensor.shape[1], chunk_size), desc="VAE Decoding Chunks"):
-                    print_vram_summary(f"Start of VAE chunk {i//chunk_size}")
-                    chunk = [latent_tensor[:, i:i + chunk_size]] # Needs to be a list of tensors
+                # The VAE is causal and uses a cache. We must clear it before starting.
+                self.vae.model.clear_cache() 
+
+                for i in tqdm(range(latent_tensor.shape[1]), desc="VAE Decoding Frames"):
+                    # Create a chunk of size 1, maintaining the dimensions
+                    # The VAE's internal decode logic is designed for this kind of streaming.
+                    chunk = [latent_tensor[:, i:i+1]] # Shape: [C, 1, H, W]
                     
-                    # Decode the small chunk
-                    decoded_chunk = self.vae.decode(chunk)[0] # Get the tensor from the list
+                    decoded_chunk = self.vae.decode(chunk)[0] # Decode the single frame
                     video_chunks.append(decoded_chunk.cpu())
                     
-                    # This is CRITICAL. It resets the VAE's internal state.
-                    self.vae.model.clear_cache()
+                    # We don't need to clear the cache every single time here,
+                    # as the VAE's internal caching mechanism is designed for this
+                    # sequential processing. However, adding a GC can help.
                     torch_gc()
 
-                # Combine the decoded chunks back into a single video tensor
+                # After the loop, clear the cache for the next full generation clip.
+                self.vae.model.clear_cache()
+
+                # Combine the decoded frames back into a single video tensor
                 videos = [torch.cat(video_chunks, dim=1)]
                 # --- END: Tiled VAE Decoding ---
 
