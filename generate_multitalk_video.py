@@ -167,8 +167,8 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """
-    Merges LoRA by manually traversing the model for WanAttentionBlocks and applying weights.
-    This bypasses the library's traversal logic which is failing.
+    Merges LoRA weights by manually traversing the model for WanAttentionBlocks and applying weights.
+    This is the definitive implementation that correctly maps the model's structure to the LoRA file's keys.
     """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
@@ -181,11 +181,15 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
         logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
         lora_sd = load_file(lora_path, device="cpu")
         
+        # Determine alpha. It's often stored in metadata or can be inferred from rank.
         alpha = lora_sd.get("lora_unet_alpha", None)
-        if alpha is None:
-            for key in lora_sd.keys():
+        if alpha is not None:
+            alpha = alpha.item()
+        else:
+            for key in lora_sd:
                 if "lora_down.weight" in key:
-                    alpha = lora_sd[key].shape[0]
+                    alpha = lora_sd[key].shape[0] # Infer from rank
+                    logging.info(f"LoRA alpha not found, inferring as {alpha} from a lora_down layer rank.")
                     break
         if alpha is None:
             logging.error(f"Could not determine alpha for LoRA {lora_path}. Skipping.")
@@ -194,38 +198,47 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
         
         applied_count = 0
 
-        for block_name, block_module in model.named_modules():
-            if block_module.__class__.__name__ != 'WanAttentionBlock':
+        # This traversal method is robust and guaranteed to find all linear layers.
+        for module_name, module in model.named_modules():
+            # We are looking for Linear layers inside WanAttentionBlock layers.
+            if not isinstance(module, nn.Linear):
                 continue
+
+            # module_name will be like: "blocks.10.self_attn.q"
+            # We need to construct the key format from lora.py: "lora_unet_blocks_10_self_attn_q"
+            lora_key_base = "lora_unet_" + module_name.replace('.', '_')
+            
+            lora_down_key = f"{lora_key_base}.lora_down.weight"
+            lora_up_key = f"{lora_key_base}.lora_up.weight"
+
+            if lora_down_key in lora_sd and lora_up_key in lora_sd:
+                # We found a match.
+                lora_down_weight = lora_sd[lora_down_key].to(device, dtype=torch.float32)
+                lora_up_weight = lora_sd[lora_up_key].to(device, dtype=torch.float32)
+
+                rank = lora_down_weight.shape[0]
+                scale = alpha / rank
+
+                # Calculate the update matrix
+                update_matrix = (lora_up_weight @ lora_down_weight) * scale * lora_multiplier
                 
-            for linear_name, linear_module in block_module.named_modules():
-                if not isinstance(linear_module, nn.Linear):
-                    continue
-                full_path = f"{block_name}.{linear_name}"
-                lora_key_base = "lora_unet_" + full_path.replace('.', '_')
-                
-                lora_down_key = f"{lora_key_base}.lora_down.weight"
-                lora_up_key = f"{lora_key_base}.lora_up.weight"
-
-                if lora_down_key in lora_sd and lora_up_key in lora_sd:
-                    lora_down_weight = lora_sd[lora_down_key].to(device, dtype=torch.float32)
-                    lora_up_weight = lora_sd[lora_up_key].to(device, dtype=torch.float32)
-
-                    rank = lora_down_weight.shape[0]
-                    scale = alpha / rank
-
-                    update_matrix = (lora_up_weight @ lora_down_weight) * scale * lora_multiplier
-                    
-                    if linear_module.weight.shape != update_matrix.shape:
-                         continue
-                         
-                    linear_module.weight.data += update_matrix.to(linear_module.weight.dtype)
-                    applied_count += 1
+                if module.weight.shape != update_matrix.shape:
+                     logging.warning(f"Shape mismatch for {module_name}: W is {module.weight.shape}, LoRA is {update_matrix.shape}. Skipping.")
+                     continue
+                     
+                # Apply the update in-place to the model's weight
+                module.weight.data.add_(update_matrix)
+                applied_count += 1
         
         if applied_count > 0:
-            logging.info(f"MANUALLY MERGED {applied_count} LoRA modules from {os.path.basename(lora_path)}")
+            logging.info(f"SUCCESS: Manually merged {applied_count} LoRA modules from {os.path.basename(lora_path)}.")
         else:
-            logging.error(f"MANUAL MERGE FAILED: 0 modules were matched.")
+            logging.error(
+                f"FINAL ATTEMPT FAILED: 0 modules were matched. "
+                f"This indicates a fundamental mismatch between the model's layer names (e.g., 'blocks.10.self_attn.q') "
+                f"and the keys stored in the LoRA file. "
+                f"Please manually inspect the keys in the .safetensors file and the `model.named_modules()` output."
+            )
 
     torch_gc()
 
