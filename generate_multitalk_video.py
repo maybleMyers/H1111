@@ -166,46 +166,49 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
     return applied_count
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
-    """merge LoRA weights to the model with fallback"""
+    """
+    Merges LoRA weights to the model using the project's existing networks.lora_wan module.
+    """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
 
-    for i, lora_path in enumerate(args.lora_weight):
-        multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
-        if multiplier == 0:
+    # This import is the intended entry point for the LoRA library.
+    try:
+        from networks import lora_wan
+    except ImportError as e:
+        logging.error(f"FATAL: Could not import `networks.lora_wan`. Error: {e}")
+        logging.error("Please ensure `networks/lora_wan.py` and its dependency `networks/lora.py` exist.")
+        return
+
+    for i, lora_weight_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+
+        if lora_multiplier == 0:
             continue
 
-        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {multiplier}")
-        lora_sd = load_file(lora_path, device="cpu")
+        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
+        
+        weights_sd = load_file(lora_weight_path, device="cpu")
 
-        try:
-            from networks import lora_wan
-            
-            network = lora_wan.create_arch_network_from_weights(
-                multiplier=multiplier, weights_sd=lora_sd, unet=model, for_inference=True
-            )
-            if not network.is_active():
-                logging.warning("Original method found 0 compatible LoRA modules. Forcing fallback.")
-                raise ImportError("Forcing fallback due to 0 matched modules.")
+        network = lora_wan.create_arch_network_from_weights(
+            multiplier=lora_multiplier,
+            weights_sd=weights_sd,
+            unet=model,
+            for_inference=True
+        )
 
-            network.merge_to(text_encoders=None, unet=model, weights_sd=lora_sd, device=device)
-            logging.info(f"Successfully merged LoRA via original method: {os.path.basename(lora_path)}")
+        if not network.is_active():
+             logging.error(
+                 f"LoRA merge FAILED for '{os.path.basename(lora_weight_path)}'. "
+                 f"The library found 0 compatible modules. "
+                 f"This means it did not find any instances of '{lora_wan.WAN_TARGET_REPLACE_MODULES}' "
+                 f"in the model. Check for model structure discrepancies."
+             )
+             continue
 
-        except (ImportError, AttributeError):
-            if 'lora_wan' in sys.modules:
-                 logging.warning("Original method failed after import. Falling back to self-contained merger.")
-            else:
-                 logging.warning("`networks.lora_wan` not found. Falling back to self-contained LoRA merger.")
-            
-            applied_count = _merge_lora_wan_style(model, lora_sd, multiplier, device)
-
-            if applied_count > 0:
-                logging.info(f"Successfully merged {applied_count} modules from LoRA via fallback: {os.path.basename(lora_path)}")
-            else:
-                logging.error(f"Fallback LoRA merge failed: 0 modules were matched for {os.path.basename(lora_path)}. Please check LoRA and model key names.")
+        network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+        logging.info(f"Successfully merged LoRA weights from: {os.path.basename(lora_weight_path)}")
     
-    # Clean up
-    del lora_sd
     torch_gc()
 
 #### CLASS DEFS ####
