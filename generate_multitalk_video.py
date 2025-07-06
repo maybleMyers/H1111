@@ -165,13 +165,13 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
             
     return applied_count
 
-def merge_lora_weights(model: torch.nn.Module, lora_paths: list, lora_multipliers: list, device: torch.device):
+def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """merge LoRA weights to the model with fallback"""
-    if not lora_paths:
+    if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
 
-    for i, lora_path in enumerate(lora_paths):
-        multiplier = lora_multipliers[i] if i < len(lora_multipliers) else 1.0
+    for i, lora_path in enumerate(args.lora_weight):
+        multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
         if multiplier == 0:
             continue
 
@@ -184,16 +184,23 @@ def merge_lora_weights(model: torch.nn.Module, lora_paths: list, lora_multiplier
             network = lora_wan.create_arch_network_from_weights(
                 multiplier=multiplier, weights_sd=lora_sd, unet=model, for_inference=True
             )
+            if not network.is_active():
+                logging.warning("Original method found 0 compatible LoRA modules. Forcing fallback.")
+                raise ImportError("Forcing fallback due to 0 matched modules.")
+
             network.merge_to(text_encoders=None, unet=model, weights_sd=lora_sd, device=device)
             logging.info(f"Successfully merged LoRA via original method: {os.path.basename(lora_path)}")
 
-        except ImportError:
-            logging.warning("`networks.lora_wan` not found. Falling back to self-contained LoRA merger.")
+        except (ImportError, AttributeError):
+            if 'lora_wan' in sys.modules:
+                 logging.warning("Original method failed after import. Falling back to self-contained merger.")
+            else:
+                 logging.warning("`networks.lora_wan` not found. Falling back to self-contained LoRA merger.")
             
             applied_count = _merge_lora_wan_style(model, lora_sd, multiplier, device)
 
             if applied_count > 0:
-                logging.info(f"Successfully merged {applied_count} modules from LoRA: {os.path.basename(lora_path)}")
+                logging.info(f"Successfully merged {applied_count} modules from LoRA via fallback: {os.path.basename(lora_path)}")
             else:
                 logging.error(f"Fallback LoRA merge failed: 0 modules were matched for {os.path.basename(lora_path)}. Please check LoRA and model key names.")
     
@@ -4150,8 +4157,7 @@ class MultiTalkPipeline:
         num_timesteps=1000,
         use_timestep_transform=True,
         t5_tokenizer_path_override=None,
-        lora_paths=None,
-        lora_multipliers=None,
+        args=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -4214,8 +4220,8 @@ class MultiTalkPipeline:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
 
-        if lora_paths:
-            merge_lora_weights(self.model, lora_paths, lora_multipliers, self.device)
+        if args and hasattr(args, 'lora_weight') and args.lora_weight:
+            merge_lora_weights(self.model, args, self.device)
         self.model.eval().requires_grad_(False)
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
@@ -5249,8 +5255,7 @@ def generate(args):
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
         t5_cpu=args.t5_cpu,
         t5_tokenizer_path_override=args.t5_tokenizer_path,
-        lora_paths=args.lora_path,
-        lora_multipliers=args.lora_multiplier,
+        args=args,
     )
 
     if args.num_persistent_param_in_dit is not None:
