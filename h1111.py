@@ -6070,7 +6070,7 @@ with gr.Blocks(
                         multitalk_motion_frame = gr.Slider(label="Motion Frame (for streaming)", minimum=1, maximum=40, value=25, step=1, info="Frames from previous chunk to condition the next.")
                     
                     with gr.Row():
-                        multitalk_sample_steps = gr.Slider(label="Sampling Steps", minimum=10, maximum=100, value=40, step=1)
+                        multitalk_sample_steps = gr.Slider(label="Sampling Steps", minimum=1, maximum=100, value=40, step=1)
                         multitalk_sample_shift = gr.Slider(label="Sample Shift", minimum=1.0, maximum=20.0, value=7.0, step=0.1)
                     
                     with gr.Row():
