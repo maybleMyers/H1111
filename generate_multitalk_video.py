@@ -4173,6 +4173,42 @@ class MultiTalkPipeline:
         self.model_names = ["model"]
         self.vram_management = False
 
+    def decode_latents_in_chunks(self, latents: torch.Tensor, chunk_size: int = 16):
+        """
+        Decodes a full-length latent tensor in manageable chunks to avoid OOM errors.
+
+        Args:
+            latents (torch.Tensor): A single 4D latent tensor of shape [C, T, H, W].
+            chunk_size (int): The number of latent frames to decode at once.
+
+        Returns:
+            torch.Tensor: The fully decoded video as a 4D tensor [C, T, H, W].
+        """
+        # Move the full latent tensor to the correct device and data type
+        latents = latents.to(device=self.device, dtype=self.param_dtype)
+        
+        C, T, H, W = latents.shape
+        decoded_chunks = []
+        
+        pbar_decode = tqdm(total=T, desc="Decoding VAE in chunks", leave=False)
+        for start_idx in range(0, T, chunk_size):
+            end_idx = min(start_idx + chunk_size, T)
+            # Get a chunk from the full latent tensor
+            latent_chunk = latents[:, start_idx:end_idx, :, :]
+            
+            # The vae.decode method expects a list of 4D tensors
+            decoded_chunk_list = self.vae.decode([latent_chunk])
+            
+            # Move the decoded pixel chunk to CPU to conserve VRAM
+            decoded_chunks.append(decoded_chunk_list[0].cpu())
+            pbar_decode.update(end_idx - start_idx)
+        
+        pbar_decode.close()
+
+        # Concatenate the decoded chunks along the time dimension (dim=1)
+        full_video = torch.cat(decoded_chunks, dim=1)
+        return full_video
+
     def add_noise(
         self,
         original_samples: torch.FloatTensor,
@@ -4401,6 +4437,7 @@ class MultiTalkPipeline:
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
+        cond_latent = None
         torch_gc()
 
         # set random seed and init noise
@@ -4494,14 +4531,29 @@ class MultiTalkPipeline:
                     self.clip.model.cpu()
                 torch_gc()
 
-                # zero padding and vae encode
-                video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
-                padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
-                y = self.vae.encode(padding_frames_pixels_values) 
-                y = torch.stack(y).to(self.param_dtype) # B C T H W
+                if is_first_clip:
+                    # For the first clip, encode the provided image
+                    video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
+                    padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
+                    y_content = self.vae.encode(padding_frames_pixels_values)
+                    y_content = torch.stack(y_content).to(self.param_dtype) # B C T H W
+                else:
+                    # For subsequent clips, use the latent from the previous clip
+                    num_zero_latents = ((frame_num - cur_motion_frames_num) - 1) // self.vae_stride[0] + 1
+                    zero_frames_latent = torch.zeros(
+                        cond_latent.shape[0], # B
+                        cond_latent.shape[1], # C
+                        num_zero_latents,
+                        cond_latent.shape[3], # H
+                        cond_latent.shape[4], # W
+                        device=self.device,
+                        dtype=self.param_dtype
+                    )
+                    y_content = torch.cat([cond_latent.to(self.device, self.param_dtype), zero_frames_latent], dim=2)
+
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
-                latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
-                y = torch.concat([msk, y], dim=1) # B 4+C T H W
+                latent_motion_frames = y_content[:, :, :cur_motion_frames_latent_num][0] # C T H W
+                y = torch.concat([msk, y_content], dim=1) # B 4+C T H W
                 torch_gc()
             
 
@@ -4684,41 +4736,36 @@ class MultiTalkPipeline:
                 if offload_model: 
                     if not self.vram_management:
                         self.model.cpu()
+                    else:
+                        self.load_models_to_device([])
                 torch_gc()
 
-                videos = self.vae.decode(x0) 
+                current_latent_chunk = latent.cpu()
+
+                if is_first_clip:
+                    gen_video_list.append(current_latent_chunk)
+                else:
+                    latent_motion_frames_num = (motion_frame - 1) // self.vae_stride[0] + 1
+                    gen_video_list.append(current_latent_chunk[:, latent_motion_frames_num:, :, :])
+
+            num_overlap_latents = (motion_frame - 1) // self.vae_stride[0] + 1
+            cond_latent = latent[:, -num_overlap_latents:, :, :].unsqueeze(0).cpu() # Shape [1, C, T, H, W]
 
             if extra_args.preview is not None and extra_args.full_preview:
-                # We have a new decoded clip in `videos` (shape B C T H W)
-                current_clip_pixels = videos[0] # Take first from batch, shape C T H W
-                
-                if is_first_clip:
-                    preview_video_list.append(current_clip_pixels)
-                else:
-                    # Append only the new part, excluding motion frames overlap
-                    new_part = current_clip_pixels[:, cur_motion_frames_num:, :, :]
-                    preview_video_list.append(new_part)
-                    
-                # Stitch all clips so far
-                if preview_video_list:
-                    stitched_preview_video = torch.cat(preview_video_list, dim=1) # dim=1 is time
-                    
-                    # Define preview path and save
+                try:
+                    logging.info(f"Generating full preview for clip {clip_count}...")
+                    stitched_preview_latent = torch.cat(gen_video_list, dim=1)                    
+                    stitched_preview_video = self.decode_latents_in_chunks(stitched_preview_latent)
                     preview_dir = os.path.join(os.path.dirname(extra_args.save_file), "previews")
                     os.makedirs(preview_dir, exist_ok=True)
                     preview_path = os.path.join(preview_dir, f"latent_preview_{extra_args.preview_suffix}.mp4")
                     save_video_without_audio(stitched_preview_video, preview_path, fps=25)
-            
-            # cache generated samples
-            videos = torch.stack(videos).cpu() # B C T H W
-            if is_first_clip:
-                gen_video_list.append(videos)
-            else:
-                gen_video_list.append(videos[:, :, cur_motion_frames_num:])
+                    del stitched_preview_latent, stitched_preview_video
+                    
+                except Exception as e:
+                    logging.error(f"Failed to generate full preview for clip {clip_count}: {e}", exc_info=True)
 
-            # decide whether is done
             if arrive_last_frame:
-                # The pbar might not be full if the last clip is shorter.
                 remaining_steps = pbar.total - pbar.n
                 if remaining_steps > 0:
                     pbar.update(remaining_steps)
@@ -4727,8 +4774,6 @@ class MultiTalkPipeline:
             # update next condition frames
             is_first_clip = False
             cur_motion_frames_num = motion_frame
-
-            cond_image = videos[:, :, -cur_motion_frames_num:].to(torch.float32).to(self.device)
             audio_start_idx += (frame_num - cur_motion_frames_num)
             audio_end_idx = audio_start_idx + clip_length
 
@@ -4756,19 +4801,24 @@ class MultiTalkPipeline:
             if dist.is_initialized():
                 dist.barrier()
         pbar.close()
-        gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
-        gen_video_samples = gen_video_samples.to(torch.float32)
-        if max_frames_num > frame_num and sum(miss_lengths) > 0:
-            # split video frames
-            gen_video_samples = gen_video_samples[:, :, :-1*miss_lengths[0]]
+
+        logging.info("Stitching latent chunks for final decode...")
+
+        full_latent_tensor = torch.cat(gen_video_list, dim=1)
+
+        num_latent_frames_max = (int(max_frames_num) - 1) // self.vae_stride[0] + 1
+        full_latent_tensor = full_latent_tensor[:, :num_latent_frames_max, :, :]
+        
+        gen_video_samples = self.decode_latents_in_chunks(full_latent_tensor)
         
         if dist.is_initialized():
             dist.barrier()
 
-        del noise, latent
+        del noise, latent, gen_video_list, full_latent_tensor
         torch_gc()
 
-        return gen_video_samples[0] if self.rank == 0 else None
+        return gen_video_samples if self.rank == 0 else None
+
 def get_mask_from_lengths(lengths, max_len=None):
     lengths = lengths.to(torch.long)
     if max_len is None:
