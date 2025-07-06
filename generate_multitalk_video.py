@@ -4832,36 +4832,30 @@ class MultiTalkPipeline:
                 print_vram_summary("After main model offload")
                 logging.info("Decoding final latents with VAE...")
                 self.vae.model.to(self.device)
-                print_vram_summary("After VAE loaded to GPU")
-
-                # --- START: Tiled VAE Decoding ---
                 latent_tensor = x0[0]  # Shape [C, T, H, W]
                 video_chunks = []
                 
                 logging.info("Decoding latents one frame at a time to minimize VRAM usage...")
                 
-                # The VAE is causal and uses a cache. We must clear it before starting.
+                # CRITICAL: Clear the VAE's internal state BEFORE starting to decode a new clip.
+                # This ensures the new clip doesn't have temporal artifacts from the previous one.
                 self.vae.model.clear_cache() 
 
                 for i in tqdm(range(latent_tensor.shape[1]), desc="VAE Decoding Frames"):
-                    # Create a chunk of size 1, maintaining the dimensions
-                    # The VAE's internal decode logic is designed for this kind of streaming.
-                    chunk = [latent_tensor[:, i:i+1]] # Shape: [C, 1, H, W]
+                    # The VAE's `decode` method is designed to be "streaming aware".
+                    # It processes one latent frame at a time and uses its internal cache
+                    # to maintain consistency *within* the current clip.
+                    chunk = [latent_tensor[:, i:i+1]]
                     
-                    decoded_chunk = self.vae.decode(chunk)[0] # Decode the single frame
+                    decoded_chunk = self.vae.decode(chunk)[0]
                     video_chunks.append(decoded_chunk.cpu())
-                    
-                    # We don't need to clear the cache every single time here,
-                    # as the VAE's internal caching mechanism is designed for this
-                    # sequential processing. However, adding a GC can help.
                     torch_gc()
 
-                # After the loop, clear the cache for the next full generation clip.
-                self.vae.model.clear_cache()
-
-                # Combine the decoded frames back into a single video tensor
+                # After the loop, the VAE's cache is full with the state of the last frame.
+                # We leave it as is, because we are about to offload the model anyway.
+                # The `clear_cache()` at the START of this block handles the reset.
+                
                 videos = [torch.cat(video_chunks, dim=1)]
-                # --- END: Tiled VAE Decoding ---
 
                 videos = [v.cpu() for v in videos]
                 if offload_model:
