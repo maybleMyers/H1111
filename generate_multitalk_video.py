@@ -167,53 +167,66 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """
-    Merges LoRA weights to the model using the project's existing networks.lora_wan module.
-    This version includes the corrected check for successful module creation.
+    Merges LoRA by manually traversing the model for WanAttentionBlocks and applying weights.
+    This bypasses the library's traversal logic which is failing.
     """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
 
-    try:
-        from networks import lora_wan
-    except ImportError as e:
-        logging.error(f"FATAL: Could not import `networks.lora_wan`. Error: {e}")
-        logging.error("Please ensure `networks/lora_wan.py` and its dependency `networks/lora.py` exist.")
-        return
-
-    for i, lora_weight_path in enumerate(args.lora_weight):
+    for i, lora_path in enumerate(args.lora_weight):
         lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
-
         if lora_multiplier == 0:
             continue
 
-        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
+        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
+        lora_sd = load_file(lora_path, device="cpu")
         
-        weights_sd = load_file(lora_weight_path, device="cpu")
+        alpha = lora_sd.get("lora_unet_alpha", None)
+        if alpha is None:
+            for key in lora_sd.keys():
+                if "lora_down.weight" in key:
+                    alpha = lora_sd[key].shape[0]
+                    break
+        if alpha is None:
+            logging.error(f"Could not determine alpha for LoRA {lora_path}. Skipping.")
+            continue
+        alpha = float(alpha)
         
-        # Call the library's creation function.
-        # It will search for `WanAttentionBlock` instances inside `model`.
-        network = lora_wan.create_arch_network_from_weights(
-            multiplier=lora_multiplier,
-            weights_sd=weights_sd,
-            unet=model,
-            for_inference=True
-        )
-        
-        # CORRECTED CHECK: Instead of `is_active()`, we check the length of the list
-        # where the created LoRA modules are stored. This is the definitive way.
-        if not network.unet_loras:
-             logging.error(
-                 f"LoRA merge FAILED for '{os.path.basename(lora_weight_path)}'. "
-                 f"The library found 0 compatible modules. "
-                 f"This means the check `isinstance(module, WanAttentionBlock)` failed for all submodules in the model. "
-                 f"Please verify that the `WanAttentionBlock` class definition in this script is identical to the one the LoRA was trained with."
-             )
-             continue
+        applied_count = 0
 
-        # If we passed the check, proceed with merging.
-        network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-        logging.info(f"Successfully merged {len(network.unet_loras)} LoRA modules from: {os.path.basename(lora_weight_path)}")
-    
+        for block_name, block_module in model.named_modules():
+            if block_module.__class__.__name__ != 'WanAttentionBlock':
+                continue
+                
+            for linear_name, linear_module in block_module.named_modules():
+                if not isinstance(linear_module, nn.Linear):
+                    continue
+                full_path = f"{block_name}.{linear_name}"
+                lora_key_base = "lora_unet_" + full_path.replace('.', '_')
+                
+                lora_down_key = f"{lora_key_base}.lora_down.weight"
+                lora_up_key = f"{lora_key_base}.lora_up.weight"
+
+                if lora_down_key in lora_sd and lora_up_key in lora_sd:
+                    lora_down_weight = lora_sd[lora_down_key].to(device, dtype=torch.float32)
+                    lora_up_weight = lora_sd[lora_up_key].to(device, dtype=torch.float32)
+
+                    rank = lora_down_weight.shape[0]
+                    scale = alpha / rank
+
+                    update_matrix = (lora_up_weight @ lora_down_weight) * scale * lora_multiplier
+                    
+                    if linear_module.weight.shape != update_matrix.shape:
+                         continue
+                         
+                    linear_module.weight.data += update_matrix.to(linear_module.weight.dtype)
+                    applied_count += 1
+        
+        if applied_count > 0:
+            logging.info(f"MANUALLY MERGED {applied_count} LoRA modules from {os.path.basename(lora_path)}")
+        else:
+            logging.error(f"MANUAL MERGE FAILED: 0 modules were matched.")
+
     torch_gc()
 
 #### CLASS DEFS ####
