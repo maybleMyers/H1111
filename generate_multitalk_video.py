@@ -168,11 +168,11 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """
     Merges LoRA weights to the model using the project's existing networks.lora_wan module.
+    This version includes the corrected check for successful module creation.
     """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
 
-    # This import is the intended entry point for the LoRA library.
     try:
         from networks import lora_wan
     except ImportError as e:
@@ -189,25 +189,30 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
         logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
         
         weights_sd = load_file(lora_weight_path, device="cpu")
-
+        
+        # Call the library's creation function.
+        # It will search for `WanAttentionBlock` instances inside `model`.
         network = lora_wan.create_arch_network_from_weights(
             multiplier=lora_multiplier,
             weights_sd=weights_sd,
             unet=model,
             for_inference=True
         )
-
-        if not network.is_active():
+        
+        # CORRECTED CHECK: Instead of `is_active()`, we check the length of the list
+        # where the created LoRA modules are stored. This is the definitive way.
+        if not network.unet_loras:
              logging.error(
                  f"LoRA merge FAILED for '{os.path.basename(lora_weight_path)}'. "
                  f"The library found 0 compatible modules. "
-                 f"This means it did not find any instances of '{lora_wan.WAN_TARGET_REPLACE_MODULES}' "
-                 f"in the model. Check for model structure discrepancies."
+                 f"This means the check `isinstance(module, WanAttentionBlock)` failed for all submodules in the model. "
+                 f"Please verify that the `WanAttentionBlock` class definition in this script is identical to the one the LoRA was trained with."
              )
              continue
 
+        # If we passed the check, proceed with merging.
         network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-        logging.info(f"Successfully merged LoRA weights from: {os.path.basename(lora_weight_path)}")
+        logging.info(f"Successfully merged {len(network.unet_loras)} LoRA modules from: {os.path.basename(lora_weight_path)}")
     
     torch_gc()
 
