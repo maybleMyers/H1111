@@ -100,31 +100,105 @@ __all__ = [
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
-def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
-    """merge LoRA weights to the model"""
-    if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
+
+def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: float, device: torch.device):
+    """
+    A self-contained LoRA merging function inspired by the source repository's logic.
+    It adapts the key matching for the model structure in this script.
+    """
+    applied_count = 0
+    
+    # The source repo uses a "diffusion_model." prefix, but our WanModel doesn't have it.
+    # The LoRA files themselves often have a "lora_unet_" prefix. We'll handle that.
+    lora_prefix_to_strip = "lora_unet_"
+    
+    # Find all lora_down keys and pair them with lora_up keys.
+    lora_pairs = {}
+    for key in lora_sd.keys():
+        if key.endswith(".lora_down.weight"):
+            up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+            if up_key in lora_sd:
+                lora_pairs[key] = up_key
+
+    if not lora_pairs:
+        logging.warning("Could not find any lora_down/lora_up pairs in the LoRA file.")
+        return 0
+
+    for down_key, up_key in lora_pairs.items():
+        # Transform LoRA key to model key
+        # e.g., "lora_unet_blocks_0_self_attn_q.lora_down.weight" -> "blocks.0.self_attn.q"
+        if down_key.startswith(lora_prefix_to_strip):
+            base_key = down_key[len(lora_prefix_to_strip):]
+        else:
+            # If prefix isn't there, assume it's a direct match attempt
+            base_key = down_key
+        
+        module_path = base_key.replace(".lora_down.weight", "").replace("_", ".")
+        
+        try:
+            # Get the target module from the main model
+            target_module = model.get_submodule(module_path)
+            
+            lora_down_weight = lora_sd[down_key].to(device, dtype=torch.float32)
+            lora_up_weight = lora_sd[up_key].to(device, dtype=torch.float32)
+
+            # Standard LoRA calculation
+            if lora_down_weight.dim() == 4: # Conv LoRA
+                 lora_down_weight = lora_down_weight.squeeze(3).squeeze(2)
+                 lora_up_weight = lora_up_weight.squeeze(3).squeeze(2)
+
+            rank = lora_down_weight.shape[0]
+            # Alpha is often stored in metadata, but if not, it's conventionally equal to rank
+            alpha = lora_sd.get("lora_unet_alpha", rank) 
+            scale = alpha / rank
+
+            update_matrix = lora_up_weight @ lora_down_weight
+            
+            # Apply the update to the original weight
+            target_module.weight.data += update_matrix * multiplier * scale
+            applied_count += 1
+
+        except AttributeError:
+            # This can happen if the module path doesn't exist.
+            # logging.debug(f"Module {module_path} not found in model for LoRA key {down_key}. Skipping.")
+            continue
+            
+    return applied_count
+
+def merge_lora_weights(model: torch.nn.Module, lora_paths: list, lora_multipliers: list, device: torch.device):
+    """merge LoRA weights to the model with fallback"""
+    if not lora_paths:
         return
 
-    for i, lora_weight_path in enumerate(args.lora_weight):
-        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+    for i, lora_path in enumerate(lora_paths):
+        multiplier = lora_multipliers[i] if i < len(lora_multipliers) else 1.0
+        if multiplier == 0:
+            continue
 
-        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
-        
-        weights_sd = load_file(lora_weight_path, device="cpu")
-        
-        # create_arch_network_from_weights is from lora_wan.py
-        network = lora_wan.create_arch_network_from_weights(
-            multiplier=lora_multiplier,
-            weights_sd=weights_sd,
-            unet=model,
-            for_inference=True
-        )
-        
-        network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-        logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {multiplier}")
+        lora_sd = load_file(lora_path, device="cpu")
+
+        try:
+            from networks import lora_wan
+            
+            network = lora_wan.create_arch_network_from_weights(
+                multiplier=multiplier, weights_sd=lora_sd, unet=model, for_inference=True
+            )
+            network.merge_to(text_encoders=None, unet=model, weights_sd=lora_sd, device=device)
+            logging.info(f"Successfully merged LoRA via original method: {os.path.basename(lora_path)}")
+
+        except ImportError:
+            logging.warning("`networks.lora_wan` not found. Falling back to self-contained LoRA merger.")
+            
+            applied_count = _merge_lora_wan_style(model, lora_sd, multiplier, device)
+
+            if applied_count > 0:
+                logging.info(f"Successfully merged {applied_count} modules from LoRA: {os.path.basename(lora_path)}")
+            else:
+                logging.error(f"Fallback LoRA merge failed: 0 modules were matched for {os.path.basename(lora_path)}. Please check LoRA and model key names.")
     
     # Clean up
-    del network, weights_sd
+    del lora_sd
     torch_gc()
 
 #### CLASS DEFS ####
@@ -4076,7 +4150,8 @@ class MultiTalkPipeline:
         num_timesteps=1000,
         use_timestep_transform=True,
         t5_tokenizer_path_override=None,
-        args=None,
+        lora_paths=None,
+        lora_multipliers=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -4139,8 +4214,8 @@ class MultiTalkPipeline:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
 
-        if args and hasattr(args, 'lora_weight') and args.lora_weight:
-            merge_lora_weights(self.model, args, self.device)
+        if lora_paths:
+            merge_lora_weights(self.model, lora_paths, lora_multipliers, self.device)
         self.model.eval().requires_grad_(False)
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
@@ -5174,7 +5249,8 @@ def generate(args):
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
         t5_cpu=args.t5_cpu,
         t5_tokenizer_path_override=args.t5_tokenizer_path,
-        args=args,
+        lora_paths=args.lora_path,
+        lora_multipliers=args.lora_multiplier,
     )
 
     if args.num_persistent_param_in_dit is not None:
