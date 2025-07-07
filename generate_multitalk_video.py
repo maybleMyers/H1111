@@ -242,24 +242,18 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
         if applied_count > 0:
             logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
         else:
-            for i, lora_weight_path in enumerate(args.lora_weight):
-                lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
-
-                logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
-
-                weights_sd = load_file(lora_weight_path, device="cpu")
-
-                # create_arch_network_from_weights is from lora_wan.py
-                network = lora_wan.create_arch_network_from_weights(
-                    multiplier=lora_multiplier,
-                    weights_sd=weights_sd,
-                    unet=model,
-                    for_inference=True
-                )
-
-                network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-                logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
-                del network, weights_sd
+            lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+            logging.info(f"Loading and merging LoRA with alt strat from {lora_path} with multiplier {lora_multiplier}")
+            weights_sd = load_file(lora_path, device="cpu")
+            network = lora_wan.create_arch_network_from_weights(
+                multiplier=lora_multiplier,
+                weights_sd=weights_sd,
+                unet=model,
+                for_inference=True
+            )
+            network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+            del network, weights_sd
 
     torch_gc()
 
