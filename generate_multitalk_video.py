@@ -167,46 +167,94 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """
-    DEBUGGING FUNCTION: This function's only purpose is to inspect and print the
-    exact key names from the provided LoRA safetensors file.
+    Merges LoRA weights by precisely implementing the key-matching logic
+    required for the provided LoRA file. It handles lora, diff, and diff_b keys.
     """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
-        logging.info("No LoRA weights specified.")
         return
 
-    lora_path = args.lora_weight[0]
-    logging.info(f"--- STARTING LORA FILE INSPECTION FOR: {lora_path} ---")
+    for i, lora_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+        if lora_multiplier == 0:
+            continue
 
-    try:
+        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
         lora_sd = load_file(lora_path, device="cpu")
-    except Exception as e:
-        logging.error(f"Failed to load the safetensors file at {lora_path}. Error: {e}")
-        return
 
-    print("\n\n=======================================================================")
-    print(" LORA FILE KEY INSPECTION: Please provide this output for the next step.")
-    print("=======================================================================\n")
-    print(f"Keys found in '{os.path.basename(lora_path)}':\n")
-    
-    keys_found = list(lora_sd.keys())
-    if not keys_found:
-        print("  NO KEYS FOUND IN FILE.")
-    else:
-        # Print a representative sample of keys
-        for i, key in enumerate(keys_found):
-            if i < 20: # Print the first 20 keys to see the pattern
-                print(f"  - {key}")
-        if len(keys_found) > 20:
-            print(f"\n  ... and {len(keys_found) - 20} more keys.")
+        # Get the model's state_dict to apply changes directly to the parameters
+        model_sd = model.state_dict()
+        applied_count = 0
 
-    print("\n=======================================================================")
-    print(" END OF LORA FILE INSPECTION ")
-    print("=======================================================================\n\n")
+        for key, value in lora_sd.items():
+            # The keys in the LoRA file have a 'diffusion_model.' prefix that needs to be stripped.
+            lora_prefix = "diffusion_model."
+            if not key.startswith(lora_prefix):
+                continue
+            
+            target_key_base = key[len(lora_prefix):]
+            target_param = None
+            
+            # 1. Handle traditional lora_down/lora_up pairs for Linear layers
+            if key.endswith(".lora_down.weight"):
+                up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+                if up_key not in lora_sd:
+                    continue
 
-    logging.warning("LoRA inspection complete. Merging is disabled in this debug step. The program will now continue without LoRA.")
+                # Construct the target parameter name, e.g., "blocks.0.cross_attn.k.weight"
+                target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
+                
+                if target_param_name not in model_sd:
+                    continue
+                
+                target_param = model_sd[target_param_name]
+                
+                lora_down_weight = value.to(device, dtype=torch.float32)
+                lora_up_weight = lora_sd[up_key].to(device, dtype=torch.float32)
 
-    # We do not attempt to merge, we just let the program continue.
-    return
+                # Standard LoRA calculation (alpha/rank is implicitly handled in some training scripts)
+                # For this LoRA type, scale is often just the multiplier.
+                update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
+
+                with torch.no_grad():
+                    target_param.add_(update_matrix)
+                applied_count += 1
+            
+            # 2. Handle 'diff' keys, typically for RMSNorm/LayerNorm weights
+            elif key.endswith(".diff"):
+                target_param_name = target_key_base.replace(".diff", ".weight") # In RMSNorm, the parameter is 'weight'
+                
+                if target_param_name not in model_sd:
+                    continue
+                    
+                target_param = model_sd[target_param_name]
+                update = value.to(device, dtype=torch.float32) * lora_multiplier
+                
+                with torch.no_grad():
+                    target_param.add_(update)
+                applied_count += 1
+                
+            # 3. Handle 'diff_b' keys, typically for Linear layer biases
+            elif key.endswith(".diff_b"):
+                target_param_name = target_key_base.replace(".diff_b", ".bias")
+                
+                if target_param_name not in model_sd:
+                    continue
+                    
+                target_param = model_sd[target_param_name]
+                update = value.to(device, dtype=torch.float32) * lora_multiplier
+                
+                with torch.no_grad():
+                    target_param.add_(update)
+                applied_count += 1
+
+        if applied_count > 0:
+            logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
+            # Reload the modified state dict into the model
+            model.load_state_dict(model_sd)
+        else:
+            logging.error(f"LoRA Merge FAILED: 0 key patterns were matched. The LoRA file's keys might be in an unexpected format.")
+
+    torch_gc()
 
 #### CLASS DEFS ####
 class XLMRoberta(nn.Module):
