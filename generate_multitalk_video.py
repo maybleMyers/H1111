@@ -169,6 +169,7 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
     """
     Merges LoRA weights by precisely implementing the key-matching logic
     required for the provided LoRA file. It handles lora, diff, and diff_b keys.
+    This version includes the corrected device placement for all tensors.
     """
     if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
@@ -179,20 +180,19 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
             continue
 
         logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
+        # LoRA weights are loaded to CPU first.
         lora_sd = load_file(lora_path, device="cpu")
 
-        # Get the model's state_dict to apply changes directly to the parameters
+        # Get the model's state_dict. These parameters are on the target `device` (e.g., cuda:0).
         model_sd = model.state_dict()
         applied_count = 0
 
         for key, value in lora_sd.items():
-            # The keys in the LoRA file have a 'diffusion_model.' prefix that needs to be stripped.
             lora_prefix = "diffusion_model."
             if not key.startswith(lora_prefix):
                 continue
             
             target_key_base = key[len(lora_prefix):]
-            target_param = None
             
             # 1. Handle traditional lora_down/lora_up pairs for Linear layers
             if key.endswith(".lora_down.weight"):
@@ -200,59 +200,54 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
                 if up_key not in lora_sd:
                     continue
 
-                # Construct the target parameter name, e.g., "blocks.0.cross_attn.k.weight"
                 target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
-                
                 if target_param_name not in model_sd:
                     continue
                 
-                target_param = model_sd[target_param_name]
+                # All tensors involved in the calculation are explicitly moved to the CPU for the matmul.
+                lora_down_weight = value.to("cpu", dtype=torch.float32)
+                lora_up_weight = lora_sd[up_key].to("cpu", dtype=torch.float32)
                 
-                lora_down_weight = value.to(device, dtype=torch.float32)
-                lora_up_weight = lora_sd[up_key].to(device, dtype=torch.float32)
-
-                # Standard LoRA calculation (alpha/rank is implicitly handled in some training scripts)
-                # For this LoRA type, scale is often just the multiplier.
+                # Calculation is done on CPU.
                 update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
 
                 with torch.no_grad():
-                    target_param.add_(update_matrix)
+                    # The final update matrix is moved to the target device right before the operation.
+                    model_sd[target_param_name].add_(update_matrix.to(device))
                 applied_count += 1
             
             # 2. Handle 'diff' keys, typically for RMSNorm/LayerNorm weights
             elif key.endswith(".diff"):
-                target_param_name = target_key_base.replace(".diff", ".weight") # In RMSNorm, the parameter is 'weight'
-                
+                target_param_name = target_key_base.replace(".diff", ".weight")
                 if target_param_name not in model_sd:
                     continue
-                    
-                target_param = model_sd[target_param_name]
-                update = value.to(device, dtype=torch.float32) * lora_multiplier
+                
+                # The update value is moved to the target device right before the operation.
+                update = (value.to(torch.float32) * lora_multiplier).to(device)
                 
                 with torch.no_grad():
-                    target_param.add_(update)
+                    model_sd[target_param_name].add_(update)
                 applied_count += 1
                 
             # 3. Handle 'diff_b' keys, typically for Linear layer biases
             elif key.endswith(".diff_b"):
                 target_param_name = target_key_base.replace(".diff_b", ".bias")
-                
                 if target_param_name not in model_sd:
                     continue
-                    
-                target_param = model_sd[target_param_name]
-                update = value.to(device, dtype=torch.float32) * lora_multiplier
                 
+                # The update value is moved to the target device right before the operation.
+                update = (value.to(torch.float32) * lora_multiplier).to(device)
+
                 with torch.no_grad():
-                    target_param.add_(update)
+                    model_sd[target_param_name].add_(update)
                 applied_count += 1
 
         if applied_count > 0:
             logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
-            # Reload the modified state dict into the model
+            # Reload the modified state dict into the model to apply all changes.
             model.load_state_dict(model_sd)
         else:
-            logging.error(f"LoRA Merge FAILED: 0 key patterns were matched. The LoRA file's keys might be in an unexpected format.")
+            logging.error(f"LoRA Merge FAILED: 0 key patterns were matched. Please verify LoRA keys start with '{lora_prefix}'.")
 
     torch_gc()
 
