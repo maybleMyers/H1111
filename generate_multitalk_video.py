@@ -166,103 +166,91 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
     return applied_count
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
-    """
-    Merges LoRA weights into the model's parameters in-place.
-
-    It first attempts to merge using the `lora_wan` library. If this method fails to
-    match any keys, it falls back to a manual merge implementation that directly
-    modifies parameter tensors, ensuring correct device placement.
-    """
+    """merge LoRA weights to the model"""
     if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
         return
 
-    param_dict = {name: param for name, param in model.named_parameters()}
-
-    for i, lora_path in enumerate(args.lora_weight):
+    for i, lora_weight_path in enumerate(args.lora_weight):
         lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
-        if lora_multiplier == 0:
-            continue
 
-        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
-        lora_sd = load_file(lora_path, device="cpu")
-
-        network = None
+        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
+        
+        weights_sd = load_file(lora_weight_path, device="cpu")
+        
         try:
             network = lora_wan.create_arch_network_from_weights(
                 multiplier=lora_multiplier,
-                weights_sd=lora_sd,
+                weights_sd=weights_sd,
                 unet=model,
                 for_inference=True
             )
-        except Exception as e:
-            logging.warning(f"Failed to create LoRA network using lora_wan for {lora_path}: {e}. Meow.")
-            network = None
-
-        if network and hasattr(network, 'modules') and network.modules:
-            network.merge_to(text_encoders=None, unet=model, weights_sd=lora_sd, device=device)
-            logging.info(f"Successfully merged LoRA using lora_wan: {os.path.basename(lora_path)}")
+            
+            network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
             del network
-            continue
-
-        logging.info("lora_wan found no keys to merge. Attempting another merge strategy...")
-
-        applied_count = 0
-        for key, value in lora_sd.items():
-            lora_prefix = "diffusion_model."
-            if not key.startswith(lora_prefix):
-                continue
+        except:
+            param_dict = {name: param for name, param in model.named_parameters()}
             
-            target_key_base = key[len(lora_prefix):]
+            applied_count = 0
             
-            if key.endswith(".lora_down.weight"):
-                up_key = key.replace(".lora_down.weight", ".lora_up.weight")
-                if up_key not in lora_sd:
-                    continue
-
-                target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
-                if target_param_name not in param_dict:
+            for key, value in weights_sd.items():
+                lora_prefix = "diffusion_model."
+                if not key.startswith(lora_prefix):
                     continue
                 
-                target_param = param_dict[target_param_name]
-                lora_down_weight = value.to(torch.float32)
-                lora_up_weight = lora_sd[up_key].to(torch.float32)
+                target_key_base = key[len(lora_prefix):]
                 
-                update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
-                
-                with torch.no_grad():
-                    target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
-                applied_count += 1
-            
-            elif key.endswith(".diff"):
-                target_param_name = target_key_base.replace(".diff", ".weight")
-                if target_param_name not in param_dict:
-                    continue
+                if key.endswith(".lora_down.weight"):
+                    up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+                    if up_key not in weights_sd:
+                        continue
+
+                    target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
+                    if target_param_name not in param_dict:
+                        continue
                     
-                target_param = param_dict[target_param_name]
-                update = value.to(torch.float32) * lora_multiplier
-                
-                with torch.no_grad():
-                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
-                applied_count += 1
-                
-            elif key.endswith(".diff_b"):
-                target_param_name = target_key_base.replace(".diff_b", ".bias")
-                if target_param_name not in param_dict:
-                    continue
+                    target_param = param_dict[target_param_name]
                     
-                target_param = param_dict[target_param_name]
-                update = value.to(torch.float32) * lora_multiplier
+                    lora_down_weight = value.to(torch.float32)
+                    lora_up_weight = weights_sd[up_key].to(torch.float32)
+                    
+                    update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
+                    
+                    with torch.no_grad():
+                        target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
+                    applied_count += 1
+                
+                elif key.endswith(".diff"):
+                    target_param_name = target_key_base.replace(".diff", ".weight")
+                    if target_param_name not in param_dict:
+                        continue
+                        
+                    target_param = param_dict[target_param_name]
+                    update = value.to(torch.float32) * lora_multiplier
+                    
+                    with torch.no_grad():
+                        target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                    applied_count += 1
+                    
+                elif key.endswith(".diff_b"):
+                    target_param_name = target_key_base.replace(".diff_b", ".bias")
+                    if target_param_name not in param_dict:
+                        continue
+                        
+                    target_param = param_dict[target_param_name]
+                    update = value.to(torch.float32) * lora_multiplier
 
-                with torch.no_grad():
-                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
-                applied_count += 1
+                    with torch.no_grad():
+                        target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                    applied_count += 1
 
-        if applied_count > 0:
-            logging.info(f"SUCCESS: Manually merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
-        else:
-            logging.error(f"LoRA Merge FAILED: 0 key patterns were matched for {os.path.basename(lora_path)} using both lora_wan and alternate method.")
-
-    del lora_sd
+            if applied_count > 0:
+                logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_weight_path)} into the model.")
+            else:
+                logging.error(f"LoRA Merge FAILED: 0 key patterns were matched.")
+        
+        del weights_sd
+    
     torch_gc()
 
 #### CLASS DEFS ####
