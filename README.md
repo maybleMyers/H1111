@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/7/2025  
+    Support FusioniX lora from vrgamedevgirl with multitalk.  
 7/2/2025  
     Add previews to multitalk model, some bug fixes, change layout.  
 6/29/2025  
@@ -9,8 +11,6 @@
     Add chunking to framepack's clip to process longer prompts.  
 5/31/2025  
     Default button added to framepack tab to save current settings.  
-5/30/2025
-    Add support for the phatom model. Download from https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/phantom14B.safetensors and put it in the wan subfolder to use it with the new phantom tab. It is cool because it can take alot of input reference images and make a video with them. It is a wan 2.1 fine tune.  
 
 # H1111
 
@@ -27,8 +27,9 @@ WanX-i2v
 WanX-v2v  
 SkyReels-i2v  
 SkyReels-t2v  
+Multitalk  
 
-I have mostly been workiing on the framepack tab and the WanX-i2v tab. They are the best to use right now. WanX-i2v is used for skyreels v2 and the fun control models.    
+I have mostly been workiing on the framepack, multitalk and the WanX-i2v tab. WanX-i2v is used for skyreels v2 and the fun control models.    
 
 This supports queuing multiple different jobs if you open 2+ browser tabs and use the same model.
 
@@ -101,7 +102,9 @@ pip install -r requirementsMulti.txt
 
 Set the  Low VRAM (Persistent Params) for your vram, 5 is good for 24gb gpu, 20 works well with a 48gb gpu.  
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
-720p does not work on a 24gb gpu.  
+720p does not work well on a 24gb gpu.  
+
+I added support for the LoRa here: https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.1_I2V_14B_FusionX_LoRA.safetensors You can do low steps and get ok results with it. You can generate with 4-8 steps and get an ok result.  
 
 Thanks to Meigen-AI for their awesome work on this model xD. https://github.com/MeiGen-AI/MultiTalk  
 Kong, Z., Gao, F., Zhang, Y., Kang, Z., Wei, X., Cai, X., Chen, G., & Luo, W. (2025). [Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation](https://arxiv.org/abs/2505.22647). *arXiv preprint arXiv:2505.22647*.
@@ -193,6 +196,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+7/7/2025  
+    Support FusioniX lora from vrgamedevgirl.  
 7/2/2025  
     Add previews to multitalk model, some bug fixes, change layout.  
 6/29/2025  

@@ -100,31 +100,161 @@ __all__ = [
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
-def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
-    """merge LoRA weights to the model"""
-    if not hasattr(args, 'lora_weight') or args.lora_weight is None or len(args.lora_weight) == 0:
-        return
 
-    for i, lora_weight_path in enumerate(args.lora_weight):
-        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
-
-        logging.info(f"Loading and merging LoRA from {lora_weight_path} with multiplier {lora_multiplier}")
-        
-        weights_sd = load_file(lora_weight_path, device="cpu")
-        
-        # create_arch_network_from_weights is from lora_wan.py
-        network = lora_wan.create_arch_network_from_weights(
-            multiplier=lora_multiplier,
-            weights_sd=weights_sd,
-            unet=model,
-            for_inference=True
-        )
-        
-        network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-        logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: float, device: torch.device):
+    """
+    A self-contained LoRA merging function inspired by the source repository's logic.
+    It adapts the key matching for the model structure in this script.
+    """
+    applied_count = 0
     
-    # Clean up
-    del network, weights_sd
+    # The source repo uses a "diffusion_model." prefix, but our WanModel doesn't have it.
+    # The LoRA files themselves often have a "lora_unet_" prefix. We'll handle that.
+    lora_prefix_to_strip = "lora_unet_"
+    
+    # Find all lora_down keys and pair them with lora_up keys.
+    lora_pairs = {}
+    for key in lora_sd.keys():
+        if key.endswith(".lora_down.weight"):
+            up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+            if up_key in lora_sd:
+                lora_pairs[key] = up_key
+
+    if not lora_pairs:
+        logging.warning("Could not find any lora_down/lora_up pairs in the LoRA file.")
+        return 0
+
+    for down_key, up_key in lora_pairs.items():
+        # Transform LoRA key to model key
+        # e.g., "lora_unet_blocks_0_self_attn_q.lora_down.weight" -> "blocks.0.self_attn.q"
+        if down_key.startswith(lora_prefix_to_strip):
+            base_key = down_key[len(lora_prefix_to_strip):]
+        else:
+            # If prefix isn't there, assume it's a direct match attempt
+            base_key = down_key
+        
+        module_path = base_key.replace(".lora_down.weight", "").replace("_", ".")
+        
+        try:
+            # Get the target module from the main model
+            target_module = model.get_submodule(module_path)
+            
+            lora_down_weight = lora_sd[down_key].to(device, dtype=torch.float32)
+            lora_up_weight = lora_sd[up_key].to(device, dtype=torch.float32)
+
+            # Standard LoRA calculation
+            if lora_down_weight.dim() == 4: # Conv LoRA
+                 lora_down_weight = lora_down_weight.squeeze(3).squeeze(2)
+                 lora_up_weight = lora_up_weight.squeeze(3).squeeze(2)
+
+            rank = lora_down_weight.shape[0]
+            # Alpha is often stored in metadata, but if not, it's conventionally equal to rank
+            alpha = lora_sd.get("lora_unet_alpha", rank) 
+            scale = alpha / rank
+
+            update_matrix = lora_up_weight @ lora_down_weight
+            
+            # Apply the update to the original weight
+            target_module.weight.data += update_matrix * multiplier * scale
+            applied_count += 1
+
+        except AttributeError:
+            # This can happen if the module path doesn't exist.
+            # logging.debug(f"Module {module_path} not found in model for LoRA key {down_key}. Skipping.")
+            continue
+            
+    return applied_count
+
+def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
+    """
+    Merges LoRA weights by directly modifying the model's parameters in-place,
+    ensuring all device placements are correct.
+    """
+    if not hasattr(args, 'lora_weight') or not args.lora_weight:
+        return
+    param_dict = {name: param for name, param in model.named_parameters()}
+
+    for i, lora_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+        if lora_multiplier == 0:
+            continue
+
+        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
+        lora_sd = load_file(lora_path, device="cpu") # Load LoRA to CPU
+
+        applied_count = 0
+
+        for key, value in lora_sd.items():
+            lora_prefix = "diffusion_model."
+            if not key.startswith(lora_prefix):
+                continue
+            
+            target_key_base = key[len(lora_prefix):]
+            
+            # 1. Handle traditional lora_down/lora_up pairs for Linear layers
+            if key.endswith(".lora_down.weight"):
+                up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+                if up_key not in lora_sd:
+                    continue
+
+                target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
+                if target_param_name not in param_dict:
+                    continue
+                
+                target_param = param_dict[target_param_name]
+                
+                lora_down_weight = value.to(torch.float32)
+                lora_up_weight = lora_sd[up_key].to(torch.float32)
+                
+                update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
+                
+                with torch.no_grad():
+                    # Move the final update to the SAME device as the target parameter
+                    target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+            
+            # 2. Handle 'diff' keys (for norm weights)
+            elif key.endswith(".diff"):
+                target_param_name = target_key_base.replace(".diff", ".weight")
+                if target_param_name not in param_dict:
+                    continue
+                    
+                target_param = param_dict[target_param_name]
+                update = value.to(torch.float32) * lora_multiplier
+                
+                with torch.no_grad():
+                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+                
+            # 3. Handle 'diff_b' keys (for biases)
+            elif key.endswith(".diff_b"):
+                target_param_name = target_key_base.replace(".diff_b", ".bias")
+                if target_param_name not in param_dict:
+                    continue
+                    
+                target_param = param_dict[target_param_name]
+                update = value.to(torch.float32) * lora_multiplier
+
+                with torch.no_grad():
+                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+
+        if applied_count > 0:
+            logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
+        else:
+            lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+            logging.info(f"Loading and merging LoRA with alt strat from {lora_path} with multiplier {lora_multiplier}")
+            weights_sd = load_file(lora_path, device="cpu")
+            network = lora_wan.create_arch_network_from_weights(
+                multiplier=lora_multiplier,
+                weights_sd=weights_sd,
+                unet=model,
+                for_inference=True
+            )
+            network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_path)}")
+            del network, weights_sd
+
     torch_gc()
 
 #### CLASS DEFS ####
