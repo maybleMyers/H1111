@@ -252,7 +252,7 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
                 for_inference=True
             )
             network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
-            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_weight_path)}")
+            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_path)}")
             del network, weights_sd
 
     torch_gc()
