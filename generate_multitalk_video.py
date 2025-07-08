@@ -4359,58 +4359,57 @@ class MultiTalkPipeline:
 
     def decode_latent_in_chunks(self, latents, chunk_size):
         """
-        Decodes a large latent tensor in smaller, memory-efficient chunks.
-        Replicates the frame-by-frame causal decoding loop of the VAE but manages VRAM.
+        Decodes a large latent tensor in smaller, memory-efficient chunks
+        by calling the VAE's decoder module on one chunk at a time.
         """
         vae = self.vae
-        latents = latents[0] # Remove batch dimension for processing
-        logging.info(f"Decoding latents of shape {latents.shape} in chunks of size {chunk_size}.")
+        # The input `latents` is a list with one 5D tensor: `[Tensor(B, C, F, H, W)]`
+        latents_tensor = latents[0]
+        logging.info(f"Decoding latents of shape {latents_tensor.shape} in chunks of size {chunk_size}.")
 
-        # Perform scaling and initial conv on the GPU. This part is usually not the bottleneck.
-        # If this still causes OOM, this part can also be chunked.
+        # Perform scaling and initial conv on the full latent tensor on GPU.
         with torch.no_grad():
-            latents = latents.to(device=self.device, dtype=vae.dtype)
-            scaled_latents = latents / vae.scale[1].view(1, -1, 1, 1, 1) + vae.scale[0].view(1, -1, 1, 1, 1)
+            latents_tensor = latents_tensor.to(device=self.device, dtype=vae.dtype)
+            scaled_latents = latents_tensor / vae.scale[1].view(1, -1, 1, 1, 1) + vae.scale[0].view(1, -1, 1, 1, 1)
             x_full = vae.model.conv2(scaled_latents)
 
         total_frames = x_full.shape[2]
         decoded_chunks_cpu = []
         
-        # Ensure VAE's internal cache is clear before starting
+        # Ensure VAE's internal cache is clear before starting the sequence.
         vae.model.clear_cache()
 
         for i in tqdm(range(0, total_frames, chunk_size), desc="VAE Decoding in Chunks"):
             start_idx = i
             end_idx = min(i + chunk_size, total_frames)
             
+            # Process one chunk of the latent tensor at a time.
             latent_chunk = x_full[:, :, start_idx:end_idx].to(self.device)
-
-            decoded_frames_gpu = []
-            for frame_idx in range(latent_chunk.shape[2]):
-                frame = latent_chunk[:, :, frame_idx:frame_idx+1, :, :]
-                
-                vae.model._conv_idx = [0]
-                decoded_frame = vae.model.decoder(
-                    frame,
-                    feat_cache=vae.model._feat_map,
-                    feat_idx=vae.model._conv_idx
-                )
-                decoded_frames_gpu.append(decoded_frame)
-
-            video_chunk = torch.cat(decoded_frames_gpu, dim=2)
+            
+            # The VAE's decoder module will process the entire chunk,
+            # using its internal causal convolutions and updating its cache.
+            vae.model._conv_idx = [0]
+            video_chunk = vae.model.decoder(
+                latent_chunk,
+                feat_cache=vae.model._feat_map,
+                feat_idx=vae.model._conv_idx
+            )
             decoded_chunks_cpu.append(video_chunk.cpu())
             
-            del video_chunk, latent_chunk, decoded_frames_gpu
-            if 'decoded_frame' in locals(): del decoded_frame
+            # Clean up GPU memory for the next chunk
+            del video_chunk, latent_chunk
             torch_gc()
 
-        # Clean up VAE cache after decoding is complete
+        # Clean up VAE cache after decoding is complete and free the large intermediate tensor.
         vae.model.clear_cache()
+        del x_full, latents_tensor, scaled_latents
+        torch_gc()
         
-        final_video = torch.cat(decoded_chunks_cpu, dim=2)
-        final_video = final_video.unsqueeze(0) 
-
-        return final_video
+        # Concatenate all CPU chunks to form the final 5D video tensor.
+        final_video_tensor = torch.cat(decoded_chunks_cpu, dim=2)
+        
+        # Return a list containing the decoded 4D tensor, matching the original vae.decode() output format for a single batch item.
+        return [final_video_tensor.squeeze(0)]
     
     def load_models_to_device(self, loadmodel_names=[]):
         # only load models to device if cpu_offload is enabled
@@ -4878,12 +4877,11 @@ class MultiTalkPipeline:
                 torch_gc()
                 
                 if extra_args.vae_decode_chunk_size:
-                    # returns a 5D tensor: [1, C, T, H, W]
-                    videos_tensor = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
+                    videos_list = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
                 else:
-                    # self.vae.decode returns a list of 4D tensors. We stack them into a 5D tensor.
                     videos_list = self.vae.decode(x0)
-                    videos_tensor = torch.stack(videos_list)
+                
+                videos_tensor = torch.stack(videos_list)
 
             if extra_args.preview is not None and extra_args.full_preview:
                 # We have a new decoded clip in `videos_tensor` (shape B C T H W)
