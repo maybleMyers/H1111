@@ -4407,11 +4407,10 @@ class MultiTalkPipeline:
         # Clean up VAE cache after decoding is complete
         vae.model.clear_cache()
         
-        # Concatenate all CPU chunks to form the final video
         final_video = torch.cat(decoded_chunks_cpu, dim=2)
-        final_video = final_video.unsqueeze(0) # Add back batch dimension
-        
-        return [final_video]
+        final_video = final_video.unsqueeze(0) 
+
+        return final_video
     
     def load_models_to_device(self, loadmodel_names=[]):
         # only load models to device if cpu_offload is enabled
@@ -4879,13 +4878,16 @@ class MultiTalkPipeline:
                 torch_gc()
                 
                 if extra_args.vae_decode_chunk_size:
-                    videos = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
+                    # returns a 5D tensor: [1, C, T, H, W]
+                    videos_tensor = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
                 else:
-                    videos = self.vae.decode(x0)
+                    # self.vae.decode returns a list of 4D tensors. We stack them into a 5D tensor.
+                    videos_list = self.vae.decode(x0)
+                    videos_tensor = torch.stack(videos_list)
 
             if extra_args.preview is not None and extra_args.full_preview:
-                # We have a new decoded clip in `videos` (shape B C T H W)
-                current_clip_pixels = videos[0] # Take first from batch, shape C T H W
+                # We have a new decoded clip in `videos_tensor` (shape B C T H W)
+                current_clip_pixels = videos_tensor[0] # Take first from batch, shape C T H W
                 
                 if is_first_clip:
                     preview_video_list.append(current_clip_pixels)
@@ -4905,11 +4907,11 @@ class MultiTalkPipeline:
                     save_video_without_audio(stitched_preview_video, preview_path, fps=25)
             
             # cache generated samples
-            videos = torch.stack(videos).cpu() # B C T H W
+            video_to_cache = videos_tensor.cpu()
             if is_first_clip:
-                gen_video_list.append(videos)
+                gen_video_list.append(video_to_cache)
             else:
-                gen_video_list.append(videos[:, :, cur_motion_frames_num:])
+                gen_video_list.append(video_to_cache[:, :, cur_motion_frames_num:])
 
             # decide whether is done
             if arrive_last_frame:
@@ -4923,7 +4925,7 @@ class MultiTalkPipeline:
             is_first_clip = False
             cur_motion_frames_num = motion_frame
 
-            cond_image = videos[:, :, -cur_motion_frames_num:].to(torch.float32).to(self.device)
+            cond_image = videos_tensor[:, :, -cur_motion_frames_num:].to(torch.float32).to(self.device)
             audio_start_idx += (frame_num - cur_motion_frames_num)
             audio_end_idx = audio_start_idx + clip_length
 
