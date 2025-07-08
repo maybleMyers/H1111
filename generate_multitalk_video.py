@@ -4871,10 +4871,10 @@ class MultiTalkPipeline:
                     pbar.update(1)
                     del latent_model_input, timestep
                 
-                if offload_model: 
-                    if not self.vram_management:
-                        self.model.cpu()
-                torch_gc()
+                if offload_model:
+                    logging.info("Fully offloading DiT model to CPU to maximize VRAM for VAE decoding.")
+                    self.model.cpu()
+                    torch_gc()
                 
                 if extra_args.vae_decode_chunk_size:
                     videos_list = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
