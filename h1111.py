@@ -62,6 +62,7 @@ def multitalk_batch_handler(
     use_apg: bool,
     apg_momentum: float,
     apg_norm_thresh: float,
+    vae_decode_chunk_size: Optional[int],
     enable_preview: bool,
     preview_steps: int,
     use_full_video_preview: bool,
@@ -133,7 +134,10 @@ def multitalk_batch_handler(
             "--audio_type", str(audio_type),
             "--num_persistent_param_in_dit", str(num_persistent_backend),
         ]
-        
+
+        if vae_decode_chunk_size is not None and int(vae_decode_chunk_size) > 0:
+            command.extend(["--vae_decode_chunk_size", str(vae_decode_chunk_size)])
+
         if audio_person2 and os.path.exists(audio_person2):
             command.extend(["--cond_audio_person2", str(audio_person2)])
             
@@ -6081,7 +6085,17 @@ with gr.Blocks(
                         multitalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         multitalk_random_seed_btn = gr.Button("🎲️")
                     with gr.Accordion("Advanced & Performance", open=True):
-                        multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        with gr.Row(): 
+                            multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                            multitalk_vae_decode_chunk_size = gr.Slider(
+                                label="VAE Decode Chunk Size",
+                                minimum=0,
+                                maximum=64,
+                                step=1,
+                                value=8,
+                                info="0=disable. Enables chunked VAE decoding to save VRAM. Recommended: 8-24.",
+                                interactive=True
+                            )
                         multitalk_num_persistent = gr.Slider(
                             minimum=0, 
                             maximum=26, 
@@ -7400,6 +7414,7 @@ with gr.Blocks(
             multitalk_use_apg,
             multitalk_apg_momentum,
             multitalk_apg_norm_thresh,
+            multitalk_vae_decode_chunk_size,
             multitalk_enable_preview,
             multitalk_preview_steps,
             multitalk_use_full_video_preview,
