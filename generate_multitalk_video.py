@@ -4880,7 +4880,7 @@ class MultiTalkPipeline:
                 if extra_args.vae_decode_chunk_size:
                     if offload_model:
                         logging.info("Fully offloading DiT model to CPU for chunked VAE decoding.")
-                        self.model.cpu()
+                        self.load_models_to_device([])
                         torch_gc()
                     
                     videos_list = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
