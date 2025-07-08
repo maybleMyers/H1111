@@ -4748,7 +4748,13 @@ class MultiTalkPipeline:
 
             # evaluation mode
             with torch.no_grad(), no_sync():
-                
+                if extra_args.vae_decode_chunk_size:
+                    torch_gc()
+                    if not self.vram_management:
+                        self.model.to(self.device)
+                    else:
+                        self.load_models_to_device(["model"])
+
                 # prepare timesteps
                 timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
                 timesteps.append(0.)
@@ -4871,12 +4877,12 @@ class MultiTalkPipeline:
                     pbar.update(1)
                     del latent_model_input, timestep
                 
-                if offload_model:
-                    logging.info("Fully offloading DiT model to CPU to maximize VRAM for VAE decoding.")
-                    self.model.cpu()
-                    torch_gc()
-                
                 if extra_args.vae_decode_chunk_size:
+                    if offload_model:
+                        logging.info("Fully offloading DiT model to CPU for chunked VAE decoding.")
+                        self.model.cpu()
+                        torch_gc()
+                    
                     videos_list = self.decode_latent_in_chunks(x0, extra_args.vae_decode_chunk_size)
                 else:
                     videos_list = self.vae.decode(x0)
