@@ -844,6 +844,12 @@ def _parse_args():
         description="Generate a image or video from a text prompt or image using Wan"
     )
     parser.add_argument(
+        "--preview_suffix",
+        type=str,
+        default=None,
+        help="Unique suffix for preview files to avoid conflicts in concurrent runs."
+    )
+    parser.add_argument(
         "--full_preview",
         action="store_true",
         default=None,
