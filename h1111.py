@@ -62,8 +62,6 @@ def multitalk_batch_handler(
     use_apg: bool,
     apg_momentum: float,
     apg_norm_thresh: float,
-    enable_preview: bool,
-    preview_steps: int,
     use_full_video_preview: bool,
     # Paths
     ckpt_dir: str,
@@ -146,11 +144,10 @@ def multitalk_batch_handler(
             command.extend(["--apg_momentum", str(apg_momentum)])
             command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
 
-        if enable_preview and preview_steps > 0:
-            command.extend(["--preview", str(preview_steps)])
+        if use_full_video_preview:
+            command.append("--full_preview")
+            # The generation script now requires the suffix to be passed for the full preview
             command.extend(["--preview_suffix", unique_preview_suffix])
-            if use_full_video_preview:
-                command.append("--full_preview")
         # LoRA Handling
         lora_weights_paths = []
         lora_multipliers_values = []
@@ -181,7 +178,7 @@ def multitalk_batch_handler(
 
         current_preview_yield_path = None
         last_preview_mtime = 0
-        preview_base_dir = os.path.join(save_path, "previews")
+        preview_base_dir = os.path.join(os.path.dirname(save_file_prefix), "previews")
         preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
 
         current_video_file_for_item = None
@@ -252,7 +249,7 @@ def multitalk_batch_handler(
             else:
                  progress_text_update = line_strip
 
-            if enable_preview:
+            if use_full_video_preview:
                 found_preview_path = None
 
                 if os.path.exists(preview_mp4_gen_path):
@@ -4754,7 +4751,6 @@ def wanx_generate_video(
         "--sample_solver", str(sample_solver)
     ]
     
-    # Fix 3: Only add boolean flags if they're True
     if enable_preview and preview_steps > 0:
         command.extend(["--preview", str(preview_steps)])
         # --- ADDED: Pass the unique suffix ---
@@ -6106,13 +6102,7 @@ with gr.Blocks(
                         allow_preview=True, preview=True
                     )
                     with gr.Accordion("Live Preview (During Generation)", open=True):
-                        multitalk_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
-                        multitalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews (slower)", value=True)
-                        multitalk_preview_steps = gr.Slider(
-                            minimum=1, maximum=50, step=1, value=5,
-                            label="Preview Every N Steps",
-                            info="Generates previews during the sampling loop."
-                        )
+                        multitalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews Every Section", value=True)
                         multitalk_preview_output = gr.Video(
                             label="Latest Preview", height=300,
                             interactive=False, elem_id="multitalk_preview_video"
@@ -7400,8 +7390,6 @@ with gr.Blocks(
             multitalk_use_apg,
             multitalk_apg_momentum,
             multitalk_apg_norm_thresh,
-            multitalk_enable_preview,
-            multitalk_preview_steps,
             multitalk_use_full_video_preview,
             multitalk_ckpt_dir,
             multitalk_wav2vec_dir,
