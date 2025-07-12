@@ -93,7 +93,6 @@ from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
 from networks import lora_wan
 from safetensors.torch import load_file
-from blissful_tuner.latent_preview import LatentPreviewer
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -843,19 +842,6 @@ def _validate_args(args):
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
-    )
-    parser.add_argument(
-        "--preview",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory."
-    )
-    parser.add_argument(
-        "--preview_suffix",
-        type=str,
-        default=None,
-        help="Unique suffix for preview files to avoid conflicts in concurrent runs."
     )
     parser.add_argument(
         "--full_preview",
@@ -4541,6 +4527,9 @@ class MultiTalkPipeline:
         np.random.seed(seed)
         random.seed(seed)
         torch.backends.cudnn.deterministic = True
+        preview_suffix = None
+        if extra_args.full_preview and self.rank == 0:
+            preview_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
 
         # start video generation iteratively
         while True:
@@ -4576,35 +4565,6 @@ class MultiTalkPipeline:
                 lat_w,
                 dtype=torch.float32,
                 device=self.device) 
-            
-            previewer = None
-            if LatentPreviewer is not None and extra_args.preview is not None and extra_args.preview > 0 and self.rank == 0:
-                logging.info(f"Initializing latent previewer for clip {clip_count+1} (every {extra_args.preview} steps)...")
-                try:
-                    preview_timesteps_tensor = torch.from_numpy(
-                        np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
-                    ).to(self.device)
-
-                    class PreviewArgs:
-                        pass
-                    
-                    preview_args = PreviewArgs()
-                    preview_args.save_path = os.path.dirname(extra_args.save_file)
-                    preview_args.fps = 25 
-                    preview_args.preview_vae = None 
-                    
-                    previewer = LatentPreviewer(
-                        args=preview_args, # Pass the mock args object
-                        original_latents=noise.clone(),
-                        timesteps=preview_timesteps_tensor,
-                        device=self.device,
-                        dtype=self.param_dtype,
-                        model_type="wan",
-                    )
-                    logging.info("Latent Previewer initialized successfully.")
-                except Exception as e:
-                    logging.error(f"Failed to initialize Latent Previewer: {e}", exc_info=True)
-                    previewer = None
 
             # get mask
             msk = torch.ones(1, frame_num, lat_h, lat_w, device=self.device)
@@ -4798,15 +4758,6 @@ class MultiTalkPipeline:
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
 
-                    if previewer is not None and (i + 1) % extra_args.preview == 0 and (i + 1) < len(timesteps) - 1:
-                        try:
-                            if not extra_args.full_preview:
-                                logging.debug(f"Generating preview for step {i + 1}")
-                                # The latent is shape [C, F, H, W], which preview() expects
-                                previewer.preview(latent.clone(), i, preview_suffix=extra_args.preview_suffix)
-                        except Exception as e:
-                            logging.error(f"Error during latent preview at step {i + 1}: {e}", exc_info=True)
-
                     x0 = [latent.to(self.device)] 
                     pbar.update(1)
                     del latent_model_input, timestep
@@ -4818,7 +4769,7 @@ class MultiTalkPipeline:
 
                 videos = self.vae.decode(x0) 
 
-            if extra_args.preview is not None and extra_args.full_preview:
+            if extra_args.full_preview:
                 # We have a new decoded clip in `videos` (shape B C T H W)
                 current_clip_pixels = videos[0] # Take first from batch, shape C T H W
                 
@@ -4836,7 +4787,7 @@ class MultiTalkPipeline:
                     # Define preview path and save
                     preview_dir = os.path.join(os.path.dirname(extra_args.save_file), "previews")
                     os.makedirs(preview_dir, exist_ok=True)
-                    preview_path = os.path.join(preview_dir, f"latent_preview_{extra_args.preview_suffix}.mp4")
+                    preview_path = os.path.join(preview_dir, f"latent_preview_{preview_suffix}.mp4")
                     save_video_without_audio(stitched_preview_video, preview_path, fps=25)
             
             # cache generated samples
