@@ -4535,7 +4535,7 @@ class MultiTalkPipeline:
         torch.backends.cudnn.deterministic = True
         preview_suffix = None
         if extra_args.full_preview and self.rank == 0:
-            preview_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+            preview_suffix = extra_args.preview_suffix if extra_args.preview_suffix else datetime.now().strftime("%Y%m%d%H%M%S")
 
         # start video generation iteratively
         while True:
