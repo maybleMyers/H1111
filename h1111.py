@@ -178,7 +178,7 @@ def multitalk_batch_handler(
 
         current_preview_yield_path = None
         last_preview_mtime = 0
-        preview_base_dir = os.path.join(save_path, "previews")
+        preview_base_dir = os.path.join(os.path.dirname(save_file_prefix), "previews")
         preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
 
         current_video_file_for_item = None
