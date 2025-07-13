@@ -25,7 +25,7 @@ from datetime import datetime
 from tqdm import tqdm
 from diffusers_helper.bucket_tools import find_nearest_bucket
 import time
-
+from gradio_image_annotation import image_annotator
 
 
 # Add global stop event
@@ -40,7 +40,7 @@ FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json"
 def multitalk_batch_handler(
     prompt: str,
     negative_prompt: str,
-    cond_image: str,
+    cond_image_data: dict,
     audio_person1: Optional[str],
     audio_person2: Optional[str],
     batch_size: int,
@@ -77,11 +77,12 @@ def multitalk_batch_handler(
     stop_event.clear()
 
     # --- Initial Checks ---
+    if not cond_image_data or not cond_image_data.get('image'):
+        yield [], None, "Error: Reference Image not provided.", ""
+        return
+    cond_image = cond_image_data['image']
     if not cond_image or not os.path.exists(cond_image):
         yield [], None, "Error: Reference Image not found.", ""
-        return
-    if not audio_person1 or not os.path.exists(audio_person1):
-        yield [], None, "Error: Audio for Person 1 not found.", ""
         return
     os.makedirs(save_path, exist_ok=True)
 
@@ -134,7 +135,30 @@ def multitalk_batch_handler(
         
         if audio_person2 and os.path.exists(audio_person2):
             command.extend(["--cond_audio_person2", str(audio_person2)])
-            
+
+        boxes = cond_image_data.get('boxes', [])
+        bbox1_str = None
+        bbox2_str = None
+        if boxes:
+            for box_info in boxes:
+                label = box_info.get('label', '').strip().lower()
+                # The coordinates are directly in box_info, not in a nested 'box' dictionary.
+                if all(k in box_info for k in ["xmin", "ymin", "xmax", "ymax"]):
+                    coords = ",".join(map(str, [
+                        box_info["xmin"], box_info["ymin"], 
+                        box_info["xmax"], box_info["ymax"]
+                    ]))
+                    
+                    if label == 'person 1' and not bbox1_str:
+                        bbox1_str = coords
+                    elif label == 'person 2' and not bbox2_str:
+                        bbox2_str = coords
+        
+        if bbox1_str:
+            command.extend(["--bbox_person1", bbox1_str])
+        if bbox2_str:
+            command.extend(["--bbox_person2", bbox2_str])   
+
         if use_teacache:
             command.append("--use_teacache")
             command.extend(["--teacache_thresh", str(teacache_thresh)])
@@ -5643,6 +5667,7 @@ with gr.Blocks(
     framepack_original_dims = gr.State(value="")
     fpe_selected_index = gr.State(value=None)
     phantom_selected_index = gr.State(value=None)
+    multitalk_annotations_state = gr.State(value=None)
     demo.load(None, None, None, js="""
         () => {
             document.title = 'H1111';
@@ -6052,7 +6077,13 @@ with gr.Blocks(
             with gr.Row():
                 # Left Column for inputs and core settings
                 with gr.Column():
-                    multitalk_cond_image = gr.Image(label="Reference Image (required)", type="filepath")
+                    multitalk_cond_image = image_annotator(
+                        label="Reference Image & Bounding Boxes",
+                        image_type="filepath",
+                        label_list=["Person 1", "Person 2"],
+                        label_colors=[(255, 0, 0), (0, 255, 0)], # Red for P1, Green for P2
+                    )
+                    multitalk_bbox_json_output = gr.JSON(label="Current BBox Data (for Debugging)", visible=False)
                     with gr.Row():
                         multitalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
                         multitalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
@@ -7364,13 +7395,17 @@ with gr.Blocks(
 #multitalk event handlers
     multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
-
+    multitalk_cond_image.change(
+        fn=lambda data: (data, data), # Pass the data through to both outputs
+        inputs=[multitalk_cond_image],
+        outputs=[multitalk_annotations_state, multitalk_bbox_json_output]
+    )
     multitalk_generate_btn.click(
         fn=multitalk_batch_handler,
         inputs=[
             multitalk_prompt,
             multitalk_negative_prompt,
-            multitalk_cond_image,
+            multitalk_annotations_state,
             multitalk_audio_person1,
             multitalk_audio_person2,
             multitalk_batch_size,

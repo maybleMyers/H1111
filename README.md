@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/13/2025  
+    Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
 7/7/2025  
     Support FusioniX lora from vrgamedevgirl with multitalk.  
 7/2/2025  
@@ -8,9 +10,7 @@
 6/29/2025  
     Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
 6/21/2025  
-    Add chunking to framepack's clip to process longer prompts.  
-5/31/2025  
-    Default button added to framepack tab to save current settings.  
+    Add chunking to framepack's clip to process longer prompts.    
 
 # H1111
 
@@ -104,6 +104,8 @@ Set the  Low VRAM (Persistent Params) for your vram, 5 is good for 24gb gpu, 20 
 Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can use as little as 10 steps to speed it up.  
 720p does not work well on a 24gb gpu.  
 
+To use the BBoxes just click the picture and drag a box and set the label for person 1 or person 2 audio to match the input.  
+
 I added support for the LoRa here: https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.1_I2V_14B_FusionX_LoRA.safetensors You can do low steps and get ok results with it. You can generate with 4-8 steps and get an ok result.  
 
 Thanks to Meigen-AI for their awesome work on this model xD. https://github.com/MeiGen-AI/MultiTalk  
@@ -196,6 +198,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+7/13/2025  
+    Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
 7/7/2025  
     Support FusioniX lora from vrgamedevgirl.  
 7/2/2025  
