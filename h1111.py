@@ -6083,7 +6083,7 @@ with gr.Blocks(
                         label_list=["Person 1", "Person 2"],
                         label_colors=[(255, 0, 0), (0, 255, 0)], # Red for P1, Green for P2
                     )
-                    multitalk_bbox_json_output = gr.JSON(label="Current BBox Data (for Debugging)")
+                    multitalk_bbox_json_output = gr.JSON(label="Current BBox Data (for Debugging)", visible=False)
                     with gr.Row():
                         multitalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
                         multitalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
