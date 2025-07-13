@@ -4612,10 +4612,12 @@ class MultiTalkPipeline:
                 if 'bbox' in input_data:
                     assert len(input_data['bbox']) == len(input_data['cond_audio']), f"The number of target bbox should be the same with cond_audio"
                     background_mask = torch.zeros([src_h, src_w])
-                    for _, person_bbox in input_data['bbox'].items():
+                    sorted_keys = sorted(input_data['bbox'].keys())
+                    for key in sorted_keys:
+                        person_bbox = input_data['bbox'][key]
                         x_min, y_min, x_max, y_max = person_bbox
                         human_mask = torch.zeros([src_h, src_w])
-                        human_mask[int(x_min):int(x_max), int(y_min):int(y_max)] = 1
+                        human_mask[int(y_min):int(y_max), int(x_min):int(x_max)] = 1
                         background_mask += human_mask
                         human_masks.append(human_mask)
                 else:
