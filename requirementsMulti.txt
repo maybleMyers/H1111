@@ -104,3 +104,4 @@ librosa
 pyloudnorm
 soundfile
 xfuser
+gradio_image_annotation
