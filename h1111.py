@@ -40,7 +40,7 @@ FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json"
 def multitalk_batch_handler(
     prompt: str,
     negative_prompt: str,
-    cond_image: str,
+    cond_image_data: dict,
     audio_person1: Optional[str],
     audio_person2: Optional[str],
     batch_size: int,
@@ -77,7 +77,12 @@ def multitalk_batch_handler(
     stop_event.clear()
 
     # --- Initial Checks ---
-    if not cond_image or not os.path.exists(cond_image):
+    if not cond_image_data or not cond_image_data.get('image'):
+        yield [], None, "Error: Reference Image not provided.", ""
+        return
+    image_path = cond_image_data['image']
+    bboxes = cond_image_data.get('boxes', [])
+    if not os.path.exists(image_path):
         yield [], None, "Error: Reference Image not found.", ""
         return
     if not audio_person1 or not os.path.exists(audio_person1):
@@ -116,7 +121,7 @@ def multitalk_batch_handler(
             "--t5_tokenizer_path", str(t5_tokenizer_path),
             "--prompt", str(prompt),
             "--n_prompt", str(negative_prompt),
-            "--cond_image", str(cond_image),
+            "--cond_image", str(image_path),
             "--cond_audio_person1", str(audio_person1),
             "--base_seed", str(current_seed),
             "--save_file", save_file_prefix,
@@ -134,6 +139,23 @@ def multitalk_batch_handler(
         
         if audio_person2 and os.path.exists(audio_person2):
             command.extend(["--cond_audio_person2", str(audio_person2)])
+
+        bbox1_str = None
+        bbox2_str = None
+        if bboxes:
+            for box_info in bboxes:
+                box = box_info['box']
+                label = box_info['label'].strip().lower()
+                coords = ",".join(map(str, [int(c) for c in box]))
+                if label in ['person 1', 'person1', '1'] and not bbox1_str:
+                    bbox1_str = coords
+                elif label in ['person 2', 'person2', '2'] and not bbox2_str:
+                    bbox2_str = coords
+        
+        if bbox1_str:
+            command.extend(["--bbox_person1", bbox1_str])
+        if bbox2_str:
+            command.extend(["--bbox_person2", bbox2_str])            
             
         if use_teacache:
             command.append("--use_teacache")
@@ -6052,7 +6074,13 @@ with gr.Blocks(
             with gr.Row():
                 # Left Column for inputs and core settings
                 with gr.Column():
-                    multitalk_cond_image = gr.Image(label="Reference Image (required)", type="filepath")
+                    multitalk_cond_image = gr.Image(
+                        label="Reference Image & Bounding Boxes",
+                        type="filepath",
+                        tool="box",
+                        interactive=True,
+                        info="Upload image, then draw BBoxes. Use 'Person 1' and 'Person 2' as the text labels for the boxes."
+                    )
                     with gr.Row():
                         multitalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
                         multitalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
