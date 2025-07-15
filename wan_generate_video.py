@@ -625,7 +625,7 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int, Optional[int]]:
     # Or if it's FunControl, which might have different size constraints
     if args.video_path is None and not WAN_CONFIGS[args.task].is_fun_control:
         if size not in SUPPORTED_SIZES[args.task]:
-            logger.warning(f"Size {size} is not supported for task {args.task}. Supported sizes are {SUPPORTED_SIZES[args.task]}.")
+            logger.warning(f"Size {size} is not officially reccomended for task {args.task}. Supported sizes are {SUPPORTED_SIZES[args.task]}.")
 
     video_length = args.video_length # Might be None if V2V auto-detect
 
@@ -1906,11 +1906,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Data Types ---
     dit_dtype = detect_wan_sd_dtype(args.dit) if args.dit is not None else torch.bfloat16
+    dit_dtype = detect_wan_sd_dtype(args.dit) if args.dit is not None else torch.bfloat16
     if dit_dtype.itemsize == 1: # FP8 weights loaded
         dit_dtype = torch.bfloat16 # Use bfloat16 for computation
         if args.fp8_scaled:
             raise ValueError("Cannot use --fp8_scaled with pre-quantized FP8 weights.")
-        dit_weight_dtype = None # Weights are already FP8
+        dit_weight_dtype = torch.float8_e4m3fn
     elif args.fp8_scaled:
         dit_weight_dtype = None # Optimize later
     elif args.fp8:
