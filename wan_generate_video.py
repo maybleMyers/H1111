@@ -2133,11 +2133,20 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Load DiT Model ---
     if is_pusa_i2v:
-        logger.info(f"Loading Pusa DiT model from: {args.pusa_model_path}")
-        # Use the pusa_model_path for the 'dit' argument in load_wan_model
-        model = load_wan_model(config=cfg, device=device, dit_path=args.pusa_model_path, attn_mode=args.attn_mode, split_attn=False, loading_device="cpu", dit_weight_dtype=dit_dtype, fp8_scaled=False)
-    else:
-        model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag
+        logger.info(f"Pusa I2V mode: Injecting Pusa model '{args.pusa_model_path}' as a LoRA to be loaded onto the base DiT model.")
+
+        # Prepend the Pusa model path to the lora_weight list
+        if args.lora_weight is None:
+            args.lora_weight = []
+        args.lora_weight.insert(0, args.pusa_model_path)
+
+        # Prepend the Pusa multiplier (1.0) to the lora_multiplier list
+        if not isinstance(args.lora_multiplier, list):
+            # Handles the case where --lora_multiplier is not used and defaults to a float
+            args.lora_multiplier = [args.lora_multiplier] * (len(args.lora_weight) - 1)
+        args.lora_multiplier.insert(0, 1.0)
+
+    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v or is_pusa_i2v)
 
     # --- Merge LoRA ---
     if args.lora_weight is not None and len(args.lora_weight) > 0:
