@@ -2135,7 +2135,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if is_pusa_i2v:
         logger.info(f"Loading Pusa DiT model from: {args.pusa_model_path}")
         # Use the pusa_model_path for the 'dit' argument in load_wan_model
-        model = load_wan_model(config=cfg, device=device, weight_path=args.pusa_model_path, attn_mode=args.attn_mode, fp8_optimize=False, loading_device="cpu", dtype=dit_dtype, is_i2v=True)
+        model = load_wan_model(config=cfg, device=device, dit_path=args.pusa_model_path, attn_mode=args.attn_mode, split_attn=False, loading_device="cpu", dit_weight_dtype=dit_dtype, fp8_scaled=False)
     else:
         model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag
 
