@@ -6824,11 +6824,11 @@ with gr.Blocks(
                             visible=False,
                             info="When (0-1) in the timeline control starts to fade out"
                         )
-                    with gr.Row():
+                    with gr.Accordion("Pusa model", open=False):
                         wanx_pusa_i2v_enable = gr.Checkbox(label="Enable Pusa I2V Mode", value=False,
                                                            info="Uses a simplified I2V model. Disables Fun-Control and End Image.")
                         wanx_pusa_model_path = gr.Dropdown(label="Pusa DiT Model Path", choices=get_dit_models("wan"),
-                                                           visible=False, interactive=True, allow_custom_value=True,
+                                                           visible=True, interactive=True, allow_custom_value=True,
                                                            info="Path to the full Pusa DiT model checkpoint.")
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
