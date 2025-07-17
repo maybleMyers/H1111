@@ -2073,7 +2073,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if is_pusa_i2v:
         if args.video_length is None:
             raise ValueError("video_length must be specified for Pusa I2V mode.")
-        noise, context, context_null, pusa_image_latent, inputs = prepare_pusa_i2v_inputs(args, cfg, accelerator, device, vae)
+        # Pusa I2V requires the same input format as standard I2V (a 20-channel 'y' tensor)
+        # but uses a different scheduler. We'll use the standard I2V input preparation
+        # and then extract the image latent for the initial noise injection.
+        noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+        
+        # The `y` tensor contains the 4-channel mask and 16-channel VAE latent.
+        # We extract the VAE latent of the first frame for the injection step in run_sampling.
+        # y shape is [20, F, H, W]. We want the latent part [16 channels] of the first frame [:, 0:1, :, :].
+        pusa_image_latent = y[4:, 0:1, :, :]
     elif is_v2v:
         # Standard V2V path (mutually exclusive with FunControl)
         # 1. Load and prepare video
