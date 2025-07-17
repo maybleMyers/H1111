@@ -3947,6 +3947,8 @@ def wanx_batch_handler(
     cfg_apply_ratio: float,
     enable_preview: bool,
     preview_steps: int,
+    pusa_i2v_enable: bool,
+    pusa_model_path: Optional[str],
     *lora_params,   # <-- DO NOT ADD NAMED ARGS AFTER THIS!
 ):
     """Handle both folder-based batch processing and regular processing for all WanX tabs"""
@@ -4061,7 +4063,9 @@ def wanx_batch_handler(
                 enable_cfg_skip, cfg_skip_mode, cfg_apply_ratio,
                 None, 1.0, 0.0, 1.0, # Placeholders for control video args in random mode
                 enable_preview=enable_preview,
-                preview_steps=preview_steps
+                preview_steps=preview_steps,
+                pusa_i2v_enable=pusa_i2v_enable,
+                pusa_model_path=pusa_model_path,                
             ):
                 # Store the latest video info from this *specific* generator run
                 if videos_update:
@@ -4198,7 +4202,9 @@ def wanx_batch_handler(
                 control_video, control_strength, control_start, control_end,
                 # --- Pass preview args ---
                 enable_preview=enable_preview,
-                preview_steps=preview_steps
+                preview_steps=preview_steps,
+                pusa_i2v_enable=pusa_i2v_enable,
+                pusa_model_path=pusa_model_path,                
             )
 
 def process_single_video(
@@ -4669,7 +4675,9 @@ def wanx_generate_video(
     control_start=0.0,
     control_end=1.0,
     enable_preview: bool = False,
-    preview_steps: int = 5
+    preview_steps: int = 5,
+    pusa_i2v_enable: bool = False,
+    pusa_model_path: Optional[str] = None    
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
     """Generate video with WanX model (supports both i2v, t2v and Fun-Control)"""
     global stop_event
@@ -4711,7 +4719,17 @@ def wanx_generate_video(
     preview_png_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.png")
 
     # Check if this is a Fun-Control task
-    is_fun_control = "-FC" in task and control_video is not None
+    is_fun_control = "-FC" in task and control_video is not None and not pusa_i2v_enable
+
+    # Pusa mode check
+    if pusa_i2v_enable:
+        if not input_image:
+            yield [], [], "Error: Pusa mode requires an input image.", ""
+            return
+        if not pusa_model_path or not os.path.exists(pusa_model_path):
+            yield [], [], f"Error: Pusa model path not found or invalid: {pusa_model_path}", ""
+            return
+        logging.info("Pusa I2V mode enabled.")
     if is_fun_control:
         print(f"DEBUG - Using Fun-Control mode with control video: {control_video}")
         # Verify control video is provided
@@ -4798,6 +4816,13 @@ def wanx_generate_video(
         command.extend(["--control_weight", str(control_strength)])
         command.extend(["--control_start", str(control_start)])
         command.extend(["--control_end", str(control_end)])
+
+    if pusa_i2v_enable:
+        command.append("--pusa_i2v")
+        command.extend(["--pusa_model_path", str(pusa_model_path)])
+    else:
+        # Only add the default DiT path if not in Pusa mode
+        command.extend(["--dit", str(dit_path)])
 
     # Handle SLG parameters
     if slg_layers and str(slg_layers).strip() and str(slg_layers).lower() != "none":
@@ -6799,6 +6824,12 @@ with gr.Blocks(
                             visible=False,
                             info="When (0-1) in the timeline control starts to fade out"
                         )
+                    with gr.Row():
+                        wanx_pusa_i2v_enable = gr.Checkbox(label="Enable Pusa I2V Mode", value=False,
+                                                           info="Uses a simplified I2V model. Disables Fun-Control and End Image.")
+                        wanx_pusa_model_path = gr.Dropdown(label="Pusa DiT Model Path", choices=get_dit_models("wan"),
+                                                           visible=False, interactive=True, allow_custom_value=True,
+                                                           info="Path to the full Pusa DiT model checkpoint.")
                     wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
         
@@ -9898,10 +9929,10 @@ with gr.Blocks(
             wanx_enable_cfg_skip,
             wanx_cfg_skip_mode,
             wanx_cfg_apply_ratio,
-            # --- ADDED PREVIEW INPUTS ---
             wanx_enable_preview,
             wanx_preview_steps,
-            # --- END ADDED ---
+            wanx_pusa_i2v_enable,
+            wanx_pusa_model_path,            
             *wanx_lora_weights,
             *wanx_lora_multipliers,
             wanx_input,              # Input image (used as input_file in handler)
