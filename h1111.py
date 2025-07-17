@@ -4726,8 +4726,9 @@ def wanx_generate_video(
         if not input_image:
             yield [], [], "Error: Pusa mode requires an input image.", ""
             return
-        if not pusa_model_path or not os.path.exists(pusa_model_path):
-            yield [], [], f"Error: Pusa model path not found or invalid: {pusa_model_path}", ""
+        full_pusa_model_path = os.path.join(dit_folder, pusa_model_path) if not os.path.isabs(pusa_model_path) else pusa_model_path
+        if not pusa_model_path or not os.path.exists(full_pusa_model_path):
+            yield [], [], f"Error: Pusa model path not found or invalid: {full_pusa_model_path}", ""
             return
         logging.info("Pusa I2V mode enabled.")
     if is_fun_control:
@@ -4819,7 +4820,7 @@ def wanx_generate_video(
 
     if pusa_i2v_enable:
         command.append("--pusa_i2v")
-        command.extend(["--pusa_model_path", str(pusa_model_path)])
+        command.extend(["--pusa_model_path", str(full_pusa_model_path)])
     else:
         # Only add the default DiT path if not in Pusa mode
         command.extend(["--dit", str(dit_path)])
