@@ -31,6 +31,7 @@ from wan.modules.vae import WanVAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from modules.scheduling_flow_match_pusa import FlowMatchSchedulerPusa
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
@@ -104,6 +105,9 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Guidance scale for classifier free guidance. Default is 5.0.",
     )
+    # Pusa I2V arguments
+    parser.add_argument("--pusa_i2v", action="store_true", help="Enable Pusa I2V mode for image-to-video generation.")
+    parser.add_argument("--pusa_model_path", type=str, default=None, help="Path to the full Pusa DiT model checkpoint.")
     # V2V arguments
     parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference (standard Wan V2V)")
     parser.add_argument("--strength", type=float, default=0.75, help="Strength for video2video inference (0.0-1.0)")
@@ -237,7 +241,15 @@ def parse_args() -> argparse.Namespace:
     if not (0.0 <= args.control_falloff_percentage <= 0.49):
         raise ValueError("--control_falloff_percentage must be between 0.0 and 0.49")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
-         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
+         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")
+    if args.pusa_i2v and args.image_path is None:
+        raise ValueError("--pusa_i2v requires --image_path to be specified.")
+    if args.pusa_i2v and args.pusa_model_path is None:
+        raise ValueError("--pusa_i2v requires --pusa_model_path to be specified.")
+    if args.pusa_i2v and args.video_path is not None:
+        raise ValueError("--pusa_i2v cannot be used with --video_path (V2V).")
+    if args.pusa_i2v and args.control_path is not None:
+        raise ValueError("--pusa_i2v cannot be used with --control_path (Fun-Control).")
     return args
 
 def create_funcontrol_conditioning_latent(
@@ -1375,8 +1387,87 @@ def prepare_i2v_inputs(
 # END OF MODIFIED FUNCTION prepare_i2v_inputs
 # ========================================================================= #
 
+def prepare_pusa_i2v_inputs(
+   args: argparse.Namespace, config, accelerator: Accelerator, device: torch.device, vae: WanVAE
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+   """Prepare inputs for the simplified Pusa I2V method.
+
+   Args:
+       args: command line arguments
+       config: model configuration
+       accelerator: Accelerator instance
+       device: device to use
+       vae: VAE model, used for image encoding
+
+   Returns:
+       Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+           (noise, context, context_null, image_latent, (arg_c, arg_null))
+           'image_latent' is the simple VAE encoding of the input image.
+   """
+   if vae is None:
+       raise ValueError("VAE must be provided for Pusa I2V input preparation.")
+   if not args.image_path:
+       raise ValueError("--image_path is required for Pusa I2V mode.")
+
+   logger.info("Preparing inputs for Pusa I2V.")
+
+   # --- Get dimensions and calculate latent shape ---
+   height, width = args.video_size
+   frames = args.video_length
+   (ch, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
+   
+   # --- Set seed for noise generation ---
+   seed = args.seed
+   seed_g = torch.Generator(device=device).manual_seed(seed) if not args.cpu_noise else torch.manual_seed(seed)
+
+   # --- Generate initial noise tensor ---
+   noise = torch.randn(
+       (16, lat_f, lat_h, lat_w),
+       dtype=torch.float32,
+       generator=seed_g,
+       device=device if not args.cpu_noise else "cpu"
+   ).to(device)
+
+   # --- Encode Text Prompts ---
+   n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
+   text_encoder = load_text_encoder(args, config, device)
+   text_encoder.model.to(device)
+   with torch.no_grad():
+       context = text_encoder([args.prompt], device)
+       context_null = text_encoder([n_prompt], device)
+   del text_encoder
+   clean_memory_on_device(device)
+
+   # --- Encode Input Image with VAE ---
+   logger.info(f"Encoding input image for Pusa I2V: {args.image_path}")
+   vae.to_device(device)
+   img = Image.open(args.image_path).convert("RGB")
+   
+   # Resize image to the target video dimensions
+   img_resized = img.resize((width, height), Image.LANCZOS)
+   img_tensor = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device) # CHW, [-1, 1]
+   img_tensor = img_tensor.unsqueeze(1) # Add frame dimension -> C, 1, H, W
+
+   with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+       # Encode the single image frame. vae.encode expects a list.
+       image_latent = vae.encode([img_tensor])[0] # Result shape [C', 1, H', W']
+
+   logger.info(f"Pusa input image encoded. Latent shape: {image_latent.shape}")
+   vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+   clean_memory_on_device(device)
+
+   # --- Prepare Model Input Arguments ---
+   # Pusa I2V doesn't use 'y' or 'clip_fea' in the same way.
+   # The image latent is injected directly into the noise tensor later.
+   # We pass an empty dict for the image-related arguments for now.
+   arg_c = {"context": context, "seq_len": seq_len}
+   arg_null = {"context": context_null, "seq_len": seq_len}
+
+   return noise, context, context_null, image_latent, (arg_c, arg_null)
+
 
 # --- V2V Helper Functions ---
+
 
 def load_video(video_path, start_frame=0, num_frames=None, bucket_reso=(256, 256)):
     """Load video frames and resize them to the target resolution for V2V.
@@ -1644,7 +1735,11 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
     Returns:
         Tuple[Any, torch.Tensor]: (scheduler, timesteps)
     """
-    if args.sample_solver == "unipc":
+    if args.pusa_i2v:
+        scheduler = FlowMatchSchedulerPusa(shift=args.flow_shift, extra_one_step=True)
+        scheduler.set_timesteps(args.infer_steps, denoising_strength=1.0)
+        timesteps = scheduler.timesteps.to(device)
+    elif args.sample_solver == "unipc":
         scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=config.num_train_timesteps, shift=1, use_dynamic_shifting=False)
         scheduler.set_timesteps(args.infer_steps, device=device, shift=args.flow_shift)
         timesteps = scheduler.timesteps
@@ -1699,7 +1794,8 @@ def run_sampling(
     accelerator: Accelerator,
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
-    preview_suffix: Optional[str] = None # <<< ADD suffix argument
+    preview_suffix: Optional[str] = None, # <<< ADD suffix argument
+    pusa_image_latent: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
     Args:
@@ -1721,6 +1817,15 @@ def run_sampling(
     arg_c, arg_null = inputs
 
     latent = noise # Initialize latent state
+
+    # --- Pusa I2V: Inject image latent into the first frame of the noise ---
+    if pusa_image_latent is not None:
+        logger.info("Pusa I2V mode: Injecting image latent into the first frame.")
+        # Ensure pusa_image_latent is on the correct device and dtype
+        pusa_image_latent = pusa_image_latent.to(device=latent.device, dtype=latent.dtype)
+        # The latent shape is [C, F, H, W], pusa_image_latent is [C, 1, H, W]
+        latent[:, 0:1, :, :] = pusa_image_latent
+
     # Determine storage device (CPU if offloading, otherwise compute device)
     latent_storage_device = torch.device("cpu") if use_cpu_offload else device
     latent = latent.to(latent_storage_device) # Move initial state to storage device
@@ -1797,7 +1902,16 @@ def run_sampling(
             # Handle unexpected shape
             raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
 
-        timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
+        # --- Pusa I2V: Timestep Manipulation ---
+        if pusa_image_latent is not None:
+            # For Pusa, timestep is per-frame. We create a tensor for it.
+            # latent_on_device is [B, C, F, H, W] or [C, F, H, W]
+            num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
+            timestep = t.unsqueeze(0).unsqueeze(1).repeat(1, num_frames).to(device) # Shape [1, F]
+            timestep[:, 0] = 0 # Freeze the first frame
+        else:
+            # Standard behavior
+            timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
@@ -1841,14 +1955,19 @@ def run_sampling(
 
             # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
             # latent_on_device should already have the batch dim handled by the logic above
+            scheduler_step_timestep = t if pusa_image_latent is None else timestep
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
-                t,
+                scheduler_step_timestep, # Pass the original single timestep 't' or the Pusa per-frame tensor
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
                 return_dict=False,
                 generator=seed_g
             )
-            prev_latent = scheduler_output[0] # Get the new latent state [B, C, F, H, W]
+            # The scheduler should return a tuple, with the first element being the latent
+            if isinstance(scheduler_output, tuple):
+                prev_latent = scheduler_output[0]
+            else:
+                prev_latent = scheduler_output
 
             # 4. Update latent state (move back to storage device)
             latent = prev_latent.to(latent_storage_device)
@@ -1894,12 +2013,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     cfg = WAN_CONFIGS[args.task]
 
     # --- Determine Mode ---
-    is_i2v = args.image_path is not None
+    is_pusa_i2v = args.pusa_i2v
+    is_i2v = args.image_path is not None and not is_pusa_i2v
     is_v2v = args.video_path is not None
     is_fun_control = args.control_path is not None and cfg.is_fun_control
-    is_t2v = not is_i2v and not is_v2v and not is_fun_control
+    is_t2v = not is_i2v and not is_v2v and not is_fun_control and not is_pusa_i2v
 
-    if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
+    if is_pusa_i2v: logger.info("Running Pusa Image-to-Video (I2V) inference")
+    elif is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
     else: logger.info(f"Running Text-to-Video (T2V) inference")
@@ -1935,8 +2056,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Load VAE (if needed for input processing) ---
     vae = None
-    # VAE is needed early for V2V, I2V (both types), and FunControl T2V
-    needs_vae_early = is_v2v or is_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
+    # VAE is needed early for V2V, I2V (both types), FunControl T2V, and Pusa I2V
+    needs_vae_early = is_v2v or is_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) or is_pusa_i2v
     if needs_vae_early:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
@@ -1947,8 +2068,13 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     context_null = None
     inputs = None
     video_latents = None # For V2V mixing
+    pusa_image_latent = None # For Pusa I2V
 
-    if is_v2v:
+    if is_pusa_i2v:
+        if args.video_length is None:
+            raise ValueError("video_length must be specified for Pusa I2V mode.")
+        noise, context, context_null, pusa_image_latent, inputs = prepare_pusa_i2v_inputs(args, cfg, accelerator, device, vae)
+    elif is_v2v:
         # Standard V2V path (mutually exclusive with FunControl)
         # 1. Load and prepare video
         video_frames_np, actual_frames_loaded = load_video(
@@ -2006,7 +2132,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # If VAE wasn't loaded early (standard T2V), vae is still None
 
     # --- Load DiT Model ---
-    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag (for potential internal use)
+    if is_pusa_i2v:
+        logger.info(f"Loading Pusa DiT model from: {args.pusa_model_path}")
+        # Use the pusa_model_path for the 'dit' argument in load_wan_model
+        model = load_wan_model(config=cfg, device=device, weight_path=args.pusa_model_path, attn_mode=args.attn_mode, fp8_optimize=False, loading_device="cpu", dtype=dit_dtype, is_i2v=True)
+    else:
+        model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v) # Pass is_i2v flag
 
     # --- Merge LoRA ---
     if args.lora_weight is not None and len(args.lora_weight) > 0:
@@ -2094,7 +2225,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         accelerator,
         previewer=previewer, # MODIFIED: Pass the previewer instance
         use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
-        preview_suffix=args.preview_suffix # <<< Pass the suffix from args
+        preview_suffix=args.preview_suffix, # <<< Pass the suffix from args
+        pusa_image_latent=pusa_image_latent # Pass the encoded image latent for Pusa
     )
 
     # --- Cleanup ---
@@ -2345,6 +2477,7 @@ def main():
         # Determine specific mode string
         mode_str = "Unknown"
         if args.video_path: mode_str = "V2V"
+        elif args.pusa_i2v: mode_str = "Pusa-I2V"
         elif args.image_path and args.control_path: mode_str = "FunControl-I2V" # FunControl overrides if control_path is present
         elif args.control_path: mode_str = "FunControl-T2V"
         elif args.image_path: mode_str = "I2V"
