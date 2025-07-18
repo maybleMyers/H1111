@@ -1902,22 +1902,21 @@ def run_sampling(
             # Handle unexpected shape
             raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
 
-        # --- Timestep preparation ---
-        model_timestep = torch.stack([t]).to(device)
-        scheduler_timestep = t # Default to the scalar tensor for standard schedulers
-
+        # --- Pusa I2V: Timestep Manipulation ---
         if pusa_image_latent is not None:
-            # For Pusa, the scheduler needs a per-frame timestep tensor.
+            # For Pusa, timestep is per-frame. We create a tensor for it.
+            # latent_on_device is [B, C, F, H, W] or [C, F, H, W]
             num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
-            pusa_timestep = t.unsqueeze(0).unsqueeze(1).repeat(1, num_frames).to(device)
-            pusa_timestep[:, 0] = 0 # Freeze the first frame
-            scheduler_timestep = pusa_timestep
-            # The model itself still uses the scalar timestep via model_timestep
+            timestep = t.unsqueeze(0).unsqueeze(1).repeat(1, num_frames).to(device) # Shape [1, F]
+            timestep[:, 0] = 0 # Freeze the first frame
+        else:
+            # Standard behavior
+            timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
             # 1. Predict conditional noise estimate
-            noise_pred_cond = model(latent_model_input_list, t=model_timestep, **arg_c)[0]
+            noise_pred_cond = model(latent_model_input_list, t=timestep, **arg_c)[0]
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
@@ -1929,17 +1928,17 @@ def run_sampling(
                 uncond_input_args = arg_null
 
                 if apply_slg_step and args.slg_mode == "original":
-                    noise_pred_uncond = model(latent_model_input_list, t=model_timestep, **uncond_input_args)[0].to(latent_storage_device)
-                    skip_layer_out = model(latent_model_input_list, t=model_timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
+                    skip_layer_out = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                 elif apply_slg_step and args.slg_mode == "uncond":
-                    noise_pred_uncond = model(latent_model_input_list, t=model_timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 else: # Regular CFG
-                    noise_pred_uncond = model(latent_model_input_list, t=model_timestep, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
@@ -1956,9 +1955,10 @@ def run_sampling(
 
             # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
             # latent_on_device should already have the batch dim handled by the logic above
+            scheduler_step_timestep = t if pusa_image_latent is None else timestep
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
-                scheduler_timestep, # Pass the original single timestep 't' or the Pusa per-frame tensor
+                scheduler_step_timestep, # Pass the original single timestep 't' or the Pusa per-frame tensor
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
                 return_dict=False,
                 generator=seed_g

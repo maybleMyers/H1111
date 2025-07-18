@@ -831,7 +831,12 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+            # Pusa timestep is 2D [B, F], standard is 1D [B]
+            # Model requires a single embedding, so we average if it's per-frame
+            is_per_frame_time = len(t.shape) == 2
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+            if is_per_frame_time:
+                e = e.mean(dim=1) # Average across the frame dimension
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
