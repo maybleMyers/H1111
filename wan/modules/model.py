@@ -25,22 +25,15 @@ __all__ = ["WanModel"]
 
 
 def sinusoidal_embedding_1d(dim, position):
-    # Handle both 1D and 2D position inputs
-    original_shape = position.shape
-    
-    # Flatten to 1D if input is 2D
-    if len(original_shape) == 2:
-        position = position.reshape(-1)  # Flatten to (B*T)
-    
-    sinusoid = torch.outer(position.type(torch.float64), torch.pow(
-        10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
+    # preprocess
+    assert dim % 2 == 0
+    half = dim // 2
+    position = position.type(torch.float64)
+
+    # calculation
+    sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    
-    # Reshape back to original batch shape if input was 2D
-    if len(original_shape) == 2:
-        x = x.reshape(original_shape[0], original_shape[1], dim)
-    
-    return x.to(position.dtype)
+    return x
 
 
 # @amp.autocast(enabled=False)
@@ -831,12 +824,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
-            # Pusa timestep is 2D [B, F], standard is 1D [B]
-            # Model requires a single embedding, so we average if it's per-frame
-            is_per_frame_time = len(t.shape) == 2
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-            if is_per_frame_time:
-                e = e.mean(dim=1) # Average across the frame dimension
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
