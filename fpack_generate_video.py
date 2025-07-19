@@ -611,7 +611,9 @@ def prepare_i2v_inputs(
         # Instantiate the self-contained WebUI chunker
         clip_chunker = WebuiPromptChunker(text_encoder2, tokenizer2)
         logger.info(f"Encoding prompts with WebUI-style chunking for CLIP-L...")
-
+        from transformers import logging as hf_logging
+        original_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
         llama_vecs = {}
         llama_attention_masks = {}
         clip_l_poolers = {}
@@ -680,7 +682,9 @@ def prepare_i2v_inputs(
             llama_vec_n = torch.zeros_like(llama_vecs[0])
             llama_attention_mask_n = torch.zeros_like(llama_attention_masks[0])
             clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0])
-            
+
+        hf_logging.set_verbosity(original_verbosity)
+        
         del text_encoder1, text_encoder2, tokenizer1, tokenizer2, clip_chunker
         clean_memory_on_device(device)
 

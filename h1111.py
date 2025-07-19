@@ -1141,6 +1141,18 @@ def get_step_from_preview_path(path): # Helper function
         return int(match_section.group(1))
     return -1 # Default if no number found
 
+def parse_time_to_seconds(time_str: str) -> Optional[float]:
+    """Parses MM:SS or HH:MM:SS into seconds."""
+    parts = time_str.strip().split(':')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except (ValueError, IndexError):
+        return None
+    return None
+
 def process_framepack_video(
     prompt: str,
     negative_prompt: str,
@@ -1322,7 +1334,7 @@ def process_framepack_video(
             yield all_videos, None, "Generation stopped by user.", ""
             return
         skip_event.clear()
-
+        item_start_time = time.time()
         last_preview_mtime = 0
 
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
@@ -1545,11 +1557,32 @@ def process_framepack_video(
                 percentage = int(tqdm_match.group(1))
                 current_step = int(tqdm_match.group(2))
                 total_steps = int(tqdm_match.group(3))
-                time_elapsed = tqdm_match.group(4)
-                time_remaining = tqdm_match.group(5)
+                time_elapsed_str = tqdm_match.group(4)
+                time_remaining_str = tqdm_match.group(5)
+
+                total_eta_str = time_remaining_str # Default to per-section ETA
+                if actual_total_sections and actual_total_sections > 0:
+                    remaining_sec_section = parse_time_to_seconds(time_remaining_str)
+                    elapsed_sec_section = parse_time_to_seconds(time_elapsed_str)
+
+                    if remaining_sec_section is not None and elapsed_sec_section is not None and (elapsed_sec_section + remaining_sec_section) > 0:
+                        total_time_per_section = elapsed_sec_section + remaining_sec_section
+                        remaining_full_sections = actual_total_sections - display_section_num
+                        remaining_time_full_sections = remaining_full_sections * total_time_per_section
+                        total_remaining_seconds = remaining_sec_section + remaining_time_full_sections
+
+                        if total_remaining_seconds > 0:
+                            eta_hours = int(total_remaining_seconds / 3600)
+                            eta_minutes = int((total_remaining_seconds % 3600) / 60)
+                            eta_seconds = int(total_remaining_seconds % 60)
+                            if eta_hours > 0:
+                                total_eta_str = f"{eta_hours:d}:{eta_minutes:02d}:{eta_seconds:02d}"
+                            else:
+                                total_eta_str = f"{eta_minutes:02d}:{eta_seconds:02d}"
+
                 current_total_for_display = actual_total_sections if actual_total_sections is not None else total_sections_estimate
                 section_str = f"Section {display_section_num}/{current_total_for_display}"
-                progress_text_update = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed}, Remaining: {time_remaining}"
+                progress_text_update = f"Item {i+1}/{batch_size} | {section_str} | Step {current_step}/{total_steps} ({percentage}%) | Elapsed: {time_elapsed_str}, Remaining: {total_eta_str}"
                 denoising_phase = f"Denoising Section {display_section_num}"
                 if current_phase != denoising_phase:
                     current_phase = denoising_phase
