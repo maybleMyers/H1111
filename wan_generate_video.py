@@ -804,72 +804,95 @@ def load_dit_model(
     return model
 
 
-def merge_lora_weights(model: WanModel, args: argparse.Namespace, device: torch.device) -> None:
-    """merge LoRA weights to the model
-
-    Args:
-        model: DiT model
-        args: command line arguments
-        device: device to use
+def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
     """
-    if args.lora_weight is None or len(args.lora_weight) == 0:
+    Merges LoRA weights by directly modifying the model's parameters in-place,
+    ensuring all device placements are correct.
+    """
+    if not hasattr(args, 'lora_weight') or not args.lora_weight:
         return
+    param_dict = {name: param for name, param in model.named_parameters()}
 
-    for i, lora_weight in enumerate(args.lora_weight):
-        if args.lora_multiplier is not None and len(args.lora_multiplier) > i:
-            lora_multiplier = args.lora_multiplier[i]
+    for i, lora_path in enumerate(args.lora_weight):
+        lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+        if lora_multiplier == 0:
+            continue
+
+        logging.info(f"Loading and merging LoRA from {lora_path} with multiplier {lora_multiplier}")
+        lora_sd = load_file(lora_path, device="cpu") # Load LoRA to CPU
+
+        applied_count = 0
+
+        for key, value in lora_sd.items():
+            lora_prefix = "diffusion_model."
+            if not key.startswith(lora_prefix):
+                continue
+            
+            target_key_base = key[len(lora_prefix):]
+            
+            # 1. Handle traditional lora_down/lora_up pairs for Linear layers
+            if key.endswith(".lora_down.weight"):
+                up_key = key.replace(".lora_down.weight", ".lora_up.weight")
+                if up_key not in lora_sd:
+                    continue
+
+                target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
+                if target_param_name not in param_dict:
+                    continue
+                
+                target_param = param_dict[target_param_name]
+                
+                lora_down_weight = value.to(torch.float32)
+                lora_up_weight = lora_sd[up_key].to(torch.float32)
+                
+                update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
+                
+                with torch.no_grad():
+                    # Move the final update to the SAME device as the target parameter
+                    target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+            
+            # 2. Handle 'diff' keys (for norm weights)
+            elif key.endswith(".diff"):
+                target_param_name = target_key_base.replace(".diff", ".weight")
+                if target_param_name not in param_dict:
+                    continue
+                    
+                target_param = param_dict[target_param_name]
+                update = value.to(torch.float32) * lora_multiplier
+                
+                with torch.no_grad():
+                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+                
+            # 3. Handle 'diff_b' keys (for biases)
+            elif key.endswith(".diff_b"):
+                target_param_name = target_key_base.replace(".diff_b", ".bias")
+                if target_param_name not in param_dict:
+                    continue
+                    
+                target_param = param_dict[target_param_name]
+                update = value.to(torch.float32) * lora_multiplier
+
+                with torch.no_grad():
+                    target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                applied_count += 1
+
+        if applied_count > 0:
+            logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
         else:
-            lora_multiplier = 1.0
-
-        logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
-        weights_sd = load_file(lora_weight)
-
-        # apply include/exclude patterns
-        original_key_count = len(weights_sd.keys())
-        if args.include_patterns is not None and len(args.include_patterns) > i:
-            include_pattern = args.include_patterns[i]
-            regex_include = re.compile(include_pattern)
-            weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
-            logger.info(f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}")
-        if args.exclude_patterns is not None and len(args.exclude_patterns) > i:
-            original_key_count_ex = len(weights_sd.keys())
-            exclude_pattern = args.exclude_patterns[i]
-            regex_exclude = re.compile(exclude_pattern)
-            weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
-            logger.info(
-                f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}"
-            )
-        if len(weights_sd) != original_key_count:
-            remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
-            remaining_keys.sort()
-            logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
-            if len(weights_sd) == 0:
-                logger.warning(f"No keys left after filtering.")
-
-        if args.lycoris:
-            lycoris_net, _ = create_network_from_weights(
+            lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
+            logging.info(f"Loading and merging LoRA with alt strat from {lora_path} with multiplier {lora_multiplier}")
+            weights_sd = load_file(lora_path, device="cpu")
+            network = lora_wan.create_arch_network_from_weights(
                 multiplier=lora_multiplier,
-                file=None,
                 weights_sd=weights_sd,
                 unet=model,
-                text_encoder=None,
-                vae=None,
-                for_inference=True,
+                for_inference=True
             )
-            lycoris_net.merge_to(None, model, weights_sd, dtype=None, device=device)
-        else:
-            network = lora_wan.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
-            network.merge_to(None, model, weights_sd, device=device, non_blocking=True)
-
-        synchronize_device(device)
-        logger.info("LoRA weights loaded")
-
-    # save model here before casting to dit_weight_dtype
-    if args.save_merged_model:
-        logger.info(f"Saving merged model to {args.save_merged_model}")
-        mem_eff_save_file(model.state_dict(), args.save_merged_model)  # save_file needs a lot of memory
-        logger.info("Merged model saved")
-
+            network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
+            logging.info(f"Successfully merged LoRA: {os.path.basename(lora_path)}")
+            del network, weights_sd
 
 def optimize_model(
     model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype, dit_weight_dtype: torch.dtype
@@ -1857,7 +1880,7 @@ def run_sampling(
             # Preview the state *after* step 'i' is completed
             if previewer is not None and (i + 1) % args.preview == 0 and (i + 1) < num_timesteps:
                  try:
-                      logger.debug(f"Generating preview for step {i + 1}")
+                      #logger.debug(f"Generating preview for step {i + 1}")
                       # Pass the *resulting* latent from this step (prev_latent).
                       # Ensure it's on the compute device for the previewer call.
                       # LatentPreviewer handles internal device management.
@@ -1869,7 +1892,7 @@ def run_sampling(
                           preview_latent_input = prev_latent # Assume already [C, F, H, W]
 
                       # Pass the latent on the main compute device
-                      print(f"DEBUG run_sampling: Step {i}, prev_latent shape: {prev_latent.shape}, preview_latent_input shape: {preview_latent_input.shape}")
+                      #print(f"DEBUG run_sampling: Step {i}, prev_latent shape: {prev_latent.shape}, preview_latent_input shape: {preview_latent_input.shape}")
                       previewer.preview(preview_latent_input.to(device), i, preview_suffix=preview_suffix) # Pass 0-based index 'i'
                  except Exception as e:
                       logger.error(f"Error during latent preview generation at step {i + 1}: {e}", exc_info=True)

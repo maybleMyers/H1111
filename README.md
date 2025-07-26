@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/26/2025  
+    Add fusion lora support to wanX-i2v, updated torch27 requirements. Some bug fixes.  
 7/13/2025  
     Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
 7/7/2025  
@@ -8,9 +10,7 @@
 7/2/2025  
     Add previews to multitalk model, some bug fixes, change layout.  
 6/29/2025  
-    Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI  
-6/21/2025  
-    Add chunking to framepack's clip to process longer prompts.    
+    Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI     
 
 # H1111
 
@@ -198,6 +198,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+7/26/2025  
+    Add fusion lora support to wanX-i2v, updated torch27 requirements. Some bug fixes.  
 7/13/2025  
     Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
 7/7/2025  

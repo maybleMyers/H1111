@@ -6845,7 +6845,7 @@ with gr.Blocks(
 
                     wanx_video_length = gr.Slider(minimum=1, maximum=401, step=4, label="Video Length in Frames", value=81)
                     wanx_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wanx_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
+                    wanx_infer_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
                     wanx_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=3.0, 
                                             info="Recommended: 3.0 for 480p, 5.0 for others")
                     wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Guidance Scale", value=5.0)

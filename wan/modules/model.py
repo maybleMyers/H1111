@@ -754,9 +754,9 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
              raise ValueError("Input x is not in the expected list format.")            
 
         if y is not None:
-            print('WanModel concat debug:')
-            for i, (u, v) in enumerate(zip(x, y)):
-                print(f"x[{i}]: {u.shape}, y[{i}]: {v.shape}, y[{i}].dim(): {v.dim()}")
+            #print('WanModel concat debug:')
+            #for i, (u, v) in enumerate(zip(x, y)):
+                #print(f"x[{i}]: {u.shape}, y[{i}]: {v.shape}, y[{i}].dim(): {v.dim()}")
             x = [
                 torch.cat([u, v], dim=0)
                 for u, v in zip(x, y)

@@ -25,7 +25,7 @@ class LatentPreviewer():
     def __init__(self, args, original_latents, timesteps, device, dtype, model_type="hunyuan"):
         #print(f"DEBUG LATENT_PREVIEW.PY: LatentPreviewer __init__ called from file: {__file__}")
         self.mode = "latent2rgb" if not hasattr(args, 'preview_vae') or args.preview_vae is None else "taehv"
-        ##logger.info(f"Initializing latent previewer with mode {self.mode}...")
+        ######logger.info(f"Initializing latent previewer with mode {self.mode}...")
         # Correctly handle framepack - it should subtract noise like others unless specifically told otherwise
         self.subtract_noise = True # Default to True for all models now
         # If you specifically need framepack NOT to subtract noise, you'd add a condition here
@@ -44,7 +44,7 @@ class LatentPreviewer():
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         if self.mode == "taehv":
-            #logger.info(f"Loading TAEHV: {args.preview_vae}...")
+            ####logger.info(f"Loading TAEHV: {args.preview_vae}...")
             if os.path.exists(args.preview_vae):
                 tae_sd = load_torch_file(args.preview_vae, safe_load=True, device=args.device)
             else:
@@ -73,27 +73,27 @@ class LatentPreviewer():
         target = os.path.join(preview_dir, f"{base_name}.mp4")
         target_img = os.path.join(preview_dir, f"{base_name}.png")
         
-        logger.info(f"LatentPreviewer.write_preview: Input frames shape: {frames.shape}, dtype: {frames.dtype}, device: {frames.device}")
-        logger.info(f"LatentPreviewer.write_preview: Target width={width}, height={height}, fps={self.fps}")
+        ####logger.info(f"LatentPreviewer.write_preview: Input frames shape: {frames.shape}, dtype: {frames.dtype}, device: {frames.device}")
+        ####logger.info(f"LatentPreviewer.write_preview: Target width={width}, height={height}, fps={self.fps}")
 
 
         # Check if we only have a single frame.
         if frames.shape[0] == 1:
-            logger.info(f"LatentPreviewer.write_preview: Saving single frame to {target_img}")
+            ####logger.info(f"LatentPreviewer.write_preview: Saving single frame to {target_img}")
             try:
                 # Clamp, scale, convert to byte and move to CPU
                 frame = frames[0].clamp(0, 1).mul(255).byte().cpu()
                 # Permute from (3, H, W) to (H, W, 3) for PIL.
                 frame_np = frame.permute(1, 2, 0).numpy()
                 Image.fromarray(frame_np).save(target_img)
-                logger.info(f"LatentPreviewer: Successfully saved single frame preview to {target_img}")
+                ####logger.info(f"LatentPreviewer: Successfully saved single frame preview to {target_img}")
             except Exception as e:
                 logger.error(f"LatentPreviewer: Error saving single frame preview to {target_img}: {e}", exc_info=True)
             return
 
         # Otherwise, write out as a video.
         output_fps = max(1, self.fps)
-        logger.info(f"LatentPreviewer.write_preview: Attempting to write MP4 video to {target} at {output_fps} FPS with {frames.shape[0]} frames.")
+        ####logger.info(f"LatentPreviewer.write_preview: Attempting to write MP4 video to {target} at {output_fps} FPS with {frames.shape[0]} frames.")
         
         container = None # Initialize for finally block
         try:
@@ -104,7 +104,7 @@ class LatentPreviewer():
             stream.height = height
             stream.options = {'crf': '23', 'preset': 'fast'} # Reasonable defaults
 
-            #logger.info(f"LatentPreviewer: AV container opened for {target}. Stream options: {stream.options}")
+            #####logger.info(f"LatentPreviewer: AV container opened for {target}. Stream options: {stream.options}")
 
             for frame_idx, frame_tensor in enumerate(frames): # Renamed 'frame' to 'frame_tensor'
                 #logger.debug(f"LatentPreviewer: Processing frame {frame_idx+1}/{frames.shape[0]}")
@@ -125,13 +125,13 @@ class LatentPreviewer():
                      break # Stop trying to encode if one frame fails critically
 
             # Flush out any remaining packets and close.
-            #logger.info(f"LatentPreviewer: Flushing stream for {target}")
+            #####logger.info(f"LatentPreviewer: Flushing stream for {target}")
             for packet in stream.encode(): # Flush stream
                 container.mux(packet)
             
             container.close() # Close container
             container = None # Indicate successful close
-            logger.info(f"LatentPreviewer: Successfully finished writing preview video: {target}")
+            ####logger.info(f"LatentPreviewer: Successfully finished writing preview video: {target}")
             if not os.path.exists(target) or os.path.getsize(target) == 0:
                 logger.error(f"LatentPreviewer: Video file {target} was NOT created or is empty after closing.")
 
