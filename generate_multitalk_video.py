@@ -4462,7 +4462,7 @@ class MultiTalkPipeline:
             pbar.set_description(f"Generating clip {clip_count}/{total_clips}")
             if hasattr(self, 'vram_management') and self.vram_management and initial_persistent_params:
                 # Reduce by 15% for each section after the first
-                scale_factor = max(0.3, 1.0 - (clip_count - 1) * 0.03)
+                scale_factor = max(0.3, 1.0 - (clip_count - 1) * 0.04)
                 scaled_params = int(initial_persistent_params * scale_factor)
 
                 logging.info(f"Section {clip_count}: Scaling num_persistent_param_in_dit to {scaled_params:,} (factor: {scale_factor:.2f})")

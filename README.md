@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/27/2025  
+    Make multitalk memory management better, it was oom'ing on longer gens but should be stable now.  
 7/26/2025  
     Add fusion lora support to wanX-i2v, updated torch27 requirements. Some bug fixes.  
 7/13/2025  
@@ -9,8 +11,6 @@
     Support FusioniX lora from vrgamedevgirl with multitalk.  
 7/2/2025  
     Add previews to multitalk model, some bug fixes, change layout.  
-6/29/2025  
-    Support for MultiTalk model. Works very well but takes a while. Thanks to Meigen-AI     
 
 # H1111
 
@@ -106,7 +106,7 @@ Generation takes a while, maybe 7 hrs on a 4090 for a 25 second video. You can u
 
 To use the BBoxes just click the picture and drag a box and set the label for person 1 or person 2 audio to match the input.  
 
-I added support for the LoRa here: https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.1_I2V_14B_FusionX_LoRA.safetensors You can do low steps and get ok results with it. You can generate with 4-8 steps and get an ok result.  
+I added support for the LoRa here: https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.1_I2V_14B_FusionX_LoRA.safetensors You can do low steps and get ok results with it. You can generate with 4-10 steps and get an ok result, you do not need to convert the lora.  
 
 Thanks to Meigen-AI for their awesome work on this model xD. https://github.com/MeiGen-AI/MultiTalk  
 Kong, Z., Gao, F., Zhang, Y., Kang, Z., Wei, X., Cai, X., Chen, G., & Luo, W. (2025). [Let Them Talk: Audio-Driven Multi-Person Conversational Video Generation](https://arxiv.org/abs/2505.22647). *arXiv preprint arXiv:2505.22647*.
@@ -198,6 +198,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+7/27/2025  
+    Make multitalk memory management better, it was oom'ing on longer gens but should be stable now.  
 7/26/2025  
     Add fusion lora support to wanX-i2v, updated torch27 requirements. Some bug fixes.  
 7/13/2025  
