@@ -61,7 +61,6 @@ import html
 import string
 import binascii
 import ftfy
-import xformers.ops
 from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 import os.path as osp
@@ -72,27 +71,28 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.distributed.utils import _free_storage
 import torchvision.transforms as T
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 from xfuser.core.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-try:
-    import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
 
-try:
-    import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
 from wan.modules.clip import AttentionBlock as clipAttentionBlock
 from wan.modules.xlm_roberta import AttentionBlock as robertaAttentionBlock
 import warnings
 from networks import lora_wan
 from safetensors.torch import load_file
+
+try:
+    import flash_attn
+    FLASH_ATTN_2_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_2_AVAILABLE = False
+
+try:
+    import flash_attn_interface
+    FLASH_ATTN_3_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_3_AVAILABLE = False
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -106,11 +106,11 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
     It adapts the key matching for the model structure in this script.
     """
     applied_count = 0
-    
+
     # The source repo uses a "diffusion_model." prefix, but our WanModel doesn't have it.
     # The LoRA files themselves often have a "lora_unet_" prefix. We'll handle that.
     lora_prefix_to_strip = "lora_unet_"
-    
+
     # Find all lora_down keys and pair them with lora_up keys.
     lora_pairs = {}
     for key in lora_sd.keys():
@@ -131,13 +131,13 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
         else:
             # If prefix isn't there, assume it's a direct match attempt
             base_key = down_key
-        
+
         module_path = base_key.replace(".lora_down.weight", "").replace("_", ".")
-        
+
         try:
             # Get the target module from the main model
             target_module = model.get_submodule(module_path)
-            
+
             lora_down_weight = lora_sd[down_key].to(device, dtype=torch.float32)
             lora_up_weight = lora_sd[up_key].to(device, dtype=torch.float32)
 
@@ -148,11 +148,11 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
 
             rank = lora_down_weight.shape[0]
             # Alpha is often stored in metadata, but if not, it's conventionally equal to rank
-            alpha = lora_sd.get("lora_unet_alpha", rank) 
+            alpha = lora_sd.get("lora_unet_alpha", rank)
             scale = alpha / rank
 
             update_matrix = lora_up_weight @ lora_down_weight
-            
+
             # Apply the update to the original weight
             target_module.weight.data += update_matrix * multiplier * scale
             applied_count += 1
@@ -161,7 +161,7 @@ def _merge_lora_wan_style(model: torch.nn.Module, lora_sd: dict, multiplier: flo
             # This can happen if the module path doesn't exist.
             # logging.debug(f"Module {module_path} not found in model for LoRA key {down_key}. Skipping.")
             continue
-            
+
     return applied_count
 
 def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device: torch.device):
@@ -187,9 +187,9 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
             lora_prefix = "diffusion_model."
             if not key.startswith(lora_prefix):
                 continue
-            
+
             target_key_base = key[len(lora_prefix):]
-            
+
             # 1. Handle traditional lora_down/lora_up pairs for Linear layers
             if key.endswith(".lora_down.weight"):
                 up_key = key.replace(".lora_down.weight", ".lora_up.weight")
@@ -199,38 +199,38 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
                 target_param_name = target_key_base.replace(".lora_down.weight", ".weight")
                 if target_param_name not in param_dict:
                     continue
-                
+
                 target_param = param_dict[target_param_name]
-                
+
                 lora_down_weight = value.to(torch.float32)
                 lora_up_weight = lora_sd[up_key].to(torch.float32)
-                
+
                 update_matrix = (lora_up_weight @ lora_down_weight) * lora_multiplier
-                
+
                 with torch.no_grad():
                     # Move the final update to the SAME device as the target parameter
                     target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
                 applied_count += 1
-            
+
             # 2. Handle 'diff' keys (for norm weights)
             elif key.endswith(".diff"):
                 target_param_name = target_key_base.replace(".diff", ".weight")
                 if target_param_name not in param_dict:
                     continue
-                    
+
                 target_param = param_dict[target_param_name]
                 update = value.to(torch.float32) * lora_multiplier
-                
+
                 with torch.no_grad():
                     target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
                 applied_count += 1
-                
+
             # 3. Handle 'diff_b' keys (for biases)
             elif key.endswith(".diff_b"):
                 target_param_name = target_key_base.replace(".diff_b", ".bias")
                 if target_param_name not in param_dict:
                     continue
-                    
+
                 target_param = param_dict[target_param_name]
                 update = value.to(torch.float32) * lora_multiplier
 
@@ -261,7 +261,7 @@ class XLMRoberta(nn.Module):
     """
     XLMRobertaModel with no pooler and no LM head.
     """
-    
+
     def __init__(self,
                  vocab_size=250002,
                  max_seq_len=514,
@@ -336,7 +336,7 @@ class SingleStreamAttention(nn.Module):
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
     def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False, kv_seq=None) -> torch.Tensor:
-       
+
         N_t, N_h, N_w = shape
         if not enable_sp:
             x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
@@ -349,12 +349,12 @@ class SingleStreamAttention(nn.Module):
 
         if self.qk_norm:
             q = self.q_norm(q)
-        
+
         # get kv from encoder_hidden_states
         _, N_a, _ = encoder_hidden_states.shape
         encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
         encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
@@ -374,13 +374,20 @@ class SingleStreamAttention(nn.Module):
             attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
         else:
             attn_bias = None
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
-        x = rearrange(x, "B M H K -> B H M K") 
+        q = q.transpose(1, 2)  # B H M K
+        encoder_k = encoder_k.transpose(1, 2)  # B H Na K
+        encoder_v = encoder_v.transpose(1, 2)  # B H Na K
+        scale = self.scale
+        if attn_bias is not None:
+            raise NotImplementedError("attn_bias not supported in SDPA")
+        x = F.scaled_dot_product_attention(q, encoder_k, encoder_v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale)
+        x = x.transpose(1, 2)  # B M H K
+        x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -424,32 +431,32 @@ class SingleStreamMutiAttention(SingleStreamAttention):
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
-    def forward(self, 
-                x: torch.Tensor, 
-                encoder_hidden_states: torch.Tensor, 
-                shape=None, 
+    def forward(self,
+                x: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                shape=None,
                 x_ref_attn_map=None,
                 human_num=None) -> torch.Tensor:
-        
+
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
         if human_num == 1:
             return super().forward(x, encoder_hidden_states, shape)
 
-        N_t, _, _ = shape 
-        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t) 
+        N_t, _, _ = shape
+        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
         # get q for hidden_state
         B, N, C = x.shape
-        q = self.q_linear(x) 
-        q_shape = (B, N, self.num_heads, self.head_dim) 
+        q = self.q_linear(x)
+        q_shape = (B, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
         if self.qk_norm:
             q = self.q_norm(q)
 
-  
-        max_values = x_ref_attn_map.max(1).values[:, None, None] 
-        min_values = x_ref_attn_map.min(1).values[:, None, None] 
+
+        max_values = x_ref_attn_map.max(1).values[:, None, None]
+        min_values = x_ref_attn_map.min(1).values[:, None, None]
         max_min_values = torch.cat([max_values, min_values], dim=2)
 
         human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
@@ -460,22 +467,22 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
         max_indices = x_ref_attn_map.argmax(dim=0)
         normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
+        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N
 
         q = rearrange(q, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
-        _, N_a, _ = encoder_hidden_states.shape 
-        encoder_kv = self.kv_linear(encoder_hidden_states) 
+        _, N_a, _ = encoder_hidden_states.shape
+        encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
-        encoder_k, encoder_v = encoder_kv.unbind(0) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+        encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
-        
+
         per_frame = torch.zeros(N_a, dtype=encoder_k.dtype).to(encoder_k.device)
         per_frame[:per_frame.size(0)//2] = (self.rope_h1[0] + self.rope_h1[1]) / 2
         per_frame[per_frame.size(0)//2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
@@ -484,25 +491,30 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
         encoder_k = rearrange(encoder_k, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
- 
+
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
+        q = q.transpose(1, 2)  # B H M K
+        encoder_k = encoder_k.transpose(1, 2)  # B H Na K
+        encoder_v = encoder_v.transpose(1, 2)  # B H Na K
+        scale = self.scale
+        x = F.scaled_dot_product_attention(q, encoder_k, encoder_v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale)
+        x = x.transpose(1, 2)  # B M H K
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
         x = self.proj_drop(x)
 
         # reshape x to origin shape
-        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t) 
+        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
 
         return x
-    
+
 class XLMRobertaWithHead(XLMRoberta):
 
     def __init__(self, **kwargs):
@@ -526,12 +538,12 @@ class XLMRobertaWithHead(XLMRoberta):
         # head
         x = self.head(x)
         return x
-    
+
 class QuickGELU(nn.Module):
 
     def forward(self, x):
         return x * torch.sigmoid(1.702 * x)
-    
+
 class AttentionPool(nn.Module):
 
     def __init__(self,
@@ -573,7 +585,7 @@ class AttentionPool(nn.Module):
         k, v = self.to_kv(x).view(b, s, 2, n, d).unbind(2)
 
         # compute attention
-        x = flash_attention(q, k, v, version=2)
+        x = attention(q, k, v)
         x = x.reshape(b, 1, c)
 
         # output
@@ -583,12 +595,12 @@ class AttentionPool(nn.Module):
         # mlp
         x = x + self.mlp(self.norm(x))
         return x[:, 0]
-    
+
 class LayerNorm(nn.LayerNorm):
 
     def forward(self, x):
         return super().forward(x.float()).type_as(x)
-    
+
 def pos_interpolate(pos, seq_len):
     if pos.size(1) == seq_len:
         return pos
@@ -606,7 +618,7 @@ def pos_interpolate(pos, seq_len):
                 align_corners=False).flatten(2).transpose(1, 2)
         ],
                          dim=1)
-    
+
 class VisionTransformer(nn.Module):
 
     def __init__(self,
@@ -699,7 +711,7 @@ class VisionTransformer(nn.Module):
         else:
             x = self.transformer(x)
             return x
-        
+
 class XLMRobertaCLIP(nn.Module):
 
     def __init__(self,
@@ -804,7 +816,7 @@ class XLMRobertaCLIP(nn.Module):
             ]
         }]
         return groups
-    
+
 def _validate_args(args):
     # Basic check
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
@@ -984,7 +996,7 @@ def _parse_args():
         type=str,
         default=None,
         help="Bounding box for person 2 in 'x_min,y_min,x_max,y_max' format (optional)."
-    )    
+    )
     parser.add_argument(
         "--motion_frame",
         type=int,
@@ -1057,7 +1069,7 @@ def _parse_args():
         help="The negative text prompt for video generation."
     )
 
-    
+
     args = parser.parse_args()
 
     _validate_args(args)
@@ -1350,9 +1362,9 @@ class WanLayerNorm(nn.LayerNorm):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         out = F.layer_norm(
-            inputs.float(), 
-            self.normalized_shape, 
-            None if self.weight is None else self.weight.float(), 
+            inputs.float(),
+            self.normalized_shape,
+            None if self.weight is None else self.weight.float(),
             None if self.bias is None else self.bias.float() ,
             self.eps
         ).to(origin_dtype)
@@ -1398,8 +1410,8 @@ class WanSelfAttention(nn.Module):
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-        
-        x = flash_attention(
+
+        x = attention(
             q=q,
             k=k,
             v=v,
@@ -1411,7 +1423,7 @@ class WanSelfAttention(nn.Module):
         x = x.flatten(2)
         x = self.o(x)
         with torch.no_grad():
-            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
+            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
                                                     ref_target_masks=ref_target_masks)
 
         return x, x_ref_attn_map
@@ -1442,9 +1454,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        img_x = attention(q, k_img, v_img, k_lens=None)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -1510,7 +1522,7 @@ class WanAttentionBlock(nn.Module):
                 class_interval=class_interval
             )
         self.norm_x = WanLayerNorm(dim, eps, elementwise_affine=True)  if norm_input_visual else nn.Identity()
-        
+
 
     def forward(
         self,
@@ -1538,7 +1550,7 @@ class WanAttentionBlock(nn.Module):
             freqs, ref_target_masks=ref_target_masks)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
-        
+
         x = x.to(dtype)
 
         # cross-attention of text
@@ -1609,8 +1621,8 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         self,
         seq_len=5,
         seq_len_vf=12,
-        blocks=12,  
-        channels=768, 
+        blocks=12,
+        channels=768,
         intermediate_dim=512,
         output_dim=768,
         context_tokens=32,
@@ -1621,7 +1633,7 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         self.seq_len = seq_len
         self.blocks = blocks
         self.channels = channels
-        self.input_dim = seq_len * blocks * channels  
+        self.input_dim = seq_len * blocks * channels
         self.input_dim_vf = seq_len_vf * blocks * channels
         self.intermediate_dim = intermediate_dim
         self.context_tokens = context_tokens
@@ -1649,11 +1661,11 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         audio_embeds_vf = audio_embeds_vf.view(batch_size_vf, window_size_vf * blocks_vf * channels_vf)
 
         # first projection
-        audio_embeds = torch.relu(self.proj1(audio_embeds)) 
-        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf)) 
+        audio_embeds = torch.relu(self.proj1(audio_embeds))
+        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf))
         audio_embeds = rearrange(audio_embeds, "(bz f) c -> bz f c", bz=B)
         audio_embeds_vf = rearrange(audio_embeds_vf, "(bz f) c -> bz f c", bz=B)
-        audio_embeds_c = torch.concat([audio_embeds, audio_embeds_vf], dim=1) 
+        audio_embeds_c = torch.concat([audio_embeds, audio_embeds_vf], dim=1)
         batch_size_c, N_t, C_a = audio_embeds_c.shape
         audio_embeds_c = audio_embeds_c.view(batch_size_c*N_t, C_a)
 
@@ -2875,18 +2887,18 @@ class WanVAE:
 
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 ASPECT_RATIO_627 = {
-     '0.26': ([320, 1216], 1), '0.38': ([384, 1024], 1), '0.50': ([448, 896], 1), '0.67': ([512, 768], 1), 
-     '0.82': ([576, 704], 1),  '1.00': ([640, 640], 1),  '1.22': ([704, 576], 1), '1.50': ([768, 512], 1), 
-     '1.86': ([832, 448], 1),  '2.00': ([896, 448], 1),  '2.50': ([960, 384], 1), '2.83': ([1088, 384], 1), 
+     '0.26': ([320, 1216], 1), '0.38': ([384, 1024], 1), '0.50': ([448, 896], 1), '0.67': ([512, 768], 1),
+     '0.82': ([576, 704], 1),  '1.00': ([640, 640], 1),  '1.22': ([704, 576], 1), '1.50': ([768, 512], 1),
+     '1.86': ([832, 448], 1),  '2.00': ([896, 448], 1),  '2.50': ([960, 384], 1), '2.83': ([1088, 384], 1),
      '3.60': ([1152, 320], 1), '3.80': ([1216, 320], 1), '4.00': ([1280, 320], 1)}
 
 
 ASPECT_RATIO_960 = {
-     '0.22': ([448, 2048], 1), '0.29': ([512, 1792], 1), '0.36': ([576, 1600], 1), '0.45': ([640, 1408], 1), 
-     '0.55': ([704, 1280], 1), '0.63': ([768, 1216], 1), '0.76': ([832, 1088], 1), '0.88': ([896, 1024], 1), 
-     '1.00': ([960, 960], 1), '1.14': ([1024, 896], 1), '1.31': ([1088, 832], 1), '1.50': ([1152, 768], 1), 
-     '1.58': ([1216, 768], 1), '1.82': ([1280, 704], 1), '1.91': ([1344, 704], 1), '2.20': ([1408, 640], 1), 
-     '2.30': ([1472, 640], 1), '2.67': ([1536, 576], 1), '2.89': ([1664, 576], 1), '3.62': ([1856, 512], 1), 
+     '0.22': ([448, 2048], 1), '0.29': ([512, 1792], 1), '0.36': ([576, 1600], 1), '0.45': ([640, 1408], 1),
+     '0.55': ([704, 1280], 1), '0.63': ([768, 1216], 1), '0.76': ([832, 1088], 1), '0.88': ([896, 1024], 1),
+     '1.00': ([960, 960], 1), '1.14': ([1024, 896], 1), '1.31': ([1088, 832], 1), '1.50': ([1152, 768], 1),
+     '1.58': ([1216, 768], 1), '1.82': ([1280, 704], 1), '1.91': ([1344, 704], 1), '2.20': ([1408, 640], 1),
+     '2.30': ([1472, 640], 1), '2.67': ([1536, 576], 1), '2.89': ([1664, 576], 1), '3.62': ([1856, 512], 1),
      '3.75': ([1920, 512], 1)}
 
 
@@ -2921,7 +2933,7 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
 
     source_min, source_max = source_range
     new_min, new_max = target_range
- 
+
     normalized = (column - source_min) / (source_max - source_min + epsilon)
     scaled = normalized * (new_max - new_min) + new_min
     return scaled
@@ -2929,7 +2941,7 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
 
 @torch.compile
 def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
-    
+
     ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
     scale = 1.0 / visual_q.shape[-1] ** 0.5
     visual_q = visual_q * scale
@@ -2953,14 +2965,14 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
         x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
         x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
         x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
-       
+
         if mode == 'mean':
             x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
         elif mode == 'max':
             x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
-        
+
         x_ref_attn_maps.append(x_ref_attnmap)
-    
+
     del attn
     del x_ref_attn_map_source
     torch_gc()
@@ -2979,7 +2991,7 @@ def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, spli
     N_t, N_h, N_w = shape
     if enable_sp:
         ref_k = get_sp_group().all_gather(ref_k, dim=1)
-    
+
     x_seqlens = N_h * N_w
     ref_k     = ref_k[:, :x_seqlens]
     _, seq_lens, heads, _ = visual_q.shape
@@ -2987,11 +2999,11 @@ def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, spli
     x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
 
     split_chunk = heads // split_num
-    
+
     for i in range(split_num):
         x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_k[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_target_masks)
         x_ref_attn_maps += x_ref_attn_maps_perhead
-    
+
     return x_ref_attn_maps / split_num
 
 
@@ -3040,14 +3052,14 @@ class RotaryPositionalEmbedding1D(nn.Module):
         x_ = (x_ * cos) + (rotate_half(x_) * sin)
 
         return x_.type_as(x)
-    
+
 def save_video_without_audio(frames_tensor, save_path, fps=25, quality=8):
     """Saves a CTHW tensor as an MP4 video without audio."""
     # Normalize from [-1, 1] to [0, 1] and then to [0, 255]
     video_to_save = ((frames_tensor.clamp(-1, 1) + 1) / 2 * 255).byte()
     # Permute from C, T, H, W to T, H, W, C for imageio
     video_to_save = video_to_save.permute(1, 2, 3, 0).cpu().numpy()
-    
+
     try:
         writer = imageio.get_writer(save_path, fps=fps, quality=quality, codec='libx264', macro_block_size=1)
         for frame in video_to_save:
@@ -3058,7 +3070,7 @@ def save_video_without_audio(frames_tensor, save_path, fps=25, quality=8):
         logging.error(f"Failed to save full preview video to {save_path}: {e}")
 
 def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, quality=5):
-    
+
     def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None):
         writer = imageio.get_writer(
             save_path, fps=fps, quality=quality, ffmpeg_params=ffmpeg_params
@@ -3071,7 +3083,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
 
     video_audio = (gen_video_samples+1)/2 # C T H W
     video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
-    video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8) 
+    video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)
     save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
 
 
@@ -3113,24 +3125,24 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
 
 
 class MomentumBuffer:
-    def __init__(self, momentum: float): 
-        self.momentum = momentum 
-        self.running_average = 0 
-    
-    def update(self, update_value: torch.Tensor): 
-        new_average = self.momentum * self.running_average 
+    def __init__(self, momentum: float):
+        self.momentum = momentum
+        self.running_average = 0
+
+    def update(self, update_value: torch.Tensor):
+        new_average = self.momentum * self.running_average
         self.running_average = update_value + new_average
-    
 
 
-def project( 
-        v0: torch.Tensor, # [B, C, T, H, W] 
-        v1: torch.Tensor, # [B, C, T, H, W] 
-        ): 
-    dtype = v0.dtype 
-    v0, v1 = v0.double(), v1.double() 
-    v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3, -4]) 
-    v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3, -4], keepdim=True) * v1 
+
+def project(
+        v0: torch.Tensor, # [B, C, T, H, W]
+        v1: torch.Tensor, # [B, C, T, H, W]
+        ):
+    dtype = v0.dtype
+    v0, v1 = v0.double(), v1.double()
+    v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3, -4])
+    v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3, -4], keepdim=True) * v1
     v0_orthogonal = v0 - v0_parallel
     return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
 
@@ -3364,23 +3376,23 @@ def enable_vram_management(
     model.vram_management_enabled = True
 
 
-def adaptive_projected_guidance( 
-          diff: torch.Tensor, # [B, C, T, H, W] 
-          pred_cond: torch.Tensor, # [B, C, T, H, W] 
-          momentum_buffer: MomentumBuffer = None, 
+def adaptive_projected_guidance(
+          diff: torch.Tensor, # [B, C, T, H, W]
+          pred_cond: torch.Tensor, # [B, C, T, H, W]
+          momentum_buffer: MomentumBuffer = None,
           eta: float = 0.0,
           norm_threshold: float = 55,
-          ): 
-    if momentum_buffer is not None: 
-        momentum_buffer.update(diff) 
+          ):
+    if momentum_buffer is not None:
+        momentum_buffer.update(diff)
         diff = momentum_buffer.running_average
-    if norm_threshold > 0: 
-        ones = torch.ones_like(diff) 
-        diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True) 
+    if norm_threshold > 0:
+        ones = torch.ones_like(diff)
+        diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True)
         print(f"diff_norm: {diff_norm}")
-        scale_factor = torch.minimum(ones, norm_threshold / diff_norm) 
-        diff = diff * scale_factor 
-    diff_parallel, diff_orthogonal = project(diff, pred_cond) 
+        scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
+        diff = diff * scale_factor
+    diff_parallel, diff_orthogonal = project(diff, pred_cond)
     normalized_update = diff_orthogonal + eta * diff_parallel
     return normalized_update
 
@@ -3488,7 +3500,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.audio_window = audio_window
         self.intermediate_dim = intermediate_dim
         self.vae_scale = vae_scale
-        
+
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -3505,7 +3517,7 @@ class WanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                              window_size, qk_norm, cross_attn_norm, eps, 
+                              window_size, qk_norm, cross_attn_norm, eps,
                               output_dim=output_dim, norm_input_visual=norm_input_visual)
             for _ in range(num_layers)
         ])
@@ -3526,7 +3538,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.img_emb = MLPProj(1280, dim)
         else:
             raise NotImplementedError('Not supported model type.')
-        
+
         # init audio adapter
         self.audio_proj = AudioProjModel(
                     seq_len=audio_window,
@@ -3550,7 +3562,7 @@ class WanModel(ModelMixin, ConfigMixin):
     ):
         print("teacache_init")
         self.enable_teacache = True
-        
+
         self.__class__.cnt = 0
         self.__class__.num_steps = sample_steps*3
         self.__class__.teacache_thresh = teacache_thresh
@@ -3572,13 +3584,13 @@ class WanModel(ModelMixin, ConfigMixin):
         else:
             if model_scale == 'multitalk-480':
                 self.__class__.coefficients = [-3.02331670e+02,  2.23948934e+02, -5.25463970e+01,  5.87348440e+00, -2.01973289e-01]
-        
+
             if model_scale == 'multitalk-720':
                 self.__class__.coefficients = [-114.36346466,   65.26524496,  -18.82220707,    4.91518089,   -0.23412683]
             self.__class__.ret_steps = 1*3
             self.__class__.cutoff_steps = sample_steps*3 - 3
         print("teacache_init done")
-    
+
     def disable_teacache(self):
         self.enable_teacache = False
 
@@ -3634,34 +3646,34 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # clip embedding
         if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea) 
+            context_clip = self.img_emb(clip_fea)
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
-        
+
         audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-        latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
         middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
+        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
         human_num = len(audio_embedding)
         audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
 
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:
-            ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
-            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
+            ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32)
+            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
             token_ref_target_masks = token_ref_target_masks.squeeze(0)
             token_ref_target_masks = (token_ref_target_masks > 0)
-            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
+            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
             token_ref_target_masks = token_ref_target_masks.to(x.dtype)
 
         # teacache
@@ -3822,23 +3834,23 @@ def resize_and_centercrop(cond_image, target_size):
             orig_h, orig_w = cond_image.height, cond_image.width
 
         target_h, target_w = target_size
-        
+
         # Calculate the scaling factor for resizing
         scale_h = target_h / orig_h
         scale_w = target_w / orig_w
-        
+
         # Compute the final size
         scale = max(scale_h, scale_w)
         final_h = math.ceil(scale * orig_h)
         final_w = math.ceil(scale * orig_w)
-        
+
         # Resize
         if isinstance(cond_image, torch.Tensor):
             if len(cond_image.shape) == 3:
                 cond_image = cond_image[None]
-            resized_tensor = nn.functional.interpolate(cond_image, size=(final_h, final_w), mode='nearest').contiguous() 
+            resized_tensor = nn.functional.interpolate(cond_image, size=(final_h, final_w), mode='nearest').contiguous()
             # crop
-            cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size) 
+            cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
             cropped_tensor = cropped_tensor.squeeze(0)
         else:
             resized_image = cond_image.resize((final_w, final_h), resample=Image.BILINEAR)
@@ -3846,7 +3858,7 @@ def resize_and_centercrop(cond_image, target_size):
             # tensor and crop
             resized_tensor = torch.from_numpy(resized_image)[None, ...].permute(0, 3, 1, 2).contiguous()
             cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
-            cropped_tensor = cropped_tensor[:, :, None, :, :] 
+            cropped_tensor = cropped_tensor[:, :, None, :, :]
 
         return cropped_tensor
 
@@ -3878,7 +3890,7 @@ def usp_dit_forward_multitalk(
     t:              [B].
     context:        A list of text embeddings each with shape [L, C].
     """
-    
+
     assert clip_fea is not None and y is not None
     # params
     device = self.patch_embedding.weight.device
@@ -3922,36 +3934,36 @@ def usp_dit_forward_multitalk(
         ]))
 
     if clip_fea is not None:
-        context_clip = self.img_emb(clip_fea)  
+        context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1)
 
     # get audio token
     audio_cond = audio.to(device=x.device, dtype=x.dtype)
-    first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-    latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+    first_frame_audio_emb_s = audio_cond[:, :1, ...]
+    latter_frame_audio_emb = audio_cond[:, 1:, ...]
+    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
     middle_index = self.audio_window // 2
-    latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-    latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-    latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-    latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-    latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-    latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-    latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-    audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
+    latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+    latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+    latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+    latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+    latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+    latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+    latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+    audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
     human_num = len(audio_embedding)
     audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
 
 
     # convert ref_target_masks to token_ref_target_masks
     if ref_target_masks is not None:
-        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
-        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
-        token_ref_target_masks = token_ref_target_masks.squeeze(0) 
+        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32)
+        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
+        token_ref_target_masks = token_ref_target_masks.squeeze(0)
         token_ref_target_masks = (token_ref_target_masks > 0)
-        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
+        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
         token_ref_target_masks = token_ref_target_masks.to(x.dtype)
-    
+
     if self.enable_teacache:
         modulated_inp = e0 if self.use_ret_steps else e
         if self.cnt%3==0: # cond
@@ -4054,133 +4066,14 @@ def usp_dit_forward_multitalk(
         self.cnt += 1
         if self.cnt >= self.num_steps:
             self.cnt = 0
-        
+
     return torch.stack(x).float()
 
 
-def usp_attn_forward_multitalk(self,
-                     x,
-                     seq_lens,
-                     grid_sizes,
-                     freqs,
-                     dtype=torch.bfloat16,
-                     ref_target_masks=None):
-    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-    half_dtypes = (torch.float16, torch.bfloat16)
-
-    def half(x):
-        return x if x.dtype in half_dtypes else x.to(dtype)
-
-    # query, key, value function
-    def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
-        return q, k, v
-
-    q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
-
-
-    x = xFuserLongContextAttention()(
-        None,
-        query=half(q),
-        key=half(k),
-        value=half(v),
-        window_size=self.window_size)
-
-
-    # output
-    x = x.flatten(2)
-    x = self.o(x)
-
-    with torch.no_grad():
-        x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
-                                            ref_target_masks=ref_target_masks, enable_sp=True) 
-
-    return x, x_ref_attn_map
 
 
 
 
-def usp_crossattn_multi_forward_multitalk(self, 
-                                        x: torch.Tensor, 
-                                        encoder_hidden_states: torch.Tensor,  # 1, 21, 64, C
-                                        shape=None, 
-                                        x_ref_attn_map=None,
-                                        human_num=None) -> torch.Tensor:
-        
-        N_t, N_h, N_w = shape 
-        sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_rank()
-        audio_tokens_per_frame = 32
-        visual_seqlen, frame_ids = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
-        encoder_hidden_states = encoder_hidden_states[:, min(frame_ids):max(frame_ids)+1, ...]
-        encoder_hidden_states = rearrange(encoder_hidden_states, "B T N C -> B (T N) C")
-        N_a = len(frame_ids)
-        kv_seq = [audio_tokens_per_frame * human_num] * N_a
-
-        if human_num == 1:
-            return super(SingleStreamMutiAttention, self).forward(x, encoder_hidden_states, shape, enable_sp=True, kv_seq=kv_seq)
-
-
-        # get q for hidden_state
-        B, N, C = x.shape
-        q = self.q_linear(x) 
-        q_shape = (B, N, self.num_heads, self.head_dim) 
-        q = q.view(q_shape).permute((0, 2, 1, 3))
-
-        if self.qk_norm:
-            q = self.q_norm(q)
-
-        max_values = x_ref_attn_map.max(1).values[:, None, None] 
-        min_values = x_ref_attn_map.min(1).values[:, None, None] 
-        max_min_values = torch.cat([max_values, min_values], dim=2)
-        max_min_values = get_sp_group().all_gather(max_min_values, dim=1)
-
-        human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
-        human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
-
-        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
-        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
-        back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
-        max_indices = x_ref_attn_map.argmax(dim=0)
-        normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
-        q = self.rope_1d(q, normalized_pos)
- 
-        encoder_kv = self.kv_linear(encoder_hidden_states) 
-        encoder_kv_shape = (B, encoder_hidden_states.size(1), 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
-        encoder_k, encoder_v = encoder_kv.unbind(0) # B H N C
-
-        if self.qk_norm:
-            encoder_k = self.add_k_norm(encoder_k)
-
-        # position embedding for condition audio embeddings
-        per_frame = torch.zeros(audio_tokens_per_frame * human_num, dtype=encoder_k.dtype).to(encoder_k.device)
-        per_frame[:audio_tokens_per_frame] = (self.rope_h1[0] + self.rope_h1[1]) / 2
-        per_frame[audio_tokens_per_frame:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
-        encoder_pos = torch.concat([per_frame]*N_a, dim=0)
-        encoder_k = self.rope_1d(encoder_k, encoder_pos)
-
-        # get attn
-        q = rearrange(q, "B H M K -> B M H K")
-        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
-        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
-        x = rearrange(x, "B M H K -> B H M K")
-
-        # linear transform
-        x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x) 
-        x = self.proj_drop(x)
-
-        return x
 
 class MultiTalkPipeline:
 
@@ -4286,7 +4179,7 @@ class MultiTalkPipeline:
         else:
             if not init_on_cpu:
                 self.model.to(self.device)
-        
+
         self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
@@ -4342,7 +4235,7 @@ class MultiTalkPipeline:
 
     def enable_cpu_offload(self):
         self.cpu_offload = True
-    
+
     def load_models_to_device(self, loadmodel_names=[]):
         # only load models to device if cpu_offload is enabled
         if not self.cpu_offload:
@@ -4431,8 +4324,8 @@ class MultiTalkPipeline:
         input_prompt = input_data['prompt']
         cond_file_path = input_data['cond_image']
         cond_image = Image.open(cond_file_path).convert('RGB')
-        
-        
+
+
         # decide a proper size
         bucket_config_module = importlib.import_module("wan.utils.multitalk_utils")
         if size_buckget == 'multitalk-480':
@@ -4460,10 +4353,10 @@ class MultiTalkPipeline:
             HUMAN_NUMBER = 2
             audio_embedding_path_2 = input_data['cond_audio']['person2']
 
-        
-        full_audio_embs = []        
+
+        full_audio_embs = []
         audio_embedding_paths = [audio_embedding_path_1, audio_embedding_path_2]
-        for human_idx in range(HUMAN_NUMBER):   
+        for human_idx in range(HUMAN_NUMBER):
             audio_embedding_path = audio_embedding_paths[human_idx]
             if not os.path.exists(audio_embedding_path):
                 continue
@@ -4472,8 +4365,8 @@ class MultiTalkPipeline:
                 continue
             if full_audio_emb.shape[0] <= frame_num:
                 continue
-            full_audio_embs.append(full_audio_emb) 
-        
+            full_audio_embs.append(full_audio_emb)
+
         assert len(full_audio_embs) == HUMAN_NUMBER, f"Aduio file not exists or length not satisfies frame nums."
         # Calculate total number of clips for progress bar
         _total_audio_frames = 0
@@ -4495,7 +4388,7 @@ class MultiTalkPipeline:
             total_clips = _clip_count
         else:
             total_clips = 1 if _total_audio_frames > 0 else 0
-        
+
         total_sampling_steps = total_clips * sampling_steps
         pbar = tqdm(total=total_sampling_steps, disable=not progress, dynamic_ncols=True)
         # preprocess text embedding
@@ -4514,7 +4407,7 @@ class MultiTalkPipeline:
 
         torch_gc()
         # prepare params for video generation
-        indices = (torch.arange(2 * 2 + 1) - 2) * 1 
+        indices = (torch.arange(2 * 2 + 1) - 2) * 1
         clip_length = frame_num
         is_first_clip = True
         arrive_last_frame = False
@@ -4540,10 +4433,10 @@ class MultiTalkPipeline:
         # start video generation iteratively
         while True:
             clip_count += 1
-            pbar.set_description(f"Generating clip {clip_count}/{total_clips}")            
+            pbar.set_description(f"Generating clip {clip_count}/{total_clips}")
             audio_embs = []
             # split audio with window size
-            for human_idx in range(HUMAN_NUMBER):   
+            for human_idx in range(HUMAN_NUMBER):
                 center_indices = torch.arange(
                     audio_start_idx,
                     audio_end_idx,
@@ -4570,7 +4463,7 @@ class MultiTalkPipeline:
                 lat_h,
                 lat_w,
                 dtype=torch.float32,
-                device=self.device) 
+                device=self.device)
 
             # get mask
             msk = torch.ones(1, frame_num, lat_h, lat_w, device=self.device)
@@ -4585,7 +4478,7 @@ class MultiTalkPipeline:
             with torch.no_grad():
                 # get clip embedding
                 self.clip.model.to(self.device)
-                clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) 
+                clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype)
                 if offload_model:
                     self.clip.model.cpu()
                 torch_gc()
@@ -4593,13 +4486,13 @@ class MultiTalkPipeline:
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
                 padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
-                y = self.vae.encode(padding_frames_pixels_values) 
+                y = self.vae.encode(padding_frames_pixels_values)
                 y = torch.stack(y).to(self.param_dtype) # B C T H W
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
                 latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
                 torch_gc()
-            
+
 
             # construct human mask
             human_masks = []
@@ -4638,12 +4531,12 @@ class MultiTalkPipeline:
                 human_masks.append(background_mask)
 
             ref_target_masks = torch.stack(human_masks, dim=0).to(self.device)
-            # resize and centercrop for ref_target_masks 
+            # resize and centercrop for ref_target_masks
             ref_target_masks = resize_and_centercrop(ref_target_masks, (target_h, target_w))
 
             _, _, _,lat_h, lat_w = y.shape
-            ref_target_masks = F.interpolate(ref_target_masks.unsqueeze(0), size=(lat_h, lat_w), mode='nearest').squeeze() 
-            ref_target_masks = (ref_target_masks > 0) 
+            ref_target_masks = F.interpolate(ref_target_masks.unsqueeze(0), size=(lat_h, lat_w), mode='nearest').squeeze()
+            ref_target_masks = (ref_target_masks > 0)
             ref_target_masks = ref_target_masks.float().to(self.device)
 
             torch_gc()
@@ -4656,14 +4549,14 @@ class MultiTalkPipeline:
 
             # evaluation mode
             with torch.no_grad(), no_sync():
-                
+
                 # prepare timesteps
                 timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
                 timesteps.append(0.)
                 timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
                 if self.use_timestep_transform:
                     timesteps = [timestep_transform(t, shift=shift, num_timesteps=self.num_timesteps) for t in timesteps]
-                
+
                 # sample videos
                 latent = noise
 
@@ -4702,7 +4595,7 @@ class MultiTalkPipeline:
                     self.model.to(self.device)
                 else:
                     self.load_models_to_device(["model"])
-                
+
                 # injecting motion frames
                 if not is_first_clip:
                     latent_motion_frames = latent_motion_frames.to(latent.dtype).to(self.device)
@@ -4712,10 +4605,10 @@ class MultiTalkPipeline:
                     latent[:, :T_m] = add_latent
 
                 # infer with APG
-                # refer https://arxiv.org/abs/2410.02416   
-                if extra_args.use_apg:  
-                    text_momentumbuffer  = MomentumBuffer(extra_args.apg_momentum) 
-                    audio_momentumbuffer = MomentumBuffer(extra_args.apg_momentum) 
+                # refer https://arxiv.org/abs/2410.02416
+                if extra_args.use_apg:
+                    text_momentumbuffer  = MomentumBuffer(extra_args.apg_momentum)
+                    audio_momentumbuffer = MomentumBuffer(extra_args.apg_momentum)
 
 
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
@@ -4725,33 +4618,33 @@ class MultiTalkPipeline:
 
                     # inference with CFG strategy
                     noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0] 
+                    latent_model_input, t=timestep, **arg_c)[0]
                     torch_gc()
                     noise_pred_drop_text = self.model(
-                        latent_model_input, t=timestep, **arg_null_text)[0] 
+                        latent_model_input, t=timestep, **arg_null_text)[0]
                     torch_gc()
                     noise_pred_uncond = self.model(
-                        latent_model_input, t=timestep, **arg_null)[0]  
+                        latent_model_input, t=timestep, **arg_null)[0]
                     torch_gc()
 
                     if extra_args.use_apg:
                         # correct update direction
                         diff_uncond_text  = noise_pred_cond - noise_pred_drop_text
                         diff_uncond_audio = noise_pred_drop_text - noise_pred_uncond
-                        noise_pred = noise_pred_cond + (text_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_text, 
-                                                                                                            noise_pred_cond, 
-                                                                                                            momentum_buffer=text_momentumbuffer, 
+                        noise_pred = noise_pred_cond + (text_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_text,
+                                                                                                            noise_pred_cond,
+                                                                                                            momentum_buffer=text_momentumbuffer,
                                                                                                             norm_threshold=extra_args.apg_norm_threshold) \
-                               + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio, 
-                                                                                        noise_pred_cond, 
-                                                                                        momentum_buffer=audio_momentumbuffer, 
+                               + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio,
+                                                                                        noise_pred_cond,
+                                                                                        momentum_buffer=audio_momentumbuffer,
                                                                                         norm_threshold=extra_args.apg_norm_threshold)
                     else:
                         # vanilla CFG strategy
                         noise_pred = noise_pred_uncond + text_guide_scale * (
                             noise_pred_cond - noise_pred_drop_text) + \
-                            audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)  
-                    noise_pred = -noise_pred  
+                            audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
+                    noise_pred = -noise_pred
 
                     # update latent
                     dt = timesteps[i] - timesteps[i + 1]
@@ -4766,38 +4659,38 @@ class MultiTalkPipeline:
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
 
-                    x0 = [latent.to(self.device)] 
+                    x0 = [latent.to(self.device)]
                     pbar.update(1)
                     del latent_model_input, timestep
-                
-                if offload_model: 
+
+                if offload_model:
                     if not self.vram_management:
                         self.model.cpu()
                 torch_gc()
 
-                videos = self.vae.decode(x0) 
+                videos = self.vae.decode(x0)
 
             if extra_args.full_preview:
                 # We have a new decoded clip in `videos` (shape B C T H W)
                 current_clip_pixels = videos[0] # Take first from batch, shape C T H W
-                
+
                 if is_first_clip:
                     preview_video_list.append(current_clip_pixels)
                 else:
                     # Append only the new part, excluding motion frames overlap
                     new_part = current_clip_pixels[:, cur_motion_frames_num:, :, :]
                     preview_video_list.append(new_part)
-                    
+
                 # Stitch all clips so far
                 if preview_video_list:
                     stitched_preview_video = torch.cat(preview_video_list, dim=1) # dim=1 is time
-                    
+
                     # Define preview path and save
                     preview_dir = os.path.join(os.path.dirname(extra_args.save_file), "previews")
                     os.makedirs(preview_dir, exist_ok=True)
                     preview_path = os.path.join(preview_dir, f"latent_preview_{preview_suffix}.mp4")
                     save_video_without_audio(stitched_preview_video, preview_path, fps=25)
-            
+
             # cache generated samples
             videos = torch.stack(videos).cpu() # B C T H W
             if is_first_clip:
@@ -4830,27 +4723,27 @@ class MultiTalkPipeline:
                     source_frame = len(full_audio_embs[human_inx])
                     source_frames.append(source_frame)
                     if audio_end_idx >= len(full_audio_embs[human_inx]):
-                        miss_length   = audio_end_idx - len(full_audio_embs[human_inx]) + 3 
+                        miss_length   = audio_end_idx - len(full_audio_embs[human_inx]) + 3
                         add_audio_emb = torch.flip(full_audio_embs[human_inx][-1*miss_length:], dims=[0])
                         full_audio_embs[human_inx] = torch.cat([full_audio_embs[human_inx], add_audio_emb], dim=0)
                         miss_lengths.append(miss_length)
                     else:
                         miss_lengths.append(0)
-            
+
             if max_frames_num <= frame_num: break
-            
+
             torch_gc()
-            if offload_model:    
+            if offload_model:
                 torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
         pbar.close()
-        gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
+        gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)]
         gen_video_samples = gen_video_samples.to(torch.float32)
         if max_frames_num > frame_num and sum(miss_lengths) > 0:
             # split video frames
             gen_video_samples = gen_video_samples[:, :, :-1*miss_lengths[0]]
-        
+
         if dist.is_initialized():
             dist.barrier()
 
@@ -4964,7 +4857,7 @@ class Wav2Vec2Model(Wav2Vec2Model):
             attention_mask = self._get_feature_vector_attention_mask(
                 extract_features.shape[1], attention_mask, add_adapter=False
             )
-            
+
 
         hidden_states, extract_features = self.feature_projection(extract_features)
         hidden_states = self._mask_hidden_states(
@@ -4991,8 +4884,8 @@ class Wav2Vec2Model(Wav2Vec2Model):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
-    
-def custom_init(device, wav2vec):    
+
+def custom_init(device, wav2vec):
     audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec, local_files_only=True)
@@ -5022,15 +4915,15 @@ def audio_prepare_multi(left_path, right_path, audio_type, sample_rate=16000):
         len1 = human_speech_array1.shape[0]
         len2 = human_speech_array2.shape[0]
         max_len = max(len1, len2)
-        
+
         new_human_speech1 = np.zeros(max_len)
         new_human_speech1[:len1] = human_speech_array1
-        
+
         new_human_speech2 = np.zeros(max_len)
         new_human_speech2[:len2] = human_speech_array2
-        
+
     elif audio_type=='add':
-        new_human_speech1 = np.concatenate([human_speech_array1[: human_speech_array1.shape[0]], np.zeros(human_speech_array2.shape[0])]) 
+        new_human_speech1 = np.concatenate([human_speech_array1[: human_speech_array1.shape[0]], np.zeros(human_speech_array2.shape[0])])
         new_human_speech2 = np.concatenate([np.zeros(human_speech_array1.shape[0]), human_speech_array2[:human_speech_array2.shape[0]]])
     sum_human_speechs = new_human_speech1 + new_human_speech2
     return new_human_speech1, new_human_speech2, sum_human_speechs
@@ -5170,7 +5063,7 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     assert args.task == "multitalk-14B", 'You should choose multitalk in args.task.'
-    
+
 
     # TODO: add prompt refine
     # img = Image.open(args.image).convert("RGB")
@@ -5236,7 +5129,7 @@ def generate(args):
     wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
     args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
     os.makedirs(args.audio_save_dir,exist_ok=True)
-    
+
     if len(input_data['cond_audio'])==2:
         new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
         audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
@@ -5267,8 +5160,8 @@ def generate(args):
         device_id=device,
         rank=rank,
         t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp, 
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
         t5_cpu=args.t5_cpu,
         t5_tokenizer_path_override=args.t5_tokenizer_path,
         args=args,
@@ -5279,7 +5172,7 @@ def generate(args):
         wan_i2v.enable_vram_management(
             num_persistent_param_in_dit=args.num_persistent_param_in_dit
         )
-    
+
     logging.info("Generating video ...")
     video = wan_i2v.generate(
         input_data,
@@ -5296,19 +5189,19 @@ def generate(args):
         max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
         extra_args=args,
         )
-    
+
 
     if rank == 0:
-        
+
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/",
                                                                         "_")[:50]
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
-        
+
         logging.info(f"Saving generated video to {args.save_file}.mp4")
         save_video_ffmpeg(video, args.save_file, [input_data['video_audio']])
-        
+
     logging.info("Finished.")
 
 def flash_attention(
@@ -5435,6 +5328,7 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
+
     if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
         return flash_attention(
             q=q,
