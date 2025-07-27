@@ -3274,22 +3274,39 @@ def enable_vram_management_recursively(
     total_num_param=0,
 ):
     for name, module in model.named_children():
-        for source_module, target_module in module_map.items():
-            if isinstance(module, source_module):
-                num_param = sum(p.numel() for p in module.parameters())
-                # print(str(module) + ':' + str(num_param))
-                if (
-                    max_num_param is not None
-                    and total_num_param + num_param > max_num_param
-                ):
-                    # print(str(module) + '-->\t\t num:' + str(num_param) + "\t total:" + str(total_num_param))
-                    module_config_ = overflow_module_config
-                else:
-                    module_config_ = module_config
-                module_ = target_module(module, **module_config_)
-                setattr(model, name, module_)
-                total_num_param += num_param
+        is_wrapper = isinstance(module, (AutoWrappedLinear, AutoWrappedModule))
+        
+        if is_wrapper:
+            base_module = module.module if isinstance(module, AutoWrappedModule) else module
+        else:
+            base_module = module
+
+        target_wrapper_class = None
+        for source_class, target_class in module_map.items():
+            if isinstance(base_module, source_class):
+                target_wrapper_class = target_class
                 break
+
+        if target_wrapper_class:
+            num_param = sum(p.numel() for p in base_module.parameters())
+            config_to_use = overflow_module_config if (max_num_param is not None and total_num_param + num_param > max_num_param) else module_config
+            total_num_param += num_param
+            
+            if is_wrapper:
+                module.offload_dtype = config_to_use['offload_dtype']
+                module.offload_device = config_to_use['offload_device']
+                module.onload_dtype = config_to_use['onload_dtype']
+                module.onload_device = config_to_use['onload_device']
+                module.computation_dtype = config_to_use['computation_dtype']
+                module.computation_device = config_to_use['computation_device']
+                
+                module.state = 1  
+                module.offload()
+                
+            else:
+                new_module = target_wrapper_class(base_module, **config_to_use)
+                setattr(model, name, new_module)
+        
         else:
             total_num_param = enable_vram_management_recursively(
                 module,
@@ -3299,6 +3316,7 @@ def enable_vram_management_recursively(
                 overflow_module_config,
                 total_num_param,
             )
+            
     return total_num_param
 
 @contextmanager
@@ -4412,6 +4430,14 @@ class MultiTalkPipeline:
         is_first_clip = True
         arrive_last_frame = False
         cur_motion_frames_num = 1
+
+        # Initial VRAM management setup
+        initial_persistent_params = getattr(self, '_initial_persistent_params', None)
+        if initial_persistent_params is None and hasattr(self, 'vram_management') and self.vram_management:
+            # Store the initial value
+            self._initial_persistent_params = extra_args.num_persistent_param_in_dit
+            initial_persistent_params = self._initial_persistent_params
+
         clip_count = 0
         audio_start_idx = 0
         audio_end_idx = audio_start_idx + clip_length
@@ -4434,6 +4460,16 @@ class MultiTalkPipeline:
         while True:
             clip_count += 1
             pbar.set_description(f"Generating clip {clip_count}/{total_clips}")
+            if hasattr(self, 'vram_management') and self.vram_management and initial_persistent_params:
+                # Reduce by 15% for each section after the first
+                scale_factor = max(0.3, 1.0 - (clip_count - 1) * 0.03)
+                scaled_params = int(initial_persistent_params * scale_factor)
+
+                logging.info(f"Section {clip_count}: Scaling num_persistent_param_in_dit to {scaled_params:,} (factor: {scale_factor:.2f})")
+
+                # Re-enable VRAM management with scaled parameters
+                self.enable_vram_management(num_persistent_param_in_dit=scaled_params)
+
             audio_embs = []
             # split audio with window size
             for human_idx in range(HUMAN_NUMBER):
@@ -4664,10 +4700,12 @@ class MultiTalkPipeline:
                     del latent_model_input, timestep
 
                 if offload_model:
-                    if not self.vram_management:
+                    if self.vram_management:
+                        self.load_models_to_device([])
+                    else:
                         self.model.cpu()
-                torch_gc()
-
+                
+                torch_gc() 
                 videos = self.vae.decode(x0)
 
             if extra_args.full_preview:
@@ -4731,7 +4769,12 @@ class MultiTalkPipeline:
                         miss_lengths.append(0)
 
             if max_frames_num <= frame_num: break
-
+            if clip_count > 1:
+                torch_gc()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
             torch_gc()
             if offload_model:
                 torch.cuda.synchronize()
