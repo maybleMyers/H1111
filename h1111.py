@@ -36,6 +36,157 @@ logger = logging.getLogger(__name__)
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 
+#wan2.2
+def wan22_batch_handler(
+    prompt: str,
+    image_path: str,
+    task: str,
+    size: str,
+    frame_num: int,
+    ckpt_dir: str,
+    offload_model: bool,
+    t5_cpu: bool,
+    convert_model_dtype: bool,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    sample_shift: float,
+    sample_guide_scale: float,
+    batch_size: int,
+    save_path: str,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    if "i2v" in task and (not image_path or not os.path.exists(image_path)):
+        yield [], None, "Error: Input Image not provided or not found for I2V task.", ""
+        return
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        save_file_prefix = os.path.join(save_path, f"wan22_{run_id}_s{current_seed}")
+
+        command = [
+            sys.executable,
+            os.path.join("Wan2.2", "generate.py"), # Use the script in the subfolder
+            "--task", str(task),
+            "--size", str(size),
+            "--ckpt_dir", str(ckpt_dir),
+            "--prompt", str(prompt),
+            "--base_seed", str(current_seed),
+            "--save_file", save_file_prefix + ".mp4", # Script expects full filename
+            "--frame_num", str(frame_num),
+            "--sample_steps", str(sample_steps),
+            "--sample_shift", str(sample_shift),
+            "--sample_guide_scale", str(sample_guide_scale),
+            "--sample_solver", str(sample_solver),
+        ]
+
+        if "i2v" in task and image_path:
+            command.extend(["--image", str(image_path)])
+
+        if offload_model: command.extend(["--offload_model", "True"])
+        if t5_cpu: command.append("--t5_cpu")
+        if convert_model_dtype: command.append("--convert_model_dtype")
+        
+        # --- Execute Subprocess ---
+        print(f"Running Wan2.2 Command: {' '.join(command)}")
+        
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, None, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"WAN2.2_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),", line_strip)
+            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
+
+            if final_save_match:
+                found_path = final_save_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_elapsed = tqdm_match.group(3).strip()
+                time_remaining = tqdm_match.group(4).strip()
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
+            else:
+                 progress_text_update = line_strip
+
+            yield all_generated_videos.copy(), None, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+        
+        final_video_path = save_file_prefix + ".mp4"
+        if os.path.exists(final_video_path):
+            current_video_file_for_item = final_video_path
+        
+        if return_code == 0 and current_video_file_for_item:
+            params_for_meta = {
+                "model_type": "Wan2.2",
+                "prompt": prompt, "image_path": os.path.basename(image_path) if image_path else None,
+                "task": task, "size": size, "frame_num": frame_num,
+                "ckpt_dir": ckpt_dir, "offload_model": offload_model, "t5_cpu": t5_cpu,
+                "convert_model_dtype": convert_model_dtype, "seed": current_seed,
+                "sample_solver": sample_solver, "sample_steps": sample_steps,
+                "sample_shift": sample_shift, "sample_guide_scale": sample_guide_scale,
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+                print(f"Added metadata to {current_video_file_for_item}")
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+            
+            all_generated_videos.append((current_video_file_for_item, f"Wan2.2 - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+        
+        yield all_generated_videos.copy(), None, status_text, progress_text_update
+        
+        clear_cuda_cache()
+        time.sleep(0.2)
+        
+    yield all_generated_videos, None, "Wan2.2 Batch complete.", ""
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -5696,6 +5847,7 @@ with gr.Blocks(
     wanx_trimmed_video_path = gr.State(value=None) 
     wanx_v2v_selected_index = gr.State(value=None)
     wanx_t2v_selected_index = gr.State(value=None)
+    wan22_selected_index = gr.State(value=None)
     framepack_selected_index = gr.State(value=None)
     framepack_original_dims = gr.State(value="")
     fpe_selected_index = gr.State(value=None)
@@ -6607,6 +6759,65 @@ with gr.Blocks(
                 skyreels_block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
                 skyreels_split_uncond = gr.Checkbox(label="Split Unconditional", value=True)
 
+        # Wan2.2 Tab
+        with gr.Tab(id=12, label="Wan2.2") as wan22_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wan22_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A cat wearing a chef hat, cooking pizza.", 
+                        lines=5
+                    )
+                with gr.Column(scale=1):
+                    wan22_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    wan22_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    wan22_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wan22_progress_text")
+
+            with gr.Row():
+                wan22_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                wan22_stop_btn = gr.Button("Stop Generation", variant="stop")
+            
+            with gr.Row():
+                with gr.Column():
+                    wan22_input_image = gr.Image(label="Input Image (for i2v tasks)", type="filepath")
+                    
+                    gr.Markdown("### Generation Parameters")
+                    wan22_task = gr.Dropdown(
+                        label="Task", 
+                        choices=["t2v-A14B", "i2v-A14B", "ti2v-5B"], 
+                        value="i2v-A14B"
+                    )
+                    wan22_size = gr.Dropdown(
+                        label="Size (Resolution)", 
+                        choices=["1280*720", "720*1280", "1024*576", "576*1024", "832*480", "480*832"], 
+                        value="832*480"
+                    )
+                    wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan22_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=40)
+                    wan22_sample_shift = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Sample Shift", value=5.0)
+                    wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=10.0, step=0.1, label="Guidance Scale", value=3.5)
+                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        wan22_random_seed_btn = gr.Button("🎲️")
+
+                with gr.Column():
+                    wan22_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_wan22", allow_preview=True, preview=True
+                    )
+                    wan22_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
+                    
+                    with gr.Accordion("Performance & Model Paths", open=True):
+                        wan22_ckpt_dir = gr.Textbox(label="Checkpoint Directory", value="Wan2.2/Wan2.2-I2V-A14B")
+                        wan22_save_path = gr.Textbox(label="Save Path", value="outputs/wan22")
+                        wan22_offload_model = gr.Checkbox(label="Offload Model to CPU", value=True)
+                        wan22_t5_cpu = gr.Checkbox(label="Place T5 on CPU", value=True)
+                        wan22_convert_model_dtype = gr.Checkbox(label="Convert Model DType (for speed)", value=True)
+        
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
             with gr.Row():
@@ -9427,6 +9638,72 @@ with gr.Blocks(
     ).then(
         fn=change_to_tab_two, inputs=None, outputs=[tabs]
     )
+
+    # Wan2.2 Tab Event Handlers
+    wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
+
+    wan22_generate_btn.click(
+        fn=wan22_batch_handler,
+        inputs=[
+            wan22_prompt,
+            wan22_input_image,
+            wan22_task,
+            wan22_size,
+            wan22_frame_num,
+            wan22_ckpt_dir,
+            wan22_offload_model,
+            wan22_t5_cpu,
+            wan22_convert_model_dtype,
+            wan22_seed,
+            wan22_sample_solver,
+            wan22_sample_steps,
+            wan22_sample_shift,
+            wan22_sample_guide_scale,
+            wan22_batch_size,
+            wan22_save_path,
+        ],
+        outputs=[wan22_output, gr.Video(visible=False), wan22_batch_progress, wan22_progress_text], # Pass a dummy video output for the preview slot
+        queue=True
+    )
+
+    def handle_wan22_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    wan22_output.select(fn=handle_wan22_gallery_select, outputs=wan22_selected_index)
+
+    def parse_wh_from_size_str(size_str: str) -> Tuple[int, int]:
+        try:
+            w, h = map(int, size_str.split('*'))
+            return w, h
+        except:
+            return 832, 480 # Fallback
+
+    def prepare_and_send_to_wanx_v2v(gallery, prompt, selected_idx, size, frame_num, steps, seed, shift, scale):
+        w, h = parse_wh_from_size_str(size)
+        # Now call the actual send function with parsed values
+        return send_wanx_v2v_to_hunyuan_v2v(
+            gallery=gallery, prompt=prompt, selected_index=selected_idx,
+            width=w, height=h, video_length=frame_num, fps=16, # fps is fixed for wan2.2
+            infer_steps=steps, seed=seed, flow_shift=shift, guidance_scale=scale,
+            negative_prompt=""
+        )
+
+    wan22_send_to_wanx_v2v_btn.click(
+        fn=prepare_and_send_to_wanx_v2v,
+        inputs=[
+            wan22_output, wan22_prompt, wan22_selected_index,
+            wan22_size, wan22_frame_num, wan22_sample_steps, wan22_seed,
+            wan22_sample_shift, wan22_sample_guide_scale
+        ],
+        outputs=[
+            wanx_v2v_input, wanx_v2v_prompt, wanx_v2v_width, wanx_v2v_height,
+            wanx_v2v_video_length, wanx_v2v_fps, wanx_v2v_infer_steps,
+            wanx_v2v_seed, wanx_v2v_flow_shift, wanx_v2v_guidance_scale,
+            wanx_v2v_negative_prompt
+        ]
+    ).then(fn=change_to_wanx_v2v_tab, inputs=None, outputs=[tabs])
+
     #Video Info
     def clean_video_path(video_path) -> str:
         """Extract clean video path from Gradio's various return formats"""
