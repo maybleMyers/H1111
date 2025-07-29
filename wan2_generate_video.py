@@ -1961,14 +1961,14 @@ def run_sampling(
             if model_high is not None:
                 # For dual-dit models, use high noise model for high timesteps (early in denoising)
                 # Use low noise model for low timesteps (later in denoising)
-                # Threshold at 0.5 (middle of [0, 1] range)
-                timestep_val = t.item() / 1000.0  # Normalize to [0, 1] assuming 1000-step schedule
-                if timestep_val > 0.5:
+                # Use config boundary (0.900 for i2v-A14B)
+                boundary = cfg.boundary * 1000  # 0.900 * 1000 = 900 timesteps
+                if t.item() >= boundary:
                     current_model = model_high
-                    # logger.debug(f"Step {i}: Using high noise model (t={timestep_val:.3f})")
+                    # logger.debug(f"Step {i}: Using high noise model (t={t.item():.0f} >= {boundary:.0f})")
                 else:
                     current_model = model
-                    # logger.debug(f"Step {i}: Using low noise model (t={timestep_val:.3f})")
+                    # logger.debug(f"Step {i}: Using low noise model (t={t.item():.0f} < {boundary:.0f})")
             
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
             # 1. Predict conditional noise estimate
