@@ -6866,9 +6866,9 @@ with gr.Blocks(
                     )
                     wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wan22_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=40)
+                    wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
-                    wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
                     wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -6907,7 +6907,7 @@ with gr.Blocks(
             with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
                     wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
-                    wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
+                    wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
@@ -6919,7 +6919,7 @@ with gr.Blocks(
                         wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
                     with gr.Group(visible=False) as wan22_ti2v5b_paths:
                         wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/DiT-ti2v-5B-v1.safetensors")
-                    wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/VAE-v1.pth")
+                    wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
                     wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                     wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
         
