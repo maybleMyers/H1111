@@ -8,6 +8,9 @@ from .shared_config import wan_shared_cfg
 ti2v_5B = EasyDict(__name__='Config: Wan TI2V 5B')
 ti2v_5B.update(wan_shared_cfg)
 
+# Model type identification
+ti2v_5B.i2v = False  # This is a TI2V model (text+image to video, not pure I2V)
+
 # t5
 ti2v_5B.t5_checkpoint = 'models_t5_umt5-xxl-enc-bf16.pth'
 ti2v_5B.t5_tokenizer = 'google/umt5-xxl'
@@ -27,6 +30,10 @@ ti2v_5B.window_size = (-1, -1)
 ti2v_5B.qk_norm = True
 ti2v_5B.cross_attn_norm = True
 ti2v_5B.eps = 1e-6
+ti2v_5B.in_channels = 16  # Standard latent channels for TI2V
+ti2v_5B.out_channels = 16  # Output latent channels
+ti2v_5B.in_dim = 16  # Same as in_channels for compatibility
+ti2v_5B.out_dim = 16  # Same as out_channels for compatibility
 
 # inference
 ti2v_5B.sample_fps = 24

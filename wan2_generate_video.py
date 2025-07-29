@@ -1232,15 +1232,18 @@ def prepare_i2v_inputs(
 
         # Prepare Model Input Arguments for FunControl
         y_for_model = y[0] # Shape becomes [32, F, H, W]
+        # A14B models don't have img_emb layer, so don't pass clip_fea
+        use_clip_fea = clip_context if not ("A14B" in args.task) else None
+        
         arg_c = {
             "context": context,
-            "clip_fea": clip_context,
+            "clip_fea": use_clip_fea,
             "seq_len": seq_len,
             "y": [y_for_model], # Pass the 4D tensor in the list
         }
         arg_null = {
             "context": context_null,
-            "clip_fea": clip_context,
+            "clip_fea": use_clip_fea,
             "seq_len": seq_len,
             "y": [y_for_model], # Pass the 4D tensor in the list
         }
@@ -1409,15 +1412,18 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare model input arguments for Standard I2V
+        # A14B models don't have img_emb layer, so don't pass clip_fea
+        use_clip_fea = clip_context if not ("A14B" in args.task) else None
+        
         arg_c = {
             "context": context, # Model expects batch dim? Assuming yes.
-            "clip_fea": clip_context,
+            "clip_fea": use_clip_fea,
             "seq_len": max_seq_len, # Use original seq len calculation
             "y": [y], # Use the 'original method' y
         }
         arg_null = {
             "context": context_null,
-            "clip_fea": clip_context,
+            "clip_fea": use_clip_fea,
             "seq_len": max_seq_len,
             "y": [y], # Use the 'original method' y
         }
@@ -2212,6 +2218,11 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Optimize Model (FP8, Swapping, Compile) ---
     optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+    
+    # Also optimize the high noise model for dual-dit architectures
+    if is_dual_dit and model_high is not None:
+        logger.info("Optimizing high noise model for dual-dit architecture")
+        optimize_model(model_high, args, device, dit_dtype, dit_weight_dtype)
 
     # --- Setup Scheduler & Timesteps ---
     scheduler, timesteps = setup_scheduler(args, cfg, device)
