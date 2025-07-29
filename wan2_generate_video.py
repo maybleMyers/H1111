@@ -1962,6 +1962,7 @@ def run_sampling(
                 # For dual-dit models, use high noise model for high timesteps (early in denoising)
                 # Use low noise model for low timesteps (later in denoising)
                 # Use config boundary (0.900 for i2v-A14B)
+                cfg = WAN_CONFIGS[args.task]
                 boundary = cfg.boundary * 1000  # 0.900 * 1000 = 900 timesteps
                 if t.item() >= boundary:
                     current_model = model_high
