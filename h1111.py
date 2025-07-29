@@ -39,36 +39,53 @@ FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json"
 #wan2.2
 def wan22_batch_handler(
     prompt: str,
+    negative_prompt: str,
     image_path: str,
     task: str,
     size: str,
     frame_num: int,
-    ckpt_dir: str,
-    offload_model: bool,
-    t5_cpu: bool,
-    convert_model_dtype: bool,
+    fps: int,
     base_seed: int,
     sample_solver: str,
     sample_steps: int,
-    sample_shift: float,
+    flow_shift: float,
     sample_guide_scale: float,
     batch_size: int,
     save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
 
     # --- Initial Checks ---
     if "i2v" in task and (not image_path or not os.path.exists(image_path)):
-        yield [], None, "Error: Input Image not provided or not found for I2V task.", ""
+        yield [], [], "Error: Input Image not provided or not found for I2V task.", ""
         return
     os.makedirs(save_path, exist_ok=True)
 
     all_generated_videos = []
-
+    
     for i in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, None, "Generation stopped by user.", ""
+            yield all_generated_videos, [], "Generation stopped by user.", ""
             return
 
         current_seed = base_seed
@@ -78,34 +95,72 @@ def wan22_batch_handler(
             current_seed = base_seed + i
 
         status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+        yield all_generated_videos.copy(), [], status_text, "Starting item..."
 
         # --- Prepare command for a single generation ---
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        save_file_prefix = os.path.join(save_path, f"wan22_{run_id}_s{current_seed}")
+        unique_preview_suffix = f"wan22_{run_id}"
+
+        height, width = size.split('*')[::-1] # "W*H" -> H, W
 
         command = [
-            sys.executable,
-            os.path.join("Wan2.2", "generate.py"), # Use the script in the subfolder
+            sys.executable, "wan2_generate_video.py",
             "--task", str(task),
-            "--size", str(size),
-            "--ckpt_dir", str(ckpt_dir),
             "--prompt", str(prompt),
-            "--base_seed", str(current_seed),
-            "--save_file", save_file_prefix + ".mp4", # Script expects full filename
-            "--frame_num", str(frame_num),
-            "--sample_steps", str(sample_steps),
-            "--sample_shift", str(sample_shift),
-            "--sample_guide_scale", str(sample_guide_scale),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--flow_shift", str(flow_shift),
             "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", vae_path,
+            "--t5", t5_path,
         ]
 
-        if "i2v" in task and image_path:
-            command.extend(["--image", str(image_path)])
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+        
+        # --- Model Path Logic based on Task ---
+        if "A14B" in task:
+            command.extend(["--dit_low_noise", dit_low_noise_path, "--dit_high_noise", dit_high_noise_path])
+            if "i2v" in task:
+                command.extend(["--clip", clip_path])
+        elif "ti2v-5B" in task:
+            command.extend(["--dit", dit_path])
 
-        if offload_model: command.extend(["--offload_model", "True"])
-        if t5_cpu: command.append("--t5_cpu")
-        if convert_model_dtype: command.append("--convert_model_dtype")
+        if "i2v" in task and image_path:
+            command.extend(["--image_path", str(image_path)])
+
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_t5: command.append("--fp8_t5")
+        
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # --- LoRA Handling ---
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult), (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
         
         # --- Execute Subprocess ---
         print(f"Running Wan2.2 Command: {' '.join(command)}")
@@ -115,6 +170,11 @@ def wan22_batch_handler(
             text=True, encoding='utf-8', errors='replace', bufsize=1
         )
 
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
 
@@ -122,54 +182,57 @@ def wan22_batch_handler(
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
                 except: process.kill(); process.wait()
-                yield all_generated_videos, None, "Generation stopped by user.", ""
+                yield all_generated_videos, [], "Generation stopped by user.", ""
                 return
 
             line_strip = line.strip()
             if not line_strip: continue
             print(f"WAN2.2_SUBPROCESS: {line_strip}")
+            progress_text_update = line_strip
 
-            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^<]+)<([^,]+),", line_strip)
-            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
 
-            if final_save_match:
-                found_path = final_save_match.group(1).strip()
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
                 if os.path.exists(found_path):
                     current_video_file_for_item = found_path
-                progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
             elif tqdm_match:
                 percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
-                time_elapsed = tqdm_match.group(3).strip()
-                time_remaining = tqdm_match.group(4).strip()
+                time_elapsed = tqdm_match.group(3)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
-                progress_text_update = f"Step {steps_iter} ({percentage}%) | Elapsed: {time_elapsed} | ETA: {time_remaining}"
-            else:
-                 progress_text_update = line_strip
 
-            yield all_generated_videos.copy(), None, status_text, progress_text_update
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
 
         process.stdout.close()
         return_code = process.wait()
         
-        final_video_path = save_file_prefix + ".mp4"
-        if os.path.exists(final_video_path):
-            current_video_file_for_item = final_video_path
-        
         if return_code == 0 and current_video_file_for_item:
             params_for_meta = {
-                "model_type": "Wan2.2",
-                "prompt": prompt, "image_path": os.path.basename(image_path) if image_path else None,
-                "task": task, "size": size, "frame_num": frame_num,
-                "ckpt_dir": ckpt_dir, "offload_model": offload_model, "t5_cpu": t5_cpu,
-                "convert_model_dtype": convert_model_dtype, "seed": current_seed,
-                "sample_solver": sample_solver, "sample_steps": sample_steps,
-                "sample_shift": sample_shift, "sample_guide_scale": sample_guide_scale,
+                "model_type": "Wan2.2", "prompt": prompt, "negative_prompt": negative_prompt,
+                "image_path": os.path.basename(image_path) if image_path else None,
+                "task": task, "size": size, "frame_num": frame_num, "fps": fps,
+                "dit_low_noise": dit_low_noise_path, "dit_high_noise": dit_high_noise_path,
+                "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
+                "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
+                "flow_shift": flow_shift, "sample_guide_scale": sample_guide_scale,
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
             }
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
-                print(f"Added metadata to {current_video_file_for_item}")
             except Exception as meta_err:
                 print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
             
@@ -180,12 +243,12 @@ def wan22_batch_handler(
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
         
-        yield all_generated_videos.copy(), None, status_text, progress_text_update
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
         
         clear_cuda_cache()
         time.sleep(0.2)
         
-    yield all_generated_videos, None, "Wan2.2 Batch complete.", ""
+    yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
 ### Multitalk
 def multitalk_batch_handler(
@@ -6769,6 +6832,12 @@ with gr.Blocks(
                         value="A cat wearing a chef hat, cooking pizza.", 
                         lines=5
                     )
+                    wan22_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="low quality, blurry, watermark",
+                        lines=3,
+                    )
                 with gr.Column(scale=1):
                     wan22_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
@@ -6787,7 +6856,8 @@ with gr.Blocks(
                     wan22_task = gr.Dropdown(
                         label="Task", 
                         choices=["t2v-A14B", "i2v-A14B", "ti2v-5B"], 
-                        value="i2v-A14B"
+                        value="i2v-A14B",
+                        info="Selects the model architecture and configuration to use."
                     )
                     wan22_size = gr.Dropdown(
                         label="Size (Resolution)", 
@@ -6795,10 +6865,11 @@ with gr.Blocks(
                         value="832*480"
                     )
                     wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=40)
-                    wan22_sample_shift = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Sample Shift", value=5.0)
-                    wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=10.0, step=0.1, label="Guidance Scale", value=3.5)
-                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                    wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         wan22_random_seed_btn = gr.Button("🎲️")
@@ -6809,14 +6880,48 @@ with gr.Blocks(
                         columns=[2], rows=[2], object_fit="contain", height="auto",
                         show_label=True, elem_id="gallery_wan22", allow_preview=True, preview=True
                     )
-                    wan22_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-                    
-                    with gr.Accordion("Performance & Model Paths", open=True):
-                        wan22_ckpt_dir = gr.Textbox(label="Checkpoint Directory", value="Wan2.2/Wan2.2-I2V-A14B")
-                        wan22_save_path = gr.Textbox(label="Save Path", value="outputs/wan22")
-                        wan22_offload_model = gr.Checkbox(label="Offload Model to CPU", value=True)
-                        wan22_t5_cpu = gr.Checkbox(label="Place T5 on CPU", value=True)
-                        wan22_convert_model_dtype = gr.Checkbox(label="Convert Model DType (for speed)", value=True)
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        wan22_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        wan22_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        wan22_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="wan22_preview_gallery"
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            wan22_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            wan22_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        wan22_lora_weights = []
+                        wan22_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                wan22_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                wan22_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+            
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                    wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
+                with gr.Row():
+                    wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    with gr.Group(visible=True) as wan22_a14b_paths:
+                        wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_fp16.safetensors")
+                        wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_fp16.safetensors")
+                        wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
+                    with gr.Group(visible=False) as wan22_ti2v5b_paths:
+                        wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/DiT-ti2v-5B-v1.safetensors")
+                    wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/VAE-v1.pth")
+                    wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                    wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
         
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -9643,27 +9748,61 @@ with gr.Blocks(
     wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
 
+    def update_wan22_model_paths_visibility(task):
+        is_a14b = "A14B" in task
+        is_i2v_a14b = "i2v-A14B" in task
+        is_ti2v5b = "ti2v-5B" in task
+        
+        return (
+            gr.update(visible=is_a14b),      # A14B model paths group
+            gr.update(visible=is_ti2v5b),    # ti2v-5B model path group
+            gr.update(visible=is_i2v_a14b)   # CLIP path textbox inside A14B group
+        )
+
+    wan22_task.change(
+        fn=update_wan22_model_paths_visibility,
+        inputs=[wan22_task],
+        outputs=[wan22_a14b_paths, wan22_ti2v5b_paths, wan22_clip_path]
+    )
+
     wan22_generate_btn.click(
         fn=wan22_batch_handler,
         inputs=[
             wan22_prompt,
+            wan22_negative_prompt,
             wan22_input_image,
             wan22_task,
             wan22_size,
             wan22_frame_num,
-            wan22_ckpt_dir,
-            wan22_offload_model,
-            wan22_t5_cpu,
-            wan22_convert_model_dtype,
+            wan22_fps,
             wan22_seed,
             wan22_sample_solver,
             wan22_sample_steps,
-            wan22_sample_shift,
+            wan22_flow_shift,
             wan22_sample_guide_scale,
             wan22_batch_size,
             wan22_save_path,
+            # Performance & Model Paths
+            wan22_attn_mode,
+            wan22_block_swap,
+            wan22_fp8,
+            wan22_fp8_scaled,
+            wan22_fp8_t5,
+            wan22_dit_low_noise_path,
+            wan22_dit_high_noise_path,
+            wan22_clip_path,
+            wan22_dit_path,
+            wan22_vae_path,
+            wan22_t5_path,
+            # LoRAs
+            wan22_lora_folder,
+            *wan22_lora_weights,
+            *wan22_lora_multipliers,
+            # Previews
+            wan22_enable_preview,
+            wan22_preview_steps,
         ],
-        outputs=[wan22_output, gr.Video(visible=False), wan22_batch_progress, wan22_progress_text], # Pass a dummy video output for the preview slot
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
     )
 
@@ -9672,37 +9811,15 @@ with gr.Blocks(
 
     wan22_output.select(fn=handle_wan22_gallery_select, outputs=wan22_selected_index)
 
-    def parse_wh_from_size_str(size_str: str) -> Tuple[int, int]:
-        try:
-            w, h = map(int, size_str.split('*'))
-            return w, h
-        except:
-            return 832, 480 # Fallback
-
-    def prepare_and_send_to_wanx_v2v(gallery, prompt, selected_idx, size, frame_num, steps, seed, shift, scale):
-        w, h = parse_wh_from_size_str(size)
-        # Now call the actual send function with parsed values
-        return send_wanx_v2v_to_hunyuan_v2v(
-            gallery=gallery, prompt=prompt, selected_index=selected_idx,
-            width=w, height=h, video_length=frame_num, fps=16, # fps is fixed for wan2.2
-            infer_steps=steps, seed=seed, flow_shift=shift, guidance_scale=scale,
-            negative_prompt=""
-        )
-
-    wan22_send_to_wanx_v2v_btn.click(
-        fn=prepare_and_send_to_wanx_v2v,
-        inputs=[
-            wan22_output, wan22_prompt, wan22_selected_index,
-            wan22_size, wan22_frame_num, wan22_sample_steps, wan22_seed,
-            wan22_sample_shift, wan22_sample_guide_scale
-        ],
-        outputs=[
-            wanx_v2v_input, wanx_v2v_prompt, wanx_v2v_width, wanx_v2v_height,
-            wanx_v2v_video_length, wanx_v2v_fps, wanx_v2v_infer_steps,
-            wanx_v2v_seed, wanx_v2v_flow_shift, wanx_v2v_guidance_scale,
-            wanx_v2v_negative_prompt
-        ]
-    ).then(fn=change_to_wanx_v2v_tab, inputs=None, outputs=[tabs])
+    wan22_lora_refresh_outputs_list = []
+    for i in range(len(wan22_lora_weights)):
+        wan22_lora_refresh_outputs_list.extend([wan22_lora_weights[i], wan22_lora_multipliers[i]])
+    
+    wan22_lora_refresh_btn.click(
+        fn=refresh_lora_dropdowns_simple,
+        inputs=[wan22_lora_folder],
+        outputs=wan22_lora_refresh_outputs_list
+    )
 
     #Video Info
     def clean_video_path(video_path) -> str:
