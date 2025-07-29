@@ -6791,7 +6791,7 @@ with gr.Blocks(
                     )
                     wan22_size = gr.Dropdown(
                         label="Size (Resolution)", 
-                        choices=["1280*720", "720*1280", "1024*576", "576*1024", "832*480", "480*832"], 
+                        choices=["1280*720", "720*1280", "1024*576", "576*1024", "832*480", "480*832", "704*1280", "1280*704"], 
                         value="832*480"
                     )
                     wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
