@@ -18,6 +18,7 @@ from PIL import Image
 import cv2 # Added for V2V video loading/resizing
 import numpy as np # Added for V2V video processing
 import torchvision.transforms.functional as TF
+import torchvision
 from tqdm import tqdm
 
 from networks import lora_wan
