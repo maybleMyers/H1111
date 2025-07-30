@@ -46,6 +46,7 @@ import av
 import cv2
 import glob
 from PIL import Image
+from einops import rearrange
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
