@@ -140,6 +140,7 @@ def hv_load_video(video_path, start_frame, end_frame, bucket_reso):
     return video
 
 def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, fps=24):
+    from einops import rearrange  # Local import to avoid scope issues
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
     for x in videos:
@@ -179,6 +180,7 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
     container.close()
 
 def save_images_grid(videos: torch.Tensor, parent_dir: str, image_name: str, rescale: bool = False, n_rows: int = 1, save_individually=True):
+    from einops import rearrange  # Local import to avoid scope issues
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
     for x in videos:
