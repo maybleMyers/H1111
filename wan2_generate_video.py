@@ -41,8 +41,164 @@ except:
 
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
-# Original load_video/load_images are still needed for Fun-Control / image loading
-from hv_generate_video import save_images_grid, save_videos_grid, synchronize_device, load_images as hv_load_images, load_video as hv_load_video
+# Local implementations to avoid xformers/flash-attention dependency
+import av
+import cv2
+import glob
+from PIL import Image
+
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
+
+def synchronize_device(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "xpu":
+        torch.xpu.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+def glob_images(directory, base="*"):
+    img_paths = []
+    for ext in IMAGE_EXTENSIONS:
+        if base == "*":
+            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    img_paths = list(set(img_paths))  # remove duplicates
+    img_paths.sort()
+    return img_paths
+
+def resize_image_to_bucket(image, bucket_reso):
+    is_pil_image = isinstance(image, Image.Image)
+    if is_pil_image:
+        image_width, image_height = image.size
+    else:
+        image_height, image_width = image.shape[:2]
+
+    if bucket_reso == (image_width, image_height):
+        return np.array(image) if is_pil_image else image
+
+    bucket_width, bucket_height = bucket_reso
+    if bucket_width == image_width or bucket_height == image_height:
+        image = np.array(image) if is_pil_image else image
+    else:
+        # resize the image to the bucket resolution to match the short side
+        scale_width = bucket_width / image_width
+        scale_height = bucket_height / image_height
+        scale = max(scale_width, scale_height)
+        image_width = int(image_width * scale + 0.5)
+        image_height = int(image_height * scale + 0.5)
+
+        if scale > 1:
+            image = Image.fromarray(image) if not is_pil_image else image
+            image = image.resize((image_width, image_height), Image.LANCZOS)
+            image = np.array(image)
+        else:
+            image = np.array(image) if is_pil_image else image
+            image = cv2.resize(image, (image_width, image_height), interpolation=cv2.INTER_AREA)
+
+    # crop the image to the bucket resolution
+    crop_left = (image_width - bucket_width) // 2
+    crop_top = (image_height - bucket_height) // 2
+    image = image[crop_top : crop_top + bucket_height, crop_left : crop_left + bucket_width]
+    return image
+
+def hv_load_images(image_dir, video_length, bucket_reso):
+    image_files = glob_images(image_dir)
+    if len(image_files) == 0:
+        raise ValueError(f"No image files found in {image_dir}")
+    if len(image_files) < video_length:
+        raise ValueError(f"Number of images in {image_dir} is less than {video_length}")
+
+    image_files.sort()
+    images = []
+    for image_file in image_files[:video_length]:
+        image = Image.open(image_file)
+        image = resize_image_to_bucket(image, bucket_reso)  # returns a numpy array
+        images.append(image)
+
+    return images
+
+def hv_load_video(video_path, start_frame, end_frame, bucket_reso):
+    container = av.open(video_path)
+    video = []
+    for i, frame in enumerate(container.decode(video=0)):
+        if start_frame is not None and i < start_frame:
+            continue
+        if end_frame is not None and i >= end_frame:
+            break
+        frame = frame.to_image()
+
+        if bucket_reso is not None:
+            frame = resize_image_to_bucket(frame, bucket_reso)
+        else:
+            frame = np.array(frame)
+
+        video.append(frame)
+    container.close()
+    return video
+
+def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, fps=24):
+    videos = rearrange(videos, "b c t h w -> t b c h w")
+    outputs = []
+    for x in videos:
+        x = torchvision.utils.make_grid(x, nrow=n_rows)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        if rescale:
+            x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        x = torch.clamp(x, 0, 1)
+        x = (x * 255).numpy().astype(np.uint8)
+        outputs.append(x)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    height, width, _ = outputs[0].shape
+
+    # create output container
+    container = av.open(path, mode="w")
+
+    # create video stream
+    codec = "libx264"
+    pixel_format = "yuv420p"
+    stream = container.add_stream(codec, rate=fps)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = pixel_format
+    stream.bit_rate = 4000000  # 4Mbit/s
+
+    for frame_array in outputs:
+        frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+        packets = stream.encode(frame)
+        for packet in packets:
+            container.mux(packet)
+
+    for packet in stream.encode():
+        container.mux(packet)
+
+    container.close()
+
+def save_images_grid(videos: torch.Tensor, parent_dir: str, image_name: str, rescale: bool = False, n_rows: int = 1, save_individually=True):
+    videos = rearrange(videos, "b c t h w -> t b c h w")
+    outputs = []
+    for x in videos:
+        x = torchvision.utils.make_grid(x, nrow=n_rows)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        if rescale:
+            x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        x = torch.clamp(x, 0, 1)
+        x = (x * 255).numpy().astype(np.uint8)
+        outputs.append(x)
+
+    if save_individually:
+        output_dir = os.path.join(parent_dir, image_name)
+    else:
+        output_dir = parent_dir
+
+    os.makedirs(output_dir, exist_ok=True)
+    for i, x in enumerate(outputs):
+        image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png")
+        image = Image.fromarray(x)
+        image.save(image_path)
 
 import logging
 
