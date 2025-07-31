@@ -9,6 +9,9 @@ import math
 from typing import Tuple, Optional, List, Union, Any
 from pathlib import Path # Added for glob_images in V2V
 
+# Set PyTorch CUDA allocator to reduce memory fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import accelerate
 from accelerate import Accelerator
@@ -2751,6 +2754,10 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             # Clean up temporary directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+            
+            # Force cleanup of any lingering GPU memory
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         
         # Load the input image
         from PIL import Image
@@ -2797,6 +2804,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 final_latent = result_latent.unsqueeze(0)
         else:
             final_latent = None
+            
+        # Store a flag that we already have a VAE loaded
+        args._vae_already_loaded = True
             
         logger.info("TI2V generation complete using official implementation (latent output)")
         return final_latent
@@ -3063,6 +3073,11 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
 
     # Move VAE back to CPU/cache
     vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+    
+    # Explicit cleanup to prevent memory fragmentation
+    del latent_decode
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     clean_memory_on_device(device)
 
     logger.info(f"Decoded video shape: {videos.shape}")
