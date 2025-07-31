@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+7/31/2025  
+    I have added support for the wan 2.2 i2v 14b and 5b models on the wan2.2b branch. 24GB gpu needed as of now for vae things. Download the appropriate models from https://huggingface.co/maybleMyers/wan_files_for_h1111/  . Use the 2.1 vae for 14b and the 2.2 vae for 5b.  
 7/27/2025  
     Make multitalk memory management better, it was oom'ing on longer gens but should be stable now.  
 7/26/2025  
@@ -9,8 +11,6 @@
     Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
 7/7/2025  
     Support FusioniX lora from vrgamedevgirl with multitalk.  
-7/2/2025  
-    Add previews to multitalk model, some bug fixes, change layout.  
 
 # H1111
 
@@ -198,6 +198,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+7/31/2025  
+    I have added support for the wan 2.2 i2v 14b and 5b models on the wan2.2b branch. 24GB gpu needed as of now for vae things. Download the appropriate models from https://huggingface.co/maybleMyers/wan_files_for_h1111/  . Use the 2.1 vae for 14b and the 2.2 vae for 5b. The easiest way to switch branches is to git pull then git switch wan2.2b  
 7/27/2025  
     Make multitalk memory management better, it was oom'ing on longer gens but should be stable now.  
 7/26/2025  
