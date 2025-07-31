@@ -1049,3 +1049,17 @@ class Wan2_2_VAE:
         except TypeError as e:
             logging.info(e)
             return None
+
+    def to_device(self, device):
+        """Compatibility method for WanVAE interface"""
+        self.device = device
+        self.model.to(device)
+        self.scale[0] = self.scale[0].to(device)  # mean
+        self.scale[1] = self.scale[1].to(device)  # 1/std
+
+    def to_dtype(self, dtype):
+        """Compatibility method for WanVAE interface"""
+        self.dtype = dtype
+        self.model.to(dtype=dtype)
+        self.scale[0] = self.scale[0].to(dtype)  # mean
+        self.scale[1] = self.scale[1].to(dtype)  # 1/std

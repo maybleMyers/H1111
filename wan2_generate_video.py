@@ -27,6 +27,7 @@ from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
+from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -835,8 +836,8 @@ def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config)
 
 
 # Modified function (replace the original)
-def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torch.dtype) -> WanVAE:
-    """load VAE model with robust path handling
+def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torch.dtype):
+    """load VAE model with robust path handling and automatic model selection
 
     Args:
         args: command line arguments
@@ -845,10 +846,9 @@ def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torc
         dtype: data type for the model
 
     Returns:
-        WanVAE: loaded VAE model
+        WanVAE or Wan2_2_VAE: loaded VAE model
     """
     vae_override_path = args.vae
-    vae_filename = config.vae_checkpoint # Get expected filename, e.g., "Wan2.1_VAE.pth"
     # Assume models are in 'wan' dir relative to script if not otherwise specified
     vae_base_dir = "wan"
 
@@ -861,12 +861,26 @@ def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torc
         final_vae_path = vae_override_path
         logger.info(f"Using VAE override path from --vae: {final_vae_path}")
 
-    # 2. If override is invalid or not provided, construct default path
+    # 2. If override is invalid or not provided, select VAE based on task type
     if final_vae_path is None:
+        # Select correct VAE based on model type
+        if args.task == "ti2v-5B":
+            # 5B model uses the new Wan2.2_VAE.pth
+            vae_filename = "Wan2.2_VAE.pth"
+            logger.info(f"Detected ti2v-5B task, using new VAE: {vae_filename}")
+        elif args.task in ["i2v-A14B", "t2v-A14B"]:
+            # 14B models use the older Wan2.1_VAE.pth
+            vae_filename = "Wan2.1_VAE.pth"
+            logger.info(f"Detected 14B task ({args.task}), using older VAE: {vae_filename}")
+        else:
+            # Fallback to config default for other tasks
+            vae_filename = config.vae_checkpoint
+            logger.info(f"Using config default VAE for task {args.task}: {vae_filename}")
+
         constructed_path = os.path.join(vae_base_dir, vae_filename)
         if os.path.isfile(constructed_path):
             final_vae_path = constructed_path
-            logger.info(f"Constructed default VAE path: {final_vae_path}")
+            logger.info(f"Constructed VAE path: {final_vae_path}")
             if vae_override_path:
                  logger.warning(f"Ignoring potentially invalid --vae argument: {vae_override_path}")
         else:
@@ -885,7 +899,17 @@ def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torc
     # At this point, final_vae_path should be valid
     logger.info(f"Loading VAE model from final path: {final_vae_path}")
     cache_device = torch.device("cpu") if args.vae_cache_cpu else None
-    vae = WanVAE(vae_path=final_vae_path, device=device, dtype=dtype, cache_device=cache_device)
+    
+    # Use different VAE classes based on task type
+    if args.task == "ti2v-5B":
+        # Use the new Wan2_2_VAE for 5B model
+        logger.info(f"Using Wan2_2_VAE for ti2v-5B model")
+        vae = Wan2_2_VAE(vae_pth=final_vae_path, device=device, dtype=dtype)
+    else:
+        # Use the original WanVAE for 14B models
+        logger.info(f"Using WanVAE for {args.task} model")
+        vae = WanVAE(vae_path=final_vae_path, device=device, dtype=dtype, cache_device=cache_device)
+    
     return vae
 
 
@@ -1627,12 +1651,14 @@ def prepare_ti2v_inputs(
     # Resize image to match video dimensions
     image = image.resize((width, height), Image.LANCZOS)
     
-    # Convert to tensor and normalize to [0, 1]
-    image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+    # Calculate latent dimensions following VAE strides (needed for expansion)
+    lat_f = (frames - 1) // config.vae_stride[0] + 1
+    lat_h = height // config.vae_stride[1] 
+    lat_w = width // config.vae_stride[2]
     
-    # Convert to VAE input format: [0, 1] -> [-1, 1]
-    image_tensor = image_tensor * 2.0 - 1.0
-    image_tensor = image_tensor.to(device, dtype=vae.dtype)
+    # Convert to tensor and normalize to [0, 1]
+    # Follow official implementation format: [3, 1, H, W]
+    image_tensor = TF.to_tensor(image).sub_(0.5).div_(0.5).to(device, dtype=vae.dtype).unsqueeze(1)  # [3, 1, H, W]
     
     # Encode image to latent space
     logger.info("Encoding input image to latent space...")
@@ -1640,15 +1666,26 @@ def prepare_ti2v_inputs(
         # Ensure VAE is on correct device
         vae.to_device(device)
         
-        # Encode image
-        image_latent = vae.encode(image_tensor).latent_dist.sample()  # [1, C, H', W']
-        
-        # Scale by VAE scaling factor
-        image_latent = image_latent * vae.config.scaling_factor
-        
-        # Expand to video dimensions by repeating first frame
-        # ti2v-5B expects image conditioning at the start
-        image_latent = image_latent.unsqueeze(2).expand(-1, -1, frames, -1, -1)  # [1, C, F, H', W']
+        # Encode image - handle different VAE types
+        if hasattr(vae, 'model') and hasattr(vae, 'scale'):
+            # Wan2_2_VAE type - expects list input with frame dimension [C, F, H, W]
+            # image_tensor is already [3, 1, H, W] from official format
+            encoded_latents = vae.encode([image_tensor])  # Returns list of encoded latents
+            image_latent = encoded_latents[0]  # Get the first (and only) latent [C, 1, H', W']
+            
+            # CRITICAL: Expand the single image frame to all temporal positions to match noise
+            # This matches the official implementation where z[0] has same temporal dims as noise
+            image_latent = image_latent.expand(-1, lat_f, -1, -1)  # [C, F, H', W'] - expand to all frames
+            
+        else:
+            # Original WanVAE type - expects tensor input
+            image_latent = vae.encode(image_tensor).latent_dist.sample()  # [1, C, H', W']
+            # Scale by VAE scaling factor
+            image_latent = image_latent * vae.config.scaling_factor
+            
+            # For TI2V, we need to expand the single image frame to all temporal positions
+            # This matches the official implementation where z[0] has full temporal dimensions
+            image_latent = image_latent.expand(-1, lat_f, -1, -1)  # [C, F, H', W'] - expand to all frames
         
     logger.info(f"Image latent shape: {image_latent.shape}")
     
@@ -1660,35 +1697,48 @@ def prepare_ti2v_inputs(
     # Prepare text context
     t5 = load_text_encoder(args, config, device)
     
-    # Encode positive prompt
-    context = t5.encode([args.prompt])[0]  # [1, seq_len, dim]
+    # Encode positive prompt - follow official API
+    context = t5([args.prompt], device)[0]  # [1, seq_len, dim]
     
     # Encode negative prompt (use default if not specified)
     negative_prompt = args.negative_prompt if args.negative_prompt else ""
-    context_null = t5.encode([negative_prompt])[0]  # [1, seq_len, dim]
+    context_null = t5([negative_prompt], device)[0]  # [1, seq_len, dim]
     
-    # Move T5 to CPU for memory management
-    t5.to_device("cpu") 
+    # Move T5 to CPU for memory management - follow official pattern
+    t5.model.cpu()
     clean_memory_on_device(device)
     
-    # Generate noise matching the latent dimensions
-    latent_size, frames_latent = calculate_dimensions(args.video_size, frames, config)
+    # Generate noise matching the latent dimensions - follow official pattern
+    # Create noise tensor [z_dim, F, H, W] - 4D like official implementation  
+    # For ti2v-5B: z_dim=48 (VAE latent channels)
+    vae_z_dim = 48 if args.task == "ti2v-5B" else 16  # 48 for 5B, 16 for others
     noise = torch.randn(
-        1, config.in_channels, frames_latent, latent_size[2], latent_size[3],
-        device=device, dtype=accelerator.mixed_precision_dtype,
+        vae_z_dim, lat_f, lat_h, lat_w,
+        device=device if not args.cpu_noise else "cpu", dtype=torch.float32,
         generator=torch.Generator(device=device if not args.cpu_noise else "cpu").manual_seed(args.seed)
     )
     
-    # Prepare inputs dict for ti2v model
-    inputs = {
-        "image_latent": image_latent,  # Image conditioning
-        "size_cond": torch.tensor([height, width], dtype=torch.float32, device=device).unsqueeze(0),
-        "max_area": torch.tensor([height * width], dtype=torch.float32, device=device).unsqueeze(0)
+    # Calculate sequence length for model
+    seq_len = lat_f * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    
+    # Prepare arguments for ti2v model following standard format (no image_latent param)
+    arg_c = {
+        "context": [context],
+        "seq_len": seq_len
+    }
+    
+    arg_null = {
+        "context": [context_null], 
+        "seq_len": seq_len
     }
     
     logger.info(f"TI2V inputs prepared: noise {noise.shape}, context {context.shape}, image_latent {image_latent.shape}")
     
-    return noise, context, context_null, inputs
+    # Store image_latent in arg_c and arg_null for access during sampling (not as model param)
+    arg_c["_image_latent"] = image_latent  # Store for later use, not passed to model
+    arg_null["_image_latent"] = image_latent
+    
+    return noise, context, context_null, (arg_c, arg_null)
 
 
 # --- V2V Helper Functions ---
@@ -2012,6 +2062,7 @@ def run_sampling(
     device: torch.device,
     seed_g: torch.Generator,
     accelerator: Accelerator,
+    is_ti2v: bool = False, # Flag for TI2V (Text+Image-to-Video) mode
     model_high: Optional[WanModel] = None, # High noise model for dual-dit architectures
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
@@ -2113,7 +2164,31 @@ def run_sampling(
             # Handle unexpected shape
             raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
 
-        timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
+        # Prepare timestep - use official TI2V timestep processing if applicable
+        if is_ti2v and "_ti2v_mask2" in inputs[0]:
+            # Official TI2V timestep processing with mask-based spatial-temporal modulation
+            # This is critical for proper image conditioning
+            timestep_base = torch.stack([t]).to(device)
+            
+            # Get sequence length from args
+            seq_len = inputs[0]["seq_len"]
+            
+            # Use stored masks from official implementation
+            ti2v_mask2 = inputs[0]["_ti2v_mask2"]
+            
+            # Official timestep processing: temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+            # mask2[0] is the first tensor in the mask list, [0] is the first channel
+            temp_ts = (ti2v_mask2[0][0][:, ::2, ::2] * timestep_base).flatten()
+            temp_ts = torch.cat([
+                temp_ts,
+                temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep_base
+            ])
+            # TEMPORARY: Use standard timestep while we debug the expanded timestep issue
+            # TODO: Fix the tensor dimension mismatch when using expanded timesteps
+            timestep = timestep_base  # Keep original timestep [1] for now
+        else:
+            # Standard timestep for T2V, I2V, V2V
+            timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
         with accelerator.autocast(), torch.no_grad():
             # --- Select appropriate model for dual-dit architectures ---
@@ -2132,8 +2207,10 @@ def run_sampling(
                     # logger.debug(f"Step {i}: Using low noise model (t={t.item():.0f} < {boundary:.0f})")
             
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
-            # 1. Predict conditional noise estimate
-            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **arg_c)[0]
+            # 1. Predict conditional noise estimate  
+            # Filter out non-model parameters before passing to model
+            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
@@ -2142,20 +2219,21 @@ def run_sampling(
             if apply_cfg:
                 apply_slg_step = apply_slg_global and (i >= slg_start_step and i < slg_end_step)
                 slg_indices_for_call = args.slg_layers if apply_slg_step else None
-                uncond_input_args = arg_null
+                # Filter out non-model parameters for uncond args too
+                model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
 
                 if apply_slg_step and args.slg_mode == "original":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
-                    skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                    skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                 elif apply_slg_step and args.slg_mode == "uncond":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 else: # Regular CFG
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **uncond_input_args)[0].to(latent_storage_device)
+                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
                     noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
@@ -2183,6 +2261,16 @@ def run_sampling(
 
             # 4. Update latent state (move back to storage device)
             latent = prev_latent.to(latent_storage_device)
+            
+            # 5. Apply image conditioning for TI2V (if image_latent is available)
+            # CRITICAL: This must happen after EVERY timestep, not just once - following official implementation
+            if "_image_latent" in arg_c and "_ti2v_mask2" in arg_c:
+                image_latent = arg_c["_image_latent"].to(latent_storage_device)
+                ti2v_mask2 = arg_c["_ti2v_mask2"]
+                
+                # Apply mask-based conditioning using stored masks: latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                # This matches the official implementation exactly
+                latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -2321,18 +2409,404 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # 3. Prepare V2V inputs (noise matching latent shape, context, etc.)
         noise, context, context_null, inputs = prepare_v2v_inputs(args, cfg, accelerator, device, video_latents)
 
+    elif is_ti2v:
+        # TI2V path - use official WanTI2V implementation  
+        logger.info("Using official WanTI2V implementation for ti2v-5B")
+        
+        # Import the official TI2V class
+        from Wan2_2.wan.textimage2video import WanTI2V
+        from Wan2_2.wan.configs.wan_ti2v_5B import ti2v_5B
+        
+        # The official implementation expects a diffusers checkpoint directory
+        # We need to create a temporary directory structure that matches what it expects
+        import os
+        import tempfile
+        import shutil
+        from safetensors.torch import save_file
+        
+        # Create temporary directory with expected structure
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Load our single safetensor file
+            from safetensors.torch import load_file
+            state_dict = load_file(args.dit)
+            
+            # Create the expected checkpoint structure 
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Save the model file
+            save_file(state_dict, os.path.join(temp_dir, "diffusion_pytorch_model.safetensors"))
+            
+            # Create config.json with full model configuration matching WanModel
+            import json
+            config_dict = {
+                "_class_name": "WanModel",
+                "_diffusers_version": "0.21.0",
+                "model_type": "ti2v",
+                "patch_size": [1, 2, 2],
+                "text_len": 512,
+                "in_dim": 48,
+                "dim": 3072,
+                "ffn_dim": 14336,
+                "freq_dim": 256,
+                "text_dim": 4096,
+                "out_dim": 48,
+                "num_heads": 24,
+                "num_layers": 30,
+                "window_size": [-1, -1],
+                "qk_norm": True,
+                "cross_attn_norm": True,
+                "eps": 1e-6
+            }
+            with open(os.path.join(temp_dir, "config.json"), "w") as f:
+                json.dump(config_dict, f, indent=2)
+            
+            # Copy VAE and T5 files to temp directory
+            import shutil
+            vae_filename = os.path.basename(args.vae)
+            t5_filename = os.path.basename(args.t5)
+            
+            shutil.copy2(args.vae, os.path.join(temp_dir, vae_filename))
+            shutil.copy2(args.t5, os.path.join(temp_dir, t5_filename))
+            
+            # Update the config to use relative paths within temp directory
+            from easydict import EasyDict
+            ti2v_5B_config = EasyDict(ti2v_5B)
+            ti2v_5B_config.vae_checkpoint = vae_filename
+            ti2v_5B_config.t5_checkpoint = t5_filename 
+            
+            # Create a custom WanTI2V instance that handles tokenizer path correctly
+            class CustomWanTI2V(WanTI2V):
+                def __init__(self, config, checkpoint_dir, **kwargs):
+                    # Override just the T5 initialization to handle tokenizer path correctly
+                    from functools import partial
+                    from Wan2_2.wan.distributed.fsdp import shard_model
+                    from Wan2_2.wan.modules.t5 import T5EncoderModel
+                    from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
+                    from Wan2_2.wan.modules.model import WanModel
+                    
+                    # Initialize base attributes
+                    self.device = torch.device(f"cuda:{kwargs.get('device_id', 0)}")
+                    self.config = config
+                    self.rank = kwargs.get('rank', 0)
+                    self.t5_cpu = kwargs.get('t5_cpu', False)
+                    self.init_on_cpu = kwargs.get('init_on_cpu', True)
+                    
+                    self.num_train_timesteps = config.num_train_timesteps
+                    self.param_dtype = config.param_dtype
+                    
+                    if kwargs.get('t5_fsdp') or kwargs.get('dit_fsdp') or kwargs.get('use_sp'):
+                        self.init_on_cpu = False
+                    
+                    # Create text encoder with correct tokenizer path
+                    shard_fn = partial(shard_model, device_id=kwargs.get('device_id', 0))
+                    self.text_encoder = T5EncoderModel(
+                        text_len=config.text_len,
+                        dtype=config.t5_dtype,
+                        device=torch.device('cpu'),
+                        checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                        tokenizer_path="google/umt5-xxl",  # Use HF repo ID directly
+                        shard_fn=shard_fn if kwargs.get('t5_fsdp') else None)
+                    
+                    # Initialize VAE and model normally
+                    self.vae_stride = config.vae_stride
+                    self.patch_size = config.patch_size
+                    self.vae = Wan2_2_VAE(
+                        vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                        device=self.device)
+                    
+                    import logging
+                    logging.info(f"Creating WanModel from {checkpoint_dir}")
+                    self.model = WanModel.from_pretrained(checkpoint_dir)
+                    self.model = self._configure_model(
+                        model=self.model,
+                        use_sp=kwargs.get('use_sp', False),
+                        dit_fsdp=kwargs.get('dit_fsdp', False),
+                        shard_fn=shard_fn,
+                        convert_model_dtype=kwargs.get('convert_model_dtype', False))
+                    
+                    if kwargs.get('use_sp'):
+                        from Wan2_2.wan.distributed.util import get_world_size
+                        self.sp_size = get_world_size()
+                    else:
+                        self.sp_size = 1
+                    
+                    self.sample_neg_prompt = config.sample_neg_prompt
+                
+                def i2v(self, *args, **kwargs):
+                    # Call the original i2v method but with explicit model unloading before VAE decode
+                    import gc
+                    from tqdm import tqdm
+                    from contextlib import contextmanager
+                    import torch
+                    import random
+                    import sys
+                    import math
+                    from PIL import Image
+                    import torchvision.transforms.functional as TF
+                    from Wan2_2.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+                    from Wan2_2.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+                    from Wan2_2.wan.utils.utils import best_output_size, masks_like
+                    
+                    # Extract parameters
+                    input_prompt = args[0] if args else kwargs['input_prompt']
+                    img = args[1] if len(args) > 1 else kwargs['img']
+                    max_area = kwargs.get('max_area', 704 * 1280)
+                    frame_num = kwargs.get('frame_num', 121)
+                    shift = kwargs.get('shift', 5.0)
+                    sample_solver = kwargs.get('sample_solver', 'unipc')
+                    sampling_steps = kwargs.get('sampling_steps', 40)
+                    guide_scale = kwargs.get('guide_scale', 5.0)
+                    n_prompt = kwargs.get('n_prompt', "")
+                    seed = kwargs.get('seed', -1)
+                    offload_model = kwargs.get('offload_model', True)
+                    
+                    # Reproduce the original i2v logic but with better memory management
+                    # preprocess
+                    ih, iw = img.height, img.width
+                    dh, dw = self.patch_size[1] * self.vae_stride[1], self.patch_size[2] * self.vae_stride[2]
+                    ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+
+                    scale = max(ow / iw, oh / ih)
+                    img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
+
+                    # center-crop
+                    x1 = (img.width - ow) // 2
+                    y1 = (img.height - oh) // 2
+                    img = img.crop((x1, y1, x1 + ow, y1 + oh))
+                    assert img.width == ow and img.height == oh
+
+                    # to tensor
+                    img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
+
+                    F = frame_num
+                    seq_len = ((F - 1) // self.vae_stride[0] + 1) * (oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (self.patch_size[1] * self.patch_size[2])
+                    seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
+
+                    seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+                    seed_g = torch.Generator(device=self.device)
+                    seed_g.manual_seed(seed)
+                    noise = torch.randn(
+                        self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
+                        oh // self.vae_stride[1], ow // self.vae_stride[2],
+                        dtype=torch.float32, generator=seed_g, device=self.device)
+
+                    if n_prompt == "":
+                        n_prompt = self.sample_neg_prompt
+
+                    # preprocess
+                    if not self.t5_cpu:
+                        self.text_encoder.model.to(self.device)
+                        context = self.text_encoder([input_prompt], self.device)
+                        context_null = self.text_encoder([n_prompt], self.device)
+                        if offload_model:
+                            self.text_encoder.model.cpu()
+                    else:
+                        context = self.text_encoder([input_prompt], torch.device('cpu'))
+                        context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                        context = [t.to(self.device) for t in context]
+                        context_null = [t.to(self.device) for t in context_null]
+
+                    z = self.vae.encode([img])
+
+                    @contextmanager
+                    def noop_no_sync():
+                        yield
+
+                    no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+                    # evaluation mode
+                    with (
+                            torch.amp.autocast('cuda', dtype=self.param_dtype),
+                            torch.no_grad(),
+                            no_sync(),
+                    ):
+
+                        if sample_solver == 'unipc':
+                            sample_scheduler = FlowUniPCMultistepScheduler(
+                                num_train_timesteps=self.num_train_timesteps,
+                                shift=1,
+                                use_dynamic_shifting=False)
+                            sample_scheduler.set_timesteps(
+                                sampling_steps, device=self.device, shift=shift)
+                            timesteps = sample_scheduler.timesteps
+                        elif sample_solver == 'dpm++':
+                            sample_scheduler = FlowDPMSolverMultistepScheduler(
+                                num_train_timesteps=self.num_train_timesteps,
+                                shift=1,
+                                use_dynamic_shifting=False)
+                            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                            timesteps, _ = retrieve_timesteps(
+                                sample_scheduler,
+                                device=self.device,
+                                sigmas=sampling_sigmas)
+                        else:
+                            raise NotImplementedError("Unsupported solver.")
+
+                        # sample videos
+                        latent = noise
+                        mask1, mask2 = masks_like([noise], zero=True)
+                        latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+
+                        arg_c = {
+                            'context': [context[0]],
+                            'seq_len': seq_len,
+                        }
+
+                        arg_null = {
+                            'context': context_null,
+                            'seq_len': seq_len,
+                        }
+
+                        if offload_model or self.init_on_cpu:
+                            self.model.to(self.device)
+                            torch.cuda.empty_cache()
+
+                        for _, t in enumerate(tqdm(timesteps)):
+                            latent_model_input = [latent.to(self.device)]
+                            timestep = [t]
+
+                            timestep = torch.stack(timestep).to(self.device)
+
+                            temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                            temp_ts = torch.cat([
+                                temp_ts,
+                                temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                            ])
+                            timestep = temp_ts.unsqueeze(0)
+
+                            noise_pred_cond = self.model(
+                                latent_model_input, t=timestep, **arg_c)[0]
+                            if offload_model:
+                                torch.cuda.empty_cache()
+                            noise_pred_uncond = self.model(
+                                latent_model_input, t=timestep, **arg_null)[0]
+                            if offload_model:
+                                torch.cuda.empty_cache()
+                            noise_pred = noise_pred_uncond + guide_scale * (
+                                noise_pred_cond - noise_pred_uncond)
+
+                            temp_x0 = sample_scheduler.step(
+                                noise_pred.unsqueeze(0),
+                                t,
+                                latent.unsqueeze(0),
+                                return_dict=False,
+                                generator=seed_g)[0]
+                            latent = temp_x0.squeeze(0)
+                            latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+
+                            x0 = [latent]
+                            del latent_model_input, timestep
+
+                        # CRITICAL: Unload model BEFORE VAE decode to free GPU memory
+                        if offload_model:
+                            self.model.cpu()
+                            torch.cuda.synchronize()
+                        
+                        # Delete intermediate tensors
+                        del mask1, mask2, z, context, context_null, arg_c, arg_null
+                        del noise_pred_cond, noise_pred_uncond, noise_pred
+                        if 'temp_x0' in locals():
+                            del temp_x0
+                        
+                        # Force memory cleanup
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        
+                        # Additional memory cleanup
+                        import time
+                        time.sleep(0.5)  # Give GPU time to free memory
+                        torch.cuda.empty_cache()
+
+                        # Return latent instead of decoded video to avoid OOM
+                        # Let the main pipeline handle VAE decode with its own memory management
+                        if self.rank == 0:
+                            # Return the latent directly
+                            return x0  # Return list of latents
+
+                    del noise, latent
+                    del sample_scheduler
+                    if offload_model:
+                        gc.collect()
+                        torch.cuda.synchronize()
+                    
+                    return None
+            
+            # Create custom TI2V model instance that handles tokenizer path correctly
+            wan_ti2v = CustomWanTI2V(
+                config=ti2v_5B_config,
+                checkpoint_dir=temp_dir,  # Use our temporary directory
+                device_id=0,
+                rank=0,  
+                t5_fsdp=False,
+                dit_fsdp=False,
+                use_sp=False,
+                t5_cpu=False,
+                init_on_cpu=True,
+                convert_model_dtype=True,
+            )
+        finally:
+            # Clean up temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+        
+        # Load the input image
+        from PIL import Image
+        input_image = Image.open(args.image_path).convert('RGB')
+        
+        # Generate using official implementation but return latent instead of decoded video
+        # We need to modify generate to return latent to avoid VAE decode inside
+        result_latent = wan_ti2v.i2v(
+            input_prompt=args.prompt,
+            img=input_image,
+            max_area=args.video_size[0] * args.video_size[1],
+            frame_num=args.video_length,
+            shift=args.flow_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.infer_steps,
+            guide_scale=args.guidance_scale,
+            n_prompt=args.negative_prompt or "",
+            seed=args.seed,
+            offload_model=True
+        )
+        
+        # Explicitly unload all models to free GPU memory
+        import gc
+        if hasattr(wan_ti2v, 'model'):
+            wan_ti2v.model.cpu()
+            del wan_ti2v.model
+        if hasattr(wan_ti2v, 'text_encoder'):
+            wan_ti2v.text_encoder.model.cpu()
+            del wan_ti2v.text_encoder
+        if hasattr(wan_ti2v, 'vae'):
+            wan_ti2v.vae.model.cpu()
+            del wan_ti2v.vae
+        del wan_ti2v
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # The result_latent is the generated latent, not the decoded video
+        # We'll return it as is and let the main pipeline handle VAE decode
+        if result_latent is not None:
+            # Convert to expected format [1, C, F, H, W]
+            if isinstance(result_latent, list):
+                final_latent = result_latent[0].unsqueeze(0)
+            else:
+                final_latent = result_latent.unsqueeze(0)
+        else:
+            final_latent = None
+            
+        logger.info("TI2V generation complete using official implementation (latent output)")
+        return final_latent
+
     elif is_i2v:
         # I2V path (handles both standard and FunControl internally based on config)
         if args.video_length is None:
              raise ValueError("video_length must be specified for I2V mode.")
         noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_i2v_inputs moves VAE to CPU/cache after use
-
-    elif is_ti2v:
-        # TI2V path (Text+Image-to-Video for ti2v-5B model)
-        if args.video_length is None:
-             raise ValueError("video_length must be specified for TI2V mode.")
-        noise, context, context_null, inputs = prepare_ti2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_ti2v_inputs moves VAE to CPU/cache after use
 
     elif is_fun_control: # Pure FunControl T2V (no image input unless using start/end image)
@@ -2394,6 +2868,41 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # `latent` here is the initial state *before* the sampling loop starts
     latent = noise # Start with noise (already shaped correctly for T2V/I2V/V2V)
+    
+    # Create masks for TI2V before sampling loop (following official implementation)
+    ti2v_mask1, ti2v_mask2 = None, None
+    if is_ti2v and "_image_latent" in inputs[0]:
+        image_latent = inputs[0]["_image_latent"].to(latent.device)
+        
+        # Create masks following official implementation: masks_like([noise], zero=True)
+        # These masks are created once and reused throughout the sampling process
+        if latent.dim() == 4:  # [48, 21, 44, 80] format (no batch dim)
+            # Create mask list like official implementation
+            ti2v_mask1 = [torch.ones_like(latent)]
+            ti2v_mask2 = [torch.ones_like(latent)]
+            ti2v_mask2[0][:, 0, :, :] = 0  # First frame gets image conditioning
+            
+            # Apply initial mask-based conditioning: latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+            latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
+            
+        elif latent.dim() == 5:  # [1, 48, 21, 44, 80] format (with batch dim)
+            # Ensure image_latent has batch dimension
+            if image_latent.dim() == 4:
+                image_latent = image_latent.unsqueeze(0)
+            
+            # Create mask list like official implementation  
+            ti2v_mask1 = [torch.ones_like(latent)]
+            ti2v_mask2 = [torch.ones_like(latent)]
+            ti2v_mask2[0][:, :, 0, :, :] = 0  # First frame gets image conditioning
+            
+            # Apply initial mask-based conditioning
+            latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
+        
+        logger.info("Applied initial image conditioning for TI2V using mask-based blending")
+        
+        # Store masks in inputs for use during sampling
+        inputs[0]["_ti2v_mask1"] = ti2v_mask1
+        inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     # --- V2V Strength Adjustment ---
     if is_v2v and args.strength < 1.0:
@@ -2455,6 +2964,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         device,
         seed_g,
         accelerator,
+        is_ti2v=is_ti2v,  # Pass TI2V flag for special processing
         model_high=model_high if is_dual_dit else None,  # Pass high noise model for dual-dit
         previewer=previewer, # MODIFIED: Pass the previewer instance
         use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
@@ -2529,18 +3039,26 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure latent is on the correct device and expected dtype for VAE
     latent_decode = latent.to(device=device, dtype=vae.dtype)
 
-    # VAE decode expects list of [C, F, H, W] or a single [B, C, F, H, W]
-    # WanVAE wrapper seems to handle the list internally now? Check its decode method.
-    # Assuming it takes [B, C, F, H, W] directly or handles the list internally.
+    # Handle different VAE decode APIs
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
-        # WanVAE.decode returns a list of decoded videos [C, F, H, W]
-        decoded_list = vae.decode(latent_decode) # Pass the batch tensor
-        if decoded_list and len(decoded_list) > 0:
-             # Stack list back into batch dimension: B, C, F, H, W
-             videos = torch.stack(decoded_list, dim=0)
+        if hasattr(vae, 'model') and hasattr(vae, 'scale'):
+            # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
+            # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
+            latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
+            decoded_list = vae.decode(latent_list)
+            if decoded_list and len(decoded_list) > 0:
+                # Stack list back into batch dimension: [1, C, F, H, W]
+                videos = torch.stack(decoded_list, dim=0)
+            else:
+                raise RuntimeError("VAE decoding failed or returned empty list.")
         else:
-             raise RuntimeError("VAE decoding failed or returned empty list.")
+            # Original WanVAE type - handles tensor input directly
+            decoded_list = vae.decode(latent_decode)
+            if decoded_list and len(decoded_list) > 0:
+                videos = torch.stack(decoded_list, dim=0)
+            else:
+                raise RuntimeError("VAE decoding failed or returned empty list.")
 
 
     # Move VAE back to CPU/cache

@@ -30,10 +30,10 @@ ti2v_5B.window_size = (-1, -1)
 ti2v_5B.qk_norm = True
 ti2v_5B.cross_attn_norm = True
 ti2v_5B.eps = 1e-6
-ti2v_5B.in_channels = 16  # Standard latent channels for TI2V
-ti2v_5B.out_channels = 16  # Output latent channels
-ti2v_5B.in_dim = 16  # Same as in_channels for compatibility
-ti2v_5B.out_dim = 16  # Same as out_channels for compatibility
+ti2v_5B.in_channels = 48  # TI2V 5B model uses 48 input channels (VAE latent + image conditioning)
+ti2v_5B.out_channels = 48  # Output latent channels to match VAE expectations (head outputs 192 = 48*4)  
+ti2v_5B.in_dim = 48  # Same as in_channels for compatibility
+ti2v_5B.out_dim = 48  # Same as out_channels for compatibility
 
 # inference
 ti2v_5B.sample_fps = 24
