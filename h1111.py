@@ -76,9 +76,6 @@ def wan22_batch_handler(
     stop_event.clear()
 
     # --- Initial Checks ---
-    if "i2v" in task and (not image_path or not os.path.exists(image_path)):
-        yield [], [], "Error: Input Image not provided or not found for I2V task.", ""
-        return
     os.makedirs(save_path, exist_ok=True)
 
     all_generated_videos = []
@@ -6835,7 +6832,7 @@ with gr.Blocks(
                     wan22_negative_prompt = gr.Textbox(
                         scale=3,
                         label="Negative Prompt",
-                        value="low quality, blurry, watermark",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
                         lines=3,
                     )
                 with gr.Column(scale=1):
@@ -6918,7 +6915,7 @@ with gr.Blocks(
                         wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_fp16.safetensors")
                         wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
                     with gr.Group(visible=False) as wan22_ti2v5b_paths:
-                        wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/DiT-ti2v-5B-v1.safetensors")
+                        wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/Wan2.2-TI2V-5B_fp16.safetensors")
                     wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
                     wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                     wan22_save_path = gr.Textbox(label="Save Path", value="outputs")

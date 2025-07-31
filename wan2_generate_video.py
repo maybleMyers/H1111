@@ -812,7 +812,7 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int, Optional[int]]:
     return height, width, video_length
 
 
-def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config) -> Tuple[Tuple[int, int, int, int], int]:
+def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config, task: str = None) -> Tuple[Tuple[int, int, int, int], int]:
     """calculate dimensions for the generation
 
     Args:
@@ -834,8 +834,10 @@ def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config)
 
     # calculate sequence length
     seq_len = math.ceil((lat_h * lat_w) / (config.patch_size[1] * config.patch_size[2]) * lat_f)
-
-    return ((16, lat_f, lat_h, lat_w), seq_len)
+    
+    # Determine channels based on task
+    channels = 48 if task == "ti2v-5B" else 16
+    return ((channels, lat_f, lat_h, lat_w), seq_len)
 
 
 # Modified function (replace the original)
@@ -1199,8 +1201,8 @@ def prepare_t2v_inputs(
     # calculate dimensions and sequence length
     height, width = args.video_size
     frames = args.video_length # Should be set by now
-    (ch, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
-    target_shape = (ch, lat_f, lat_h, lat_w) # Should be (16, lat_f, lat_h, lat_w) for base latent
+    (ch, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config, args.task)
+    target_shape = (ch, lat_f, lat_h, lat_w) # Will be (48, lat_f, lat_h, lat_w) for ti2v-5B, (16, lat_f, lat_h, lat_w) for others
 
     # configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
@@ -1319,7 +1321,7 @@ def prepare_i2v_inputs(
         # Calculate dimensions (FunControl might use different aspect logic)
         height, width = args.video_size
         frames = args.video_length # Should be set by now
-        (_, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config)
+        (_, lat_f, lat_h, lat_w), seq_len = calculate_dimensions(args.video_size, args.video_length, config, args.task)
         pixel_height = lat_h * config.vae_stride[1]
         pixel_width = lat_w * config.vae_stride[2]
         noise_channels = 16 # FunControl DiT denoises 16 channels
@@ -2320,13 +2322,18 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     is_ti2v = args.image_path is not None and "ti2v" in args.task  # Text+Image-to-Video
     is_v2v = args.video_path is not None
     is_fun_control = args.control_path is not None and cfg.is_fun_control
+    # For ti2v-5B without image, treat as T2V mode (matches official implementation)
     is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
 
     if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_ti2v: logger.info(f"Running Text+Image-to-Video (TI2V) inference")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
-    else: logger.info(f"Running Text-to-Video (T2V) inference")
+    else: 
+        if args.task == "ti2v-5B" and args.image_path is None:
+            logger.info(f"Running Text-to-Video (T2V) inference for ti2v-5B (no image provided)")
+        else:
+            logger.info(f"Running Text-to-Video (T2V) inference")
 
     # --- Data Types ---
     # Default to fp16 for new Wan2.2 models, detect from checkpoint if available
@@ -2539,7 +2546,6 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 
                 def i2v(self, *args, **kwargs):
                     # Call the original i2v method but with explicit model unloading before VAE decode
-                    import gc
                     from tqdm import tqdm
                     from contextlib import contextmanager
                     import torch
@@ -2780,7 +2786,6 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         )
         
         # Explicitly unload all models to free GPU memory
-        import gc
         if hasattr(wan_ti2v, 'model'):
             wan_ti2v.model.cpu()
             del wan_ti2v.model
