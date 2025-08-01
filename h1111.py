@@ -75,6 +75,7 @@ def wan22_batch_handler(
     # ADD THIS NEW PARAMETER:
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
+    vae_fp32: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -146,6 +147,8 @@ def wan22_batch_handler(
             command.append("--dynamic_model_loading")
         if unload_text_encoders:
             command.append("--unload_text_encoders")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -6927,6 +6930,10 @@ with gr.Blocks(
                         label="Unload Text Encoders after use (T5/CLIP) to save RAM",
                         value=False,
                     )
+                    wan22_vae_fp32 = gr.Checkbox(
+                        label="Use FP32 VAE (higher quality, more VRAM)",
+                        value=False,
+                    )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
                         wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_fp16.safetensors")
@@ -9920,6 +9927,7 @@ with gr.Blocks(
             # ADD THIS:
             wan22_dynamic_model_loading,
             wan22_unload_text_encoders,
+            wan22_vae_fp32,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
