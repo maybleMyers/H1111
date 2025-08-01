@@ -232,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
+    parser.add_argument("--unload_text_encoders", action="store_true", help="unload T5 and CLIP models from RAM after encoding to save memory")
     parser.add_argument("--t5", type=str, default=None, help="text encoder (T5) checkpoint path")
     parser.add_argument("--clip", type=str, default=None, help="text encoder (CLIP) checkpoint path")
     # LoRA
@@ -1336,6 +1337,11 @@ def prepare_t2v_inputs(
     # free text encoder and clean memory
     del text_encoder
     clean_memory_on_device(device)
+    
+    if args.unload_text_encoders:
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded T5 model from memory")
 
     # Initialize 'y' (conditioning latent) to None
     y = None
@@ -1463,6 +1469,11 @@ def prepare_i2v_inputs(
                 context_null = text_encoder([n_prompt], device)
         del text_encoder
         clean_memory_on_device(device)
+        
+        if args.unload_text_encoders:
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Unloaded T5 model from memory")
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -1475,6 +1486,11 @@ def prepare_i2v_inputs(
             clip_context = clip.visual([img_tensor_clip.unsqueeze(1)]) # Add Frame dim
         del clip, img_clip, img_tensor_clip
         clean_memory_on_device(device)
+        
+        if args.unload_text_encoders:
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Unloaded CLIP model from memory")
 
         fun_ref_latent = None
         # Check if the task requires ref_conv and if a reference image is provided via --image_path
@@ -1624,6 +1640,11 @@ def prepare_i2v_inputs(
                 context_null = text_encoder([n_prompt], device)
         del text_encoder
         clean_memory_on_device(device)
+        
+        if args.unload_text_encoders:
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Unloaded T5 model from memory")
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -1637,6 +1658,11 @@ def prepare_i2v_inputs(
         logger.info(f"CLIP Encoding complete")
         del clip
         clean_memory_on_device(device)
+        
+        if args.unload_text_encoders:
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Unloaded CLIP model from memory")
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #4: VAE Encoding and 'y' construction ---
         logger.info(f"Encoding image(s) to latent space (Standard I2V method)")
@@ -1815,6 +1841,13 @@ def prepare_ti2v_inputs(
     # Move T5 to CPU for memory management - follow official pattern
     t5.model.cpu()
     clean_memory_on_device(device)
+    
+    if args.unload_text_encoders:
+        del t5.model
+        del t5
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded T5 model from memory")
     
     # Generate noise matching the latent dimensions - follow official pattern
     # Create noise tensor [z_dim, F, H, W] - 4D like official implementation  
@@ -2036,6 +2069,11 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     # Free text encoder and clean memory
     del text_encoder
     clean_memory_on_device(device)
+    
+    if args.unload_text_encoders:
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded T5 model from memory")
 
     # Generate noise with the same shape as video_latents (including batch dimension)
     noise = torch.randn(

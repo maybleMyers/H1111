@@ -74,6 +74,7 @@ def wan22_batch_handler(
     preview_steps: int,
     # ADD THIS NEW PARAMETER:
     dynamic_model_loading: bool,
+    unload_text_encoders: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -143,6 +144,8 @@ def wan22_batch_handler(
         # ADD THIS:
         if dynamic_model_loading and "A14B" in task:
             command.append("--dynamic_model_loading")
+        if unload_text_encoders:
+            command.append("--unload_text_encoders")
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -5920,7 +5923,7 @@ with gr.Blocks(
     fpe_selected_index = gr.State(value=None)
     phantom_selected_index = gr.State(value=None)
     multitalk_annotations_state = gr.State(value=None)
-    demo.load(None, None, None, js="""
+    demo.load(None, None, None, js=r"""
         () => {
             document.title = 'H1111';
 
@@ -6918,6 +6921,10 @@ with gr.Blocks(
                     wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
                     wan22_dynamic_model_loading = gr.Checkbox(
                         label="Dynamic Model Loading (A14B models only to lower RAM usages)", 
+                        value=False,
+                    )
+                    wan22_unload_text_encoders = gr.Checkbox(
+                        label="Unload Text Encoders after use (T5/CLIP) to save RAM",
                         value=False,
                     )
                 with gr.Row():
@@ -9912,6 +9919,7 @@ with gr.Blocks(
             wan22_preview_steps,
             # ADD THIS:
             wan22_dynamic_model_loading,
+            wan22_unload_text_encoders,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
