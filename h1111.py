@@ -72,6 +72,8 @@ def wan22_batch_handler(
     # Previews
     enable_preview: bool,
     preview_steps: int,
+    # ADD THIS NEW PARAMETER:
+    dynamic_model_loading: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -138,6 +140,9 @@ def wan22_batch_handler(
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
         if fp8_t5: command.append("--fp8_t5")
+        # ADD THIS:
+        if dynamic_model_loading and "A14B" in task:
+            command.append("--dynamic_model_loading")
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -6911,6 +6916,10 @@ with gr.Blocks(
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
                     wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                    wan22_dynamic_model_loading = gr.Checkbox(
+                        label="Dynamic Model Loading (A14B models only to lower RAM usages)", 
+                        value=False,
+                    )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
                         wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_fp16.safetensors")
@@ -9851,14 +9860,17 @@ with gr.Blocks(
             gr.update(visible=is_i2v_a14b),  # CLIP path textbox inside A14B group
             gr.update(value=dit_low_path),   # Low noise model path
             gr.update(value=dit_high_path),  # High noise model path
-            gr.update(value=boundary_value, visible=boundary_visible)  # Boundary slider
+            gr.update(value=boundary_value, visible=boundary_visible),  # Boundary slider
+            # ADD THIS:
+            gr.update(visible=is_a14b)  # Dynamic model loading checkbox
         )
 
     wan22_task.change(
         fn=update_wan22_model_paths_and_settings,
         inputs=[wan22_task],
         outputs=[wan22_a14b_paths, wan22_ti2v5b_paths, wan22_clip_path, 
-                wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_dual_dit_boundary]
+                wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_dual_dit_boundary,
+                wan22_dynamic_model_loading]  # ADD THIS
     )
 
     wan22_generate_btn.click(
@@ -9898,6 +9910,8 @@ with gr.Blocks(
             # Previews
             wan22_enable_preview,
             wan22_preview_steps,
+            # ADD THIS:
+            wan22_dynamic_model_loading,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
