@@ -228,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
     parser.add_argument("--dit_low_noise", type=str, default=None, help="DiT low noise checkpoint path (for dual-dit models)")
     parser.add_argument("--dit_high_noise", type=str, default=None, help="DiT high noise checkpoint path (for dual-dit models)")
+    parser.add_argument("--dual_dit_boundary", type=float, default=None, help="Override boundary for dual-dit models (0.0-1.0). Low noise model used above after threshold. Default: 0.875 for t2v-A14B, 0.900 for i2v-A14B")
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
@@ -781,6 +782,14 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
     # parse slg_layers
     if args.slg_layers is not None:
         args.slg_layers = list(map(int, args.slg_layers.split(",")))
+    
+    # Validate dual_dit_boundary
+    if args.dual_dit_boundary is not None:
+        if not (0.0 <= args.dual_dit_boundary <= 1.0):
+            raise ValueError(f"--dual_dit_boundary must be between 0.0 and 1.0, got {args.dual_dit_boundary}")
+        # Only applicable for dual-dit models
+        if "A14B" not in args.task:
+            logger.warning(f"--dual_dit_boundary specified but task '{args.task}' is not a dual-dit model. This setting will be ignored.")
 
     return args
 
@@ -2201,9 +2210,12 @@ def run_sampling(
             if model_high is not None:
                 # For dual-dit models, use high noise model for high timesteps (early in denoising)
                 # Use low noise model for low timesteps (later in denoising)
-                # Use config boundary (0.900 for i2v-A14B)
+                # Use custom boundary if provided, otherwise use config default
                 cfg = WAN_CONFIGS[args.task]
-                boundary = cfg.boundary * 1000  # 0.900 * 1000 = 900 timesteps
+                if args.dual_dit_boundary is not None:
+                    boundary = args.dual_dit_boundary * 1000  # Custom boundary
+                else:
+                    boundary = cfg.boundary * 1000  # Default: 0.875 * 1000 = 875 for t2v-A14B, 0.900 * 1000 = 900 for i2v-A14B
                 if t.item() >= boundary:
                     current_model = model_high
                     # logger.debug(f"Step {i}: Using high noise model (t={t.item():.0f} >= {boundary:.0f})")
@@ -2969,6 +2981,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
+    
+    # Log dual-dit boundary information if applicable
+    if is_dual_dit and model_high is not None:
+        if args.dual_dit_boundary is not None:
+            boundary_percent = args.dual_dit_boundary * 100
+            logger.info(f"Using custom dual-dit boundary: {boundary_percent:.1f}% (high noise model used above {args.dual_dit_boundary * 1000:.0f} timesteps)")
+        else:
+            default_boundary = cfg.boundary
+            boundary_percent = default_boundary * 100
+            logger.info(f"Using default dual-dit boundary: {boundary_percent:.1f}% (high noise model used above {default_boundary * 1000:.0f} timesteps)")
+    
     final_latent = run_sampling(
         model,
         latent, # Initial state (noise or mixed)

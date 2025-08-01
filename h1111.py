@@ -50,6 +50,7 @@ def wan22_batch_handler(
     sample_steps: int,
     flow_shift: float,
     sample_guide_scale: float,
+    dual_dit_boundary: float,
     batch_size: int,
     save_path: str,
     # Model Paths & Performance
@@ -109,6 +110,7 @@ def wan22_batch_handler(
             "--fps", str(fps),
             "--infer_steps", str(sample_steps),
             "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
             "--flow_shift", str(flow_shift),
             "--sample_solver", str(sample_solver),
             "--seed", str(current_seed),
@@ -6866,6 +6868,7 @@ with gr.Blocks(
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
                     wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                    wan22_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
                     wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -9745,21 +9748,48 @@ with gr.Blocks(
     wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
 
-    def update_wan22_model_paths_visibility(task):
+    def update_wan22_model_paths_and_settings(task):
         is_a14b = "A14B" in task
         is_i2v_a14b = "i2v-A14B" in task
+        is_t2v_a14b = "t2v-A14B" in task
         is_ti2v5b = "ti2v-5B" in task
+        
+        # Set model paths based on task
+        if is_t2v_a14b:
+            dit_low_path = "wan/wan22_t2v_14B_low_noise_fp16.safetensors"
+            dit_high_path = "wan/wan22_t2v_14B_high_noise_fp16.safetensors"
+            boundary_value = 0.875  # Default for t2v-A14B
+            boundary_visible = True
+        elif is_i2v_a14b:
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"
+            boundary_value = 0.900  # Default for i2v-A14B
+            boundary_visible = True
+        elif is_ti2v5b:
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"  # Keep current default
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"  # Keep current default
+            boundary_value = 0.875  # Default value
+            boundary_visible = False  # Hide for ti2v-5B as it's not dual-dit
+        else:
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"  # Keep current default
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"  # Keep current default
+            boundary_value = 0.875
+            boundary_visible = False
         
         return (
             gr.update(visible=is_a14b),      # A14B model paths group
             gr.update(visible=is_ti2v5b),    # ti2v-5B model path group
-            gr.update(visible=is_i2v_a14b)   # CLIP path textbox inside A14B group
+            gr.update(visible=is_i2v_a14b),  # CLIP path textbox inside A14B group
+            gr.update(value=dit_low_path),   # Low noise model path
+            gr.update(value=dit_high_path),  # High noise model path
+            gr.update(value=boundary_value, visible=boundary_visible)  # Boundary slider
         )
 
     wan22_task.change(
-        fn=update_wan22_model_paths_visibility,
+        fn=update_wan22_model_paths_and_settings,
         inputs=[wan22_task],
-        outputs=[wan22_a14b_paths, wan22_ti2v5b_paths, wan22_clip_path]
+        outputs=[wan22_a14b_paths, wan22_ti2v5b_paths, wan22_clip_path, 
+                wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_dual_dit_boundary]
     )
 
     wan22_generate_btn.click(
@@ -9777,6 +9807,7 @@ with gr.Blocks(
             wan22_sample_steps,
             wan22_flow_shift,
             wan22_sample_guide_scale,
+            wan22_dual_dit_boundary,
             wan22_batch_size,
             wan22_save_path,
             # Performance & Model Paths
