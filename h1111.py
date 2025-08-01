@@ -6497,8 +6497,7 @@ with gr.Blocks(
                 block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
 
         #Image to Video Tab
-        with gr.Tab(label="Hunyuan-i2v") as i2v_tab: # Keep tab name consistent if needed elsewhere
-            # ... (Keep existing Rows for prompt, batch size, progress) ...
+        with gr.Tab(label="Hunyuan-i2v", visible=False) as i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     i2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -6601,7 +6600,7 @@ with gr.Blocks(
                 i2v_vae_spatial_tile_min = gr.Number(label="VAE Spatial Tile Min Size", value=128, step=16, info="Set 0 to disable spatial tiling")
 
         # Video to Video Tab
-        with gr.Tab(id=2, label="Hunyuan v2v") as v2v_tab:
+        with gr.Tab(id=2, label="Hunyuan v2v", visible=False) as v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     v2v_prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
@@ -7427,7 +7426,7 @@ with gr.Blocks(
                     )
 
         #WanX-v2v Tab
-        with gr.Tab(id=6, label="WanX-v2v") as wanx_v2v_tab:
+        with gr.Tab(id=6, label="WanX-v2v", visible=False) as wanx_v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     wanx_v2v_prompt = gr.Textbox(
