@@ -7583,9 +7583,11 @@ with gr.Blocks(
                 send_to_multitalk_btn = gr.Button("Send to MultiTalk", variant="primary")
             with gr.Row():
                 send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
+                send_to_wan22_btn = gr.Button("Send to Wan2.2", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
+                
 
 
             with gr.Row():
@@ -8852,6 +8854,9 @@ with gr.Blocks(
 
     def change_to_wanx_t2v_tab():
         return gr.Tabs(selected=5)  # WanX-t2v tab index
+    
+    def change_to_wan22_tab():
+        return gr.Tabs(selected=12)  # Wan2.2 tab index
 
 
     send_to_wanx_i2v_btn.click(
@@ -8934,6 +8939,71 @@ with gr.Blocks(
     ).then(
         fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
     )
+    
+    # Wan2.2 send-to logic
+    send_to_wan22_btn.click(
+        fn=lambda m: ("Parameters ready for Wan2.2", m),
+        inputs=[metadata_output],
+        outputs=[status, params_state]
+    ).then(
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("negative_prompt", ""),
+            None,  # No image by default
+            params.get("task", "i2v-A14B"),
+            f"{params.get('width', 832)}*{params.get('height', 480)}",  # Size format
+            params.get("video_length", 81),
+            params.get("fps", 16),
+            params.get("seed", -1),
+            params.get("sample_solver", "unipc"),
+            params.get("infer_steps", 40),
+            params.get("flow_shift", 5.0),
+            params.get("guidance_scale", 3.5),
+            params.get("dual_dit_boundary", 0.875),
+            1,  # batch_size
+            "outputs",  # save_path
+            params.get("attn_mode", "sdpa"),
+            params.get("blocks_to_swap", 30),
+            False,  # fp8
+            False,  # fp8_scaled
+            False,  # fp8_t5
+            # Model paths - DO NOT transfer these, keep defaults
+            "wan/wan22_i2v_14B_low_noise_fp16.safetensors",  # dit_low_noise_path
+            "wan/wan22_i2v_14B_high_noise_fp16.safetensors",  # dit_high_noise_path
+            "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",  # clip_path
+            "wan/Wan2.2-TI2V-5B_fp16.safetensors",  # dit_path
+            "wan/Wan2.1_VAE.pth",  # vae_path - DO NOT transfer
+            "wan/models_t5_umt5-xxl-enc-bf16.pth",  # t5_path - DO NOT transfer
+            # LoRAs - transfer these
+            "lora",  # lora_folder
+            # Extract individual LoRA weights
+            params.get("lora_weights", ["None", "None", "None", "None"])[0] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 0 else "None",
+            params.get("lora_weights", ["None", "None", "None", "None"])[1] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 1 else "None",
+            params.get("lora_weights", ["None", "None", "None", "None"])[2] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 2 else "None",
+            params.get("lora_weights", ["None", "None", "None", "None"])[3] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 3 else "None",
+            # Extract individual LoRA multipliers
+            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[0] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 0 else 1.0,
+            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[1] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 1 else 1.0,
+            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[2] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 2 else 1.0,
+            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[3] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 3 else 1.0,
+            True,  # enable_preview
+            5  # preview_steps
+        ],
+        inputs=[params_state],
+        outputs=[
+            wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_size,
+            wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
+            wan22_flow_shift, wan22_sample_guide_scale, wan22_dual_dit_boundary, wan22_batch_size,
+            wan22_save_path, wan22_attn_mode, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
+            wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path,
+            wan22_vae_path, wan22_t5_path, wan22_lora_folder,
+            *wan22_lora_weights, *wan22_lora_multipliers,
+            wan22_enable_preview, wan22_preview_steps
+        ]
+    ).then(
+        fn=change_to_wan22_tab, inputs=None, outputs=[tabs]
+    )
+    
     # FramePack-Extension send-to logic
     def handle_send_to_fpe_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
         """Prepare parameters and video path for the FramePack-Extension tab."""
