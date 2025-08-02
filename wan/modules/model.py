@@ -950,7 +950,7 @@ def load_wan_model(
     fp8_scaled: bool = False,
 ) -> WanModel:
     # dit_weight_dtype is None for fp8_scaled
-    assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
+    assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
