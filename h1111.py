@@ -235,7 +235,7 @@ def wan22_batch_handler(
             params_for_meta = {
                 "model_type": "Wan2.2", "prompt": prompt, "negative_prompt": negative_prompt,
                 "image_path": os.path.basename(image_path) if image_path else None,
-                "task": task, "size": size, "frame_num": frame_num, "fps": fps,
+                "task": task, "size": size, "frame_num": frame_num, "fps": fps, "dual_dit_boundary": dual_dit_boundary,
                 "dit_low_noise": dit_low_noise_path, "dit_high_noise": dit_high_noise_path,
                 "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
