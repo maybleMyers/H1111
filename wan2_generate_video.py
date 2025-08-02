@@ -351,6 +351,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
+    parser.add_argument("--mixed_dtype", action="store_true", help="use model with mixed weight dtypes (preserves original dtypes, e.g. mixed fp16/fp32)")
     parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arithmetic (RTX 4XXX+), only for fp8_scaled")
     parser.add_argument("--fp8_t5", action="store_true", help="use fp8 for Text Encoder model")
     parser.add_argument(
@@ -404,6 +405,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--control_path is provided, but the selected task does not support Fun-Control.")
     if not (0.0 <= args.control_falloff_percentage <= 0.49):
         raise ValueError("--control_falloff_percentage must be between 0.0 and 0.49")
+    if args.mixed_dtype and args.fp8:
+        raise ValueError("--mixed_dtype and --fp8 cannot be used together")
+    if args.mixed_dtype and args.fp8_scaled:
+        raise ValueError("--mixed_dtype and --fp8_scaled cannot be used together")
+    if args.mixed_dtype and args.lora_weight:
+        logger.warning("--mixed_dtype with LoRA: LoRA weights will be merged at the model's original precision")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
          logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
     return args
@@ -1100,7 +1107,10 @@ def load_dit_model(
                 loading_device = device
 
             loading_weight_dtype = dit_weight_dtype
-            if args.fp8_scaled or args.lora_weight is not None:
+            if args.mixed_dtype:
+                # For mixed dtype, load weights as-is without conversion
+                loading_weight_dtype = None
+            elif args.fp8_scaled or args.lora_weight is not None:
                 loading_weight_dtype = dit_dtype
             
             model_low = load_wan_model(config, device, args.dit_low_noise, args.attn_mode, False, loading_device, loading_weight_dtype, False)
@@ -1120,7 +1130,10 @@ def load_dit_model(
         loading_device = device
 
     loading_weight_dtype = dit_weight_dtype
-    if args.fp8_scaled or args.lora_weight is not None:
+    if args.mixed_dtype:
+        # For mixed dtype, load weights as-is without conversion
+        loading_weight_dtype = None
+    elif args.fp8_scaled or args.lora_weight is not None:
         loading_weight_dtype = dit_dtype
         
     model = load_wan_model(config, device, dit_path, args.attn_mode, False, loading_device, loading_weight_dtype, False)
@@ -1247,9 +1260,14 @@ def optimize_model(
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
         target_device = None
 
-        if dit_weight_dtype is not None:  # in case of args.fp8 and not args.fp8_scaled
-            logger.info(f"Convert model to {dit_weight_dtype}")
-            target_dtype = dit_weight_dtype
+        if args.mixed_dtype:
+            # Skip dtype conversion for mixed dtype models
+            logger.info("Using mixed dtype model - preserving original weight dtypes")
+            target_dtype = None
+        else:
+            if dit_weight_dtype is not None:  # in case of args.fp8 and not args.fp8_scaled
+                logger.info(f"Convert model to {dit_weight_dtype}")
+                target_dtype = dit_weight_dtype
 
         if args.blocks_to_swap == 0:
             logger.info(f"Move model to device: {device}")
@@ -2500,7 +2518,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         dit_dtype = detect_wan_sd_dtype(args.dit_low_noise)
     else:
         dit_dtype = torch.float16  # Default to fp16 for new models
-    if dit_dtype.itemsize == 1: # FP8 weights loaded
+    
+    if args.mixed_dtype:
+        # For mixed dtype, keep using fp16 for activations/computation
+        # This keeps memory usage low while preserving the precision of fp32 weights
+        # PyTorch will handle mixed precision ops automatically
+        dit_dtype = torch.float16
+        logger.info("Mixed dtype mode: Using fp16 for activations, preserving original weight dtypes")
+        dit_weight_dtype = None  # Will be set to None in load_dit_model
+    elif dit_dtype.itemsize == 1: # FP8 weights loaded
         dit_dtype = torch.bfloat16 # Use bfloat16 for computation
         if args.fp8_scaled:
             raise ValueError("Cannot use --fp8_scaled with pre-quantized FP8 weights.")
