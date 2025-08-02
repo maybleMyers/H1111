@@ -42,7 +42,8 @@ def wan22_batch_handler(
     negative_prompt: str,
     image_path: str,
     task: str,
-    size: str,
+    width: int,
+    height: int,
     frame_num: int,
     fps: int,
     base_seed: int,
@@ -103,8 +104,6 @@ def wan22_batch_handler(
         # --- Prepare command for a single generation ---
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"wan22_{run_id}"
-
-        height, width = size.split('*')[::-1] # "W*H" -> H, W
 
         command = [
             sys.executable, "wan2_generate_video.py",
@@ -235,7 +234,7 @@ def wan22_batch_handler(
             params_for_meta = {
                 "model_type": "Wan2.2", "prompt": prompt, "negative_prompt": negative_prompt,
                 "image_path": os.path.basename(image_path) if image_path else None,
-                "task": task, "size": size, "frame_num": frame_num, "fps": fps, "dual_dit_boundary": dual_dit_boundary,
+                "task": task, "width": width, "height": height, "frame_num": frame_num, "fps": fps,
                 "dit_low_noise": dit_low_noise_path, "dit_high_noise": dit_high_noise_path,
                 "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
@@ -5987,7 +5986,7 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
+                    framepack_is_f1 = gr.Checkbox(label="️ Use F1 Model", value=False,
                                                   info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -6067,7 +6066,7 @@ with gr.Blocks(
                     framepack_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Output FPS", value=30)
                     with gr.Row():
                         framepack_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        framepack_random_seed =gr.Button("🎲️")
+                        framepack_random_seed =gr.Button("️")
                     framepack_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Steps", value=25, interactive=True) # Moved here
 
                 # --- Right Column ---
@@ -6096,7 +6095,7 @@ with gr.Blocks(
                         framepack_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn")
                     with gr.Group():
                         with gr.Row():
-                            framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
+                            framepack_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
                             framepack_lora_folder = gr.Textbox(label="LoRa Folder", value="lora", scale=4)
                         framepack_lora_weights = []
                         framepack_lora_multipliers = []
@@ -6238,7 +6237,7 @@ with gr.Blocks(
                     gr.Markdown("### Core Generation Parameters")
                     with gr.Row():
                         fpe_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        # fpe_random_seed_btn = gr.Button("🎲️") # Optional: Add random seed button
+                        # fpe_random_seed_btn = gr.Button("️") # Optional: Add random seed button
                     
                     fpe_resolution_max_dim = gr.Number(label="Resolution (Max Dimension)", value=640, step=32, info="Target max width/height for bucket.")
                     fpe_total_second_length = gr.Slider(minimum=1.0, maximum=120.0, step=0.5, label="Additional Video Length (seconds)", value=5.0)
@@ -6287,7 +6286,7 @@ with gr.Blocks(
                         # fpe_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn") # Optional
                     gr.Markdown("### LoRA Configuration")
                     with gr.Row():
-                        fpe_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        fpe_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         fpe_lora_folder = gr.Textbox(label="LoRA Folder", value="lora", scale=4)
                     fpe_lora_weights_ui = []
                     fpe_lora_multipliers_ui = []
@@ -6366,7 +6365,7 @@ with gr.Blocks(
 
                     with gr.Row():
                         multitalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        multitalk_random_seed_btn = gr.Button("🎲️")
+                        multitalk_random_seed_btn = gr.Button("️")
                     with gr.Accordion("Advanced & Performance", open=True):
                         multitalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
                         multitalk_num_persistent = gr.Slider(
@@ -6402,7 +6401,7 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):                        
                         with gr.Row():
                             multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                            multitalk_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         
                         multitalk_lora_weights_ui = []
                         multitalk_lora_multipliers_ui = []
@@ -6467,7 +6466,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -6564,7 +6563,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v") # Keep sending to original V2V
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -6663,7 +6662,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -6789,7 +6788,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -6850,6 +6849,7 @@ with gr.Blocks(
                         lines=3,
                     )
                 with gr.Column(scale=1):
+                    wan22_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     wan22_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
                     wan22_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -6862,6 +6862,7 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     wan22_input_image = gr.Image(label="Input Image (for i2v tasks)", type="filepath")
+                    wan22_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
                     
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
@@ -6870,11 +6871,12 @@ with gr.Blocks(
                         value="i2v-A14B",
                         info="Selects the model architecture and configuration to use."
                     )
-                    wan22_size = gr.Dropdown(
-                        label="Size (Resolution)", 
-                        choices=["1280*720", "720*1280", "1024*576", "576*1024", "832*480", "480*832", "704*1280", "1280*704"], 
-                        value="832*480"
-                    )
+                    # Width and height inputs
+                    with gr.Row():
+                        wan22_width = gr.Number(label="Width", value=832, interactive=True)
+                        wan22_calc_height_btn = gr.Button("→")
+                        wan22_calc_width_btn = gr.Button("←")
+                        wan22_height = gr.Number(label="Height", value=480, interactive=True)
                     wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
@@ -6884,7 +6886,7 @@ with gr.Blocks(
                     wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        wan22_random_seed_btn = gr.Button("🎲️")
+                        wan22_random_seed_btn = gr.Button("️")
 
                 with gr.Column():
                     wan22_output = gr.Gallery(
@@ -6903,7 +6905,7 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):
                         with gr.Row():
                             wan22_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            wan22_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                            wan22_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         wan22_lora_weights = []
                         wan22_lora_multipliers = []
                         for i in range(4):
@@ -7034,7 +7036,7 @@ with gr.Blocks(
                     phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
                     phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
-                    phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    phantom_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     phantom_lora_weights_ui = []
                     phantom_lora_multipliers_ui = []
                     for i in range(4):
@@ -7226,7 +7228,7 @@ with gr.Blocks(
                     wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -7372,7 +7374,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -7519,7 +7521,7 @@ with gr.Blocks(
                     wanx_v2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
 
                     # Add LoRA section for WanX-v2v
-                    wanx_v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_v2v_lora_weights = []
                     wanx_v2v_lora_multipliers = []
                     for i in range(4):
@@ -7735,7 +7737,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
@@ -8976,7 +8978,8 @@ with gr.Blocks(
             params.get("negative_prompt", ""),
             None,  # No image by default
             params.get("task", "i2v-A14B"),
-            f"{params.get('width', 832)}*{params.get('height', 480)}",  # Size format
+            params.get('width', 832),  # Width
+            params.get('height', 480),  # Height
             params.get("video_length", 81),
             params.get("fps", 16),
             params.get("seed", -1),
@@ -9017,7 +9020,7 @@ with gr.Blocks(
         ],
         inputs=[params_state],
         outputs=[
-            wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_size,
+            wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
             wan22_flow_shift, wan22_sample_guide_scale, wan22_dual_dit_boundary, wan22_batch_size,
             wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
@@ -9841,8 +9844,29 @@ with gr.Blocks(
     )
 
     # Wan2.2 Tab Event Handlers
+    wan22_prompt.change(fn=count_prompt_tokens, inputs=wan22_prompt, outputs=wan22_token_counter)
     wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
+    
+    # Image input handling for wan22
+    wan22_input_image.change(
+        fn=update_wanx_image_dimensions,  # Reuse the same function
+        inputs=[wan22_input_image],
+        outputs=[wan22_original_dims, wan22_width, wan22_height]
+    )
+    
+    # Width/height calculation buttons
+    wan22_calc_width_btn.click(
+        fn=calculate_wanx_width,  # Reuse function from WanX
+        inputs=[wan22_height, wan22_original_dims],
+        outputs=[wan22_width]
+    )
+    
+    wan22_calc_height_btn.click(
+        fn=calculate_wanx_height,  # Reuse function from WanX
+        inputs=[wan22_width, wan22_original_dims],
+        outputs=[wan22_height]
+    )
 
     def update_wan22_model_paths_and_settings(task):
         is_a14b = "A14B" in task
@@ -9898,7 +9922,8 @@ with gr.Blocks(
             wan22_negative_prompt,
             wan22_input_image,
             wan22_task,
-            wan22_size,
+            wan22_width,
+            wan22_height,
             wan22_frame_num,
             wan22_fps,
             wan22_seed,
