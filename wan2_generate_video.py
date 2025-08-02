@@ -3581,6 +3581,39 @@ def main():
 
     # --- Decode and Save ---
     if generated_latent is not None:
+        # Unload DiT models before VAE decode to free GPU memory (especially important for fp8_scaled)
+        if args.fp8_scaled:
+            logger.info("Unloading DiT models before VAE decode to free GPU memory...")
+            
+            # Unload main model
+            if 'model' in locals() and model is not None:
+                model.cpu()
+                del model
+            
+            # Unload dual-dit models if present
+            if 'model_low' in locals() and model_low is not None:
+                model_low.cpu()
+                del model_low
+            if 'model_high' in locals() and model_high is not None:
+                model_high.cpu()
+                del model_high
+            
+            # Unload dynamic model manager if present
+            if 'model_manager' in locals() and model_manager is not None:
+                model_manager.unload_all()
+                del model_manager
+            
+            # Force memory cleanup
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            clean_memory_on_device(args.device)
+            
+            # Give GPU time to free memory
+            import time
+            time.sleep(0.5)
+            torch.cuda.empty_cache()
+        
         # Decode latent to video tensor [B, C, F, H, W], range [0, 1]
         decoded_video = decode_latent(generated_latent, args, cfg)
 
