@@ -1301,7 +1301,25 @@ def optimize_model(
 
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
-
+    # Verify mixed dtype preservation if requested
+    if args.mixed_dtype:
+        import collections
+        dtype_counts = collections.defaultdict(int)
+        dtype_params = collections.defaultdict(int)
+        
+        for name, param in model.named_parameters():
+            dtype_counts[str(param.dtype)] += 1
+            dtype_params[str(param.dtype)] += param.numel()
+        
+        logger.info("Mixed dtype verification - Parameter distribution:")
+        total_params = sum(dtype_params.values())
+        for dtype_str, count in sorted(dtype_counts.items()):
+            param_count = dtype_params[dtype_str]
+            size_gb = param_count * torch.finfo(getattr(torch, dtype_str.split('.')[-1])).bits / 8 / 1024**3
+            logger.info(f"  {dtype_str}: {count} tensors, {param_count:,} params ({param_count/total_params*100:.1f}%), {size_gb:.2f} GB")
+        
+        if len(dtype_counts) == 1:
+            logger.warning("WARNING: Only one dtype found! Mixed dtype preservation may have failed.")
 
 def prepare_t2v_inputs(
     args: argparse.Namespace, config, accelerator: Accelerator, device: torch.device, vae: Optional[WanVAE] = None
@@ -2537,11 +2555,25 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         dit_weight_dtype = torch.float8_e4m3fn
     else:
         dit_weight_dtype = dit_dtype # Use compute dtype for weights
-
+    # Format weight dtype for logging
+    if args.mixed_dtype:
+        weight_dtype_str = "Mixed (Original)"
+    elif args.fp8_scaled:
+        weight_dtype_str = "Mixed (FP8 Scaled)"
+    else:
+        weight_dtype_str = str(dit_weight_dtype)
     vae_dtype = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else (torch.bfloat16 if dit_dtype == torch.bfloat16 else torch.float16)
+    # Format weight dtype for logging
+    if args.mixed_dtype:
+        weight_dtype_str = "Mixed (Original)"
+    elif args.fp8_scaled:
+        weight_dtype_str = "Mixed (FP8 Scaled)"
+    else:
+        weight_dtype_str = str(dit_weight_dtype)
+    
     logger.info(
-        f"Using device: {device}, DiT compute: {dit_dtype}, DiT weight: {dit_weight_dtype or 'Mixed (FP8 Scaled)' if args.fp8_scaled else dit_dtype}, VAE: {vae_dtype}, T5 FP8: {args.fp8_t5}"
-    )
+        f"Using device: {device}, DiT compute: {dit_dtype}, DiT weight: {weight_dtype_str}, VAE: {vae_dtype}, T5 FP8: {args.fp8_t5}"
+     )
 
     # --- Accelerator ---
     mixed_precision = "bf16" if dit_dtype == torch.bfloat16 else "fp16"
