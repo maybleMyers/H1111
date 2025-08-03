@@ -463,18 +463,27 @@ class DynamicModelManager:
                     
                     # First, ensure all blocks are moved back from swap
                     if hasattr(self.current_model, 'offloader') and self.current_model.offloader is not None:
-                        # Wait for any pending operations
-                        self.current_model.offloader.wait_for_all_blocks()
+                        # Wait for any pending operations on all blocks
+                        for idx in range(len(self.current_model.blocks)):
+                            try:
+                                self.current_model.offloader.wait_for_block(idx)
+                            except Exception as e:
+                                logger.warning(f"Error waiting for block {idx}: {e}")
                         
                         # Move all blocks back to CPU to free GPU memory
                         for idx in range(len(self.current_model.blocks)):
-                            if hasattr(self.current_model.blocks[idx], 'cuda_stream'):
-                                # Block is on GPU, move it to CPU
+                            try:
+                                # Move block to CPU if it's not already there
                                 self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
+                            except Exception as e:
+                                logger.warning(f"Error moving block {idx} to CPU: {e}")
                         
                         # Clean up the offloader
-                        del self.current_model.offloader
-                        self.current_model.offloader = None
+                        try:
+                            del self.current_model.offloader
+                            self.current_model.offloader = None
+                        except Exception as e:
+                            logger.warning(f"Error cleaning up offloader: {e}")
             
             # Move any remaining parameters to CPU
             # This includes non-block parameters like embeddings, norms, etc.
@@ -541,12 +550,25 @@ class DynamicModelManager:
             if hasattr(self.current_model, 'blocks_to_swap') and self.current_model.blocks_to_swap is not None:
                 if self.current_model.blocks_to_swap > 0 and hasattr(self.current_model, 'offloader'):
                     if self.current_model.offloader is not None:
-                        self.current_model.offloader.wait_for_all_blocks()
+                        # Wait for all blocks using the correct method
+                        for idx in range(len(self.current_model.blocks)):
+                            try:
+                                self.current_model.offloader.wait_for_block(idx)
+                            except Exception as e:
+                                logger.warning(f"Error waiting for block {idx}: {e}")
+                        
                         # Move all blocks to CPU
                         for idx in range(len(self.current_model.blocks)):
-                            self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
-                        del self.current_model.offloader
-                        self.current_model.offloader = None
+                            try:
+                                self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
+                            except Exception as e:
+                                logger.warning(f"Error moving block {idx} to CPU: {e}")
+                        
+                        try:
+                            del self.current_model.offloader
+                            self.current_model.offloader = None
+                        except Exception as e:
+                            logger.warning(f"Error cleaning up offloader: {e}")
             
             # Move model to CPU before deletion
             try:
