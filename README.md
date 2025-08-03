@@ -8,3 +8,6 @@ wan/wan22_i2v_14B_high_noise_bf16.safetensors
 wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth  
 wan/Wan2.1_VAE.pth  
 wan/models_t5_umt5-xxl-enc-bf16.pth  
+
+v2v seems to only work well with the t2v model at like .95+
+Most warnings are safe to ignore and will probably be removed later.
