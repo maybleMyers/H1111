@@ -6956,15 +6956,15 @@ with gr.Blocks(
                         label="Unload Text Encoders after use (T5/CLIP) to save RAM",
                         value=False, visible=False
                     )
-                    wan22_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    wan22_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=True)
                     wan22_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
-                        value=False,
+                        value=True,
                     )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
-                        wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_fp16.safetensors")
-                        wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_fp16.safetensors")
+                        wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_bf16.safetensors")
+                        wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_bf16.safetensors")
                         wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
                     with gr.Group(visible=False) as wan22_ti2v5b_paths:
                         wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/Wan2.2-TI2V-5B_fp16.safetensors")
@@ -9032,8 +9032,8 @@ with gr.Blocks(
             False,  # fp8_scaled
             False,  # fp8_t5
             # Model paths - DO NOT transfer these, keep defaults
-            "wan/wan22_i2v_14B_low_noise_fp16.safetensors",  # dit_low_noise_path
-            "wan/wan22_i2v_14B_high_noise_fp16.safetensors",  # dit_high_noise_path
+            "wan/wan22_i2v_14B_low_noise_bf16.safetensors",  # dit_low_noise_path
+            "wan/wan22_i2v_14B_high_noise_bf16.safetensors",  # dit_high_noise_path
             "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",  # clip_path
             "wan/Wan2.2-TI2V-5B_fp16.safetensors",  # dit_path
             "wan/Wan2.1_VAE.pth",  # vae_path - DO NOT transfer
@@ -9943,23 +9943,23 @@ with gr.Blocks(
         
         # Set model paths based on task
         if is_t2v_a14b:
-            dit_low_path = "wan/wan22_t2v_14B_low_noise_fp16.safetensors"
-            dit_high_path = "wan/wan22_t2v_14B_high_noise_fp16.safetensors"
+            dit_low_path = "wan/wan22_t2v_14B_low_noise_bf16.safetensors"
+            dit_high_path = "wan/wan22_t2v_14B_high_noise_bf16.safetensors"
             boundary_value = 0.875  # Default for t2v-A14B
             boundary_visible = True
         elif is_i2v_a14b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"
             boundary_value = 0.900  # Default for i2v-A14B
             boundary_visible = True
         elif is_ti2v5b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"  # Keep current default
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
             boundary_value = 0.875  # Default value
             boundary_visible = False  # Hide for ti2v-5B as it's not dual-dit
         else:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_fp16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_fp16.safetensors"  # Keep current default
+            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
+            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
             boundary_value = 0.875
             boundary_visible = False
         
