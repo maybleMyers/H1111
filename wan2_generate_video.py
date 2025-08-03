@@ -233,7 +233,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
-    parser.add_argument("--unload_text_encoders", action="store_true", help="unload T5 and CLIP models from RAM after encoding to save memory")
     parser.add_argument("--t5", type=str, default=None, help="text encoder (T5) checkpoint path")
     parser.add_argument("--clip", type=str, default=None, help="text encoder (CLIP) checkpoint path")
     # LoRA
@@ -386,8 +385,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
-    parser.add_argument("--dynamic_model_loading", action="store_true", 
-                        help="Dynamically load/unload dual-dit models during inference to save RAM")
 
     args = parser.parse_args()
 
@@ -428,16 +425,22 @@ class DynamicModelManager:
         self.current_model = None
         self.current_model_type = None  # 'low' or 'high'
         self.model_paths = {}
-        self.lora_weights = None
+        self.lora_weights_list = None
+        self.lora_multipliers = None
+        
+    def has_model_loaded(self):
+        """Check if any model is currently loaded."""
+        return self.current_model is not None
         
     def set_model_paths(self, low_path: str, high_path: str):
         """Set the paths for low and high noise models."""
         self.model_paths['low'] = low_path
         self.model_paths['high'] = high_path
         
-    def save_lora_state(self, lora_weights):
+    def set_lora_weights(self, lora_weights_list, lora_multipliers):
         """Save LoRA weights to apply to dynamically loaded models."""
-        self.lora_weights = lora_weights
+        self.lora_weights_list = lora_weights_list
+        self.lora_multipliers = lora_multipliers
         
     def get_model(self, model_type: str) -> WanModel:
         """Load the requested model if not already loaded."""
@@ -459,18 +462,19 @@ class DynamicModelManager:
             loading_device = self.device
             
         loading_weight_dtype = self.dit_weight_dtype
-        if self.args.fp8_scaled or self.args.lora_weight is not None:
+        if self.args.mixed_dtype:
+            # For mixed dtype, load weights as-is without conversion
+            loading_weight_dtype = None
+        elif self.args.fp8_scaled or self.args.lora_weight is not None:
             loading_weight_dtype = self.dit_dtype
             
+        # Load model with LoRA weights if available
         model = load_wan_model(
             self.config, self.device, self.model_paths[model_type], 
-            self.args.attn_mode, False, loading_device, loading_weight_dtype, False
+            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
+            lora_weights_list=self.lora_weights_list, lora_multipliers=self.lora_multipliers
         )
         
-        # Apply LoRA if saved
-        if self.lora_weights is not None:
-            self._apply_lora_to_model(model)
-            
         # Optimize model
         optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
         
@@ -478,10 +482,6 @@ class DynamicModelManager:
         self.current_model_type = model_type
         return model
         
-    def _apply_lora_to_model(self, model):
-        """Apply saved LoRA weights to the model."""
-        if self.args.lora_weight is not None and len(self.args.lora_weight) > 0:
-            merge_lora_weights(model, self.args, self.device)
             
     def cleanup(self):
         """Clean up any loaded models."""
@@ -1095,7 +1095,7 @@ def load_dit_model(
     lora_weights_list = None
     lora_multipliers = None
     
-    if not dynamic_loading and args.lora_weight is not None and len(args.lora_weight) > 0:
+    if args.lora_weight is not None and len(args.lora_weight) > 0:
         lora_weights_list = []
         
         for i, lora_path in enumerate(args.lora_weight):
@@ -1126,37 +1126,10 @@ def load_dit_model(
     is_dual_dit = "A14B" in args.task
     
     if is_dual_dit and args.dit_low_noise and args.dit_high_noise:
-        if dynamic_loading:
-            # Return paths instead of loaded models for dynamic loading
-            logger.info(f"Dynamic loading enabled for dual-dit models")
-            return (args.dit_low_noise, args.dit_high_noise)
-        else:
-            # Original behavior - load both models
-            logger.info(f"Loading dual-dit model: low_noise from {args.dit_low_noise}, high_noise from {args.dit_high_noise}")
-            
-            loading_device = "cpu"
-            if args.blocks_to_swap == 0 and args.lora_weight is None and not args.fp8_scaled:
-                loading_device = device
-
-            loading_weight_dtype = dit_weight_dtype
-            if args.mixed_dtype:
-                # For mixed dtype, load weights as-is without conversion
-                loading_weight_dtype = None
-            elif args.fp8_scaled or args.lora_weight is not None:
-                loading_weight_dtype = dit_dtype
-            
-            model_low = load_wan_model(
-                config, device, args.dit_low_noise, args.attn_mode, False, 
-                loading_device, loading_weight_dtype, False,
-                lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
-            )
-            model_high = load_wan_model(
-                config, device, args.dit_high_noise, args.attn_mode, False, 
-                loading_device, loading_weight_dtype, False,
-                lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
-            )
-            
-            return model_low, model_high
+        # Always use dynamic loading for dual-dit models to save RAM
+        logger.info(f"Using dynamic loading for dual-dit models (default behavior)")
+        # Return paths and LoRA weights for dynamic loading
+        return (args.dit_low_noise, args.dit_high_noise, lora_weights_list, lora_multipliers)
     elif is_dual_dit:
         logger.warning(f"Task {args.task} expects dual-dit models but dit_low_noise/dit_high_noise not specified. Using single model.")
     
@@ -1417,11 +1390,10 @@ def prepare_t2v_inputs(
     # free text encoder and clean memory
     del text_encoder
     clean_memory_on_device(device)
-    
-    if args.unload_text_encoders:
-        torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Unloaded T5 model from memory")
+    # Always unload to save memory
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
 
     # Initialize 'y' (conditioning latent) to None
     y = None
@@ -1549,11 +1521,10 @@ def prepare_i2v_inputs(
                 context_null = text_encoder([n_prompt], device)
         del text_encoder
         clean_memory_on_device(device)
-        
-        if args.unload_text_encoders:
-            torch.cuda.empty_cache()
-            gc.collect()
-            logger.info("Unloaded T5 model from memory")
+        # Always unload to save memory
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded T5 model from memory")
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -1566,11 +1537,10 @@ def prepare_i2v_inputs(
             clip_context = clip.visual([img_tensor_clip.unsqueeze(1)]) # Add Frame dim
         del clip, img_clip, img_tensor_clip
         clean_memory_on_device(device)
-        
-        if args.unload_text_encoders:
-            torch.cuda.empty_cache()
-            gc.collect()
-            logger.info("Unloaded CLIP model from memory")
+        # Always unload to save memory
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded CLIP model from memory")
 
         fun_ref_latent = None
         # Check if the task requires ref_conv and if a reference image is provided via --image_path
@@ -1720,11 +1690,10 @@ def prepare_i2v_inputs(
                 context_null = text_encoder([n_prompt], device)
         del text_encoder
         clean_memory_on_device(device)
-        
-        if args.unload_text_encoders:
-            torch.cuda.empty_cache()
-            gc.collect()
-            logger.info("Unloaded T5 model from memory")
+        # Always unload to save memory
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded T5 model from memory")
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -1738,11 +1707,10 @@ def prepare_i2v_inputs(
         logger.info(f"CLIP Encoding complete")
         del clip
         clean_memory_on_device(device)
-        
-        if args.unload_text_encoders:
-            torch.cuda.empty_cache()
-            gc.collect()
-            logger.info("Unloaded CLIP model from memory")
+        # Always unload to save memory
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("Unloaded CLIP model from memory")
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #4: VAE Encoding and 'y' construction ---
         logger.info(f"Encoding image(s) to latent space (Standard I2V method)")
@@ -1921,13 +1889,12 @@ def prepare_ti2v_inputs(
     # Move T5 to CPU for memory management - follow official pattern
     t5.model.cpu()
     clean_memory_on_device(device)
-    
-    if args.unload_text_encoders:
-        del t5.model
-        del t5
-        torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Unloaded T5 model from memory")
+    # Always unload to save memory
+    del t5.model
+    del t5
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
     
     # Generate noise matching the latent dimensions - follow official pattern
     # Create noise tensor [z_dim, F, H, W] - 4D like official implementation  
@@ -2149,11 +2116,10 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     # Free text encoder and clean memory
     del text_encoder
     clean_memory_on_device(device)
-    
-    if args.unload_text_encoders:
-        torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Unloaded T5 model from memory")
+    # Always unload to save memory
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
 
     # Generate noise with the same shape as video_latents (including batch dimension)
     noise = torch.randn(
@@ -2289,8 +2255,7 @@ def run_sampling(
     seed_g: torch.Generator,
     accelerator: Accelerator,
     is_ti2v: bool = False, # Flag for TI2V (Text+Image-to-Video) mode
-    model_high: Optional[WanModel] = None, # High noise model for dual-dit architectures
-    model_manager: Optional[DynamicModelManager] = None,  # New parameter
+    model_manager: Optional[DynamicModelManager] = None,  # Dynamic model manager for dual-dit
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
     preview_suffix: Optional[str] = None # <<< ADD suffix argument
@@ -2419,31 +2384,18 @@ def run_sampling(
 
         with accelerator.autocast(), torch.no_grad():
             # --- Select appropriate model for dual-dit architectures ---
-            if model_manager is not None:
+            if model_manager is not None:  # Always true for dual-dit models now
                 # Dynamic loading mode
-                cfg = WAN_CONFIGS[args.task]
-                if args.dual_dit_boundary is not None:
-                    boundary = args.dual_dit_boundary * 1000
-                else:
-                    boundary = cfg.boundary * 1000
-                    
-                if t.item() >= boundary:
-                    current_model = model_manager.get_model('high')
-                else:
-                    current_model = model_manager.get_model('low')
-            elif model_high is not None:
-                # Original dual-dit mode (both models loaded)
                 cfg = WAN_CONFIGS[args.task]
                 if args.dual_dit_boundary is not None:
                     boundary = args.dual_dit_boundary * 1000  # Custom boundary
                 else:
                     boundary = cfg.boundary * 1000  # Default: 0.875 * 1000 = 875 for t2v-A14B, 0.900 * 1000 = 900 for i2v-A14B
+                
                 if t.item() >= boundary:
-                    current_model = model_high
-                    # logger.debug(f"Step {i}: Using high noise model (t={t.item():.0f} >= {boundary:.0f})")
+                    current_model = model_manager.get_model('high')
                 else:
-                    current_model = model
-                    # logger.debug(f"Step {i}: Using low noise model (t={t.item():.0f} < {boundary:.0f})")
+                    current_model = model_manager.get_model('low')
             else:
                 # Single model mode
                 current_model = model
@@ -3099,28 +3051,34 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # If VAE wasn't loaded early (standard T2V), vae is still None
 
     # --- Load DiT Model(s) ---
-    model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v, 
-                                  dynamic_loading=args.dynamic_model_loading)
+    model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
     
     # Handle dual-dit models
     is_dual_dit = isinstance(model_result, tuple)
     model_manager = None
     
-    if is_dual_dit and args.dynamic_model_loading:
+    if is_dual_dit:
         # Set up dynamic model manager
-        model_low_path, model_high_path = model_result
+        if len(model_result) == 4:
+            # New format with LoRA weights
+            model_low_path, model_high_path, lora_weights_list, lora_multipliers = model_result
+        else:
+            # Old format compatibility
+            model_low_path, model_high_path = model_result
+            lora_weights_list, lora_multipliers = None, None
+            
         model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         
-        # Load initial model (low noise) for LoRA merging
-        model = model_manager.get_model('low')
-        model_low = model_high = None  # Not used in dynamic mode
-        logger.info("Using dynamic model loading for dual-dit architecture")
-    elif is_dual_dit:
-        # Original behavior
-        model_low, model_high = model_result
-        model = model_low  # Use low noise model as primary for LoRA merging
-        logger.info("Loaded dual-dit models for A14B architecture")
+        # Set LoRA weights if available
+        if lora_weights_list is not None:
+            model_manager.set_lora_weights(lora_weights_list, lora_multipliers)
+        
+        # Don't load any model initially - let the sampling loop load the appropriate one
+        # This avoids loading low noise model just to immediately swap to high noise
+        model = None
+        model_low = model_high = None  # Not used anymore
+        logger.info("Using dynamic model loading for dual-dit architecture (default)")
     else:
         model = model_result
         model_low = model_high = None
@@ -3155,12 +3113,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             return None # Exit early
 
     # --- Optimize Model (FP8, Swapping, Compile) ---
-    optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
-    
-    # Also optimize the high noise model for dual-dit architectures
-    if is_dual_dit and model_high is not None:
-        logger.info("Optimizing high noise model for dual-dit architecture")
-        optimize_model(model_high, args, device, dit_dtype, dit_weight_dtype)
+    # Only optimize if we have a model loaded (not for dual-dit dynamic loading)
+    if model is not None:
+        optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+    else:
+        # For dual-dit, optimization will happen when each model is loaded
+        logger.info("Model optimization will be performed during dynamic loading")
 
     # --- Setup Scheduler & Timesteps ---
     scheduler, timesteps = setup_scheduler(args, cfg, device)
@@ -3279,18 +3237,20 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         seed_g,
         accelerator,
         is_ti2v=is_ti2v,  # Pass TI2V flag for special processing
-        model_high=model_high if is_dual_dit and not args.dynamic_model_loading else None,
         model_manager=model_manager,  # New parameter
         previewer=previewer, # MODIFIED: Pass the previewer instance
         use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
-        preview_suffix=args.preview_suffix # <<< Pass the suffix from args
+        preview_suffix=args.preview_suffix # Pass the preview suffix to run_sampling
     )
 
     # --- Cleanup ---
     if model_manager:
         model_manager.cleanup()
     
-    del model
+    # Only delete model if it exists
+    if model is not None:
+        del model
+        
     if 'scheduler' in locals(): del scheduler
     if 'context' in locals(): del context
     if 'context_null' in locals(): del context_null
