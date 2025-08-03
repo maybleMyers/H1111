@@ -2355,10 +2355,10 @@ def prepare_v2v_i2v_inputs(
     use_clip_fea = clip_context if not ("A14B" in args.task) else None
     
     # For i2v models, we need to prepare 'y' tensor (mask + latent)
-    # Create a simple mask that marks all frames as to-be-generated
-    # This differs from standard I2V which marks first frame as given
+    # For V2V with i2v, we want to preserve the first frame and generate the rest
+    # This is like standard I2V where the first frame is given
     msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
-    # Don't mask any frames - we want to regenerate the entire video
+    msk[:, 0] = 1  # Mask (preserve) the first frame only
     
     # Concatenate mask with video latents to create 'y'
     y = torch.cat([msk, video_latents.squeeze(0)], dim=0)  # [4+C', F', H', W']
