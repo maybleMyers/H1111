@@ -6928,7 +6928,7 @@ with gr.Blocks(
                     wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
                     wan22_dynamic_model_loading = gr.Checkbox(
                         label="Dynamic Model Loading (A14B models only to lower RAM usages)", 
-                        value=False, visibl=False
+                        value=False, visible=False
                     )
                     wan22_unload_text_encoders = gr.Checkbox(
                         label="Unload Text Encoders after use (T5/CLIP) to save RAM",
