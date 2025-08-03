@@ -248,6 +248,7 @@ def wan22_batch_handler(
                 "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
                 "flow_shift": flow_shift, "sample_guide_scale": sample_guide_scale,
+                "dual_dit_boundary": dual_dit_boundary,  # Add dual_dit_boundary to metadata
                 "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
                 "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
             }
@@ -6881,7 +6882,7 @@ with gr.Blocks(
                     )
                     with gr.Group(visible=False) as wan22_v2v_controls:
                         wan22_input_video = gr.Video(label="Input Video", format="mp4")
-                        wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, label="V2V Strength", value=0.75, info="How much to modify the input video (0=keep original, 1=full rewrite)")
+                        wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.005, label="V2V Strength", value=0.95, info="How much to modify the input video (1=keep original, 0=full rewrite)")
                         wan22_v2v_low_noise_only = gr.Checkbox(label="Use Low Noise Model Only", value=False, info="For V2V with dual-dit models, use only the low noise model")
                         wan22_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Extract first frame for CLIP conditioning. Recommended for i2v-A14B.")
                     
@@ -8988,13 +8989,26 @@ with gr.Blocks(
         fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
     )
     
+    # Add a function to handle video transfer to wan22 tab
+    def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+        """Handle both parameters and video transfer from Video Info to Wan2.2 tab"""
+        if not metadata:
+            metadata = {}
+        
+        # If we have a video, enable V2V mode automatically
+        if video_path:
+            metadata["enable_v2v"] = True
+            
+        return f"Parameters ready for Wan2.2", metadata, video_path
+
     # Wan2.2 send-to logic
     send_to_wan22_btn.click(
-        fn=lambda m: ("Parameters ready for Wan2.2", m),
-        inputs=[metadata_output],
-        outputs=[status, params_state]
+        fn=handle_send_to_wan22_tab,
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, wan22_input_video]
     ).then(
-        lambda params: [
+        # Modified lambda to handle both params and video enable state
+        lambda params, video_path: [
             params.get("prompt", ""),
             params.get("negative_prompt", ""),
             None,  # No image by default
@@ -9037,9 +9051,11 @@ with gr.Blocks(
             params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[2] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 2 else 1.0,
             params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[3] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 3 else 1.0,
             True,  # enable_preview
-            5  # preview_steps
+            5,  # preview_steps
+            # V2V controls - enable if video was sent
+            params.get("enable_v2v", False)  # wan22_enable_v2v
         ],
-        inputs=[params_state],
+        inputs=[params_state, wan22_input_video],
         outputs=[
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
@@ -9048,7 +9064,8 @@ with gr.Blocks(
             wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path,
             wan22_vae_path, wan22_t5_path, wan22_lora_folder,
             *wan22_lora_weights, *wan22_lora_multipliers,
-            wan22_enable_preview, wan22_preview_steps
+            wan22_enable_preview, wan22_preview_steps,
+            wan22_enable_v2v  # Add V2V enable checkbox
         ]
     ).then(
         fn=change_to_wan22_tab, inputs=None, outputs=[tabs]
