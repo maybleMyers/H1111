@@ -449,16 +449,65 @@ class DynamicModelManager:
             
         # Unload current model if exists
         if self.current_model is not None:
-            logger.info(f"Unloading {self.current_model_type} noise model...")
+            logger.info(f"Unloading {self.current_model_type} noise model (GPU + CPU blocks)...")
+            
+            # Get memory usage before unloading
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"GPU memory before unload: {memory_before:.2f} GB")
+            
+            # Handle block swapping cleanup if enabled
+            if hasattr(self.current_model, 'blocks_to_swap') and self.current_model.blocks_to_swap is not None:
+                if self.current_model.blocks_to_swap > 0:
+                    logger.info(f"Cleaning up block swapping for {self.current_model_type} model...")
+                    
+                    # First, ensure all blocks are moved back from swap
+                    if hasattr(self.current_model, 'offloader') and self.current_model.offloader is not None:
+                        # Wait for any pending operations
+                        self.current_model.offloader.wait_for_all_blocks()
+                        
+                        # Move all blocks back to CPU to free GPU memory
+                        for idx in range(len(self.current_model.blocks)):
+                            if hasattr(self.current_model.blocks[idx], 'cuda_stream'):
+                                # Block is on GPU, move it to CPU
+                                self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
+                        
+                        # Clean up the offloader
+                        del self.current_model.offloader
+                        self.current_model.offloader = None
+            
+            # Move any remaining parameters to CPU
+            # This includes non-block parameters like embeddings, norms, etc.
+            try:
+                self.current_model = self.current_model.cpu()
+            except Exception as e:
+                logger.warning(f"Error moving model to CPU: {e}")
+            
+            # Now delete the model
             del self.current_model
-            torch.cuda.empty_cache()
-            gc.collect()
+            self.current_model = None
+            self.current_model_type = None
+            
+            # Aggressive cleanup for both GPU and CPU memory
+            torch.cuda.empty_cache()  # Clear GPU cache
+            torch.cuda.synchronize()  # Wait for all GPU operations to complete
+            gc.collect()              # Force Python garbage collection (clears CPU memory)
+            torch.cuda.empty_cache()  # Second GPU cache clear
             clean_memory_on_device(self.device)
+            
+            # Additional cleanup for fragmented memory
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+            
+            # Log memory usage after unloading
+            if torch.cuda.is_available():
+                memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"GPU memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
             
         # Load new model
         logger.info(f"Loading {model_type} noise model...")
         loading_device = "cpu"
-        if self.args.blocks_to_swap == 0 and self.args.lora_weight is None and not self.args.fp8_scaled:
+        if self.args.blocks_to_swap == 0 and self.lora_weights_list is None and not self.args.fp8_scaled:
             loading_device = self.device
             
         loading_weight_dtype = self.dit_weight_dtype
@@ -486,11 +535,34 @@ class DynamicModelManager:
     def cleanup(self):
         """Clean up any loaded models."""
         if self.current_model is not None:
+            logger.info(f"Final cleanup of {self.current_model_type} noise model...")
+            
+            # Handle block swapping cleanup
+            if hasattr(self.current_model, 'blocks_to_swap') and self.current_model.blocks_to_swap is not None:
+                if self.current_model.blocks_to_swap > 0 and hasattr(self.current_model, 'offloader'):
+                    if self.current_model.offloader is not None:
+                        self.current_model.offloader.wait_for_all_blocks()
+                        # Move all blocks to CPU
+                        for idx in range(len(self.current_model.blocks)):
+                            self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
+                        del self.current_model.offloader
+                        self.current_model.offloader = None
+            
+            # Move model to CPU before deletion
+            try:
+                self.current_model = self.current_model.cpu()
+            except:
+                pass
+            
             del self.current_model
             self.current_model = None
             self.current_model_type = None
+            
+            # Aggressive cleanup for both GPU and CPU
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             gc.collect()
+            torch.cuda.empty_cache()
             clean_memory_on_device(self.device)
 
 def create_funcontrol_conditioning_latent(
