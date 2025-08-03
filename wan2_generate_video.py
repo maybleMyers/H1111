@@ -273,6 +273,11 @@ def parse_args() -> argparse.Namespace:
     # V2V arguments
     parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference (standard Wan V2V)")
     parser.add_argument("--strength", type=float, default=0.75, help="Strength for video2video inference (0.0-1.0)")
+    parser.add_argument("--v2v_low_noise_only", action="store_true", help="For V2V with dual-dit models, use only the low noise model")
+    parser.add_argument(
+        "--v2v_use_i2v", action="store_true", 
+        help="Use i2v model for V2V (extracts first frame for CLIP conditioning). Recommended for i2v-A14B."
+    )
     # I2V arguments
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
     parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
@@ -393,8 +398,12 @@ def parse_args() -> argparse.Namespace:
     ), "latent_path is only supported for images or video output"
 
     # Add checks for mutually exclusive arguments
-    if args.video_path is not None and args.image_path is not None:
-        raise ValueError("--video_path and --image_path cannot be used together.")
+    if args.video_path is not None and args.image_path is not None and not args.v2v_use_i2v:
+        raise ValueError("--video_path and --image_path cannot be used together unless --v2v_use_i2v is specified.")
+    if args.v2v_use_i2v and args.video_path is None:
+        raise ValueError("--v2v_use_i2v requires --video_path to be specified.")
+    if args.v2v_use_i2v and "i2v" not in args.task:
+        logger.warning("--v2v_use_i2v is recommended for i2v models. Current task: %s", args.task)
     if args.video_path is not None and args.control_path is not None:
         raise ValueError("--video_path (standard V2V) and --control_path (Fun-Control) cannot be used together.")
     if args.image_path is not None and "t2v" in args.task:
@@ -2235,6 +2244,142 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     return noise, context, context_null, (arg_c, arg_null)
 
 
+def prepare_v2v_i2v_inputs(
+    args: argparse.Namespace, 
+    config, 
+    accelerator: Accelerator, 
+    device: torch.device, 
+    vae: WanVAE,
+    video_frames_np: List[np.ndarray]  # Pass in loaded video frames
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+    """Prepare V2V inputs for i2v models (combines V2V video encoding with I2V conditioning).
+    
+    Args:
+        args: command line arguments
+        config: model configuration
+        accelerator: Accelerator instance
+        device: device to use
+        vae: VAE model instance
+        video_frames_np: List of video frames as numpy arrays (HWC, 0-255)
+        
+    Returns:
+        Tuple containing noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
+    """
+    if vae is None:
+        raise ValueError("VAE must be provided for V2V-I2V input preparation.")
+        
+    logger.info("Preparing V2V inputs for i2v model (with CLIP conditioning)")
+    
+    # Get dimensions from args
+    height, width = args.video_size
+    frames = args.video_length
+    
+    # Convert frames to tensor and encode to latents
+    video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))  # [F,H,W,C]
+    video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+    video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+    
+    # Encode video to latents
+    video_latents = encode_video_to_latents(video_tensor, vae, device, vae.dtype, args)
+    logger.info(f"Encoded video to latents: {video_latents.shape}")
+    
+    # Extract first frame for CLIP conditioning (i2v requirement)
+    first_frame_np = video_frames_np[0]  # HWC, 0-255
+    first_frame_pil = Image.fromarray(first_frame_np)
+    
+    # Calculate dimensions from latents
+    _, _, lat_f, lat_h, lat_w = video_latents.shape
+    seq_len = (lat_h * lat_w) // (config.patch_size[1] * config.patch_size[2]) * lat_f
+    
+    # Configure negative prompt
+    n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
+    
+    # Set seed
+    seed = args.seed
+    if not args.cpu_noise:
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
+    else:
+        seed_g = torch.manual_seed(seed)
+    
+    # Load text encoder and encode prompts
+    text_encoder = load_text_encoder(args, config, device)
+    text_encoder.model.to(device)
+    
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                context = text_encoder([args.prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        else:
+            context = text_encoder([args.prompt], device)
+            context_null = text_encoder([n_prompt], device)
+    
+    # Free text encoder
+    del text_encoder
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
+    
+    # Load CLIP model and encode first frame
+    clip = load_clip_model(args, config, device)
+    clip.model.to(device)
+    
+    # Convert first frame for CLIP
+    img_tensor_clip = TF.to_tensor(first_frame_pil).sub_(0.5).div_(0.5).to(device)  # CHW, [-1, 1]
+    
+    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+        clip_context = clip.visual([img_tensor_clip.unsqueeze(1)])  # Add Frame dim
+    
+    logger.info("Encoded first frame with CLIP for i2v conditioning")
+    
+    # Free CLIP model
+    del clip
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded CLIP model from memory")
+    
+    # Generate noise matching video latents shape
+    noise = torch.randn(
+        video_latents.shape,  # [B, C', F', H', W']
+        dtype=torch.float32,
+        device=device if not args.cpu_noise else "cpu",
+        generator=seed_g
+    )
+    noise = noise.to(device)
+    
+    # Prepare model input arguments
+    # A14B models don't have img_emb layer, so don't pass clip_fea
+    use_clip_fea = clip_context if not ("A14B" in args.task) else None
+    
+    # For i2v models, we need to prepare 'y' tensor (mask + latent)
+    # Create a simple mask that marks all frames as to-be-generated
+    # This differs from standard I2V which marks first frame as given
+    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
+    # Don't mask any frames - we want to regenerate the entire video
+    
+    # Concatenate mask with video latents to create 'y'
+    y = torch.cat([msk, video_latents.squeeze(0)], dim=0)  # [4+C', F', H', W']
+    
+    arg_c = {
+        "context": context,
+        "clip_fea": use_clip_fea,
+        "seq_len": seq_len,
+        "y": [y],  # i2v models expect y as a list
+    }
+    
+    arg_null = {
+        "context": context_null,
+        "clip_fea": use_clip_fea,
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    return noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
+
+
 # --- End V2V Helper Functions ---
 
 def load_control_video(control_path: str, frames: int, height: int, width: int, args=None) -> torch.Tensor:
@@ -2481,15 +2626,20 @@ def run_sampling(
             if model_manager is not None:  # Always true for dual-dit models now
                 # Dynamic loading mode
                 cfg = WAN_CONFIGS[args.task]
-                if args.dual_dit_boundary is not None:
-                    boundary = args.dual_dit_boundary * 1000  # Custom boundary
-                else:
-                    boundary = cfg.boundary * 1000  # Default: 0.875 * 1000 = 875 for t2v-A14B, 0.900 * 1000 = 900 for i2v-A14B
-                
-                if t.item() >= boundary:
-                    current_model = model_manager.get_model('high')
-                else:
+                # Force low noise model for V2V if requested
+                if hasattr(args, 'v2v_low_noise_only') and args.v2v_low_noise_only:
                     current_model = model_manager.get_model('low')
+                else:
+                    # Normal boundary logic
+                    if args.dual_dit_boundary is not None:
+                        boundary = args.dual_dit_boundary * 1000  # Custom boundary
+                    else:
+                        boundary = cfg.boundary * 1000  # Default: 0.875 * 1000 = 875 for t2v-A14B, 0.900 * 1000 = 900 for i2v-A14B
+                    
+                    if t.item() >= boundary:
+                        current_model = model_manager.get_model('high')
+                    else:
+                        current_model = model_manager.get_model('low')
             else:
                 # Single model mode
                 current_model = model
@@ -2603,6 +2753,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # --- Determine Mode ---
     is_i2v = args.image_path is not None and "i2v" in args.task
     is_ti2v = args.image_path is not None and "ti2v" in args.task  # Text+Image-to-Video
+    is_v2v_i2v = args.video_path is not None and args.v2v_use_i2v  # V2V using i2v model
     is_v2v = args.video_path is not None
     is_fun_control = args.control_path is not None and cfg.is_fun_control
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
@@ -2611,6 +2762,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_ti2v: logger.info(f"Running Text+Image-to-Video (TI2V) inference")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
+    elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
     else: 
         if args.task == "ti2v-5B" and args.image_path is None:
@@ -2677,7 +2829,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # --- Load VAE (if needed for input processing) ---
     vae = None
     # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
-    needs_vae_early = is_v2v or is_i2v or is_ti2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
+    needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
     if needs_vae_early:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
@@ -2689,7 +2841,43 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     inputs = None
     video_latents = None # For V2V mixing
 
-    if is_v2v:
+    if is_v2v_i2v:
+        # V2V using i2v model - combines video encoding with CLIP conditioning
+        # 1. Load video frames
+        video_frames_np, actual_frames_loaded = load_video(
+            args.video_path,
+            start_frame=0,
+            num_frames=args.video_length,
+            bucket_reso=tuple(args.video_size)
+        )
+        if actual_frames_loaded == 0:
+            raise ValueError(f"Could not load any frames from video: {args.video_path}")
+            
+        # Update video_length if needed
+        if args.video_length is None or actual_frames_loaded < args.video_length:
+            logger.info(f"Updating video_length based on loaded frames: {actual_frames_loaded}")
+            args.video_length = actual_frames_loaded
+            height, width, video_length = check_inputs(args)
+            args.video_size = [height, width]
+        else:
+            video_length = args.video_length
+            
+        # 2. Prepare V2V-I2V inputs (handles both video encoding and CLIP conditioning)
+        noise, context, context_null, clip_context, video_latents, inputs = prepare_v2v_i2v_inputs(
+            args, cfg, accelerator, device, vae, video_frames_np
+        )
+        
+        # Force low noise model for V2V if requested
+        if args.v2v_low_noise_only and args.dual_dit_boundary is None:
+            logger.info("V2V with --v2v_low_noise_only: forcing dual_dit_boundary to 1.0 (low noise model only)")
+            args.dual_dit_boundary = 1.0
+            
+        # Adjust default strength for i2v V2V
+        if args.strength == 0.75:  # Default value
+            args.strength = 0.9
+            logger.info(f"Using recommended V2V strength for i2v model: {args.strength}")
+        
+    elif is_v2v and not is_v2v_i2v:
         # Standard V2V path (mutually exclusive with FunControl)
         # 1. Load and prepare video
         video_frames_np, actual_frames_loaded = load_video(
@@ -3260,7 +3448,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     # --- V2V Strength Adjustment ---
-    if is_v2v and args.strength < 1.0:
+    if (is_v2v or is_v2v_i2v) and args.strength < 1.0:
         if video_latents is None:
              raise RuntimeError("video_latents not available for V2V strength adjustment.")
 

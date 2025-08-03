@@ -78,6 +78,7 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool  # Add these
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -136,7 +137,15 @@ def wan22_batch_handler(
         elif "ti2v-5B" in task:
             command.extend(["--dit", dit_path])
 
-        if "i2v" in task and image_path:
+        # Handle V2V vs I2V mode
+        if enable_v2v and input_video:
+            command.extend(["--video_path", str(input_video)])
+            command.extend(["--strength", str(v2v_strength)])
+            if v2v_low_noise_only:
+                command.append("--v2v_low_noise_only")
+            if v2v_use_i2v:
+                command.append("--v2v_use_i2v")
+        elif "i2v" in task and image_path:
             command.extend(["--image_path", str(image_path)])
 
         if fp8: command.append("--fp8")
@@ -6864,6 +6873,18 @@ with gr.Blocks(
                     wan22_input_image = gr.Image(label="Input Image (for i2v tasks)", type="filepath")
                     wan22_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
                     
+                    # V2V controls
+                    wan22_enable_v2v = gr.Checkbox(
+                        label="Enable Video-to-Video (V2V) Mode", 
+                        value=False,
+                        info="Use input video for video-to-video generation"
+                    )
+                    with gr.Group(visible=False) as wan22_v2v_controls:
+                        wan22_input_video = gr.Video(label="Input Video", format="mp4")
+                        wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, label="V2V Strength", value=0.75, info="How much to modify the input video (0=keep original, 1=full rewrite)")
+                        wan22_v2v_low_noise_only = gr.Checkbox(label="Use Low Noise Model Only", value=False, info="For V2V with dual-dit models, use only the low noise model")
+                        wan22_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Extract first frame for CLIP conditioning. Recommended for i2v-A14B.")
+                    
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
@@ -9848,6 +9869,13 @@ with gr.Blocks(
     wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
     
+    # V2V visibility toggle
+    wan22_enable_v2v.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_v2v],
+        outputs=[wan22_v2v_controls]
+    )
+    
     # Image input handling for wan22
     wan22_input_image.change(
         fn=update_wanx_image_dimensions,  # Reuse the same function
@@ -9866,6 +9894,28 @@ with gr.Blocks(
         fn=calculate_wanx_height,  # Reuse function from WanX
         inputs=[wan22_width, wan22_original_dims],
         outputs=[wan22_height]
+    )
+    
+    # Video input handling for wan22 V2V
+    def update_wan22_video_dimensions(video_path):
+        """Extract video dimensions and update UI"""
+        if not video_path:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        
+        info = get_video_info(video_path)  # This function already exists
+        if info:
+            return (
+                gr.update(value=info['width']),
+                gr.update(value=info['height']), 
+                gr.update(value=min(info['total_frames'], 201)),  # Cap at 201 frames
+                gr.update(value=info['fps'])
+            )
+        return gr.update(), gr.update(), gr.update(), gr.update()
+
+    wan22_input_video.change(
+        fn=update_wan22_video_dimensions,
+        inputs=[wan22_input_video],
+        outputs=[wan22_width, wan22_height, wan22_frame_num, wan22_fps]
     )
 
     def update_wan22_model_paths_and_settings(task):
@@ -9958,6 +10008,12 @@ with gr.Blocks(
             wan22_dynamic_model_loading,
             wan22_unload_text_encoders,
             wan22_vae_fp32,
+            # V2V arguments
+            wan22_enable_v2v,
+            wan22_input_video,
+            wan22_v2v_strength,
+            wan22_v2v_low_noise_only,
+            wan22_v2v_use_i2v,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
