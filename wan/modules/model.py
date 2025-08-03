@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict
 
 import torch
 import torch.nn as nn
@@ -948,6 +948,8 @@ def load_wan_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
+    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
+    lora_multipliers: Optional[List[float]] = None,
 ) -> WanModel:
     # dit_weight_dtype is None for fp8_scaled
     assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
@@ -956,8 +958,46 @@ def load_wan_model(
     loading_device = torch.device(loading_device)
 
     wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
-    logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
-    sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+    
+    # Check if we should use efficient LoRA loading
+    if lora_weights_list is not None and len(lora_weights_list) > 0:
+        logger.info(f"Loading DiT model with LoRA weights (efficient hook-based method)")
+        logger.info(f"Loading from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
+        
+        # Import the efficient loading function
+        from utils.lora_utils import load_safetensors_with_lora_and_fp8
+        
+        # Use hook-based loading that merges LoRA during load
+        sd = load_safetensors_with_lora_and_fp8(
+            model_files=dit_path,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            fp8_optimization=False,  # We'll handle fp8 separately if needed
+            calc_device=device,  # Use target device for calculations
+            move_to_device=(wan_loading_device == device),
+            target_keys=None,  # Apply to all keys
+            exclude_keys=None,
+        )
+        
+        # Detect actual input dimensions from checkpoint
+        if "patch_embedding.weight" in sd:
+            actual_in_dim = sd["patch_embedding.weight"].shape[1]
+            if actual_in_dim != config.in_dim:
+                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
+                config = type(config)(config.__dict__)  # Create a copy
+                config.in_dim = actual_in_dim
+    else:
+        # Original loading without LoRA
+        logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
+        sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+        
+        # Detect actual input dimensions from checkpoint
+        if "patch_embedding.weight" in sd:
+            actual_in_dim = sd["patch_embedding.weight"].shape[1]
+            if actual_in_dim != config.in_dim:
+                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
+                config = type(config)(config.__dict__)  # Create a copy
+                config.in_dim = actual_in_dim
 
     # remove "model.diffusion_model." prefix: 1.3B model has this prefix
     sd_keys = list(sd.keys()) # Keep original keys for potential prefix removal

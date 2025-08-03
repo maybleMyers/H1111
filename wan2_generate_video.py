@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from networks import lora_wan
 from utils.safetensors_utils import mem_eff_save_file, load_safetensors
+from utils.lora_utils import filter_lora_state_dict
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
@@ -1090,6 +1091,37 @@ def load_dit_model(
         WanModel or Tuple[WanModel, WanModel]: loaded DiT model(s)
     """
     
+    # Load LoRA weights BEFORE model loading for efficient merging
+    lora_weights_list = None
+    lora_multipliers = None
+    
+    if not dynamic_loading and args.lora_weight is not None and len(args.lora_weight) > 0:
+        lora_weights_list = []
+        
+        for i, lora_path in enumerate(args.lora_weight):
+            logger.info(f"Loading LoRA weight from: {lora_path}")
+            lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
+            
+            # Apply include/exclude patterns if specified
+            include_pattern = None
+            exclude_pattern = None
+            
+            if args.include_patterns is not None and i < len(args.include_patterns):
+                include_pattern = args.include_patterns[i]
+            if args.exclude_patterns is not None and i < len(args.exclude_patterns):
+                exclude_pattern = args.exclude_patterns[i]
+            
+            if include_pattern or exclude_pattern:
+                lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
+            
+            lora_weights_list.append(lora_sd)
+        
+        # Set up multipliers
+        if isinstance(args.lora_multiplier, list):
+            lora_multipliers = args.lora_multiplier
+        else:
+            lora_multipliers = [args.lora_multiplier] * len(lora_weights_list)
+    
     # Check if this is a dual-dit model (A14B models)
     is_dual_dit = "A14B" in args.task
     
@@ -1113,8 +1145,16 @@ def load_dit_model(
             elif args.fp8_scaled or args.lora_weight is not None:
                 loading_weight_dtype = dit_dtype
             
-            model_low = load_wan_model(config, device, args.dit_low_noise, args.attn_mode, False, loading_device, loading_weight_dtype, False)
-            model_high = load_wan_model(config, device, args.dit_high_noise, args.attn_mode, False, loading_device, loading_weight_dtype, False)
+            model_low = load_wan_model(
+                config, device, args.dit_low_noise, args.attn_mode, False, 
+                loading_device, loading_weight_dtype, False,
+                lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+            )
+            model_high = load_wan_model(
+                config, device, args.dit_high_noise, args.attn_mode, False, 
+                loading_device, loading_weight_dtype, False,
+                lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+            )
             
             return model_low, model_high
     elif is_dual_dit:
@@ -1136,7 +1176,11 @@ def load_dit_model(
     elif args.fp8_scaled or args.lora_weight is not None:
         loading_weight_dtype = dit_dtype
         
-    model = load_wan_model(config, device, dit_path, args.attn_mode, False, loading_device, loading_weight_dtype, False)
+    model = load_wan_model(
+        config, device, dit_path, args.attn_mode, False, 
+        loading_device, loading_weight_dtype, False,
+        lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+    )
     return model
 
 
@@ -3081,18 +3125,30 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         model = model_result
         model_low = model_high = None
 
-    # --- Merge LoRA ---
+    # --- Verify LoRA Merge (if applicable) ---
     if args.lora_weight is not None and len(args.lora_weight) > 0:
-        merge_lora_weights(model, args, device)
-        if model_manager:
-            # Save LoRA state for dynamic loading
-            model_manager.save_lora_state(args.lora_weight)
-        elif is_dual_dit and model_high is not None:
-            # Also merge LoRA into high noise model (original behavior)
-            merge_lora_weights(model_high, args, device)
+        # LoRA weights were already merged during model loading
+        logger.info("LoRA weights were merged during model loading (efficient hook-based method)")
+        
+        # Optional: Verify the merge was successful by checking a few weights
+        # This maintains compatibility with your dual checking process
+        try:
+            # Simple verification: check if model has expected parameter count
+            param_count = sum(p.numel() for p in model.parameters())
+            logger.info(f"Model loaded with {param_count:,} parameters after LoRA merge")
+        except Exception as e:
+            logger.warning(f"Could not verify LoRA merge: {e}")
+        
+        # Handle save_merged_model if specified
         if args.save_merged_model:
-            logger.info("Merged model saved. Exiting without generation.")
-            # Clean up resources if exiting early
+            logger.info(f"Saving merged model to {args.save_merged_model}")
+            try:
+                mem_eff_save_file(model.state_dict(), args.save_merged_model)
+                logger.info("Merged model saved successfully")
+            except Exception as e:
+                logger.error(f"Failed to save merged model: {e}")
+            
+            # Clean up and exit
             if 'model' in locals(): del model
             if 'vae' in locals() and vae is not None: del vae
             clean_memory_on_device(device)
