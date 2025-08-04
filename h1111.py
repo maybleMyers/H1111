@@ -197,7 +197,7 @@ def wan22_batch_handler(
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
-
+        last_was_loading = False
         for line in iter(process.stdout.readline, ''):
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
@@ -207,7 +207,14 @@ def wan22_batch_handler(
 
             line_strip = line.strip()
             if not line_strip: continue
-            print(f"WAN2.2_SUBPROCESS: {line_strip}")
+            if "Loading wan22_i2v_14B_high_noise_fp32.safetensors with LoRA merge:" in line_strip and '%' in line_strip:
+                print(f"\rWAN2.2_SUBPROCESS: {line_strip}", end='', flush=True)
+                last_was_loading = True
+            else:
+                if last_was_loading:
+                    print()  # Add newline to move to next line
+                    last_was_loading = False
+                print(f"WAN2.2_SUBPROCESS: {line_strip}")
             progress_text_update = line_strip
 
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
