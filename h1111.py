@@ -208,8 +208,14 @@ def wan22_batch_handler(
             line_strip = line.strip()
             if not line_strip: continue
             if ('Loading wan' in line_strip or 'with LoRA merge:' in line_strip) and '%|' in line_strip:
+                if not last_was_progress:
+                    print()  # Start progress on a new line
                 print(f"\rWAN2.2_SUBPROCESS: {line_strip}", end='', flush=True)
+                last_was_progress = True
             else:
+                if last_was_progress:
+                    print()  # Complete the progress line
+                    last_was_progress = False
                 print(f"WAN2.2_SUBPROCESS: {line_strip}")
             progress_text_update = line_strip
 
