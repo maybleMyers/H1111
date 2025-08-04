@@ -197,7 +197,7 @@ def wan22_batch_handler(
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
-        last_was_loading = False
+        last_was_progress = False
         for line in iter(process.stdout.readline, ''):
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
