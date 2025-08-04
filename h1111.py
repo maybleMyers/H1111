@@ -207,13 +207,9 @@ def wan22_batch_handler(
 
             line_strip = line.strip()
             if not line_strip: continue
-            if "Loading wan22_i2v_14B_high_noise_fp32.safetensors with LoRA merge:" in line_strip and '%' in line_strip:
+            if ('Loading wan' in line_strip or 'with LoRA merge:' in line_strip) and '%|' in line_strip:
                 print(f"\rWAN2.2_SUBPROCESS: {line_strip}", end='', flush=True)
-                last_was_loading = True
             else:
-                if last_was_loading:
-                    print()  # Add newline to move to next line
-                    last_was_loading = False
                 print(f"WAN2.2_SUBPROCESS: {line_strip}")
             progress_text_update = line_strip
 
@@ -6963,7 +6959,7 @@ with gr.Blocks(
                         label="Unload Text Encoders after use (T5/CLIP) to save RAM",
                         value=False, visible=False
                     )
-                    wan22_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=True)
+                    wan22_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
                     wan22_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
                         value=True,
