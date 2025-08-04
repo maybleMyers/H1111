@@ -5996,7 +5996,7 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                    framepack_is_f1 = gr.Checkbox(label="️ Use F1 Model", value=False,
+                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
                                                   info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -6105,7 +6105,7 @@ with gr.Blocks(
                         framepack_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn")
                     with gr.Group():
                         with gr.Row():
-                            framepack_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
+                            framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
                             framepack_lora_folder = gr.Textbox(label="LoRa Folder", value="lora", scale=4)
                         framepack_lora_weights = []
                         framepack_lora_multipliers = []
@@ -6296,7 +6296,7 @@ with gr.Blocks(
                         # fpe_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn") # Optional
                     gr.Markdown("### LoRA Configuration")
                     with gr.Row():
-                        fpe_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
+                        fpe_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
                         fpe_lora_folder = gr.Textbox(label="LoRA Folder", value="lora", scale=4)
                     fpe_lora_weights_ui = []
                     fpe_lora_multipliers_ui = []
@@ -6411,7 +6411,7 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):                        
                         with gr.Row():
                             multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            multitalk_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
+                            multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
                         
                         multitalk_lora_weights_ui = []
                         multitalk_lora_multipliers_ui = []
@@ -6476,7 +6476,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -6573,7 +6573,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v") # Keep sending to original V2V
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -6672,7 +6672,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -6798,7 +6798,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -6908,7 +6908,7 @@ with gr.Blocks(
                     wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        wan22_random_seed_btn = gr.Button("️")
+                        wan22_random_seed_btn = gr.Button("🎲")
 
                 with gr.Column():
                     wan22_output = gr.Gallery(
@@ -6927,7 +6927,7 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):
                         with gr.Row():
                             wan22_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            wan22_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
+                            wan22_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
                         wan22_lora_weights = []
                         wan22_lora_multipliers = []
                         for i in range(4):
@@ -7058,7 +7058,7 @@ with gr.Blocks(
                     phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
                     phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
-                    phantom_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     phantom_lora_weights_ui = []
                     phantom_lora_multipliers_ui = []
                     for i in range(4):
@@ -7250,7 +7250,7 @@ with gr.Blocks(
                     wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -7396,7 +7396,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -7543,7 +7543,7 @@ with gr.Blocks(
                     wanx_v2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
 
                     # Add LoRA section for WanX-v2v
-                    wanx_v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    wanx_v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
                     wanx_v2v_lora_weights = []
                     wanx_v2v_lora_multipliers = []
                     for i in range(4):
@@ -7759,7 +7759,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
