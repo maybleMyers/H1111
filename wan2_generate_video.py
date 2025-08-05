@@ -3448,28 +3448,26 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if (is_v2v or is_v2v_i2v) and args.strength < 1.0:
-        if video_latents is None:
-             raise RuntimeError("video_latents not available for V2V strength adjustment.")
-
-        # Use all timesteps but mix noise based on strength
-        # strength=0 means keep original video, strength=1 means full noise
-        logger.info(f"V2V Noise Mix: {args.strength}, using all {args.infer_steps} inference steps")
-
-        # Mix noise and video latents based on strength
-        # Ensure video_latents are on the same device and dtype as noise for mixing
-        video_latents = video_latents.to(device=latent.device, dtype=latent.dtype)
-
-        if latent.shape != video_latents.shape:
-            logger.error(f"Noise shape {latent.shape} does not match video latent shape {video_latents.shape} for V2V mixing. Cannot proceed.")
-            raise ValueError("Shape mismatch between noise and video latents in V2V.")
-
-        # Simple linear interpolation for noise mixing
-        # This gives more predictable results than scheduler.add_noise
-        latent = (1.0 - args.strength) * video_latents + args.strength * latent
-        logger.info(f"Mixed video latents and noise: {(1.0 - args.strength):.2f} * video + {args.strength:.2f} * noise")
-
-        # Use all timesteps for denoising
-        logger.info(f"Using full {len(timesteps)} timesteps for V2V sampling.")
+        # Calculate how many steps to skip based on strength
+        init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
+        init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
+        
+        # Get the actual timestep value
+        init_timestep = timesteps[init_timestep_idx]
+        
+        # Use scheduler's add_noise method to properly add noise
+        # This applies the correct alpha_t and sigma_t scaling
+        latent = scheduler.add_noise(
+            original_samples=video_latents,
+            noise=latent,  # This is pure noise
+            timesteps=torch.tensor([init_timestep], device=device)
+        )
+        
+        # Skip the early timesteps
+        timesteps = timesteps[init_timestep_idx:]
+        
+        logger.info(f"V2V: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
+        logger.info(f"Using {len(timesteps)} timesteps for V2V sampling")
     else:
          logger.info(f"Using full {len(timesteps)} timesteps for sampling.")
     previewer = None

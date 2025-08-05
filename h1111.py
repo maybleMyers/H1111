@@ -6881,7 +6881,7 @@ with gr.Blocks(
                     )
                     with gr.Group(visible=False) as wan22_v2v_controls:
                         wan22_input_video = gr.Video(label="Input Video", format="mp4")
-                        wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.005, label="V2V Strength", value=0.95, info="How much to modify the input video (1=keep original, 0=full rewrite)")
+                        wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="V2V Strength", value=0.5, info="How much to modify the input video (0=keep original, 1=full rewrite)")
                         wan22_v2v_low_noise_only = gr.Checkbox(label="Use Low Noise Model Only", value=False, info="For V2V with dual-dit models, use only the low noise model")
                         wan22_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Extract first frame for CLIP conditioning. Recommended for i2v-A14B.")
                     
