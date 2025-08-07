@@ -71,6 +71,8 @@ def wan22_batch_handler(
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
     lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
     # Previews
     enable_preview: bool,
     preview_steps: int,
@@ -167,20 +169,42 @@ def wan22_batch_handler(
         # --- LoRA Handling ---
         lora_weights_paths = []
         lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+        
         lora_inputs = [
-            (lora1_str, lora1_mult), (lora2_str, lora2_mult),
-            (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high), 
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high), 
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high)
         ]
+        
         if lora_folder and os.path.exists(lora_folder):
-            for name, mult in lora_inputs:
+            for name, mult, apply_low, apply_high in lora_inputs:
                 if name and name != "None":
                     path = os.path.join(lora_folder, name)
                     if os.path.exists(path):
-                        lora_weights_paths.append(path)
-                        lora_multipliers_values.append(str(mult))
+                        # Apply to low noise model (default behavior)
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        
+                        # Apply to high noise model (for dual-dit models)
+                        if apply_high and "A14B" in task:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+        
+        # Add low noise LoRA arguments
         if lora_weights_paths:
             command.extend(["--lora_weight"] + lora_weights_paths)
             command.extend(["--lora_multiplier"] + lora_multipliers_values)
+        
+        # Add high noise LoRA arguments (only for A14B models)
+        if lora_weights_paths_high and "A14B" in task:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
         
         # --- Execute Subprocess ---
         print(f"Running Wan2.2 Command: {' '.join(command)}")
@@ -5995,7 +6019,7 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     framepack_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     framepack_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                    framepack_is_f1 = gr.Checkbox(label="🏎️ Use F1 Model", value=False,
+                    framepack_is_f1 = gr.Checkbox(label="️ Use F1 Model", value=False,
                                                   info="Switches to the F1 model (different DiT path and logic).")                    
                 with gr.Column(scale=2):
                     framepack_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -6104,7 +6128,7 @@ with gr.Blocks(
                         framepack_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn")
                     with gr.Group():
                         with gr.Row():
-                            framepack_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
+                            framepack_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn") # Specific LoRA refresh
                             framepack_lora_folder = gr.Textbox(label="LoRa Folder", value="lora", scale=4)
                         framepack_lora_weights = []
                         framepack_lora_multipliers = []
@@ -6295,7 +6319,7 @@ with gr.Blocks(
                         # fpe_skip_btn = gr.Button("Skip Batch Item", elem_classes="light-blue-btn") # Optional
                     gr.Markdown("### LoRA Configuration")
                     with gr.Row():
-                        fpe_refresh_lora_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        fpe_refresh_lora_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         fpe_lora_folder = gr.Textbox(label="LoRA Folder", value="lora", scale=4)
                     fpe_lora_weights_ui = []
                     fpe_lora_multipliers_ui = []
@@ -6410,7 +6434,7 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):                        
                         with gr.Row():
                             multitalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            multitalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                            multitalk_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         
                         multitalk_lora_weights_ui = []
                         multitalk_lora_multipliers_ui = []
@@ -6475,7 +6499,7 @@ with gr.Blocks(
                     with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
             
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     lora_weights = []
                     lora_multipliers = []
                     for i in range(4):
@@ -6572,7 +6596,7 @@ with gr.Blocks(
                     i2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v") # Keep sending to original V2V
 
                     # Add LoRA section for Image2Video
-                    i2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    i2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     i2v_lora_weights = []
                     i2v_lora_multipliers = []
                     for i in range(4):
@@ -6671,7 +6695,7 @@ with gr.Blocks(
                         height="auto"
                     )
                     v2v_send_to_input_btn = gr.Button("Send Selected to Input")  # New button
-                    v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     v2v_lora_weights = []
                     v2v_lora_multipliers = []
                     for i in range(4):
@@ -6797,7 +6821,7 @@ with gr.Blocks(
                     skyreels_send_to_v2v_btn = gr.Button("Send Selected to Video2Video")
 
                     # Add LoRA section for SKYREELS
-                    skyreels_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    skyreels_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     skyreels_lora_weights = []
                     skyreels_lora_multipliers = []
                     for i in range(4):
@@ -6907,7 +6931,7 @@ with gr.Blocks(
                     wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        wan22_random_seed_btn = gr.Button("🎲")
+                        wan22_random_seed_btn = gr.Button("")
 
                 with gr.Column():
                     wan22_output = gr.Gallery(
@@ -6926,9 +6950,11 @@ with gr.Blocks(
                     with gr.Accordion("LoRA", open=True):
                         with gr.Row():
                             wan22_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            wan22_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                            wan22_lora_refresh_btn = gr.Button(" LoRA", elem_classes="refresh-btn")
                         wan22_lora_weights = []
                         wan22_lora_multipliers = []
+                        wan22_lora_apply_low = []
+                        wan22_lora_apply_high = []
                         for i in range(4):
                             with gr.Row():
                                 wan22_lora_weights.append(gr.Dropdown(
@@ -6937,6 +6963,13 @@ with gr.Blocks(
                                 ))
                                 wan22_lora_multipliers.append(gr.Slider(
                                     label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                wan22_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                wan22_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
                                 ))
             
             with gr.Accordion("Model Paths & Performance", open=True):
@@ -7057,7 +7090,7 @@ with gr.Blocks(
                     phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
                     phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
-                    phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    phantom_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     phantom_lora_weights_ui = []
                     phantom_lora_multipliers_ui = []
                     for i in range(4):
@@ -7249,7 +7282,7 @@ with gr.Blocks(
                     wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
 
                     # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_lora_weights = []
                     wanx_lora_multipliers = []
                     for i in range(4):
@@ -7395,7 +7428,7 @@ with gr.Blocks(
                     wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
 
                     # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_t2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_t2v_lora_weights = []
                     wanx_t2v_lora_multipliers = []
                     for i in range(4):
@@ -7542,7 +7575,7 @@ with gr.Blocks(
                     wanx_v2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
 
                     # Add LoRA section for WanX-v2v
-                    wanx_v2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    wanx_v2v_refresh_btn = gr.Button("", elem_classes="refresh-btn")
                     wanx_v2v_lora_weights = []
                     wanx_v2v_lora_multipliers = []
                     for i in range(4):
@@ -7758,7 +7791,7 @@ with gr.Blocks(
                         allow_custom_value=True,
                         interactive=True
                     )
-                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    merge_refresh_btn = gr.Button("", elem_classes="refresh-btn")
             with gr.Row():
                 with gr.Column():
                     # Output model name
@@ -9980,6 +10013,22 @@ with gr.Blocks(
                 wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_dual_dit_boundary,
                 wan22_dynamic_model_loading]  # ADD THIS
     )
+    
+    # Add visibility control for high noise LoRA checkboxes based on task
+    def update_high_noise_lora_visibility(task):
+        """Show/hide high noise LoRA checkboxes based on task"""
+        is_dual_dit = "A14B" in task  # A14B models use dual-dit
+        updates = []
+        for i in range(4):
+            updates.append(gr.update(visible=is_dual_dit))  # High noise checkbox visibility
+        return updates
+    
+    # Connect the task dropdown to update visibility of high noise checkboxes
+    wan22_task.change(
+        fn=update_high_noise_lora_visibility,
+        inputs=[wan22_task],
+        outputs=wan22_lora_apply_high
+    )
 
     wan22_generate_btn.click(
         fn=wan22_batch_handler,
@@ -10017,6 +10066,8 @@ with gr.Blocks(
             wan22_lora_folder,
             *wan22_lora_weights,
             *wan22_lora_multipliers,
+            *wan22_lora_apply_low,
+            *wan22_lora_apply_high,
             # Previews
             wan22_enable_preview,
             wan22_preview_steps,

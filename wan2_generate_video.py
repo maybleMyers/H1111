@@ -240,6 +240,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
+    # LoRA for high noise model (dual-dit models only)
+    parser.add_argument("--lora_weight_high", type=str, nargs="*", required=False, default=None, 
+                       help="LoRA weight path for high noise model (dual-dit models only)")
+    parser.add_argument("--lora_multiplier_high", type=float, nargs="*", default=1.0, 
+                       help="LoRA multiplier for high noise model")
+    parser.add_argument("--include_patterns_high", type=str, nargs="*", default=None, help="LoRA module include patterns for high noise model")
+    parser.add_argument("--exclude_patterns_high", type=str, nargs="*", default=None, help="LoRA module exclude patterns for high noise model")
     parser.add_argument(
         "--save_merged_model",
         type=str,
@@ -434,8 +441,10 @@ class DynamicModelManager:
         self.current_model = None
         self.current_model_type = None  # 'low' or 'high'
         self.model_paths = {}
-        self.lora_weights_list = None
-        self.lora_multipliers = None
+        self.lora_weights_list_low = None
+        self.lora_multipliers_low = None
+        self.lora_weights_list_high = None
+        self.lora_multipliers_high = None
         
     def has_model_loaded(self):
         """Check if any model is currently loaded."""
@@ -446,10 +455,13 @@ class DynamicModelManager:
         self.model_paths['low'] = low_path
         self.model_paths['high'] = high_path
         
-    def set_lora_weights(self, lora_weights_list, lora_multipliers):
+    def set_lora_weights(self, lora_weights_list_low, lora_multipliers_low, 
+                        lora_weights_list_high, lora_multipliers_high):
         """Save LoRA weights to apply to dynamically loaded models."""
-        self.lora_weights_list = lora_weights_list
-        self.lora_multipliers = lora_multipliers
+        self.lora_weights_list_low = lora_weights_list_low
+        self.lora_multipliers_low = lora_multipliers_low
+        self.lora_weights_list_high = lora_weights_list_high
+        self.lora_multipliers_high = lora_multipliers_high
         
     def get_model(self, model_type: str) -> WanModel:
         """Load the requested model if not already loaded."""
@@ -525,7 +537,7 @@ class DynamicModelManager:
         # Load new model
         logger.info(f"Loading {model_type} noise model...")
         loading_device = "cpu"
-        if self.args.blocks_to_swap == 0 and self.lora_weights_list is None and not self.args.fp8_scaled:
+        if self.args.blocks_to_swap == 0 and self.lora_weights_list_low is None and not self.args.fp8_scaled:
             loading_device = self.device
             
         loading_weight_dtype = self.dit_weight_dtype
@@ -535,11 +547,31 @@ class DynamicModelManager:
         elif self.args.fp8_scaled or self.args.lora_weight is not None:
             loading_weight_dtype = self.dit_dtype
             
+        # Select appropriate LoRA weights for this model type
+        lora_weights_list = None
+        lora_multipliers = None
+        if model_type == 'low':
+            lora_weights_list = self.lora_weights_list_low
+            lora_multipliers = self.lora_multipliers_low
+        else:  # 'high'
+            lora_weights_list = self.lora_weights_list_high
+            lora_multipliers = self.lora_multipliers_high
+            
+        # DEBUG: Print full LoRA list and weights being applied to this DiT model
+        if lora_weights_list is not None:
+            logger.info(f"DEBUG: Loading {model_type} noise DiT model with {len(lora_weights_list)} LoRA(s)")
+            for i, lora_sd in enumerate(lora_weights_list):
+                multiplier = lora_multipliers[i] if lora_multipliers and i < len(lora_multipliers) else 1.0
+                lora_keys = list(lora_sd.keys())[:5]  # Show first 5 keys
+                logger.info(f"DEBUG: LoRA {i+1}/{len(lora_weights_list)} for {model_type} noise model - Multiplier: {multiplier}, Keys sample: {lora_keys}")
+        else:
+            logger.info(f"DEBUG: Loading {model_type} noise DiT model with NO LoRA weights")
+            
         # Load model with LoRA weights if available
         model = load_wan_model(
             self.config, self.device, self.model_paths[model_type], 
             self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=self.lora_weights_list, lora_multipliers=self.lora_multipliers
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
         )
         
         # Optimize model
@@ -1195,11 +1227,13 @@ def load_dit_model(
     """
     
     # Load LoRA weights BEFORE model loading for efficient merging
-    lora_weights_list = None
-    lora_multipliers = None
+    lora_weights_list_low = None
+    lora_multipliers_low = None
+    lora_weights_list_high = None
+    lora_multipliers_high = None
     
     if args.lora_weight is not None and len(args.lora_weight) > 0:
-        lora_weights_list = []
+        lora_weights_list_low = []
         
         for i, lora_path in enumerate(args.lora_weight):
             logger.info(f"Loading LoRA weight from: {lora_path}")
@@ -1217,22 +1251,56 @@ def load_dit_model(
             if include_pattern or exclude_pattern:
                 lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
             
-            lora_weights_list.append(lora_sd)
+            lora_weights_list_low.append(lora_sd)
         
         # Set up multipliers
         if isinstance(args.lora_multiplier, list):
-            lora_multipliers = args.lora_multiplier
+            lora_multipliers_low = args.lora_multiplier
         else:
-            lora_multipliers = [args.lora_multiplier] * len(lora_weights_list)
+            lora_multipliers_low = [args.lora_multiplier] * len(lora_weights_list_low)
+    
+    # Load high noise model LoRA weights if specified
+    if hasattr(args, 'lora_weight_high') and args.lora_weight_high is not None and len(args.lora_weight_high) > 0:
+        lora_weights_list_high = []
+        
+        for i, lora_path in enumerate(args.lora_weight_high):
+            logger.info(f"Loading LoRA weight for high noise model from: {lora_path}")
+            lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
+            
+            # Apply include/exclude patterns if specified
+            include_pattern = None
+            exclude_pattern = None
+            
+            if hasattr(args, 'include_patterns_high') and args.include_patterns_high is not None and i < len(args.include_patterns_high):
+                include_pattern = args.include_patterns_high[i]
+            if hasattr(args, 'exclude_patterns_high') and args.exclude_patterns_high is not None and i < len(args.exclude_patterns_high):
+                exclude_pattern = args.exclude_patterns_high[i]
+            
+            if include_pattern or exclude_pattern:
+                lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
+            
+            lora_weights_list_high.append(lora_sd)
+        
+        # Set up multipliers
+        if hasattr(args, 'lora_multiplier_high') and isinstance(args.lora_multiplier_high, list):
+            lora_multipliers_high = args.lora_multiplier_high
+        else:
+            lora_multipliers_high = [args.lora_multiplier_high if hasattr(args, 'lora_multiplier_high') else 1.0] * len(lora_weights_list_high)
     
     # Check if this is a dual-dit model (A14B models)
     is_dual_dit = "A14B" in args.task
     
     if is_dual_dit and args.dit_low_noise and args.dit_high_noise:
+        # Check if high noise LoRA is provided but it's not a dual-dit model
+        if lora_weights_list_high and not is_dual_dit:
+            logger.warning("High noise LoRA weights specified but model is not dual-dit. These will be ignored.")
+            
         # Always use dynamic loading for dual-dit models to save RAM
         logger.info(f"Using dynamic loading for dual-dit models (default behavior)")
         # Return paths and LoRA weights for dynamic loading
-        return (args.dit_low_noise, args.dit_high_noise, lora_weights_list, lora_multipliers)
+        return (args.dit_low_noise, args.dit_high_noise, 
+                lora_weights_list_low, lora_multipliers_low,
+                lora_weights_list_high, lora_multipliers_high)
     elif is_dual_dit:
         logger.warning(f"Task {args.task} expects dual-dit models but dit_low_noise/dit_high_noise not specified. Using single model.")
     
@@ -1252,10 +1320,20 @@ def load_dit_model(
     elif args.fp8_scaled or args.lora_weight is not None:
         loading_weight_dtype = dit_dtype
         
+    # DEBUG: Print full LoRA list and weights being applied to single DiT model
+    if lora_weights_list_low is not None:
+        logger.info(f"DEBUG: Loading single DiT model with {len(lora_weights_list_low)} LoRA(s)")
+        for i, lora_sd in enumerate(lora_weights_list_low):
+            multiplier = lora_multipliers_low[i] if lora_multipliers_low and i < len(lora_multipliers_low) else 1.0
+            lora_keys = list(lora_sd.keys())[:5]  # Show first 5 keys
+            logger.info(f"DEBUG: LoRA {i+1}/{len(lora_weights_list_low)} for single DiT model - Multiplier: {multiplier}, Keys sample: {lora_keys}")
+    else:
+        logger.info(f"DEBUG: Loading single DiT model with NO LoRA weights")
+        
     model = load_wan_model(
         config, device, dit_path, args.attn_mode, False, 
         loading_device, loading_weight_dtype, False,
-        lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low
     )
     return model
 
@@ -1278,6 +1356,7 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
         lora_sd = load_file(lora_path, device="cpu") # Load LoRA to CPU
 
         applied_count = 0
+        matched_blocks = set()
 
         for key, value in lora_sd.items():
             lora_prefix = "diffusion_model."
@@ -1306,6 +1385,11 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
                 with torch.no_grad():
                     # Move the final update to the SAME device as the target parameter
                     target_param.add_(update_matrix.to(target_param.device, dtype=target_param.dtype))
+                
+                # Track which blocks were matched
+                if 'blocks.' in target_param_name:
+                    block_num = target_param_name.split('blocks.')[1].split('.')[0]
+                    matched_blocks.add(f"block_{block_num}")
                 applied_count += 1
             
             # 2. Handle 'diff' keys (for norm weights)
@@ -1319,6 +1403,9 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
                 
                 with torch.no_grad():
                     target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                if 'blocks.' in target_param_name:
+                    block_num = target_param_name.split('blocks.')[1].split('.')[0]
+                    matched_blocks.add(f"block_{block_num}")
                 applied_count += 1
                 
             # 3. Handle 'diff_b' keys (for biases)
@@ -1332,10 +1419,15 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
 
                 with torch.no_grad():
                     target_param.add_(update.to(target_param.device, dtype=target_param.dtype))
+                if 'blocks.' in target_param_name:
+                    block_num = target_param_name.split('blocks.')[1].split('.')[0]
+                    matched_blocks.add(f"block_{block_num}")
                 applied_count += 1
 
         if applied_count > 0:
             logging.info(f"SUCCESS: Merged {applied_count} LoRA tensors from {os.path.basename(lora_path)} into the model.")
+            if matched_blocks:
+                logging.info(f"Matched DiT blocks: {sorted(matched_blocks, key=lambda x: int(x.split('_')[1]))}")
         else:
             lora_multiplier = args.lora_multiplier[i] if hasattr(args, 'lora_multiplier') and i < len(args.lora_multiplier) else 1.0
             logging.info(f"Loading and merging LoRA with alt strat from {lora_path} with multiplier {lora_multiplier}")
@@ -3341,20 +3433,23 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     
     if is_dual_dit:
         # Set up dynamic model manager
-        if len(model_result) == 4:
+        if len(model_result) == 6:
             # New format with LoRA weights
-            model_low_path, model_high_path, lora_weights_list, lora_multipliers = model_result
+            model_low_path, model_high_path, lora_weights_list_low, lora_multipliers_low, \
+                lora_weights_list_high, lora_multipliers_high = model_result
         else:
             # Old format compatibility
             model_low_path, model_high_path = model_result
-            lora_weights_list, lora_multipliers = None, None
+            lora_weights_list_low = lora_multipliers_low = None
+            lora_weights_list_high = lora_multipliers_high = None
             
         model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         
         # Set LoRA weights if available
-        if lora_weights_list is not None:
-            model_manager.set_lora_weights(lora_weights_list, lora_multipliers)
+        if lora_weights_list_low is not None or lora_weights_list_high is not None:
+            model_manager.set_lora_weights(lora_weights_list_low, lora_multipliers_low,
+                                          lora_weights_list_high, lora_multipliers_high)
         
         # Don't load any model initially - let the sampling loop load the appropriate one
         # This avoids loading low noise model just to immediately swap to high noise
