@@ -9057,60 +9057,69 @@ with gr.Blocks(
             
         return f"Parameters ready for Wan2.2", metadata, video_path
 
-    # Wan2.2 send-to logic
+# Wan2.2 send-to logic
     send_to_wan22_btn.click(
         fn=handle_send_to_wan22_tab,
         inputs=[metadata_output, video_input],
         outputs=[status, params_state, wan22_input_video]
     ).then(
-        # Modified lambda to handle both params and video enable state
-        lambda params, video_path: [
-            params.get("prompt", ""),
-            params.get("negative_prompt", ""),
-            None,  # No image by default
-            params.get("task", "i2v-A14B"),
-            params.get('width', 832),  # Width
-            params.get('height', 480),  # Height
-            params.get("video_length", 81),
-            params.get("fps", 16),
-            params.get("seed", -1),
-            params.get("sample_solver", "unipc"),
-            params.get("infer_steps", 40),
-            params.get("flow_shift", 5.0),
-            params.get("guidance_scale", 3.5),
-            params.get("dual_dit_boundary", 0.875),
-            1,  # batch_size
-            "outputs",  # save_path
-            params.get("attn_mode", "sdpa"),
-            False,  # mixed_dtype
-            params.get("blocks_to_swap", 30),
-            False,  # fp8
-            False,  # fp8_scaled
-            False,  # fp8_t5
-            # Model paths - DO NOT transfer these, keep defaults
-            "wan/wan22_i2v_14B_low_noise_bf16.safetensors",  # dit_low_noise_path
-            "wan/wan22_i2v_14B_high_noise_bf16.safetensors",  # dit_high_noise_path
-            "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",  # clip_path
-            "wan/Wan2.2-TI2V-5B_fp16.safetensors",  # dit_path
-            "wan/Wan2.1_VAE.pth",  # vae_path - DO NOT transfer
-            "wan/models_t5_umt5-xxl-enc-bf16.pth",  # t5_path - DO NOT transfer
-            # LoRAs - transfer these
-            "lora",  # lora_folder
-            # Extract individual LoRA weights
-            params.get("lora_weights", ["None", "None", "None", "None"])[0] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 0 else "None",
-            params.get("lora_weights", ["None", "None", "None", "None"])[1] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 1 else "None",
-            params.get("lora_weights", ["None", "None", "None", "None"])[2] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 2 else "None",
-            params.get("lora_weights", ["None", "None", "None", "None"])[3] if params.get("lora_weights") and len(params.get("lora_weights", [])) > 3 else "None",
-            # Extract individual LoRA multipliers
-            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[0] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 0 else 1.0,
-            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[1] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 1 else 1.0,
-            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[2] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 2 else 1.0,
-            params.get("lora_multipliers", [1.0, 1.0, 1.0, 1.0])[3] if params.get("lora_multipliers") and len(params.get("lora_multipliers", [])) > 3 else 1.0,
-            True,  # enable_preview
-            5,  # preview_steps
-            # V2V controls - enable if video was sent
-            params.get("enable_v2v", False)  # wan22_enable_v2v
-        ],
+        # This lambda function is updated to return values for all 8 LoRAs and other new controls.
+        lambda params, video_path: (
+            (
+                # Helper to safely get and pad LoRA lists from metadata
+                (weights_from_meta := params.get("lora_weights", [])),
+                (mults_from_meta := params.get("lora_multipliers", [])),
+                (padded_weights := (weights_from_meta + ["None"] * 8)[:8]),
+                (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 8)[:8]),
+                
+                # Create the full list of return values
+                [
+                    params.get("prompt", ""),
+                    params.get("negative_prompt", ""),
+                    None,  # image_path
+                    params.get("task", "i2v-A14B"),
+                    params.get('width', 832),
+                    params.get('height', 480),
+                    params.get("frame_num", 81),
+                    params.get("fps", 16),
+                    params.get("seed", -1),
+                    params.get("sample_solver", "unipc"),
+                    params.get("sample_steps", 40),
+                    params.get("flow_shift", 5.0),
+                    params.get("sample_guide_scale", 3.5),
+                    params.get("dual_dit_boundary", 0.875),
+                    1,  # batch_size
+                    "outputs",  # save_path
+                    params.get("attn_mode", "sdpa"),
+                    params.get("mixed_dtype", False),
+                    params.get("block_swap", 30),
+                    params.get("fp8", False),
+                    params.get("fp8_scaled", False),
+                    params.get("fp8_t5", False),
+                    # Model paths - keep defaults, don't transfer from metadata
+                    "wan/wan22_i2v_14B_low_noise_bf16.safetensors",
+                    "wan/wan22_i2v_14B_high_noise_bf16.safetensors",
+                    "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                    "wan/Wan2.2-TI2V-5B_fp16.safetensors",
+                    "wan/Wan2.1_VAE.pth",
+                    "wan/models_t5_umt5-xxl-enc-bf16.pth",
+                    # LoRAs
+                    "lora",  # lora_folder
+                    *padded_weights,          # Unpack 8 LoRA weights
+                    *padded_mults,            # FIX: Corrected variable name from padded_multipliers
+                    *[True] * 8,              # Defaults for 8 "apply low" checkboxes
+                    *[False] * 8,             # Defaults for 8 "apply high" checkboxes
+                    # Previews & Performance
+                    True,  # enable_preview
+                    5,  # preview_steps
+                    params.get("dynamic_model_loading", False),
+                    params.get("unload_text_encoders", False),
+                    params.get("vae_fp32", True),
+                    # V2V controls
+                    params.get("enable_v2v", False)
+                ]
+            )[-1] # Return the created list
+        ),
         inputs=[params_state, wan22_input_video],
         outputs=[
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
@@ -9119,9 +9128,13 @@ with gr.Blocks(
             wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
             wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path,
             wan22_vae_path, wan22_t5_path, wan22_lora_folder,
-            *wan22_lora_weights, *wan22_lora_multipliers,
+            *wan22_lora_weights,           # Unpack all 8 weight dropdowns
+            *wan22_lora_multipliers,        # Unpack all 8 multiplier sliders
+            *wan22_lora_apply_low,          # Unpack all 8 "apply low" checkboxes
+            *wan22_lora_apply_high,         # Unpack all 8 "apply high" checkboxes
             wan22_enable_preview, wan22_preview_steps,
-            wan22_enable_v2v  # Add V2V enable checkbox
+            wan22_dynamic_model_loading, wan22_unload_text_encoders, wan22_vae_fp32,
+            wan22_enable_v2v
         ]
     ).then(
         fn=change_to_wan22_tab, inputs=None, outputs=[tabs]
@@ -10043,7 +10056,7 @@ with gr.Blocks(
         """Show/hide high noise LoRA checkboxes based on task"""
         is_dual_dit = "A14B" in task  # A14B models use dual-dit
         updates = []
-        for i in range(4):
+        for i in range(8):  # FIX: Changed from 4 to 8
             updates.append(gr.update(visible=is_dual_dit))  # High noise checkbox visibility
         return updates
     
