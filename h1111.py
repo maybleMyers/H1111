@@ -70,13 +70,16 @@ def wan22_batch_handler(
     # LoRAs
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
     lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
     lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
     lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
     # Previews
     enable_preview: bool,
     preview_steps: int,
-    # ADD THIS NEW PARAMETER:
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
@@ -176,7 +179,11 @@ def wan22_batch_handler(
             (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high), 
             (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
             (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high), 
-            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high)
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
         ]
         
         if lora_folder and os.path.exists(lora_folder):
@@ -272,8 +279,8 @@ def wan22_batch_handler(
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
                 "flow_shift": flow_shift, "sample_guide_scale": sample_guide_scale,
                 "dual_dit_boundary": dual_dit_boundary,  # Add dual_dit_boundary to metadata
-                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str],
-                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult],
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult],
             }
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
@@ -6971,6 +6978,23 @@ with gr.Blocks(
                                 wan22_lora_apply_high.append(gr.Checkbox(
                                     label="Apply to High Noise", value=False, scale=1
                                 ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                wan22_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                wan22_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                wan22_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                wan22_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))                                
             
             with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
@@ -10095,8 +10119,16 @@ with gr.Blocks(
     for i in range(len(wan22_lora_weights)):
         wan22_lora_refresh_outputs_list.extend([wan22_lora_weights[i], wan22_lora_multipliers[i]])
     
+    def refresh_8_loras(folder: str) -> List[gr.update]:
+        """Helper to refresh 8 LoRA dropdowns and reset multipliers."""
+        choices = get_lora_options(folder)
+        updates = []
+        for _ in range(8):
+            updates.extend([gr.update(choices=choices, value="None"), gr.update(value=1.0)])
+        return updates
+
     wan22_lora_refresh_btn.click(
-        fn=refresh_lora_dropdowns_simple,
+        fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
     )
