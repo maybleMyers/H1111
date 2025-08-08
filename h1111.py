@@ -301,6 +301,178 @@ def wan22_batch_handler(
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
+# Wan2.2 Upscale Handler
+def wan22_upscale_handler(
+    input_file: str,
+    upscale_mode: str,
+    upscale_factor: float,
+    target_width: int,
+    target_height: int,
+    upscale_steps: int,
+    upscale_strength: float,
+    enhance_weight: float,
+    upscale_guidance: float,
+    upscale_prompt: str,
+    upscale_negative: str,
+    upscale_lora: str,
+    upscale_lora_weight: float,
+    save_path: str,
+    seed: int,
+    # Model paths
+    vae_path: str,
+    t5_path: str,
+    # Performance settings
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_t5: bool,
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+    
+    # Check input
+    if not input_file:
+        yield [], None, "Error: No input file provided", ""
+        return
+    
+    if not os.path.exists(input_file):
+        yield [], None, f"Error: Input file not found: {input_file}", ""
+        return
+    
+    # Prepare output directory
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Build command for upscale mode
+    command = [
+        "python", "wan2_generate_video.py",
+        "--upscale_mode",
+        "--seed", str(seed),
+        "--save_path", save_path,
+        "--upscale_steps", str(upscale_steps),
+        "--upscale_strength", str(upscale_strength),
+        "--enhance_weight", str(enhance_weight),
+        "--upscale_lora_weight", str(upscale_lora_weight),
+        "--guidance_scale", str(upscale_guidance),
+        "--vae", vae_path,
+        "--t5", t5_path,
+        "--attn_mode", attn_mode
+    ]
+    
+    # Add input based on file type
+    if input_file.endswith('.safetensors'):
+        command.extend(["--latent_path", input_file])
+    else:
+        command.extend(["--video_path", input_file])
+    
+    # Add upscale parameters
+    if upscale_mode == "Factor":
+        command.extend(["--upscale_factor", str(upscale_factor)])
+    else:
+        command.extend(["--upscale_target_size", str(int(target_height)), str(int(target_width))])
+    
+    # Add prompts if provided
+    if upscale_prompt:
+        command.extend(["--prompt", upscale_prompt])
+    else:
+        command.extend(["--prompt", "high quality, detailed, sharp, 4k resolution, professional"])
+    
+    if upscale_negative:
+        command.extend(["--negative_prompt", upscale_negative])
+    else:
+        command.extend(["--negative_prompt", "blurry, low quality, pixelated, artifacts, distorted"])
+    
+    # Add LoRA if provided
+    if upscale_lora and os.path.exists(upscale_lora):
+        command.extend(["--upscale_lora", upscale_lora])
+    
+    # Add performance flags
+    if fp8:
+        command.append("--fp8")
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    if fp8_t5:
+        command.append("--fp8_t5")
+    if mixed_dtype:
+        command.append("--mixed_dtype")
+    if block_swap > 0:
+        command.extend(["--blocks_to_swap", str(block_swap)])
+    
+    # Default upscale model path
+    command.extend(["--upscale_model", "wan/Wan2_2-TI2V-5B_fp8_e4m3fn_scaled_KJ.safetensors"])
+    
+    print(f"Running Wan2.2 Upscale Command: {' '.join(command)}")
+    
+    # Execute subprocess
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding='utf-8', errors='replace', bufsize=1
+    )
+    
+    progress_text = "Starting upscale process..."
+    status_text = "Initializing..."
+    
+    for line in iter(process.stdout.readline, ''):
+        if stop_event.is_set():
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except:
+                process.kill()
+                process.wait()
+            yield [], None, "Upscaling stopped by user.", ""
+            return
+        
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+        
+        print(f"WAN2.2_UPSCALE: {line_strip}")
+        progress_text = line_strip
+        
+        # Parse progress updates
+        if "Upscaling from" in line_strip:
+            status_text = "Upscaling video..."
+        elif "Running V2V upscaling" in line_strip:
+            status_text = "Processing with V2V..."
+        elif "Decoding" in line_strip:
+            status_text = "Decoding result..."
+        elif "saved" in line_strip.lower():
+            status_text = "Upscaling complete!"
+            # Try to extract saved file path
+            video_match = re.search(r"saved.*?:\s*(.*\.mp4)", line_strip, re.IGNORECASE)
+            if video_match:
+                saved_path = video_match.group(1).strip()
+                if os.path.exists(saved_path):
+                    yield [(saved_path, f"Upscaled")], None, status_text, f"Saved: {os.path.basename(saved_path)}"
+                    continue
+        
+        # Check for sampling progress
+        tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+        if tqdm_match:
+            percentage = tqdm_match.group(1)
+            steps = tqdm_match.group(2)
+            time_remaining = tqdm_match.group(4)
+            progress_text = f"Step {steps} ({percentage}%) | ETA: {time_remaining}"
+            status_text = "Denoising..."
+        
+        yield [], None, status_text, progress_text
+    
+    process.stdout.close()
+    return_code = process.wait()
+    
+    if return_code == 0:
+        # Look for output video in save_path
+        output_files = glob.glob(os.path.join(save_path, "upscaled_*.mp4"))
+        if output_files:
+            latest_file = max(output_files, key=os.path.getctime)
+            yield [(latest_file, "Upscaled Video")], None, "Upscaling complete!", f"Saved: {os.path.basename(latest_file)}"
+        else:
+            yield [], None, "Upscaling completed but output file not found", ""
+    else:
+        yield [], None, f"Upscaling failed with code {return_code}", "Check console for errors"
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -7027,6 +7199,83 @@ with gr.Blocks(
                     wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
                     wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                     wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
+            
+            # Upscale Mode Accordion
+            with gr.Accordion("🔍 Upscale Mode (Using 5B Model)", open=False):
+                gr.Markdown("Use the Wan2.2 5B model as a high-quality video upscaler")
+                
+                with gr.Row():
+                    wan22_upscale_input = gr.File(
+                        label="Input Video or Latent to Upscale",
+                        file_types=[".mp4", ".avi", ".mov", ".webm", ".safetensors"],
+                        type="filepath"
+                    )
+                    with gr.Column():
+                        wan22_upscale_mode = gr.Radio(
+                            choices=["Factor", "Target Size"],
+                            value="Factor",
+                            label="Upscale Mode"
+                        )
+                        wan22_upscale_factor = gr.Slider(
+                            minimum=1.5, maximum=4.0, step=0.5, value=2.0,
+                            label="Upscale Factor",
+                            visible=True
+                        )
+                        with gr.Row(visible=False) as wan22_target_size_row:
+                            wan22_target_width = gr.Number(
+                                label="Target Width", value=1152, minimum=256, maximum=2048, step=16
+                            )
+                            wan22_target_height = gr.Number(
+                                label="Target Height", value=896, minimum=256, maximum=2048, step=16
+                            )
+                
+                with gr.Row():
+                    wan22_upscale_steps = gr.Slider(
+                        minimum=5, maximum=50, step=1, value=10,
+                        label="Upscale Steps (10 recommended with Lightning LoRA)"
+                    )
+                    wan22_upscale_strength = gr.Slider(
+                        minimum=0.1, maximum=1.0, step=0.05, value=0.5,
+                        label="Upscale Strength (lower=preserve more original)"
+                    )
+                
+                with gr.Row():
+                    wan22_enhance_weight = gr.Slider(
+                        minimum=0.0, maximum=5.0, step=0.1, value=2.0,
+                        label="Enhance-A-Video Weight (higher=more enhancement)"
+                    )
+                    wan22_upscale_guidance = gr.Slider(
+                        minimum=1.0, maximum=15.0, step=0.5, value=7.0,
+                        label="Guidance Scale for Upscaling"
+                    )
+                
+                with gr.Row():
+                    wan22_upscale_prompt = gr.Textbox(
+                        label="Upscale Prompt (optional, uses default if empty)",
+                        placeholder="high quality, detailed, sharp, 4k resolution, professional",
+                        value=""
+                    )
+                    wan22_upscale_negative = gr.Textbox(
+                        label="Upscale Negative Prompt (optional)",
+                        placeholder="blurry, low quality, pixelated, artifacts, distorted",
+                        value=""
+                    )
+                
+                with gr.Row():
+                    wan22_upscale_lora = gr.Textbox(
+                        label="Upscale LoRA Path (Lightning recommended)",
+                        value="wan/Wan2.2-Lightning/Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors"
+                    )
+                    wan22_upscale_lora_weight = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=0.8,
+                        label="Upscale LoRA Weight"
+                    )
+                
+                wan22_upscale_generate_btn = gr.Button(
+                    "🚀 Start Upscaling", 
+                    variant="primary",
+                    elem_classes="green-btn"
+                )
         
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -9953,6 +10202,52 @@ with gr.Blocks(
     # Wan2.2 Tab Event Handlers
     wan22_prompt.change(fn=count_prompt_tokens, inputs=wan22_prompt, outputs=wan22_token_counter)
     wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    
+    # Upscale mode visibility toggle
+    def toggle_upscale_size_mode(mode):
+        if mode == "Factor":
+            return gr.update(visible=True), gr.update(visible=False)
+        else:
+            return gr.update(visible=False), gr.update(visible=True)
+    
+    wan22_upscale_mode.change(
+        fn=toggle_upscale_size_mode,
+        inputs=[wan22_upscale_mode],
+        outputs=[wan22_upscale_factor, wan22_target_size_row]
+    )
+    
+    # Upscale button handler
+    wan22_upscale_generate_btn.click(
+        fn=wan22_upscale_handler,
+        inputs=[
+            wan22_upscale_input,
+            wan22_upscale_mode,
+            wan22_upscale_factor,
+            wan22_target_width,
+            wan22_target_height,
+            wan22_upscale_steps,
+            wan22_upscale_strength,
+            wan22_enhance_weight,
+            wan22_upscale_guidance,
+            wan22_upscale_prompt,
+            wan22_upscale_negative,
+            wan22_upscale_lora,
+            wan22_upscale_lora_weight,
+            wan22_save_path,
+            wan22_seed,
+            # Model paths
+            wan22_vae_path,
+            wan22_t5_path,
+            # Performance settings
+            wan22_fp8,
+            wan22_fp8_scaled,
+            wan22_fp8_t5,
+            wan22_attn_mode,
+            wan22_mixed_dtype,
+            wan22_block_swap
+        ],
+        outputs=[wan22_gallery, wan22_preview_video, wan22_batch_progress, wan22_progress_text]
+    )
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
     
     # V2V visibility toggle

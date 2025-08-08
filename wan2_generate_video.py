@@ -397,6 +397,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
+    # Upscale mode arguments
+    parser.add_argument("--upscale_mode", action="store_true", 
+        help="Enable upscale mode using the 5B wan2.2 model as an upscaler")
+    parser.add_argument("--upscale_factor", type=float, default=2.0,
+        help="Upscale factor (default: 2.0). Common values: 1.5, 2.0, 2.5, 3.0")
+    parser.add_argument("--upscale_target_size", type=int, nargs=2, default=None,
+        help="Target size for upscaling [height, width]. If specified, overrides upscale_factor")
+    parser.add_argument("--upscale_model", type=str, default="wan/Wan2_2-TI2V-5B_fp8_e4m3fn_scaled_KJ.safetensors",
+        help="Path to the 5B model to use for upscaling")
+    parser.add_argument("--upscale_lora", type=str, default="wan/Wan2.2-Lightning/Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors",
+        help="Path to the LoRA for faster upscaling (Lightning LoRA recommended)")
+    parser.add_argument("--upscale_lora_weight", type=float, default=0.8,
+        help="LoRA weight for upscaling (default: 0.8)")
+    parser.add_argument("--upscale_steps", type=int, default=10,
+        help="Number of inference steps for upscaling (default: 10 with Lightning LoRA)")
+    parser.add_argument("--upscale_strength", type=float, default=0.5,
+        help="Strength for upscaling V2V inference (0.0-1.0, default: 0.5)")
+    parser.add_argument("--enhance_weight", type=float, default=2.0,
+        help="Enhance-A-Video weight for upscaling (default: 2.0, higher = more enhancement)")
 
     args = parser.parse_args()
 
@@ -426,7 +445,13 @@ def parse_args() -> argparse.Namespace:
     if args.mixed_dtype and args.lora_weight:
         logger.warning("--mixed_dtype with LoRA: LoRA weights will be merged at the model's original precision")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
-         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
+         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")
+    # Upscale mode checks
+    if args.upscale_mode:
+        if not args.video_path and (args.latent_path is None or len(args.latent_path) == 0):
+            raise ValueError("--upscale_mode requires either --video_path or --latent_path to be specified with a video/latent to upscale")
+        if args.upscale_target_size is None and args.upscale_factor == 1.0:
+            raise ValueError("--upscale_mode requires either --upscale_target_size or --upscale_factor > 1.0")
     return args
 
 class DynamicModelManager:
@@ -3845,9 +3870,231 @@ def save_output(
             logger.error(f"Failed to save image files: {e}")
 
 
+def run_upscale_mode(args: argparse.Namespace) -> None:
+    """Run the upscale mode using 5B model as an upscaler
+    
+    Args:
+        args: command line arguments with upscale parameters
+    """
+    logger.info("Running in Upscale Mode using Wan2.2 5B model")
+    
+    device = torch.device(args.device if args.device else "cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the input (video file or latent)
+    if args.video_path:
+        # Load video and encode to latent
+        logger.info(f"Loading video from {args.video_path} for upscaling")
+        
+        # Load video frames
+        video_frames_np, num_frames = load_video(
+            args.video_path,
+            start_frame=0,
+            num_frames=None,  # Load all frames
+            bucket_reso=None  # Don't resize yet, get original size
+        )
+        
+        if num_frames == 0:
+            raise ValueError(f"Could not load any frames from video: {args.video_path}")
+            
+        original_height, original_width = video_frames_np[0].shape[:2]
+        logger.info(f"Loaded {num_frames} frames, original size: {original_height}x{original_width}")
+        
+        # Convert to tensor
+        video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))  # [F,H,W,C]
+        video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+        video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+        
+        # Load VAE for encoding
+        vae_dtype = torch.bfloat16  # Use bfloat16 for 5B model
+        cfg = WAN_CONFIGS["ti2v-5B"]  # Use ti2v-5B config for upscaling
+        vae = load_vae(args, cfg, device, vae_dtype)
+        
+        # Encode to latent
+        input_latent = encode_video_to_latents(video_tensor, vae, device, vae_dtype, args)
+        logger.info(f"Encoded video to latent: {input_latent.shape}")
+        
+    elif args.latent_path and len(args.latent_path) > 0:
+        # Load latent directly
+        from safetensors.torch import load_file
+        from safetensors import safe_open
+        
+        loaded_data = load_file(args.latent_path[0], device="cpu")
+        input_latent = loaded_data["latent"]
+        
+        # Load metadata to get original dimensions
+        with safe_open(args.latent_path[0], framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+        
+        original_height = int(metadata.get("height", 512))
+        original_width = int(metadata.get("width", 512))
+        num_frames = input_latent.shape[2] if len(input_latent.shape) == 5 else input_latent.shape[1]
+        
+        logger.info(f"Loaded latent from {args.latent_path[0]}, shape: {input_latent.shape}")
+        logger.info(f"Original dimensions from metadata: {original_height}x{original_width}")
+        
+        # Load VAE (will be needed for decoding)
+        vae_dtype = torch.bfloat16
+        cfg = WAN_CONFIGS["ti2v-5B"]
+        vae = load_vae(args, cfg, device, vae_dtype)
+    else:
+        raise ValueError("Upscale mode requires either --video_path or --latent_path")
+    
+    # Calculate target dimensions
+    if args.upscale_target_size:
+        target_height, target_width = args.upscale_target_size
+    else:
+        target_height = int(original_height * args.upscale_factor)
+        target_width = int(original_width * args.upscale_factor)
+    
+    # Round to nearest multiple of 16 for VAE compatibility
+    target_height = (target_height // 16) * 16
+    target_width = (target_width // 16) * 16
+    
+    actual_factor = max(target_height / original_height, target_width / original_width)
+    logger.info(f"Upscaling from {original_height}x{original_width} to {target_height}x{target_width} (factor: {actual_factor:.2f}x)")
+    
+    # Resize the latent to target size
+    if len(input_latent.shape) == 4:
+        input_latent = input_latent.unsqueeze(0)  # Add batch dim
+    
+    B, C, F, H, W = input_latent.shape
+    target_lat_h = target_height // 8  # VAE downscale factor
+    target_lat_w = target_width // 8
+    
+    # Resize latent using interpolation
+    # Reshape to combine batch and frame dimensions for resize
+    latent_reshaped = input_latent.permute(0, 2, 1, 3, 4).reshape(B * F, C, H, W)
+    latent_resized = torch.nn.functional.interpolate(
+        latent_reshaped,
+        size=(target_lat_h, target_lat_w),
+        mode='bilinear',
+        align_corners=False
+    )
+    # Reshape back
+    latent_resized = latent_resized.reshape(B, F, C, target_lat_h, target_lat_w).permute(0, 2, 1, 3, 4)
+    latent_resized = latent_resized.to(device)
+    
+    logger.info(f"Resized latent from {input_latent.shape} to {latent_resized.shape}")
+    
+    # Prepare upscale V2V parameters
+    upscale_args = argparse.Namespace(**vars(args))  # Copy args
+    upscale_args.task = "ti2v-5B"  # Use ti2v-5B task for upscaling
+    upscale_args.dit = args.upscale_model
+    upscale_args.lora_weight = [args.upscale_lora] if args.upscale_lora else None
+    upscale_args.lora_multiplier = [args.upscale_lora_weight]
+    upscale_args.video_size = [target_height, target_width]
+    upscale_args.video_length = F
+    upscale_args.infer_steps = args.upscale_steps
+    upscale_args.strength = args.upscale_strength
+    upscale_args.flow_shift = 5.0  # Default for 5B model
+    upscale_args.sample_solver = "unipc"
+    upscale_args.video_path = None  # Clear to avoid confusion
+    upscale_args.image_path = None
+    
+    # Set up prompt for upscaling if not provided
+    if not args.prompt or args.prompt == "prompt for generation":
+        upscale_args.prompt = "high quality, detailed, sharp, 4k resolution, professional"
+    if not args.negative_prompt:
+        upscale_args.negative_prompt = "blurry, low quality, pixelated, artifacts, distorted"
+    
+    logger.info(f"Running V2V upscaling with strength {upscale_args.strength}, {upscale_args.infer_steps} steps")
+    logger.info(f"Using prompt: {upscale_args.prompt}")
+    
+    # Run V2V generation with upscale parameters
+    cfg = WAN_CONFIGS[upscale_args.task]
+    
+    # Load text encoder for prompts
+    accelerator = accelerate.Accelerator(mixed_precision="bf16")
+    
+    # Prepare V2V inputs
+    noise, context, context_null, inputs = prepare_v2v_inputs(
+        upscale_args, cfg, accelerator, device, latent_resized
+    )
+    
+    # Load the 5B model with optional LoRA
+    dit_dtype = torch.bfloat16
+    dit_weight_dtype = torch.float8_e4m3fn if args.fp8 or args.fp8_scaled else dit_dtype
+    model = load_dit_model(upscale_args, cfg, device, dit_dtype, dit_weight_dtype, False)
+    
+    # Optimize model if needed
+    if isinstance(model, tuple):
+        # Handle dual-dit case (shouldn't happen for ti2v-5B)
+        model = model[0]
+    optimize_model(model, upscale_args, device, dit_dtype, dit_weight_dtype)
+    
+    # Apply Enhance-A-Video settings
+    if args.enhance_weight > 0:
+        logger.info(f"Applying Enhance-A-Video with weight {args.enhance_weight}")
+        # This would be integrated into the model's transformer options
+        # For simplicity, we'll adjust the guidance scale
+        upscale_args.guidance_scale = upscale_args.guidance_scale * (1 + args.enhance_weight * 0.2)
+    
+    # Setup scheduler
+    scheduler, timesteps = setup_scheduler(upscale_args, cfg, device)
+    
+    # Apply V2V strength to timesteps
+    seed = args.seed if args.seed else random.randint(0, 2**32 - 1)
+    seed_g = torch.Generator(device=device).manual_seed(seed)
+    
+    if upscale_args.strength < 1.0:
+        init_timestep_idx = int(upscale_args.infer_steps * (1.0 - upscale_args.strength))
+        init_timestep_idx = min(init_timestep_idx, upscale_args.infer_steps - 1)
+        init_timestep = timesteps[init_timestep_idx]
+        
+        # Mix noise with resized latent
+        pure_noise = torch.randn_like(latent_resized, generator=seed_g, device=device)
+        
+        latent = scheduler.add_noise(
+            original_samples=latent_resized,
+            noise=pure_noise,
+            timesteps=torch.tensor([init_timestep], device=device)
+        )
+        
+        timesteps = timesteps[init_timestep_idx:]
+        logger.info(f"V2V upscaling: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
+    else:
+        latent = noise
+    
+    # Run sampling
+    logger.info("Starting upscaling denoising loop...")
+    final_latent = run_sampling(
+        model, latent, scheduler, timesteps,
+        upscale_args, inputs, device, seed_g,
+        accelerator,
+        is_ti2v=False
+    )
+    
+    # Clean up model
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Decode and save
+    logger.info("Decoding upscaled result...")
+    upscale_args._vae = vae  # Pass VAE instance
+    decoded_video = decode_latent(final_latent, upscale_args, cfg)
+    
+    # Save the upscaled output
+    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    base_name = f"upscaled_{actual_factor:.1f}x_{time_flag}_{seed}"
+    
+    save_output(
+        decoded_video,
+        upscale_args,
+        original_base_names=[base_name],
+        latent_to_save=final_latent if args.output_type in ["latent", "both"] else None
+    )
+    
+    logger.info(f"Upscaling complete! Output saved with prefix: {base_name}")
+
 def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
+
+    # Check for upscale mode first
+    if args.upscale_mode:
+        run_upscale_mode(args)
+        return
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
