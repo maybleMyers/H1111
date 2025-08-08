@@ -4093,7 +4093,7 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
     # Decode and save
     logger.info("Decoding upscaled result...")
     upscale_args._vae = vae  # Pass VAE instance
-    decoded_video = decode_latent(final_latent, upscale__args, cfg)
+    decoded_video = decode_latent(final_latent, upscale_args, cfg)
     
     # Save the upscaled output
     time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
