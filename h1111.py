@@ -383,9 +383,15 @@ def wan22_upscale_handler(
     else:
         command.extend(["--negative_prompt", "blurry, low quality, pixelated, artifacts, distorted"])
     
-    # Add LoRA if provided
-    if upscale_lora and os.path.exists(upscale_lora):
+    # Add LoRA if provided and exists
+    if upscale_lora and upscale_lora.strip() and os.path.exists(upscale_lora):
         command.extend(["--upscale_lora", upscale_lora])
+        print(f"Using upscale LoRA: {upscale_lora}")
+    else:
+        if upscale_lora and upscale_lora.strip():
+            print(f"Warning: LoRA file not found: {upscale_lora}, proceeding without LoRA")
+        else:
+            print("No LoRA specified, using base model only")
     
     # Add performance flags
     if fp8:
@@ -7231,8 +7237,8 @@ with gr.Blocks(
                 
                 with gr.Row():
                     wan22_upscale_steps = gr.Slider(
-                        minimum=5, maximum=50, step=1, value=10,
-                        label="Upscale Steps (10 recommended with Lightning LoRA)"
+                        minimum=5, maximum=50, step=1, value=20,
+                        label="Upscale Steps (10-15 with LoRA, 20-30 without LoRA)"
                     )
                     wan22_upscale_strength = gr.Slider(
                         minimum=0.1, maximum=1.0, step=0.05, value=0.5,
@@ -7263,8 +7269,9 @@ with gr.Blocks(
                 
                 with gr.Row():
                     wan22_upscale_lora = gr.Textbox(
-                        label="Upscale LoRA Path (Lightning recommended)",
-                        value="wan/Wan2.2-Lightning/Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors"
+                        label="Upscale LoRA Path (optional, for faster inference)",
+                        placeholder="Leave empty to use base model only",
+                        value=""
                     )
                     wan22_upscale_lora_weight = gr.Slider(
                         minimum=0.0, maximum=1.0, step=0.05, value=0.8,

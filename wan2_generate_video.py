@@ -3885,18 +3885,26 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
         # Load video and encode to latent
         logger.info(f"Loading video from {args.video_path} for upscaling")
         
-        # Load video frames
+        # First load just to get dimensions - use a dummy bucket size
+        # We'll load again with proper dimensions if needed
+        import cv2
+        cap = cv2.VideoCapture(args.video_path)
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        # Now load with original dimensions as bucket
         video_frames_np, num_frames = load_video(
             args.video_path,
             start_frame=0,
             num_frames=None,  # Load all frames
-            bucket_reso=None  # Don't resize yet, get original size
+            bucket_reso=(original_height, original_width)  # Keep original size
         )
         
         if num_frames == 0:
             raise ValueError(f"Could not load any frames from video: {args.video_path}")
-            
-        original_height, original_width = video_frames_np[0].shape[:2]
+        
         logger.info(f"Loaded {num_frames} frames, original size: {original_height}x{original_width}")
         
         # Convert to tensor
@@ -3980,8 +3988,19 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
     upscale_args = argparse.Namespace(**vars(args))  # Copy args
     upscale_args.task = "ti2v-5B"  # Use ti2v-5B task for upscaling
     upscale_args.dit = args.upscale_model
-    upscale_args.lora_weight = [args.upscale_lora] if args.upscale_lora else None
-    upscale_args.lora_multiplier = [args.upscale_lora_weight]
+    
+    # Handle LoRA - only set if file exists
+    if args.upscale_lora and os.path.exists(args.upscale_lora):
+        upscale_args.lora_weight = [args.upscale_lora]
+        upscale_args.lora_multiplier = [args.upscale_lora_weight]
+        logger.info(f"Using upscale LoRA: {args.upscale_lora} with weight {args.upscale_lora_weight}")
+    else:
+        upscale_args.lora_weight = None
+        upscale_args.lora_multiplier = None
+        if args.upscale_lora:
+            logger.warning(f"LoRA file not found: {args.upscale_lora}, proceeding without LoRA")
+        else:
+            logger.info("No LoRA specified, using base model only")
     upscale_args.video_size = [target_height, target_width]
     upscale_args.video_length = F
     upscale_args.infer_steps = args.upscale_steps
