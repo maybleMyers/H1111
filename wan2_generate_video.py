@@ -4112,6 +4112,11 @@ def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
 
+    # Set device
+    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = torch.device(device_str) # Store device back in args
+    logger.info(f"Using device: {args.device}")
+    
     # Check for upscale mode first
     if args.upscale_mode:
         run_upscale_mode(args)
@@ -4119,11 +4124,6 @@ def main():
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
-
-    # Set device
-    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    args.device = torch.device(device_str) # Store device back in args
-    logger.info(f"Using device: {args.device}")
 
     generated_latent = None # To hold the generated latent if not in latents_mode
     cfg = WAN_CONFIGS[args.task] # Get config early for potential use
