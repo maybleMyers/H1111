@@ -10246,7 +10246,7 @@ with gr.Blocks(
             wan22_mixed_dtype,
             wan22_block_swap
         ],
-        outputs=[wan22_gallery, wan22_preview_video, wan22_batch_progress, wan22_progress_text]
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text]
     )
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
     
