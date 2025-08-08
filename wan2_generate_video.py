@@ -4076,7 +4076,7 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
     else:
         latent = noise
     
-    # Run sampling
+# Run sampling
     logger.info("Starting upscaling denoising loop...")
     final_latent = run_sampling(
         model, latent, scheduler, timesteps,
@@ -4085,10 +4085,19 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
         is_ti2v=False
     )
     
-    # Clean up model
+    # --- Clean up DiT model to free VRAM before VAE decoding ---
+    logger.info("Unloading DiT model to free VRAM for VAE decoding...")
     del model
+    del scheduler, inputs, context, context_null, noise, latent
+    if 'pure_noise' in locals():
+        del pure_noise # Clean up noise tensor if it exists
     torch.cuda.empty_cache()
     gc.collect()
+    # Give a moment for memory to be fully released
+    import time
+    time.sleep(0.5)
+    torch.cuda.empty_cache()
+    logger.info("DiT model unloaded.")
     
     # Decode and save
     logger.info("Decoding upscaled result...")
@@ -4116,7 +4125,7 @@ def main():
     device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     args.device = torch.device(device_str) # Store device back in args
     logger.info(f"Using device: {args.device}")
-    
+
     # Check for upscale mode first
     if args.upscale_mode:
         run_upscale_mode(args)
