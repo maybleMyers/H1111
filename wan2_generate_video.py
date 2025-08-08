@@ -404,7 +404,7 @@ def parse_args() -> argparse.Namespace:
         help="Upscale factor (default: 2.0). Common values: 1.5, 2.0, 2.5, 3.0")
     parser.add_argument("--upscale_target_size", type=int, nargs=2, default=None,
         help="Target size for upscaling [height, width]. If specified, overrides upscale_factor")
-    parser.add_argument("--upscale_model", type=str, default="wan/Wan2_2-TI2V-5B_fp8_e4m3fn_scaled_KJ.safetensors",
+    parser.add_argument("--upscale_model", type=str, default="wan/Wan2.2-TI2V-5B_fp16.safetensors",
         help="Path to the 5B model to use for upscaling")
     parser.add_argument("--upscale_lora", type=str, default="wan/Wan2.2-Lightning/Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors",
         help="Path to the LoRA for faster upscaling (Lightning LoRA recommended)")
