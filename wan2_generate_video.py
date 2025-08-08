@@ -4061,7 +4061,7 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
         init_timestep = timesteps[init_timestep_idx]
         
         # Mix noise with resized latent
-        pure_noise = torch.randn_like(latent_resized, generator=seed_g)
+        pure_noise = torch.randn(latent_resized.shape, generator=seed_g, device=device, dtype=latent_resized.dtype)
         
         latent = scheduler.add_noise(
             original_samples=latent_resized,
