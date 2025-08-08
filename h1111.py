@@ -406,7 +406,7 @@ def wan22_upscale_handler(
         command.extend(["--blocks_to_swap", str(block_swap)])
     
     # Default upscale model path
-    command.extend(["--upscale_model", "wan/Wan2_2-TI2V-5B_fp8_e4m3fn_scaled_KJ.safetensors"])
+    command.extend(["--upscale_model", "wan/Wan2.2-TI2V-5B_fp16.safetensors"])
     
     print(f"Running Wan2.2 Upscale Command: {' '.join(command)}")
     
