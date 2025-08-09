@@ -45,6 +45,14 @@ try:
 except:
     pass
 
+# Import chunked generation support
+try:
+    from wan2_generate_video_chunked import generate_with_chunks
+    CHUNKED_GENERATION_AVAILABLE = True
+except ImportError:
+    logger.warning("Chunked generation module not found. Chunked generation will be disabled.")
+    CHUNKED_GENERATION_AVAILABLE = False
+
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
 # Local implementations to avoid xformers/flash-attention dependency
@@ -396,6 +404,42 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
+    )
+    
+    # Chunked Generation & APG Arguments
+    parser.add_argument(
+        "--enable_chunking",
+        action="store_true",
+        help="Enable chunked generation for longer videos with frame conditioning"
+    )
+    parser.add_argument(
+        "--frames_per_chunk",
+        type=int,
+        default=25,
+        help="Number of frames to generate per chunk. Default is 25"
+    )
+    parser.add_argument(
+        "--motion_frames",
+        type=int,
+        default=5,
+        help="Number of overlapping frames between chunks for conditioning. Default is 5"
+    )
+    parser.add_argument(
+        "--use_apg",
+        action="store_true",
+        help="Use Adaptive Projected Guidance for improved guidance stability"
+    )
+    parser.add_argument(
+        "--apg_momentum",
+        type=float,
+        default=-0.75,
+        help="Momentum factor for APG. Default is -0.75"
+    )
+    parser.add_argument(
+        "--apg_norm_threshold",
+        type=float,
+        default=55.0,
+        help="Norm threshold for APG guidance updates. Default is 55.0"
     )
 
     args = parser.parse_args()
@@ -1152,28 +1196,59 @@ def load_vae(args: argparse.Namespace, config, device: torch.device, dtype: torc
 
 def load_text_encoder(args: argparse.Namespace, config, device: torch.device) -> T5EncoderModel:
     """load text encoder (T5) model
-
     Args:
         args: command line arguments
         config: model configuration
         device: device to use
-
     Returns:
         T5EncoderModel: loaded text encoder model
     """
     checkpoint_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_checkpoint)
     tokenizer_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_tokenizer)
-
+    
+    t5_dtype = config.t5_dtype  # Default from config
+    
+    t5_path_to_check = None
+    if args.t5 and os.path.exists(args.t5):
+        t5_path_to_check = args.t5
+    elif checkpoint_path and os.path.exists(checkpoint_path):
+        t5_path_to_check = checkpoint_path
+    if t5_path_to_check:
+        try:
+            from safetensors.torch import load_file
+            t5_state = load_file(t5_path_to_check, device="cpu")
+            first_param = next(iter(t5_state.values()))
+            actual_dtype = first_param.dtype
+            
+            if actual_dtype == torch.float32:
+                logger.warning(f"Detected FP32 T5 text encoder - preserving full precision")
+                t5_dtype = torch.float32
+            elif actual_dtype == torch.float16:
+                logger.info(f"Detected FP16 T5 text encoder")
+                t5_dtype = torch.float16
+            elif actual_dtype == torch.bfloat16:
+                logger.info(f"Detected BF16 T5 text encoder")
+                t5_dtype = torch.bfloat16
+            else:
+                logger.info(f"T5 encoder dtype: {actual_dtype}, using: {actual_dtype}")
+                t5_dtype = actual_dtype  # Use whatever dtype was detected
+                
+            del t5_state  # Free memory
+        except Exception as e:
+            logger.warning(f"Could not detect T5 dtype from {t5_path_to_check}, using config default: {config.t5_dtype}. Error: {e}")
+    else:
+        logger.info(f"No T5 checkpoint found to detect dtype, using config default: {config.t5_dtype}")
+    
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
-        dtype=config.t5_dtype,
+        dtype=t5_dtype,  # Use detected dtype instead of config.t5_dtype
         device=device,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
         weight_path=args.t5,
         fp8=args.fp8_t5,
     )
-
+    
     return text_encoder
 
 
@@ -3591,22 +3666,56 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             boundary_percent = default_boundary * 100
             logger.info(f"Using default dual-dit boundary: {boundary_percent:.1f}% (high noise model used above {default_boundary * 1000:.0f} timesteps)")
     
-    final_latent = run_sampling(
-        model,
-        latent, # Initial state (noise or mixed)
-        scheduler,
-        timesteps, # Full or partial timesteps
-        args,
-        inputs, # Contains context etc.
-        device,
-        seed_g,
-        accelerator,
-        is_ti2v=is_ti2v,  # Pass TI2V flag for special processing
-        model_manager=model_manager,  # New parameter
-        previewer=previewer, # MODIFIED: Pass the previewer instance
-        use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
-        preview_suffix=args.preview_suffix # Pass the preview suffix to run_sampling
-    )
+    # Use chunked generation if enabled and available
+    if args.enable_chunking and CHUNKED_GENERATION_AVAILABLE:
+        logger.info(f"Using chunked generation: {args.frames_per_chunk} frames per chunk, {args.motion_frames} motion frames")
+        
+        # Extract arg_c and arg_null from inputs for chunked generation
+        arg_c = inputs[0] if len(inputs) > 0 else {}
+        arg_null = inputs[1] if len(inputs) > 1 else {}
+        
+        final_latent = generate_with_chunks(
+            args=args,
+            model=model,
+            vae=vae,
+            text_encoder=text_encoder,
+            clip=clip,
+            initial_latent=latent,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            arg_c=arg_c,
+            arg_null=arg_null,
+            device=device,
+            accelerator=accelerator,
+            model_manager=model_manager,
+            enable_chunking=True,
+            frames_per_chunk=args.frames_per_chunk,
+            motion_frames=args.motion_frames,
+            use_apg=args.use_apg,
+            apg_momentum=args.apg_momentum,
+            apg_norm_threshold=args.apg_norm_threshold
+        )
+    else:
+        # Use standard generation
+        if args.enable_chunking and not CHUNKED_GENERATION_AVAILABLE:
+            logger.warning("Chunked generation requested but not available. Using standard generation.")
+        
+        final_latent = run_sampling(
+            model,
+            latent, # Initial state (noise or mixed)
+            scheduler,
+            timesteps, # Full or partial timesteps
+            args,
+            inputs, # Contains context etc.
+            device,
+            seed_g,
+            accelerator,
+            is_ti2v=is_ti2v,  # Pass TI2V flag for special processing
+            model_manager=model_manager,  # New parameter
+            previewer=previewer, # MODIFIED: Pass the previewer instance
+            use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
+            preview_suffix=args.preview_suffix # Pass the preview suffix to run_sampling
+        )
 
     # --- Cleanup ---
     if model_manager:

@@ -83,7 +83,9 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
-    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool  # Add these
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,
+    # Chunked Generation & APG parameters
+    enable_chunking: bool, frames_per_chunk: int, motion_frames: int, use_apg: bool, apg_momentum: float, apg_norm_threshold: float
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -168,6 +170,17 @@ def wan22_batch_handler(
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
+        
+        # --- Chunked Generation & APG Parameters ---
+        if enable_chunking:
+            command.append("--enable_chunking")
+            command.extend(["--frames_per_chunk", str(frames_per_chunk)])
+            command.extend(["--motion_frames", str(motion_frames)])
+        
+        if use_apg:
+            command.append("--use_apg")
+            command.extend(["--apg_momentum", str(apg_momentum)])
+            command.extend(["--apg_norm_threshold", str(apg_norm_threshold)])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -242,6 +255,8 @@ def wan22_batch_handler(
 
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
             video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+            chunk_match = re.search(r'Processing chunk (\d+)/(\d+): frames (\d+-\d+)', line_strip)
+            chunk_complete_match = re.search(r'Chunk (\d+)/(\d+): Sampling complete', line_strip)
 
             if video_saved_match:
                 found_path = video_saved_match.group(1).strip()
@@ -249,6 +264,17 @@ def wan22_batch_handler(
                     current_video_file_for_item = found_path
                 progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif chunk_match:
+                current_chunk = chunk_match.group(1)
+                total_chunks = chunk_match.group(2)
+                frame_range = chunk_match.group(3)
+                progress_text_update = f"Chunk {current_chunk}/{total_chunks}: Processing frames {frame_range}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Chunked Generation"
+            elif chunk_complete_match:
+                current_chunk = chunk_complete_match.group(1)
+                total_chunks = chunk_complete_match.group(2)
+                progress_text_update = f"Chunk {current_chunk}/{total_chunks}: Complete"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Chunked Generation"
             elif tqdm_match:
                 percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
@@ -6939,6 +6965,46 @@ with gr.Blocks(
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         wan22_random_seed_btn = gr.Button("🎲")
+                    
+                    # Chunked Generation & APG Controls
+                    with gr.Accordion("Long Video Generation (Chunked + APG)", open=False):
+                        gr.Markdown("**Enable chunked generation for longer videos with MultiTalk-style frame conditioning**")
+                        wan22_enable_chunking = gr.Checkbox(
+                            label="Enable Chunked Generation", 
+                            value=False,
+                            info="Split long videos into chunks with frame overlap for smoother generation"
+                        )
+                        with gr.Group() as wan22_chunking_controls:
+                            with gr.Row():
+                                wan22_frames_per_chunk = gr.Slider(
+                                    minimum=9, maximum=101, step=4, 
+                                    label="Frames per Chunk", value=25,
+                                    info="Number of frames generated in each chunk (4n+1)"
+                                )
+                                wan22_motion_frames = gr.Slider(
+                                    minimum=1, maximum=25, step=1,
+                                    label="Motion Frames (Overlap)", value=5,
+                                    info="Frames from previous chunk used to condition next chunk"
+                                )
+                            
+                        gr.Markdown("**APG (Adaptive Projected Guidance) - Improves guidance stability**")
+                        wan22_use_apg = gr.Checkbox(
+                            label="Enable APG", 
+                            value=False,
+                            info="Use Adaptive Projected Guidance for more stable generation"
+                        )
+                        with gr.Group() as wan22_apg_controls:
+                            with gr.Row():
+                                wan22_apg_momentum = gr.Slider(
+                                    minimum=-1.0, maximum=1.0, step=0.05,
+                                    label="APG Momentum", value=-0.75,
+                                    info="Momentum factor for guidance stabilization (-1 to 1)"
+                                )
+                                wan22_apg_norm_threshold = gr.Slider(
+                                    minimum=0, maximum=200, step=5,
+                                    label="APG Norm Threshold", value=55,
+                                    info="Maximum norm for guidance updates (0 = no limit)"
+                                )
 
                 with gr.Column():
                     wan22_output = gr.Gallery(
@@ -10118,6 +10184,13 @@ with gr.Blocks(
             wan22_v2v_strength,
             wan22_v2v_low_noise_only,
             wan22_v2v_use_i2v,
+            # Chunked Generation & APG parameters
+            wan22_enable_chunking,
+            wan22_frames_per_chunk,
+            wan22_motion_frames,
+            wan22_use_apg,
+            wan22_apg_momentum,
+            wan22_apg_norm_threshold,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
