@@ -416,6 +416,18 @@ def parse_args() -> argparse.Namespace:
         help="Strength for upscaling V2V inference (0.0-1.0, default: 0.5)")
     parser.add_argument("--enhance_weight", type=float, default=2.0,
         help="Enhance-A-Video weight for upscaling (default: 2.0, higher = more enhancement)")
+    # Tiling configuration for upscaling
+    parser.add_argument("--upscale_tile_width", type=int, default=272,
+        help="Tile width in pixels for upscaling VAE operations (default: 272)")
+    parser.add_argument("--upscale_tile_height", type=int, default=272,
+        help="Tile height in pixels for upscaling VAE operations (default: 272)")
+    parser.add_argument("--upscale_tile_stride_x", type=int, default=144,
+        help="Tile stride width in pixels for upscaling VAE operations (default: 144)")
+    parser.add_argument("--upscale_tile_stride_y", type=int, default=128,
+        help="Tile stride height in pixels for upscaling VAE operations (default: 128)")
+    parser.add_argument("--upscale_resize_mode", type=str, default="lanczos",
+        choices=["bilinear", "bicubic", "lanczos"],
+        help="Interpolation mode for pixel-level resizing in upscaling (default: lanczos)")
 
     args = parser.parse_args()
 
@@ -452,6 +464,15 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--upscale_mode requires either --video_path or --latent_path to be specified with a video/latent to upscale")
         if args.upscale_target_size is None and args.upscale_factor == 1.0:
             raise ValueError("--upscale_mode requires either --upscale_target_size or --upscale_factor > 1.0")
+        # Validate tiling parameters
+        if args.upscale_tile_width <= args.upscale_tile_stride_x:
+            raise ValueError("--upscale_tile_width must be larger than --upscale_tile_stride_x")
+        if args.upscale_tile_height <= args.upscale_tile_stride_y:
+            raise ValueError("--upscale_tile_height must be larger than --upscale_tile_stride_y")
+        if args.upscale_tile_width % 16 != 0 or args.upscale_tile_height % 16 != 0:
+            raise ValueError("Tile dimensions must be divisible by 16 for VAE compatibility")
+        if args.upscale_tile_stride_x % 8 != 0 or args.upscale_tile_stride_y % 8 != 0:
+            raise ValueError("Tile stride must be divisible by 8 for VAE compatibility")
     return args
 
 class DynamicModelManager:
@@ -1590,7 +1611,7 @@ def prepare_t2v_inputs(
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
     else:
-        # ComfyUI compatible noise
+        
         seed_g = torch.manual_seed(seed)
 
     # load text encoder
@@ -3639,6 +3660,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     
     # Only delete model if it exists
     if model is not None:
+        logger.info("Unloading DiT model from GPU memory.")
+        model.to("cpu")
         del model
         
     if 'scheduler' in locals(): del scheduler
@@ -3668,7 +3691,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     return final_latent
 
 def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.Tensor:
-    """decode latent tensor to video frames
+    """decode latent tensor to video frames with chunking to save VRAM
 
     Args:
         latent: latent tensor [B, C, F, H, W]
@@ -3680,76 +3703,69 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     """
     device = torch.device(args.device)
 
-    # Load VAE model or use the one from the generation pipeline
+    # VAE loading logic remains the same...
     vae = None
     if hasattr(args, "_vae") and args._vae is not None:
         vae = args._vae
         logger.info("Using VAE instance from generation pipeline for decoding.")
     else:
-        # Need to load VAE if it wasn't used/stored (e.g., pure T2V or latent input mode)
         logger.info("Loading VAE for decoding...")
-        # Attempt to detect DiT dtype even if DiT wasn't loaded (e.g., latent mode)
-        # Fallback to bfloat16 if DiT path isn't available
         try:
             dit_dtype_ref = detect_wan_sd_dtype(args.dit) if args.dit else torch.float16
-        except: # Handle cases where DiT path is invalid or missing in latent mode
+        except:
             dit_dtype_ref = torch.bfloat16
             logger.warning("Could not detect DiT dtype for VAE decoding, defaulting to bfloat16.")
-
         vae_dtype_decode = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else (torch.bfloat16 if dit_dtype_ref == torch.bfloat16 else torch.float16)
         vae = load_vae(args, cfg, device, vae_dtype_decode)
-        args._vae = vae # Store it in case needed again?
+        args._vae = vae
 
-    # Ensure VAE is on device for decoding
     vae.to_device(device)
 
-    logger.info(f"Decoding video from latents: shape {latent.shape}, dtype {latent.dtype}")
-    # Ensure latent is on the correct device and expected dtype for VAE
-    latent_decode = latent.to(device=device, dtype=vae.dtype)
+    b, c, f, h, w = latent.shape
+    # Set a reasonable chunk size. 16 frames is a safe default.
+    # This can be tuned based on available VRAM vs. speed.
+    chunk_size = 2
+    decoded_chunks = []
 
-    # Handle different VAE decode APIs
-    videos = None
-    with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
-        if hasattr(vae, 'model') and hasattr(vae, 'scale'):
-            # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
-            # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
-            latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
-            decoded_list = vae.decode(latent_list)
-            if decoded_list and len(decoded_list) > 0:
-                # Stack list back into batch dimension: [1, C, F, H, W]
-                videos = torch.stack(decoded_list, dim=0)
+    logger.info(f"Decoding {f} frames in chunks of {chunk_size} to conserve VRAM.")
+
+    # Process the latent tensor in chunks along the frame dimension
+    for i in tqdm(range(0, f, chunk_size), desc="Decoding Chunks"):
+        latent_chunk = latent[:, :, i:i + chunk_size].to(device=device, dtype=vae.dtype)
+
+        with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+            if hasattr(vae, 'model') and hasattr(vae, 'scale'):
+                # Wan2_2_VAE type
+                latent_list_chunk = [latent_chunk.squeeze(0)]
+                decoded_list_chunk = vae.decode(latent_list_chunk)
+                video_chunk = torch.stack(decoded_list_chunk, dim=0)
             else:
-                raise RuntimeError("VAE decoding failed or returned empty list.")
-        else:
-            # Original WanVAE type - handles tensor input directly
-            decoded_list = vae.decode(latent_decode)
-            if decoded_list and len(decoded_list) > 0:
-                videos = torch.stack(decoded_list, dim=0)
-            else:
-                raise RuntimeError("VAE decoding failed or returned empty list.")
+                # Original WanVAE type
+                decoded_list_chunk = vae.decode(latent_chunk)
+                video_chunk = torch.stack(decoded_list_chunk, dim=0)
+        
+        # Move the decoded chunk to CPU immediately to free up GPU memory
+        decoded_chunks.append(video_chunk.cpu())
+        
+        # Aggressive cleanup for maximum memory savings
+        del latent_chunk, video_chunk
+        if 'decoded_list_chunk' in locals(): del decoded_list_chunk
+        clean_memory_on_device(device)
 
+    # Concatenate all the decoded chunks on the CPU
+    videos = torch.cat(decoded_chunks, dim=2) # dim=2 is the frame dimension
+    del decoded_chunks
 
-    # Move VAE back to CPU/cache
+    logger.info("Chunked decoding complete.")
     vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
     
-    # Explicit cleanup to prevent memory fragmentation
-    del latent_decode
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    clean_memory_on_device(device)
-
-    logger.info(f"Decoded video shape: {videos.shape}")
-
-    # Post-processing: trim tail frames, convert to float32 CPU, scale to [0, 1]
+    # Post-processing remains the same...
     if args.trim_tail_frames > 0:
         logger.info(f"Trimming last {args.trim_tail_frames} frames.")
         videos = videos[:, :, : -args.trim_tail_frames, :, :]
 
-    # Scale from [-1, 1] (VAE output range) to [0, 1] (video save range)
     videos = (videos + 1.0) / 2.0
     videos = torch.clamp(videos, 0.0, 1.0)
-
-    # Move to CPU and convert to float32 for saving
     video_final = videos.cpu().to(torch.float32)
     logger.info(f"Decoding complete. Final video tensor shape: {video_final.shape}")
 
@@ -3871,123 +3887,16 @@ def save_output(
 
 
 def run_upscale_mode(args: argparse.Namespace) -> None:
-    """Run the upscale mode using 5B model as an upscaler
+    """Run the upscale mode using the new ComfyUI-aligned helper
     
     Args:
         args: command line arguments with upscale parameters
     """
-    logger.info("Running in Upscale Mode using Wan2.2 5B model")
-
-    # Create a dedicated args object for upscaling immediately and set the correct task
+    from wan_upscale_helper import run_upscale_from_args
+    
+    # Create a dedicated args object for upscaling and set the correct task
     upscale_args = argparse.Namespace(**vars(args))
     upscale_args.task = "ti2v-5B"
-
-    device = torch.device(upscale_args.device if upscale_args.device else "cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load the input (video file or latent)
-    if upscale_args.video_path:
-        # Load video and encode to latent
-        logger.info(f"Loading video from {upscale_args.video_path} for upscaling")
-        
-        # First load just to get dimensions
-        import cv2
-        cap = cv2.VideoCapture(upscale_args.video_path)
-        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        
-        # Now load with original dimensions as bucket
-        video_frames_np, num_frames = load_video(
-            upscale_args.video_path,
-            start_frame=0,
-            num_frames=None,  # Load all frames
-            bucket_reso=(original_height, original_width)  # Keep original size
-        )
-        
-        if num_frames == 0:
-            raise ValueError(f"Could not load any frames from video: {upscale_args.video_path}")
-        
-        logger.info(f"Loaded {num_frames} frames, original size: {original_height}x{original_width}")
-        
-        # Convert to tensor
-        video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))  # [F,H,W,C]
-        video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
-        video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
-        
-        # Load VAE for encoding
-        vae_dtype = torch.bfloat16  # Use bfloat16 for 5B model
-        cfg = WAN_CONFIGS[upscale_args.task]
-        vae = load_vae(upscale_args, cfg, device, vae_dtype)
-        
-        # Encode to latent
-        input_latent = encode_video_to_latents(video_tensor, vae, device, vae_dtype, upscale_args)
-        logger.info(f"Encoded video to latent: {input_latent.shape}")
-        
-    elif upscale_args.latent_path and len(upscale_args.latent_path) > 0:
-        # Load latent directly
-        from safetensors.torch import load_file
-        from safetensors import safe_open
-        
-        loaded_data = load_file(upscale_args.latent_path[0], device="cpu")
-        input_latent = loaded_data["latent"]
-        
-        # Load metadata to get original dimensions
-        with safe_open(upscale_args.latent_path[0], framework="pt", device="cpu") as f:
-            metadata = f.metadata() or {}
-        
-        original_height = int(metadata.get("height", 512))
-        original_width = int(metadata.get("width", 512))
-        num_frames = input_latent.shape[2] if len(input_latent.shape) == 5 else input_latent.shape[1]
-        
-        logger.info(f"Loaded latent from {upscale_args.latent_path[0]}, shape: {input_latent.shape}")
-        logger.info(f"Original dimensions from metadata: {original_height}x{original_width}")
-        
-        # Load VAE (will be needed for decoding)
-        vae_dtype = torch.bfloat16
-        cfg = WAN_CONFIGS[upscale_args.task]
-        vae = load_vae(upscale_args, cfg, device, vae_dtype)
-    else:
-        raise ValueError("Upscale mode requires either --video_path or --latent_path")
-    
-    # Calculate target dimensions
-    if upscale_args.upscale_target_size:
-        target_height, target_width = upscale_args.upscale_target_size
-    else:
-        target_height = int(original_height * upscale_args.upscale_factor)
-        target_width = int(original_width * upscale_args.upscale_factor)
-    
-    # Round to nearest multiple of 16 for VAE compatibility
-    target_height = (target_height // 16) * 16
-    target_width = (target_width // 16) * 16
-    
-    actual_factor = max(target_height / original_height, target_width / original_width)
-    logger.info(f"Upscaling from {original_height}x{original_width} to {target_height}x{target_width} (factor: {actual_factor:.2f}x)")
-    
-    # Resize the latent to target size
-    if len(input_latent.shape) == 4:
-        input_latent = input_latent.unsqueeze(0)  # Add batch dim
-    
-    B, C, F, H, W = input_latent.shape
-    target_lat_h = target_height // 8  # VAE downscale factor
-    target_lat_w = target_width // 8
-    
-    # Resize latent using interpolation
-    # Reshape to combine batch and frame dimensions for resize
-    latent_reshaped = input_latent.permute(0, 2, 1, 3, 4).reshape(B * F, C, H, W)
-    latent_resized = torch.nn.functional.interpolate(
-        latent_reshaped,
-        size=(target_lat_h, target_lat_w),
-        mode='bilinear',
-        align_corners=False
-    )
-    # Reshape back
-    latent_resized = latent_resized.reshape(B, F, C, target_lat_h, target_lat_w).permute(0, 2, 1, 3, 4)
-    latent_resized = latent_resized.to(device)
-    
-    logger.info(f"Resized latent from {input_latent.shape} to {latent_resized.shape}")
-    
-    # Prepare upscale V2V parameters
     upscale_args.dit = upscale_args.upscale_model
     
     # Handle LoRA - only set if file exists
@@ -4002,15 +3911,12 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
             logger.warning(f"LoRA file not found: {upscale_args.upscale_lora}, proceeding without LoRA")
         else:
             logger.info("No LoRA specified, using base model only")
-
-    upscale_args.video_size = [target_height, target_width]
-    upscale_args.video_length = F
+    
+    # Set up additional parameters for upscaling
     upscale_args.infer_steps = upscale_args.upscale_steps
     upscale_args.strength = upscale_args.upscale_strength
     upscale_args.flow_shift = 5.0  # Default for 5B model
     upscale_args.sample_solver = "unipc"
-    upscale_args.video_path = None  # Clear to avoid confusion
-    upscale_args.image_path = None
     
     # Set up prompt for upscaling if not provided
     if not upscale_args.prompt or upscale_args.prompt == "prompt for generation":
@@ -4018,113 +3924,12 @@ def run_upscale_mode(args: argparse.Namespace) -> None:
     if not upscale_args.negative_prompt:
         upscale_args.negative_prompt = "blurry, low quality, pixelated, artifacts, distorted"
     
-    logger.info(f"Running V2V upscaling with strength {upscale_args.strength}, {upscale_args.infer_steps} steps")
-    logger.info(f"Using prompt: {upscale_args.prompt}")
-    
-    # Run V2V generation with upscale parameters
-    cfg = WAN_CONFIGS[upscale_args.task]
-    
-    # Load text encoder for prompts
-    accelerator = accelerate.Accelerator(mixed_precision="bf16")
-    
-    # Prepare V2V inputs
-    noise, context, context_null, inputs = prepare_v2v_inputs(
-        upscale_args, cfg, accelerator, device, latent_resized
-    )
-    
-    # Load the 5B model with optional LoRA
-    dit_dtype = torch.bfloat16
-    dit_weight_dtype = torch.float8_e4m3fn if upscale_args.fp8 or upscale_args.fp8_scaled else dit_dtype
-    model = load_dit_model(upscale_args, cfg, device, dit_dtype, dit_weight_dtype, False)
-    
-    # Optimize model if needed
-    if isinstance(model, tuple):
-        # Handle dual-dit case (shouldn't happen for ti2v-5B)
-        model = model[0]
-    optimize_model(model, upscale_args, device, dit_dtype, dit_weight_dtype)
-    
-    # Apply Enhance-A-Video settings
-    if upscale_args.enhance_weight > 0:
-        logger.info(f"Applying Enhance-A-Video with weight {upscale_args.enhance_weight}")
-        # This would be integrated into the model's transformer options
-        # For simplicity, we'll adjust the guidance scale
-        upscale_args.guidance_scale = upscale_args.guidance_scale * (1 + upscale_args.enhance_weight * 0.2)
-    
-    # Setup scheduler
-    scheduler, timesteps = setup_scheduler(upscale_args, cfg, device)
-    
-    # Apply V2V strength to timesteps
-    seed = upscale_args.seed if upscale_args.seed else random.randint(0, 2**32 - 1)
-    seed_g = torch.Generator(device=device).manual_seed(seed)
-    
-    if upscale_args.strength < 1.0:
-        init_timestep_idx = int(upscale_args.infer_steps * (1.0 - upscale_args.strength))
-        init_timestep_idx = min(init_timestep_idx, upscale_args.infer_steps - 1)
-        init_timestep = timesteps[init_timestep_idx]
-        
-        # Mix noise with resized latent
-        pure_noise = torch.randn(latent_resized.shape, generator=seed_g, device=device, dtype=latent_resized.dtype)
-        
-        latent = scheduler.add_noise(
-            original_samples=latent_resized,
-            noise=pure_noise,
-            timesteps=torch.tensor([init_timestep], device=device)
-        )
-        
-        timesteps = timesteps[init_timestep_idx:]
-        logger.info(f"V2V upscaling: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
-    else:
-        latent = noise
-    
-# Run sampling
-    logger.info("Starting upscaling denoising loop...")
-    final_latent = run_sampling(
-        model, latent, scheduler, timesteps,
-        upscale_args, inputs, device, seed_g,
-        accelerator,
-        is_ti2v=False
-    )
-    
-    # --- Clean up DiT model to free VRAM before VAE decoding ---
-    logger.info("Unloading DiT model to free VRAM for VAE decoding...")
-    del model
-    del scheduler, inputs, context, context_null, noise, latent
-    if 'pure_noise' in locals():
-        del pure_noise # Clean up noise tensor if it exists
-    torch.cuda.empty_cache()
-    gc.collect()
-    # Give a moment for memory to be fully released
-    import time
-    time.sleep(0.5)
-    torch.cuda.empty_cache()
-    logger.info("DiT model unloaded.")
-    
-    # Decode and save
-    logger.info("Decoding upscaled result...")
-    upscale_args._vae = vae  # Pass VAE instance
-    decoded_video = decode_latent(final_latent, upscale_args, cfg)
-    
-    # Save the upscaled output
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
-    base_name = f"upscaled_{actual_factor:.1f}x_{time_flag}_{seed}"
-    
-    save_output(
-        decoded_video,
-        upscale_args,
-        original_base_names=[base_name],
-        latent_to_save=final_latent if upscale_args.output_type in ["latent", "both"] else None
-    )
-    
-    logger.info(f"Upscaling complete! Output saved with prefix: {base_name}")
+    # Run the new upscaling pipeline
+    run_upscale_from_args(upscale_args)
 
 def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
-
-    # Set device
-    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    args.device = torch.device(device_str) # Store device back in args
-    logger.info(f"Using device: {args.device}")
 
     # Check for upscale mode first
     if args.upscale_mode:
@@ -4133,6 +3938,11 @@ def main():
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
+
+    # Set device
+    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = torch.device(device_str) # Store device back in args
+    logger.info(f"Using device: {args.device}")
 
     generated_latent = None # To hold the generated latent if not in latents_mode
     cfg = WAN_CONFIGS[args.task] # Get config early for potential use

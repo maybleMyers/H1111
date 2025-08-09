@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 from utils.device_utils import clean_memory_on_device
 
-from .attention import flash_attention
+# from .attention import flash_attention  # Removed for compatibility
 from utils.device_utils import clean_memory_on_device
 from modules.custom_offloading_utils import ModelOffloader
 from modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -224,9 +224,20 @@ class WanSelfAttention(nn.Module):
         rope_apply_inplace_cached(k, grid_sizes, freqs)
         qkv = [q, k, v]
         del q, k, v
-        x = flash_attention(
-            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn
-        )
+        # Direct SDPA implementation to avoid flash attention
+        q, k, v = qkv
+        qkv.clear()
+        
+        # Transpose for SDPA: [B, L, N, C] -> [B, N, L, C]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2) 
+        v = v.transpose(1, 2)
+        
+        # Use PyTorch SDPA
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Transpose back: [B, N, L, C] -> [B, L, N, C]
+        x = x.transpose(1, 2)
 
         # output
         x = x.flatten(2)
@@ -263,7 +274,20 @@ class WanT2VCrossAttention(WanSelfAttention):
         # compute attention
         qkv = [q, k, v]
         del q, k, v
-        x = flash_attention(qkv, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
+        # Direct SDPA implementation to avoid flash attention
+        q, k, v = qkv
+        qkv.clear()
+        
+        # Transpose for SDPA: [B, L, N, C] -> [B, N, L, C]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Use PyTorch SDPA
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Transpose back: [B, N, L, C] -> [B, L, N, C]
+        x = x.transpose(1, 2)
 
         # output
         x = x.flatten(2)
@@ -305,7 +329,20 @@ class WanI2VCrossAttention(WanSelfAttention):
         # compute attention
         qkv = [q, k, v]
         del k, v
-        x = flash_attention(qkv, k_lens=context_lens, attn_mode=self.attn_mode, split_attn=self.split_attn)
+        # Direct SDPA implementation to avoid flash attention
+        q, k, v = qkv
+        qkv.clear()
+        
+        # Transpose for SDPA: [B, L, N, C] -> [B, N, L, C]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Use PyTorch SDPA
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Transpose back: [B, N, L, C] -> [B, L, N, C]
+        x = x.transpose(1, 2)
 
         # compute query, key, value
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
@@ -315,7 +352,20 @@ class WanI2VCrossAttention(WanSelfAttention):
         # compute attention
         qkv = [q, k_img, v_img]
         del q, k_img, v_img
-        img_x = flash_attention(qkv, k_lens=None, attn_mode=self.attn_mode, split_attn=self.split_attn)
+        # Direct SDPA implementation to avoid flash attention
+        q_img, k_img, v_img = qkv
+        qkv.clear()
+        
+        # Transpose for SDPA: [B, L, N, C] -> [B, N, L, C]
+        q_img = q_img.transpose(1, 2)
+        k_img = k_img.transpose(1, 2)
+        v_img = v_img.transpose(1, 2)
+        
+        # Use PyTorch SDPA
+        img_x = torch.nn.functional.scaled_dot_product_attention(q_img, k_img, v_img, dropout_p=0.0)
+        
+        # Transpose back: [B, N, L, C] -> [B, L, N, C]
+        img_x = img_x.transpose(1, 2)
 
         # output
         x = x.flatten(2)

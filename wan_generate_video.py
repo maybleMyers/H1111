@@ -994,7 +994,7 @@ def prepare_t2v_inputs(
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
     else:
-        # ComfyUI compatible noise
+        
         seed_g = torch.manual_seed(seed)
 
     # load text encoder

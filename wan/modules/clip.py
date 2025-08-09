@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from accelerate import init_empty_weights
 
-from .attention import flash_attention
+# from .attention import flash_attention  # Removed for compatibility
 from .tokenizers import HuggingfaceTokenizer
 from .xlm_roberta import XLMRoberta
 
@@ -204,8 +204,17 @@ class AttentionPool(nn.Module):
 
         # compute attention
         # this line is never used because pool_type="token" in Wan2.1
-        x = flash_attention(q, k, v, version=2)
-        x = x.reshape(b, 1, c)
+        # Direct SDPA implementation to avoid flash attention
+        # Transpose for SDPA: [B, L, N, C] -> [B, N, L, C]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Use PyTorch SDPA
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Transpose back: [B, N, L, C] -> [B, L, N, C] and reshape
+        x = x.transpose(1, 2).reshape(b, 1, c)
 
         # output
         x = self.proj(x)

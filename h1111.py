@@ -316,6 +316,12 @@ def wan22_upscale_handler(
     upscale_negative: str,
     upscale_lora: str,
     upscale_lora_weight: float,
+    # New tiling parameters
+    upscale_tile_width: int,
+    upscale_tile_height: int,
+    upscale_tile_stride_x: int,
+    upscale_tile_stride_y: int,
+    upscale_resize_mode: str,
     save_path: str,
     seed: int,
     # Model paths
@@ -346,7 +352,7 @@ def wan22_upscale_handler(
     
     # Build command for upscale mode
     command = [
-        "python", "wan2_generate_video.py",
+        sys.executable, "wan2_generate_video.py",
         "--upscale_mode",
         "--seed", str(seed),
         "--save_path", save_path,
@@ -371,6 +377,15 @@ def wan22_upscale_handler(
         command.extend(["--upscale_factor", str(upscale_factor)])
     else:
         command.extend(["--upscale_target_size", str(int(target_height)), str(int(target_width))])
+    
+    # Add tiling parameters
+    command.extend([
+        "--upscale_tile_width", str(upscale_tile_width),
+        "--upscale_tile_height", str(upscale_tile_height),
+        "--upscale_tile_stride_x", str(upscale_tile_stride_x),
+        "--upscale_tile_stride_y", str(upscale_tile_stride_y),
+        "--upscale_resize_mode", upscale_resize_mode
+    ])
     
     # Add prompts if provided
     if upscale_prompt:
@@ -440,14 +455,27 @@ def wan22_upscale_handler(
         # Parse progress updates
         if "Upscaling from" in line_strip:
             status_text = "Upscaling video..."
-        elif "Running V2V upscaling" in line_strip:
-            status_text = "Processing with V2V..."
-        elif "Decoding" in line_strip:
+        elif "Running V2V denoising" in line_strip:
+            status_text = "Processing with V2V denoising..."
+        elif "Preparing V2V sampling" in line_strip:
+            status_text = "Preparing V2V sampling..."
+        elif "Decoding final result" in line_strip:
             status_text = "Decoding result..."
-        elif "saved" in line_strip.lower():
+        elif "Upscaling complete!" in line_strip:
+            status_text = "Upscaling complete!"
+        elif "Video saved to:" in line_strip:
             status_text = "Upscaling complete!"
             # Try to extract saved file path
-            video_match = re.search(r"saved.*?:\s*(.*\.mp4)", line_strip, re.IGNORECASE)
+            video_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip, re.IGNORECASE)
+            if video_match:
+                saved_path = video_match.group(1).strip()
+                if os.path.exists(saved_path):
+                    yield [(saved_path, f"Upscaled")], None, status_text, f"Saved: {os.path.basename(saved_path)}"
+                    continue
+        elif "saved" in line_strip.lower() and ".mp4" in line_strip:
+            status_text = "Upscaling complete!"
+            # Fallback: try to extract any saved file path
+            video_match = re.search(r"(?:saved.*?:\s*|saved to:\s*)(.*\.mp4)", line_strip, re.IGNORECASE)
             if video_match:
                 saved_path = video_match.group(1).strip()
                 if os.path.exists(saved_path):
@@ -469,13 +497,29 @@ def wan22_upscale_handler(
     return_code = process.wait()
     
     if return_code == 0:
-        # Look for output video in save_path
-        output_files = glob.glob(os.path.join(save_path, "upscaled_*.mp4"))
+        # Look for output video in save_path - try multiple patterns
+        output_patterns = [
+            os.path.join(save_path, "*upscaled*.mp4"),  # New pattern: timestamp_seed_upscaled_factor_timestamp_seed.mp4
+            os.path.join(save_path, "upscaled_*.mp4"),  # Old pattern: upscaled_factor_timestamp_seed.mp4
+            os.path.join(save_path, "*.mp4")            # Any mp4 file as fallback
+        ]
+        
+        output_files = []
+        for pattern in output_patterns:
+            files = glob.glob(pattern)
+            if files:
+                output_files.extend(files)
+                break  # Use first matching pattern
+                
         if output_files:
+            # Get the most recently created file
             latest_file = max(output_files, key=os.path.getctime)
             yield [(latest_file, "Upscaled Video")], None, "Upscaling complete!", f"Saved: {os.path.basename(latest_file)}"
         else:
-            yield [], None, "Upscaling completed but output file not found", ""
+            # List all files in directory for debugging
+            all_files = glob.glob(os.path.join(save_path, "*.*"))
+            debug_info = f"Files in {save_path}: {[os.path.basename(f) for f in all_files]}"
+            yield [], None, "Upscaling completed but output file not found", debug_info
     else:
         yield [], None, f"Upscaling failed with code {return_code}", "Check console for errors"
 
@@ -7278,6 +7322,35 @@ with gr.Blocks(
                         label="Upscale LoRA Weight"
                     )
                 
+                with gr.Accordion("🔧 Advanced Tiling Settings", open=False):
+                    gr.Markdown("Configure tiled VAE processing to reduce VRAM usage")
+                    
+                    with gr.Row():
+                        wan22_upscale_tile_width = gr.Slider(
+                            minimum=128, maximum=512, step=16, value=272,
+                            label="Tile Width (pixels)"
+                        )
+                        wan22_upscale_tile_height = gr.Slider(
+                            minimum=128, maximum=512, step=16, value=272,
+                            label="Tile Height (pixels)"
+                        )
+                    
+                    with gr.Row():
+                        wan22_upscale_tile_stride_x = gr.Slider(
+                            minimum=64, maximum=256, step=8, value=144,
+                            label="Tile Stride X (pixels)"
+                        )
+                        wan22_upscale_tile_stride_y = gr.Slider(
+                            minimum=64, maximum=256, step=8, value=128,
+                            label="Tile Stride Y (pixels)"
+                        )
+                    
+                    wan22_upscale_resize_mode = gr.Dropdown(
+                        choices=["bilinear", "bicubic", "lanczos"],
+                        value="lanczos",
+                        label="Resize Interpolation Mode"
+                    )
+
                 wan22_upscale_generate_btn = gr.Button(
                     "🚀 Start Upscaling", 
                     variant="primary",
@@ -10240,6 +10313,12 @@ with gr.Blocks(
             wan22_upscale_negative,
             wan22_upscale_lora,
             wan22_upscale_lora_weight,
+            # New tiling parameters
+            wan22_upscale_tile_width,
+            wan22_upscale_tile_height,
+            wan22_upscale_tile_stride_x,
+            wan22_upscale_tile_stride_y,
+            wan22_upscale_resize_mode,
             wan22_save_path,
             wan22_seed,
             # Model paths
