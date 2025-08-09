@@ -3678,8 +3678,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             args=args,
             model=model,
             vae=vae,
-            text_encoder=text_encoder,
-            clip=clip,
+            text_encoder=None,  # Text is already encoded in arg_c/arg_null
+            clip=None,  # CLIP is already processed if needed
             initial_latent=latent,
             scheduler=scheduler,
             timesteps=timesteps,
