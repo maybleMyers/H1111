@@ -269,9 +269,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
-        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
-    )
-    parser.add_argument(
         "--guidance_scale",
         type=float,
         default=5.0,
@@ -1607,12 +1604,8 @@ def prepare_t2v_inputs(
 
     # set seed
     seed = args.seed # Seed should be set in generate()
-    if not args.cpu_noise:
-        seed_g = torch.Generator(device=device)
-        seed_g.manual_seed(seed)
-    else:
-        
-        seed_g = torch.manual_seed(seed)
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
 
     # load text encoder
     text_encoder = load_text_encoder(args, config, device)
@@ -1667,7 +1660,7 @@ def prepare_t2v_inputs(
             raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
 
     # generate noise (base latent noise, shape [16, F, H, W])
-    noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
+    noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device)
     noise = noise.to(device)
 
     # prepare model input arguments
@@ -1732,17 +1725,14 @@ def prepare_i2v_inputs(
 
         # set seed
         seed = args.seed
-        if not args.cpu_noise:
-            seed_g = torch.Generator(device=device)
-            seed_g.manual_seed(seed)
-        else:
-            seed_g = torch.manual_seed(seed)
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
 
         # generate noise (for the part being denoised by the DiT)
         noise = torch.randn(
             noise_channels, lat_f, lat_h, lat_w,
             dtype=torch.float32, generator=seed_g,
-            device=device if not args.cpu_noise else "cpu",
+            device=device,
         )
         noise = noise.to(device)
 
@@ -1899,11 +1889,8 @@ def prepare_i2v_inputs(
 
         # set seed
         seed = args.seed
-        if not args.cpu_noise:
-            seed_g = torch.Generator(device=device)
-            seed_g.manual_seed(seed)
-        else:
-            seed_g = torch.manual_seed(seed)
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #3: Noise Shape ---
         noise = torch.randn(
@@ -1911,7 +1898,7 @@ def prepare_i2v_inputs(
             lat_f_effective, # Use adjusted frame dim
             lat_h, lat_w,
             dtype=torch.float32, generator=seed_g,
-            device=device if not args.cpu_noise else "cpu",
+            device=device,
         )
         noise = noise.to(device)
 
@@ -2143,8 +2130,8 @@ def prepare_ti2v_inputs(
     vae_z_dim = 48 if args.task == "ti2v-5B" else 16  # 48 for 5B, 16 for others
     noise = torch.randn(
         vae_z_dim, lat_f, lat_h, lat_w,
-        device=device if not args.cpu_noise else "cpu", dtype=torch.float32,
-        generator=torch.Generator(device=device if not args.cpu_noise else "cpu").manual_seed(args.seed)
+        device=device, dtype=torch.float32,
+        generator=torch.Generator(device=device).manual_seed(args.seed)
     )
     
     # Calculate sequence length for model
@@ -2334,11 +2321,8 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
     # Set seed (already set in generate(), just need generator)
     seed = args.seed
-    if not args.cpu_noise:
-        seed_g = torch.Generator(device=device)
-        seed_g.manual_seed(seed)
-    else:
-        seed_g = torch.manual_seed(seed)
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
 
     # Load text encoder
     text_encoder = load_text_encoder(args, config, device)
@@ -2366,7 +2350,7 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     noise = torch.randn(
         video_latents.shape, # [B, C', F', H', W']
         dtype=torch.float32,
-        device=device if not args.cpu_noise else "cpu",
+        device=device,
         generator=seed_g
     )
     noise = noise.to(device) # Ensure noise is on the target device
@@ -2434,11 +2418,8 @@ def prepare_v2v_i2v_inputs(
     
     # Set seed
     seed = args.seed
-    if not args.cpu_noise:
-        seed_g = torch.Generator(device=device)
-        seed_g.manual_seed(seed)
-    else:
-        seed_g = torch.manual_seed(seed)
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
     
     # Load text encoder and encode prompts
     text_encoder = load_text_encoder(args, config, device)
@@ -2483,7 +2464,7 @@ def prepare_v2v_i2v_inputs(
     noise = torch.randn(
         video_latents.shape,  # [B, C', F', H', W']
         dtype=torch.float32,
-        device=device if not args.cpu_noise else "cpu",
+        device=device,
         generator=seed_g
     )
     noise = noise.to(device)
@@ -3887,7 +3868,7 @@ def save_output(
 
 
 def run_upscale_mode(args: argparse.Namespace) -> None:
-    """Run the upscale mode using the new ComfyUI-aligned helper
+    """Run the upscale mode using the video upscaling helper
     
     Args:
         args: command line arguments with upscale parameters

@@ -1,6 +1,6 @@
 """
 WAN Video Upscaling Helper
-Implements ComfyUI-aligned upscaling pipeline with tiled VAE operations
+Implements video upscaling pipeline with tiled VAE operations
 for efficient VRAM usage.
 """
 
@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 class WanUpscaler:
-    """Main upscaling class that follows ComfyUI's approach"""
+    """Main upscaling class for WAN video upscaling"""
     
     def __init__(self, args: argparse.Namespace):
         """Initialize the upscaler with command line arguments
@@ -213,7 +213,7 @@ class WanUpscaler:
         # Convert video to VAE expected range [-1, 1] and dtype
         video_tensor = (video_tensor * 2.0 - 1.0).to(device=self.device, dtype=vae_dtype)
         
-        # Use the VAE's built-in tiling implementation like ComfyUI does
+        # Use tiled encoding for memory efficiency
         try:
             with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=vae_dtype):
                 latents = vae.encode(video_tensor, device=self.device, tiled=True, 
@@ -257,24 +257,11 @@ class WanUpscaler:
         
         latent = latent.to(device=self.device, dtype=vae_dtype)
         
-        # Use the VAE's built-in tiling implementation like ComfyUI does
-        try:
-            with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=vae_dtype):
-                decoded_video = vae.decode(latent, tiled=True, 
-                                         tile_size=(self.args.upscale_tile_width//8, self.args.upscale_tile_height//8), 
-                                         tile_stride=(self.args.upscale_tile_stride_x//8, self.args.upscale_tile_stride_y//8))[0]
-                if hasattr(vae, 'model'):
-                    vae.model.clear_cache()
-        except Exception as e:
-            logger.warning(f"Tiled decoding failed: {e}, falling back to regular decoding")
-            # Fallback to regular decoding
-            with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=vae_dtype):
-                if hasattr(vae, 'decode'):
-                    # Wan2_2_VAE expects list input
-                    decoded_video = vae.decode([latent.squeeze(0)])[0]
-                    decoded_video = torch.stack([decoded_video], dim=0)
-                else:
-                    decoded_video = vae.decode_video(latent)
+        # Manual tiled decoding since Wan2_2_VAE doesn't support tiled parameter
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=vae_dtype):
+            decoded_video = self.manual_tiled_decode(vae, latent)
+            if hasattr(vae, 'model'):
+                vae.model.clear_cache()
         
         # Move to CPU and convert to [0, 1] range
         decoded_video = decoded_video.cpu().float()
@@ -291,6 +278,163 @@ class WanUpscaler:
         logger.info(f"Decoded to video shape: {decoded_video.shape}")
         
         return decoded_video
+    
+    def manual_tiled_decode(self, vae, latent):
+        """
+        Manually perform tiled decoding by splitting the latent into tiles.
+        Only tiles spatially, not temporally, for proper VAE decoding.
+        
+        Args:
+            vae: The VAE model
+            latent: Latent tensor [B, C, F, H, W] where F is temporal frames
+            
+        Returns:
+            Decoded video tensor [B, C, F_out, H*scale, W*scale]
+        """
+        B, C, F, H, W = latent.shape
+        
+        # Calculate tile dimensions in latent space (only for spatial dimensions)
+        # Wan2.2 VAE uses 16x spatial upsampling
+        upsampling_factor = 16
+        tile_h = self.args.upscale_tile_height // upsampling_factor
+        tile_w = self.args.upscale_tile_width // upsampling_factor
+        stride_h = self.args.upscale_tile_stride_y // upsampling_factor
+        stride_w = self.args.upscale_tile_stride_x // upsampling_factor
+        
+        # Ensure minimum tile size
+        tile_h = max(tile_h, 8)
+        tile_w = max(tile_w, 8)
+        stride_h = min(stride_h, tile_h - 2)  # Ensure overlap
+        stride_w = min(stride_w, tile_w - 2)
+        
+        logger.info(f"Tiling with tile size ({tile_h}, {tile_w}), stride ({stride_h}, {stride_w})")
+        
+        # If the latent is small enough, decode without tiling
+        if H <= tile_h and W <= tile_w:
+            logger.info("Latent is small enough, decoding without tiling")
+            if hasattr(vae, 'decode'):
+                # Wan2_2_VAE expects list input
+                decoded_list = vae.decode([latent.squeeze(0)])
+                if decoded_list and len(decoded_list) > 0:
+                    return torch.stack(decoded_list, dim=0)
+            return vae.decode_video(latent)
+        
+        # Calculate temporal output dimension
+        # WanVideo VAE temporal upscaling: out_T = T * 4 - 3
+        # For Wan2.2, we need to determine the temporal upscale factor
+        # From the logs: 11 latent frames -> 41 output frames
+        # This is approximately 4x temporal upscaling
+        out_T = F * 4 - 3  # Temporal frames after decoding
+        
+        # Calculate spatial output dimensions
+        out_h = H * upsampling_factor
+        out_w = W * upsampling_factor
+        out_c = 3  # RGB channels
+        
+        # Initialize output tensor with correct temporal dimension
+        output = torch.zeros((B, out_c, out_T, out_h, out_w), device=latent.device, dtype=torch.float32)
+        weight_map = torch.zeros((B, 1, out_T, out_h, out_w), device=latent.device, dtype=torch.float32)
+        
+        # Create blend weights for smooth transitions (in latent space units)
+        blend_h = min(4, (tile_h - stride_h) // 2)
+        blend_w = min(4, (tile_w - stride_w) // 2)
+        
+        # Process tiles
+        tiles_processed = 0
+        for y in range(0, H, stride_h):
+            for x in range(0, W, stride_w):
+                # Calculate tile boundaries
+                y_end = min(y + tile_h, H)
+                x_end = min(x + tile_w, W)
+                
+                # Adjust start if we're at the edge
+                if y_end == H and y_end - y < tile_h:
+                    y = max(0, H - tile_h)
+                    y_end = H
+                if x_end == W and x_end - x < tile_w:
+                    x = max(0, W - tile_w)
+                    x_end = W
+                
+                # Extract tile (keep all temporal frames, only tile spatially)
+                tile_latent = latent[:, :, :, y:y_end, x:x_end]
+                
+                # Decode tile
+                if hasattr(vae, 'decode'):
+                    # Wan2_2_VAE expects list input
+                    decoded_list = vae.decode([tile_latent.squeeze(0)])
+                    if decoded_list and len(decoded_list) > 0:
+                        tile_decoded = torch.stack(decoded_list, dim=0)
+                    else:
+                        raise RuntimeError("VAE decoding failed or returned empty list.")
+                else:
+                    tile_decoded = vae.decode_video(tile_latent)
+                
+                # Convert to float32 for blending
+                tile_decoded = tile_decoded.float()
+                
+                # Get actual decoded dimensions
+                _, _, decoded_T, decoded_h, decoded_w = tile_decoded.shape
+                
+                # Calculate output position (only for spatial dimensions)
+                out_y = y * upsampling_factor
+                out_x = x * upsampling_factor
+                out_y_end = min(out_y + decoded_h, out_h)
+                out_x_end = min(out_x + decoded_w, out_w)
+                
+                # Crop tile if it exceeds boundaries
+                if out_y_end - out_y < decoded_h:
+                    tile_decoded = tile_decoded[:, :, :, :out_y_end - out_y, :]
+                if out_x_end - out_x < decoded_w:
+                    tile_decoded = tile_decoded[:, :, :, :, :out_x_end - out_x]
+                
+                # Create weight mask for blending
+                tile_h_actual = out_y_end - out_y
+                tile_w_actual = out_x_end - out_x
+                tile_weight = torch.ones((1, 1, decoded_T, tile_h_actual, tile_w_actual), 
+                                        device=latent.device, dtype=torch.float32)
+                
+                # Apply linear blending at edges (only spatial, not temporal)
+                if y > 0 and blend_h > 0:
+                    # Blend top edge
+                    blend_size = min(blend_h * upsampling_factor, tile_h_actual)
+                    for i in range(blend_size):
+                        weight = i / float(blend_size)
+                        tile_weight[:, :, :, i, :] *= weight
+                
+                if x > 0 and blend_w > 0:
+                    # Blend left edge
+                    blend_size = min(blend_w * upsampling_factor, tile_w_actual)
+                    for i in range(blend_size):
+                        weight = i / float(blend_size)
+                        tile_weight[:, :, :, :, i] *= weight
+                
+                if y + tile_h < H and blend_h > 0:
+                    # Blend bottom edge
+                    blend_size = min(blend_h * upsampling_factor, tile_h_actual)
+                    for i in range(blend_size):
+                        weight = 1.0 - (i / float(blend_size))
+                        tile_weight[:, :, :, -(i+1), :] *= weight
+                
+                if x + tile_w < W and blend_w > 0:
+                    # Blend right edge
+                    blend_size = min(blend_w * upsampling_factor, tile_w_actual)
+                    for i in range(blend_size):
+                        weight = 1.0 - (i / float(blend_size))
+                        tile_weight[:, :, :, :, -(i+1)] *= weight
+                
+                # Add decoded tile to output with weighting
+                output[:, :, :, out_y:out_y_end, out_x:out_x_end] += tile_decoded * tile_weight
+                weight_map[:, :, :, out_y:out_y_end, out_x:out_x_end] += tile_weight
+                
+                tiles_processed += 1
+                if tiles_processed % 10 == 0:
+                    logger.info(f"Processed {tiles_processed} tiles...")
+        
+        # Normalize by weight map to handle overlapping regions
+        output = output / (weight_map + 1e-8)
+        
+        logger.info(f"Tiled decoding complete, processed {tiles_processed} tiles")
+        return output
     
     def prepare_v2v_sampling(self, latent: torch.Tensor, target_height: int, target_width: int, num_frames: int):
         """Prepare inputs for V2V sampling
@@ -414,7 +558,7 @@ class WanUpscaler:
         }
     
     def run_upscale(self):
-        """Main upscaling pipeline following ComfyUI workflow"""
+        """Main upscaling pipeline for video enhancement"""
         logger.info("Starting WAN Video Upscaling Pipeline")
         
         # Step 1: Load input

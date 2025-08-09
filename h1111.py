@@ -7255,10 +7255,9 @@ with gr.Blocks(
                 gr.Markdown("Use the Wan2.2 5B model as a high-quality video upscaler")
                 
                 with gr.Row():
-                    wan22_upscale_input = gr.File(
-                        label="Input Video or Latent to Upscale",
-                        file_types=[".mp4", ".avi", ".mov", ".webm", ".safetensors"],
-                        type="filepath"
+                    wan22_upscale_input = gr.Video(
+                        label="Input Video to Upscale",
+                        format="mp4"
                     )
                     with gr.Column():
                         wan22_upscale_mode = gr.Radio(
@@ -7267,7 +7266,7 @@ with gr.Blocks(
                             label="Upscale Mode"
                         )
                         wan22_upscale_factor = gr.Slider(
-                            minimum=1.5, maximum=4.0, step=0.5, value=2.0,
+                            minimum=0.5, maximum=4.0, step=0.05, value=1.1,
                             label="Upscale Factor",
                             visible=True
                         )
