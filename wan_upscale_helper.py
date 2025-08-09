@@ -260,7 +260,7 @@ class WanUpscaler:
         # Use the VAE's built-in tiling implementation like ComfyUI does
         try:
             with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=vae_dtype):
-                decoded_video = vae.decode(latent, device=self.device, tiled=True, 
+                decoded_video = vae.decode(latent, tiled=True, 
                                          tile_size=(self.args.upscale_tile_width//8, self.args.upscale_tile_height//8), 
                                          tile_stride=(self.args.upscale_tile_stride_x//8, self.args.upscale_tile_stride_y//8))[0]
                 if hasattr(vae, 'model'):
