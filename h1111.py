@@ -301,6 +301,522 @@ def wan22_batch_handler(
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
+### Wan2.2-FUN
+def wan22_fun_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    control_video: str,
+    control_camera_txt: str,
+    ref_image: str,
+    start_image: str,
+    end_image: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Performance Settings
+    gpu_memory_mode: str,
+    ulysses_degree: int,
+    ring_degree: int,
+    fsdp_dit: bool,
+    fsdp_text_encoder: bool,
+    compile_dit: bool,
+    # TeaCache Settings
+    enable_teacache: bool,
+    teacache_threshold: float,
+    num_skip_start_steps: int,
+    teacache_offload: bool,
+    # Other Performance Settings
+    cfg_skip_ratio: float,
+    enable_riflex: bool,
+    riflex_k: int,
+    # Model Paths
+    model_name: str,
+    transformer_path: str,
+    transformer_high_path: str,
+    vae_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+    
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, [], "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"wan22fun_{run_id}"
+        save_file_prefix = os.path.join(save_path, f"wan22fun_{run_id}_s{current_seed}")
+
+        # Get the current project root dynamically
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.join(current_dir, "wan", "origin-VideoX-Fun")
+
+        # Create a temporary Python script that will run the generation
+        script_content = f'''
+import os
+import sys
+import numpy as np
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from omegaconf import OmegaConf
+from PIL import Image
+from transformers import AutoTokenizer
+
+# Add project paths dynamically
+project_root = r"{project_root}"
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, "examples"))
+sys.path.insert(0, os.path.join(project_root, "examples", "wan2.2_fun"))
+
+from videox_fun.dist import set_multi_gpus_devices, shard_model
+from videox_fun.models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
+                               WanT5EncoderModel, Wan2_2Transformer3DModel)
+from videox_fun.data.dataset_image_video import process_pose_file
+from videox_fun.models.cache_utils import get_teacache_coefficients
+from videox_fun.pipeline import Wan2_2FunControlPipeline
+from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8,
+                                               convert_weight_dtype_wrapper,
+                                               replace_parameters_by_name)
+from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
+from videox_fun.utils.utils import (filter_kwargs, get_image_latent, get_image_to_video_latent,
+                                    get_video_to_video_latent,
+                                    save_videos_grid)
+from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+# Configuration
+GPU_memory_mode = "{gpu_memory_mode}"
+ulysses_degree = {ulysses_degree}
+ring_degree = {ring_degree}
+fsdp_dit = {fsdp_dit}
+fsdp_text_encoder = {fsdp_text_encoder}
+compile_dit = {compile_dit}
+
+enable_teacache = {enable_teacache}
+teacache_threshold = {teacache_threshold}
+num_skip_start_steps = {num_skip_start_steps}
+teacache_offload = {teacache_offload}
+
+cfg_skip_ratio = {cfg_skip_ratio}
+enable_riflex = {enable_riflex}
+riflex_k = {riflex_k}
+
+config_path = os.path.join(project_root, "config/wan2.2/wan_civitai_i2v.yaml")
+model_name = r"{model_name}"
+
+sampler_name = "{sample_solver}"
+shift = {flow_shift}
+
+transformer_path = {"r'" + transformer_path + "'" if transformer_path and transformer_path != "None" else "None"}
+transformer_high_path = {"r'" + transformer_high_path + "'" if transformer_high_path and transformer_high_path != "None" else "None"}
+vae_path = {"r'" + vae_path + "'" if vae_path and vae_path != "None" else "None"}
+
+# LoRA paths - collect non-None LoRAs
+lora_configs = []
+'''
+
+        # Add LoRA configurations
+        lora_weights = [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str]
+        lora_mults = [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult]
+        lora_apply_lows = [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, 
+                          lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low]
+        lora_apply_highs = [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high,
+                           lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high]
+        
+        for idx, (lora_str, lora_mult, apply_low, apply_high) in enumerate(zip(lora_weights, lora_mults, lora_apply_lows, lora_apply_highs)):
+            if lora_str and lora_str != "None":
+                lora_path = os.path.join(lora_folder, lora_str)
+                script_content += f'''
+lora_configs.append({{
+    "path": r"{lora_path}",
+    "weight": {lora_mult},
+    "apply_low": {apply_low},
+    "apply_high": {apply_high}
+}})
+'''
+
+        script_content += f'''
+# Determine LoRA paths for low and high noise models
+lora_path = None
+lora_high_path = None
+lora_weight = 0.55
+lora_high_weight = 0.55
+
+# Use first LoRA that applies to low noise model
+for config in lora_configs:
+    if config["apply_low"] and lora_path is None:
+        lora_path = config["path"]
+        lora_weight = config["weight"]
+        break
+
+# Use first LoRA that applies to high noise model
+for config in lora_configs:
+    if config["apply_high"] and lora_high_path is None:
+        lora_high_path = config["path"]
+        lora_high_weight = config["weight"]
+        break
+
+# Other parameters
+sample_size = [{width}, {height}]
+video_length = {frame_num}
+fps = {fps}
+weight_dtype = torch.bfloat16
+
+control_video = {"r'" + control_video + "'" if control_video else "None"}
+control_camera_txt = {"r'" + control_camera_txt + "'" if control_camera_txt else "None"}
+start_image = {"r'" + start_image + "'" if start_image else "None"}
+end_image = {"r'" + end_image + "'" if end_image else "None"}
+ref_image = {"r'" + ref_image + "'" if ref_image else "None"}
+
+prompt = """{prompt}"""
+negative_prompt = """{negative_prompt}"""
+guidance_scale = {sample_guide_scale}
+seed = {current_seed}
+num_inference_steps = {sample_steps}
+save_path = r"{save_file_prefix}"
+
+# Setup device
+device = set_multi_gpus_devices(ulysses_degree, ring_degree)
+config = OmegaConf.load(config_path)
+boundary = {dual_dit_boundary}
+
+# Load transformers
+transformer = Wan2_2Transformer3DModel.from_pretrained(
+    os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_low_noise_model_subpath', 'low_noise_model')),
+    transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+    low_cpu_mem_usage=True,
+    torch_dtype=weight_dtype,
+)
+
+transformer_2 = Wan2_2Transformer3DModel.from_pretrained(
+    os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_high_noise_model_subpath', 'high_noise_model')),
+    transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+    low_cpu_mem_usage=True,
+    torch_dtype=weight_dtype,
+)
+
+# Load custom transformer checkpoints if provided
+if transformer_path is not None:
+    print(f"Loading transformer from: {{transformer_path}}")
+    if transformer_path.endswith("safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(transformer_path)
+    else:
+        state_dict = torch.load(transformer_path, map_location="cpu")
+    state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+    m, u = transformer.load_state_dict(state_dict, strict=False)
+    print(f"missing keys: {{len(m)}}, unexpected keys: {{len(u)}}")
+
+if transformer_high_path is not None:
+    print(f"Loading high noise transformer from: {{transformer_high_path}}")
+    if transformer_high_path.endswith("safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(transformer_high_path)
+    else:
+        state_dict = torch.load(transformer_high_path, map_location="cpu")
+    state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+    m, u = transformer_2.load_state_dict(state_dict, strict=False)
+    print(f"missing keys: {{len(m)}}, unexpected keys: {{len(u)}}")
+
+# Get VAE
+Choosen_AutoencoderKL = {{
+    "AutoencoderKLWan": AutoencoderKLWan,
+}}[config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan')]
+vae = Choosen_AutoencoderKL.from_pretrained(
+    os.path.join(model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
+    additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
+).to(weight_dtype)
+
+if vae_path is not None:
+    print(f"Loading VAE from: {{vae_path}}")
+    if vae_path.endswith("safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(vae_path)
+    else:
+        state_dict = torch.load(vae_path, map_location="cpu")
+    state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+    m, u = vae.load_state_dict(state_dict, strict=False)
+    print(f"missing keys: {{len(m)}}, unexpected keys: {{len(u)}}")
+
+# Get Tokenizer
+tokenizer = AutoTokenizer.from_pretrained(
+    os.path.join(model_name, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
+)
+
+# Get Text encoder
+text_encoder = WanT5EncoderModel.from_pretrained(
+    os.path.join(model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
+    additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
+    low_cpu_mem_usage=True,
+    torch_dtype=weight_dtype,
+)
+text_encoder = text_encoder.eval()
+
+# Get Scheduler
+Choosen_Scheduler = {{
+    "vanilla": FlowMatchEulerDiscreteScheduler,
+    "unipc": FlowUniPCMultistepScheduler,
+    "dpm++": FlowDPMSolverMultistepScheduler,
+}}[sampler_name]
+if sampler_name == "unipc" or sampler_name == "dpm++":
+    config['scheduler_kwargs']['shift'] = 1
+scheduler = Choosen_Scheduler(
+    **filter_kwargs(Choosen_Scheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+)
+
+# Get Pipeline
+pipeline = Wan2_2FunControlPipeline(
+    transformer=transformer,
+    transformer_2=transformer_2,
+    vae=vae,
+    tokenizer=tokenizer,
+    text_encoder=text_encoder,
+    scheduler=scheduler,
+)
+
+# Apply multi-GPU and performance optimizations
+if ulysses_degree > 1 or ring_degree > 1:
+    from functools import partial
+    transformer.enable_multi_gpus_inference()
+    transformer_2.enable_multi_gpus_inference()
+    if fsdp_dit:
+        shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+        pipeline.transformer = shard_fn(pipeline.transformer)
+        pipeline.transformer_2 = shard_fn(pipeline.transformer_2)
+        print("Add FSDP DIT")
+    if fsdp_text_encoder:
+        shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+        pipeline.text_encoder = shard_fn(pipeline.text_encoder)
+        print("Add FSDP TEXT ENCODER")
+
+if compile_dit:
+    for i in range(len(pipeline.transformer.blocks)):
+        pipeline.transformer.blocks[i] = torch.compile(pipeline.transformer.blocks[i])
+    for i in range(len(pipeline.transformer_2.blocks)):
+        pipeline.transformer_2.blocks[i] = torch.compile(pipeline.transformer_2.blocks[i])
+    print("Add Compile")
+
+# Apply memory mode optimizations
+if GPU_memory_mode == "sequential_cpu_offload":
+    replace_parameters_by_name(transformer, ["modulation",], device=device)
+    replace_parameters_by_name(transformer_2, ["modulation",], device=device)
+    transformer.freqs = transformer.freqs.to(device=device)
+    transformer_2.freqs = transformer_2.freqs.to(device=device)
+    pipeline.enable_sequential_cpu_offload(device=device)
+elif GPU_memory_mode == "model_cpu_offload_and_qfloat8":
+    convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+    convert_model_weight_to_float8(transformer_2, exclude_module_name=["modulation",], device=device)
+    convert_weight_dtype_wrapper(transformer, weight_dtype)
+    convert_weight_dtype_wrapper(transformer_2, weight_dtype)
+    pipeline.enable_model_cpu_offload(device=device)
+elif GPU_memory_mode == "model_cpu_offload":
+    pipeline.enable_model_cpu_offload(device=device)
+elif GPU_memory_mode == "model_full_load_and_qfloat8":
+    convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+    convert_model_weight_to_float8(transformer_2, exclude_module_name=["modulation",], device=device)
+    convert_weight_dtype_wrapper(transformer, weight_dtype)
+    convert_weight_dtype_wrapper(transformer_2, weight_dtype)
+    pipeline.to(device=device)
+else:
+    pipeline.to(device=device)
+
+# Enable TeaCache if requested
+coefficients = get_teacache_coefficients(model_name) if enable_teacache else None
+if coefficients is not None:
+    print(f"Enable TeaCache with threshold {{teacache_threshold}} and skip the first {{num_skip_start_steps}} steps.")
+    pipeline.transformer.enable_teacache(
+        coefficients, num_inference_steps, teacache_threshold, num_skip_start_steps=num_skip_start_steps, offload=teacache_offload
+    )
+    pipeline.transformer_2.share_teacache(transformer=pipeline.transformer)
+
+# Enable CFG skip if requested
+if cfg_skip_ratio is not None and cfg_skip_ratio > 0:
+    print(f"Enable cfg_skip_ratio {{cfg_skip_ratio}}.")
+    pipeline.transformer.enable_cfg_skip(cfg_skip_ratio, num_inference_steps)
+    pipeline.transformer_2.share_cfg_skip(transformer=pipeline.transformer)
+
+generator = torch.Generator(device=device).manual_seed(seed)
+
+# Apply LoRAs if provided
+if lora_path is not None:
+    pipeline = merge_lora(pipeline, lora_path, lora_weight, device=device)
+if lora_high_path is not None:
+    pipeline = merge_lora(pipeline, lora_high_path, lora_high_weight, device=device, sub_transformer_name="transformer_2")
+
+# Generate video
+with torch.no_grad():
+    video_length = int((video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if video_length != 1 else 1
+    latent_frames = (video_length - 1) // vae.config.temporal_compression_ratio + 1
+
+    if enable_riflex:
+        pipeline.transformer.enable_riflex(k = riflex_k, L_test = latent_frames)
+
+    # Process inputs
+    inpaint_video, inpaint_video_mask, clip_image = get_image_to_video_latent(start_image, end_image, video_length=video_length, sample_size=sample_size)
+
+    if ref_image is not None:
+        ref_image = get_image_latent(ref_image, sample_size=sample_size)
+    
+    if control_camera_txt is not None:
+        input_video, input_video_mask = None, None
+        control_camera_video = process_pose_file(control_camera_txt, sample_size[1], sample_size[0])
+        control_camera_video = control_camera_video[:video_length].permute([3, 0, 1, 2]).unsqueeze(0)
+    else:
+        if control_video is not None:
+            input_video, input_video_mask, _, _ = get_video_to_video_latent(control_video, video_length=video_length, sample_size=sample_size, fps=fps, ref_image=None)
+        else:
+            input_video, input_video_mask = None, None
+        control_camera_video = None
+
+    sample = pipeline(
+        prompt, 
+        num_frames = video_length,
+        negative_prompt = negative_prompt,
+        height = sample_size[0],
+        width = sample_size[1],
+        generator = generator,
+        guidance_scale = guidance_scale,
+        num_inference_steps = num_inference_steps,
+        video = inpaint_video,
+        mask_video = inpaint_video_mask,
+        control_video = input_video,
+        control_camera_video = control_camera_video,
+        ref_image = ref_image,
+        boundary = boundary,
+        shift = shift,
+    ).videos
+
+# Unmerge LoRAs
+if lora_path is not None:
+    pipeline = unmerge_lora(pipeline, lora_path, lora_weight, device=device)
+if lora_high_path is not None:
+    pipeline = unmerge_lora(pipeline, lora_high_path, lora_high_weight, device=device, sub_transformer_name="transformer_2")
+
+# Save results
+import os
+if not os.path.exists(os.path.dirname(save_path)):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+if video_length == 1:
+    video_path = save_path + ".png"
+    image = sample[0, :, 0]
+    image = image.transpose(0, 1).transpose(1, 2)
+    image = (image * 255).numpy().astype(np.uint8)
+    image = Image.fromarray(image)
+    image.save(video_path)
+else:
+    video_path = save_path + ".mp4"
+    save_videos_grid(sample, video_path, fps=fps)
+
+print(f"Saved to {{video_path}}")
+'''
+
+        # Write the script to a temporary file
+        temp_script_path = os.path.join(save_path, f"temp_wan22fun_{run_id}.py")
+        with open(temp_script_path, 'w', encoding='utf-8') as f:
+            f.write(script_content)
+
+        # Execute the script
+        try:
+            yield all_generated_videos.copy(), None, status_text, "Running VideoX-Fun Control generation..."
+            
+            process = subprocess.Popen(
+                [sys.executable, temp_script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            # Monitor process output in real-time
+            for line in iter(process.stdout.readline, ''):
+                if stop_event.is_set():
+                    process.terminate()
+                    yield all_generated_videos, None, "Generation stopped by user.", ""
+                    return
+                
+                if line.strip():
+                    # Print to console for debugging (all output)
+                    print(f"[wan2.2-FUN] {line.strip()}")
+                    
+                    # Update progress based on output
+                    if "Enable TeaCache" in line or "Enable cfg_skip" in line or "Loading" in line or "loaded" in line:
+                        yield all_generated_videos.copy(), None, status_text, line.strip()
+                    elif "%" in line or "it/s" in line:  # Progress indicator
+                        yield all_generated_videos.copy(), None, status_text, line.strip()
+                    elif "Saved to" in line:
+                        yield all_generated_videos.copy(), None, status_text, "Finalizing video..."
+                    elif "Error" in line or "Traceback" in line or "Exception" in line or "missing keys" in line:
+                        yield all_generated_videos.copy(), None, status_text, f"Info: {line.strip()}"
+
+            process.wait()
+            
+            if process.returncode == 0:
+                # Find the generated video
+                video_path = save_file_prefix + ".mp4"
+                if not os.path.exists(video_path):
+                    video_path = save_file_prefix + ".png"
+                
+                if os.path.exists(video_path):
+                    all_generated_videos.append((video_path, f"Item {i+1}"))
+                    yield all_generated_videos.copy(), None, f"Item {i+1}/{batch_size} complete", ""
+                else:
+                    yield all_generated_videos, None, f"Error: Output file not found for item {i+1}", ""
+            else:
+                yield all_generated_videos, None, f"Error in item {i+1}: Process failed", ""
+                
+        except Exception as e:
+            yield all_generated_videos, None, f"Error in item {i+1}: {str(e)}", ""
+        finally:
+            # Clean up temp script
+            if os.path.exists(temp_script_path):
+                os.remove(temp_script_path)
+        
+        clear_cuda_cache()
+        time.sleep(0.2)
+        
+    yield all_generated_videos, [], "Wan2.2-FUN Batch complete.", ""
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -7027,6 +7543,160 @@ with gr.Blocks(
                     wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
                     wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
                     wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+# Wan2.2-FUN Tab
+        with gr.Tab(id=13, label="wan2.2-FUN") as wan22_fun_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wan22_fun_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="一位年轻女子站在阳光明媚的海岸线上，身穿深蓝色背心与清爽的白色衬衫，外搭一条简洁的白色围裙，围裙在轻拂的海风中微微飘动。她拥有一头鲜艳的紫色长发，在风中轻盈舞动，发间系着一个精致的黑色蝴蝶结，与身后柔和的蔚蓝天空形成鲜明对比。她面容清秀，眉目精致，透着一股甜美的青春气息；神情柔和，略带羞涩，目光静静地凝望着远方的地平线，双手自然交叠于身前，仿佛沉浸在思绪之中。在她身后，是辽阔无垠、波光粼粼的大海，阳光洒在海面上，映出温暖的金色光晕。", 
+                        lines=5
+                    )
+                    wan22_fun_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    wan22_fun_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wan22_fun_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    wan22_fun_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    wan22_fun_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wan22_fun_progress_text")
+
+            with gr.Row():
+                wan22_fun_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                wan22_fun_stop_btn = gr.Button("Stop Generation", variant="stop")
+            
+            with gr.Row():
+                with gr.Column():
+                    # Control inputs
+                    gr.Markdown("### Control & Reference Inputs")
+                    wan22_fun_control_video = gr.Video(label="Control Video (MP4)", format="mp4")
+                    wan22_fun_control_camera_txt = gr.File(label="Control Camera Text File", file_types=[".txt"])
+                    wan22_fun_ref_image = gr.Image(label="Reference Image", type="filepath")
+                    wan22_fun_start_image = gr.Image(label="Start Image (Optional)", type="filepath")
+                    wan22_fun_end_image = gr.Image(label="End Image (Optional)", type="filepath")
+                    
+                    gr.Markdown("### Generation Parameters")
+                    wan22_fun_task = gr.Dropdown(
+                        label="Task", 
+                        choices=["control-ref", "control-only", "ref-only"], 
+                        value="control-ref",
+                        info="Select the control mode for generation."
+                    )
+                    # Width and height inputs
+                    with gr.Row():
+                        wan22_fun_width = gr.Number(label="Width", value=832, interactive=True)
+                        wan22_fun_calc_height_btn = gr.Button("→")
+                        wan22_fun_calc_width_btn = gr.Button("←")
+                        wan22_fun_height = gr.Number(label="Height", value=480, interactive=True)
+                    wan22_fun_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan22_fun_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wan22_fun_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
+                    wan22_fun_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    wan22_fun_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=6.0)
+                    wan22_fun_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise model used after this threshold")
+                    wan22_fun_sample_solver = gr.Radio(choices=["vanilla", "unipc", "dpm++"], label="Sample Solver", value="vanilla")
+                    with gr.Row():
+                        wan22_fun_seed = gr.Number(label="Seed (-1 for random)", value=42)
+                        wan22_fun_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    wan22_fun_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_wan22_fun", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        wan22_fun_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        wan22_fun_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                          label="Preview Every N Steps")
+                        wan22_fun_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="wan22_fun_preview_gallery"
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            wan22_fun_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            wan22_fun_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        wan22_fun_lora_weights = []
+                        wan22_fun_lora_multipliers = []
+                        wan22_fun_lora_apply_low = []
+                        wan22_fun_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                wan22_fun_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                wan22_fun_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                wan22_fun_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                wan22_fun_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                        with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                            for i in range(4, 8):
+                                with gr.Row():
+                                    wan22_fun_lora_weights.append(gr.Dropdown(
+                                        label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                        value="None", allow_custom_value=False, interactive=True, scale=2
+                                    ))
+                                    wan22_fun_lora_multipliers.append(gr.Slider(
+                                        label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                    ))
+                                with gr.Row():
+                                    wan22_fun_lora_apply_low.append(gr.Checkbox(
+                                        label="Apply to Low Noise", value=True, scale=1
+                                    ))
+                                    wan22_fun_lora_apply_high.append(gr.Checkbox(
+                                        label="Apply to High Noise", value=False, scale=1
+                                    ))
+            
+            with gr.Accordion("Performance Settings", open=False):
+                with gr.Row():
+                    wan22_fun_gpu_memory_mode = gr.Radio(
+                        choices=["model_full_load", "model_cpu_offload", "model_cpu_offload_and_qfloat8", 
+                                "model_full_load_and_qfloat8", "sequential_cpu_offload"], 
+                        label="GPU Memory Mode", value="sequential_cpu_offload"
+                    )
+                with gr.Row():
+                    wan22_fun_ulysses_degree = gr.Number(label="Ulysses Degree", value=1, minimum=1, step=1)
+                    wan22_fun_ring_degree = gr.Number(label="Ring Degree", value=1, minimum=1, step=1)
+                with gr.Row():
+                    wan22_fun_fsdp_dit = gr.Checkbox(label="Use FSDP for DiT", value=False)
+                    wan22_fun_fsdp_text_encoder = gr.Checkbox(label="Use FSDP for Text Encoder", value=True)
+                    wan22_fun_compile_dit = gr.Checkbox(label="Compile DiT", value=False)
+                
+                gr.Markdown("### TeaCache Settings")
+                with gr.Row():
+                    wan22_fun_enable_teacache = gr.Checkbox(label="Enable TeaCache", value=True)
+                    wan22_fun_teacache_threshold = gr.Slider(minimum=0.05, maximum=0.30, step=0.01, label="TeaCache Threshold", value=0.10)
+                with gr.Row():
+                    wan22_fun_num_skip_start_steps = gr.Number(label="Skip Start Steps", value=5, minimum=0, step=1)
+                    wan22_fun_teacache_offload = gr.Checkbox(label="TeaCache CPU Offload", value=False)
+                
+                gr.Markdown("### Other Performance Settings")
+                with gr.Row():
+                    wan22_fun_cfg_skip_ratio = gr.Slider(minimum=0.0, maximum=0.25, step=0.01, label="CFG Skip Ratio", value=0.0)
+                with gr.Row():
+                    wan22_fun_enable_riflex = gr.Checkbox(label="Enable Riflex", value=False)
+                    wan22_fun_riflex_k = gr.Number(label="Riflex K", value=6, minimum=1, step=1)
+            
+            with gr.Accordion("Model Paths", open=True):
+                wan22_fun_model_name = gr.Textbox(label="Model Name/Path", value="models/Diffusion_Transformer/Wan2.2-Fun-A14B-Control")
+                wan22_fun_transformer_path = gr.Textbox(label="Transformer Path (.safetensors, optional)", value="")
+                wan22_fun_transformer_high_path = gr.Textbox(label="High Noise Transformer Path (.safetensors, optional)", value="")
+                wan22_fun_vae_path = gr.Textbox(label="VAE Path (.pth, optional)", value="")
+                wan22_fun_save_path = gr.Textbox(label="Save Path", value="outputs")
         
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -10144,6 +10814,112 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # Wan2.2-FUN event handlers
+    wan22_fun_generate_btn.click(
+        fn=wan22_fun_batch_handler,
+        inputs=[
+            wan22_fun_prompt,
+            wan22_fun_negative_prompt,
+            wan22_fun_control_video,
+            wan22_fun_control_camera_txt,
+            wan22_fun_ref_image,
+            wan22_fun_start_image,
+            wan22_fun_end_image,
+            wan22_fun_task,
+            wan22_fun_width,
+            wan22_fun_height,
+            wan22_fun_frame_num,
+            wan22_fun_fps,
+            wan22_fun_seed,
+            wan22_fun_sample_solver,
+            wan22_fun_sample_steps,
+            wan22_fun_flow_shift,
+            wan22_fun_sample_guide_scale,
+            wan22_fun_dual_dit_boundary,
+            wan22_fun_batch_size,
+            wan22_fun_save_path,
+            # Performance Settings
+            wan22_fun_gpu_memory_mode,
+            wan22_fun_ulysses_degree,
+            wan22_fun_ring_degree,
+            wan22_fun_fsdp_dit,
+            wan22_fun_fsdp_text_encoder,
+            wan22_fun_compile_dit,
+            # TeaCache Settings
+            wan22_fun_enable_teacache,
+            wan22_fun_teacache_threshold,
+            wan22_fun_num_skip_start_steps,
+            wan22_fun_teacache_offload,
+            # Other Performance Settings
+            wan22_fun_cfg_skip_ratio,
+            wan22_fun_enable_riflex,
+            wan22_fun_riflex_k,
+            # Model Paths
+            wan22_fun_model_name,
+            wan22_fun_transformer_path,
+            wan22_fun_transformer_high_path,
+            wan22_fun_vae_path,
+            # LoRAs
+            wan22_fun_lora_folder,
+            *wan22_fun_lora_weights,
+            *wan22_fun_lora_multipliers,
+            *wan22_fun_lora_apply_low,
+            *wan22_fun_lora_apply_high,
+            # Previews
+            wan22_fun_enable_preview,
+            wan22_fun_preview_steps,
+        ],
+        outputs=[wan22_fun_output, wan22_fun_preview_output, wan22_fun_batch_progress, wan22_fun_progress_text],
+        show_progress="hidden"
+    )
+
+    wan22_fun_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Random seed button for wan2.2-FUN
+    wan22_fun_random_seed_btn.click(
+        fn=lambda: random.randint(0, 2**32 - 1),
+        outputs=[wan22_fun_seed]
+    )
+
+    # Width/Height calculation for wan2.2-FUN
+    wan22_fun_calc_height_btn.click(
+        fn=lambda w: int((w * 9) / 16) if w else 480,
+        inputs=[wan22_fun_width],
+        outputs=[wan22_fun_height]
+    )
+    
+    wan22_fun_calc_width_btn.click(
+        fn=lambda h: int((h * 16) / 9) if h else 832,
+        inputs=[wan22_fun_height],
+        outputs=[wan22_fun_width]
+    )
+
+    # Token counter for wan2.2-FUN
+    wan22_fun_prompt.change(
+        fn=count_prompt_tokens,
+        inputs=[wan22_fun_prompt],
+        outputs=[wan22_fun_token_counter]
+    )
+
+    # Gallery selection for wan2.2-FUN
+    wan22_fun_selected_index = gr.State(0)
+    
+    def handle_wan22_fun_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    wan22_fun_output.select(fn=handle_wan22_fun_gallery_select, outputs=wan22_fun_selected_index)
+
+    # LoRA refresh for wan2.2-FUN
+    wan22_fun_lora_refresh_outputs_list = []
+    for i in range(len(wan22_fun_lora_weights)):
+        wan22_fun_lora_refresh_outputs_list.extend([wan22_fun_lora_weights[i], wan22_fun_lora_multipliers[i]])
+    
+    wan22_fun_lora_refresh_btn.click(
+        fn=refresh_8_loras,
+        inputs=[wan22_fun_lora_folder],
+        outputs=wan22_fun_lora_refresh_outputs_list
     )
 
     #Video Info
