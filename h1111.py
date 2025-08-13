@@ -394,18 +394,19 @@ def wan22_fun_batch_handler(
         script_content = f'''
 import os
 import sys
+
+# Setup VideoX-Fun environment
+videox_fun_root = os.getcwd()  # We're running from VideoX-Fun directory
+if videox_fun_root not in sys.path:
+    sys.path.insert(0, videox_fun_root)
+
+# Now import everything
 import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image
 from transformers import AutoTokenizer
-
-# Add project paths dynamically
-project_root = r"{project_root}"
-sys.path.insert(0, project_root)
-sys.path.insert(0, os.path.join(project_root, "examples"))
-sys.path.insert(0, os.path.join(project_root, "examples", "wan2.2_fun"))
 
 from videox_fun.dist import set_multi_gpus_devices, shard_model
 from videox_fun.models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
@@ -440,7 +441,7 @@ cfg_skip_ratio = {cfg_skip_ratio}
 enable_riflex = {enable_riflex}
 riflex_k = {riflex_k}
 
-config_path = os.path.join(project_root, "config/wan2.2/wan_civitai_i2v.yaml")
+config_path = "config/wan2.2/wan_civitai_i2v.yaml"
 model_name = r"{model_name}"
 
 sampler_name = "{sample_solver}"
@@ -750,8 +751,8 @@ else:
 print(f"Saved to {{video_path}}")
 '''
 
-        # Write the script to a temporary file
-        temp_script_path = os.path.join(save_path, f"temp_wan22fun_{run_id}.py")
+        # Write the script to a temporary file in the examples directory
+        temp_script_path = os.path.join(project_root, "examples", "wan2.2_fun", f"temp_wan22fun_{run_id}.py")
         with open(temp_script_path, 'w', encoding='utf-8') as f:
             f.write(script_content)
 
@@ -759,13 +760,15 @@ print(f"Saved to {{video_path}}")
         try:
             yield all_generated_videos.copy(), None, status_text, "Running VideoX-Fun Control generation..."
             
+            # Ensure we're running from the project root directory  
             process = subprocess.Popen(
-                [sys.executable, temp_script_path],
+                [sys.executable, os.path.join("examples", "wan2.2_fun", f"temp_wan22fun_{run_id}.py")],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                cwd=project_root
             )
 
             # Monitor process output in real-time
