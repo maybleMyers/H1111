@@ -243,10 +243,28 @@ class Wan2_2FunInpaintPipeline(DiffusionPipeline):
         if hasattr(self, 'transformer') and self.transformer is not None:
             self.transformer.move_to_device_except_swap_blocks(self._target_device)
             self._models_cpu_state['transformer'] = False  # Non-block components are on GPU
+            
+            # Move special parameters to target device (like sequential_cpu_offload does)
+            from ..utils.fp8_optimization import replace_parameters_by_name
+            replace_parameters_by_name(self.transformer, ["modulation"], device=self._target_device)
+            if hasattr(self.transformer, 'freqs'):
+                self.transformer.freqs = self.transformer.freqs.to(device=self._target_device)
+            
+            # Prepare block swap before forward
+            self.transformer.prepare_block_swap_before_forward()
         
         if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
             self.transformer_2.move_to_device_except_swap_blocks(self._target_device)
             self._models_cpu_state['transformer_2'] = False  # Non-block components are on GPU
+            
+            # Move special parameters to target device (like sequential_cpu_offload does)  
+            from ..utils.fp8_optimization import replace_parameters_by_name
+            replace_parameters_by_name(self.transformer_2, ["modulation"], device=self._target_device)
+            if hasattr(self.transformer_2, 'freqs'):
+                self.transformer_2.freqs = self.transformer_2.freqs.to(device=self._target_device)
+            
+            # Prepare block swap before forward
+            self.transformer_2.prepare_block_swap_before_forward()
         
         # Force garbage collection and empty cache
         gc.collect()
