@@ -483,6 +483,10 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
+            # Load text encoder for encoding when dynamic loading is enabled
+            if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+                self._load_model_to_device('text_encoder')
+                
             prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
@@ -507,6 +511,10 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
                     " the batch size of `prompt`."
                 )
 
+            # Load text encoder for negative prompt encoding when dynamic loading is enabled
+            if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+                self._load_model_to_device('text_encoder')
+                
             negative_prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=negative_prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
@@ -514,6 +522,10 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
                 device=device,
                 dtype=dtype,
             )
+
+        # Offload text encoder after encoding when dynamic loading is enabled
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            self._offload_model_from_device('text_encoder')
 
         return prompt_embeds, negative_prompt_embeds
 
