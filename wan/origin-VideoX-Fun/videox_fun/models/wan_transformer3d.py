@@ -1113,7 +1113,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             else:
                 ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
 
-                for block in self.blocks:
+                for block_idx, block in enumerate(self.blocks):
+                    # Handle block swapping: wait for block to be moved to GPU
+                    if self.blocks_to_swap and hasattr(self, 'offloader'):
+                        self.offloader.wait_for_block(block_idx)
+                    
                     if torch.is_grad_enabled() and self.gradient_checkpointing:
 
                         def create_custom_forward(module):
@@ -1149,12 +1153,20 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         )
                         x = block(x, **kwargs)
                     
+                    # Handle block swapping: schedule next block swap after current block use
+                    if self.blocks_to_swap and hasattr(self, 'offloader'):
+                        self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+                    
                 if cond_flag:
                     self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
                 else:
                     self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
         else:
-            for block in self.blocks:
+            for block_idx, block in enumerate(self.blocks):
+                # Handle block swapping: wait for block to be moved to GPU
+                if self.blocks_to_swap and hasattr(self, 'offloader'):
+                    self.offloader.wait_for_block(block_idx)
+                
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
 
                     def create_custom_forward(module):
@@ -1189,6 +1201,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         t=t  
                     )
                     x = block(x, **kwargs)
+                
+                # Handle block swapping: schedule next block swap after current block use
+                if self.blocks_to_swap and hasattr(self, 'offloader'):
+                    self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
 
         # head
         if torch.is_grad_enabled() and self.gradient_checkpointing:
