@@ -325,6 +325,7 @@ def wan22_fun_batch_handler(
     save_path: str,
     # Performance Settings
     gpu_memory_mode: str,
+    blocks_to_swap: int,
     ulysses_degree: int,
     ring_degree: int,
     fsdp_dit: bool,
@@ -426,6 +427,7 @@ from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 # Configuration
 GPU_memory_mode = "{gpu_memory_mode}"
+blocks_to_swap = {blocks_to_swap}
 ulysses_degree = {ulysses_degree}
 ring_degree = {ring_degree}
 fsdp_dit = {fsdp_dit}
@@ -497,7 +499,7 @@ for config in lora_configs:
         break
 
 # Other parameters
-sample_size = [{width}, {height}]
+sample_size = [{height}, {width}]
 video_length = {frame_num}
 fps = {fps}
 weight_dtype = torch.bfloat16
@@ -637,7 +639,11 @@ if compile_dit:
     print("Add Compile")
 
 # Apply memory mode optimizations
-if GPU_memory_mode == "sequential_cpu_offload":
+if GPU_memory_mode == "block_swap":
+    # Use block swapping with specified number of blocks
+    pipeline.enable_block_swap(blocks_to_swap, device=device)
+    pipeline.to(device=device)
+elif GPU_memory_mode == "sequential_cpu_offload":
     replace_parameters_by_name(transformer, ["modulation",], device=device)
     replace_parameters_by_name(transformer_2, ["modulation",], device=device)
     transformer.freqs = transformer.freqs.to(device=device)
@@ -7668,8 +7674,14 @@ with gr.Blocks(
                 with gr.Row():
                     wan22_fun_gpu_memory_mode = gr.Radio(
                         choices=["model_full_load", "model_cpu_offload", "model_cpu_offload_and_qfloat8", 
-                                "model_full_load_and_qfloat8", "sequential_cpu_offload"], 
+                                "model_full_load_and_qfloat8", "sequential_cpu_offload", "block_swap"], 
                         label="GPU Memory Mode", value="sequential_cpu_offload"
+                    )
+                with gr.Row():
+                    wan22_fun_blocks_to_swap = gr.Slider(
+                        label="Blocks to Swap (only for block_swap mode)", 
+                        minimum=0, maximum=30, step=1, value=0,
+                        info="Number of transformer blocks to swap to CPU. 0=all on GPU, higher=more on CPU"
                     )
                 with gr.Row():
                     wan22_fun_ulysses_degree = gr.Number(label="Ulysses Degree", value=1, minimum=1, step=1)
@@ -10845,6 +10857,7 @@ with gr.Blocks(
             wan22_fun_save_path,
             # Performance Settings
             wan22_fun_gpu_memory_mode,
+            wan22_fun_blocks_to_swap,
             wan22_fun_ulysses_degree,
             wan22_fun_ring_degree,
             wan22_fun_fsdp_dit,

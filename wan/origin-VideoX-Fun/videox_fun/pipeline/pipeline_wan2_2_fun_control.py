@@ -187,6 +187,28 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             vae_scale_factor=self.vae.spatial_compression_ratio, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
 
+    def enable_block_swap(self, blocks_to_swap: int, device: Optional[torch.device] = None):
+        """
+        Enable block swapping for memory-efficient inference.
+        
+        Args:
+            blocks_to_swap: Number of transformer blocks to swap to CPU
+            device: Target device for computation
+        """
+        device = device or self._execution_device
+        
+        # Enable block swapping for the low noise transformer
+        if hasattr(self, 'transformer') and self.transformer is not None:
+            self.transformer.enable_block_swap(blocks_to_swap, device, supports_backward=False)
+            self.transformer.move_to_device_except_swap_blocks(device)
+            self.transformer.prepare_block_swap_before_forward()
+        
+        # Enable block swapping for the high noise transformer if it exists
+        if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
+            self.transformer_2.enable_block_swap(blocks_to_swap, device, supports_backward=False)
+            self.transformer_2.move_to_device_except_swap_blocks(device)
+            self.transformer_2.prepare_block_swap_before_forward()
+
     def _get_t5_prompt_embeds(
         self,
         prompt: Union[str, List[str]] = None,

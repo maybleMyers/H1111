@@ -1511,3 +1511,43 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
         
         if hasattr(self, "img_emb"):
             del self.img_emb
+        
+        # Initialize block swapping attributes
+        self.blocks_to_swap = None
+        self.offloader = None
+    
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool = False):
+        """Enable block swapping to save GPU memory."""
+        from ..utils.custom_offloading_utils import ModelOffloader
+        
+        self.blocks_to_swap = blocks_to_swap
+        self.num_blocks = len(self.blocks)
+        
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 1
+        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        
+        self.offloader = ModelOffloader(
+            "wan2_2_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
+        )
+        print(
+            f"Wan2_2Transformer3DModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks."
+        )
+    
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        """Move model to device except blocks that will be swapped."""
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_blocks = self.blocks
+            self.blocks = None
+        
+        self.to(device)
+        
+        if self.blocks_to_swap:
+            self.blocks = save_blocks
+    
+    def prepare_block_swap_before_forward(self):
+        """Prepare block devices before forward pass."""
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)

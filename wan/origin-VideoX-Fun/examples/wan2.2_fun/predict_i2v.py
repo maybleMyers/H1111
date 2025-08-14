@@ -25,7 +25,7 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-# GPU memory mode, which can be choosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
+# GPU memory mode, which can be choosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload, block_swap].
 # model_full_load means that the entire model will be moved to the GPU.
 # 
 # model_full_load_and_qfloat8 means that the entire model will be moved to the GPU,
@@ -38,7 +38,12 @@ from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 # 
 # sequential_cpu_offload means that each layer of the model will be moved to the CPU after use, 
 # resulting in slower speeds but saving a large amount of GPU memory.
+#
+# block_swap enables controlled block swapping where you can specify how many blocks to keep on GPU.
 GPU_memory_mode     = "sequential_cpu_offload"
+# Number of blocks to swap to CPU (only used when GPU_memory_mode is "block_swap")
+# 0 means all blocks on GPU, higher values mean more blocks on CPU
+blocks_to_swap      = 0
 # Multi GPUs config
 # Please ensure that the product of ulysses_degree and ring_degree equals the number of GPUs used. 
 # For example, if you are using 8 GPUs, you can set ulysses_degree = 2 and ring_degree = 4.
@@ -241,7 +246,11 @@ if compile_dit:
         pipeline.transformer_2.blocks[i] = torch.compile(pipeline.transformer_2.blocks[i])
     print("Add Compile")
 
-if GPU_memory_mode == "sequential_cpu_offload":
+if GPU_memory_mode == "block_swap":
+    # Use block swapping with specified number of blocks
+    pipeline.enable_block_swap(blocks_to_swap, device=device)
+    pipeline.to(device=device)
+elif GPU_memory_mode == "sequential_cpu_offload":
     replace_parameters_by_name(transformer, ["modulation",], device=device)
     replace_parameters_by_name(transformer_2, ["modulation",], device=device)
     transformer.freqs = transformer.freqs.to(device=device)
