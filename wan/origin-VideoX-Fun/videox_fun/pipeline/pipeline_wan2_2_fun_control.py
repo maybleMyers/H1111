@@ -215,6 +215,13 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
         
         print(f"Enhanced block swap enabled: {blocks_to_swap} blocks to swap, dynamic model loading active")
 
+    @property
+    def _execution_device(self):
+        """Override execution device detection when dynamic loading is enabled."""
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled and hasattr(self, '_target_device'):
+            return self._target_device
+        return super()._execution_device
+
     def _offload_all_models(self):
         """Move all models to CPU to free GPU memory, but keep VAE on target device initially for pipeline compatibility."""
         import gc
