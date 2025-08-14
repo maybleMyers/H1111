@@ -188,25 +188,200 @@ class Wan2_2FunInpaintPipeline(DiffusionPipeline):
 
     def enable_block_swap(self, blocks_to_swap: int, device: Optional[torch.device] = None):
         """
-        Enable block swapping for memory-efficient inference.
+        Enable block swapping for memory-efficient inference with dynamic model loading.
         
         Args:
             blocks_to_swap: Number of transformer blocks to swap to CPU
             device: Target device for computation
         """
         device = device or self._execution_device
+        self._target_device = device
+        self._blocks_to_swap = blocks_to_swap
+        self._dynamic_loading_enabled = True
         
-        # Enable block swapping for the low noise transformer
+        # Store original model references for dynamic loading
+        self._models_cpu_state = {}
+        
+        # Enable block swapping for transformers (they will be managed dynamically)
         if hasattr(self, 'transformer') and self.transformer is not None:
             self.transformer.enable_block_swap(blocks_to_swap, device, supports_backward=False)
-            self.transformer.move_to_device_except_swap_blocks(device)
-            self.transformer.prepare_block_swap_before_forward()
         
-        # Enable block swapping for the high noise transformer if it exists
         if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
             self.transformer_2.enable_block_swap(blocks_to_swap, device, supports_backward=False)
-            self.transformer_2.move_to_device_except_swap_blocks(device)
-            self.transformer_2.prepare_block_swap_before_forward()
+        
+        # Move all models to CPU initially - they will be loaded on demand
+        self._offload_all_models()
+        
+        print(f"Enhanced block swap enabled: {blocks_to_swap} blocks to swap, dynamic model loading active")
+
+    def _offload_all_models(self):
+        """Move all models to CPU to free GPU memory."""
+        import gc
+        
+        # Offload text encoder
+        if hasattr(self, 'text_encoder') and self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to('cpu')
+            self._models_cpu_state['text_encoder'] = True
+        
+        # Offload VAE
+        if hasattr(self, 'vae') and self.vae is not None:
+            self.vae = self.vae.to('cpu')
+            self._models_cpu_state['vae'] = True
+            
+        # Offload transformers (except their non-swapped blocks which are managed by block swap)
+        if hasattr(self, 'transformer') and self.transformer is not None:
+            self.transformer.move_to_device_except_swap_blocks('cpu')
+            self._models_cpu_state['transformer'] = True
+        
+        if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
+            self.transformer_2.move_to_device_except_swap_blocks('cpu')
+            self._models_cpu_state['transformer_2'] = True
+        
+        # Force garbage collection and empty cache
+        gc.collect()
+        if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def _load_model_to_device(self, model_name: str):
+        """Load specified model to GPU for active use."""
+        if not hasattr(self, '_dynamic_loading_enabled') or not self._dynamic_loading_enabled:
+            return
+            
+        device = self._target_device
+        
+        if model_name == 'text_encoder' and hasattr(self, 'text_encoder'):
+            if self._models_cpu_state.get('text_encoder', False):
+                self.text_encoder = self.text_encoder.to(device)
+                self._models_cpu_state['text_encoder'] = False
+                
+        elif model_name == 'vae' and hasattr(self, 'vae'):
+            if self._models_cpu_state.get('vae', False):
+                self.vae = self.vae.to(device)
+                self._models_cpu_state['vae'] = False
+                
+        elif model_name == 'transformer' and hasattr(self, 'transformer'):
+            if self._models_cpu_state.get('transformer', False):
+                self.transformer.move_to_device_except_swap_blocks(device)
+                self.transformer.prepare_block_swap_before_forward()
+                self._models_cpu_state['transformer'] = False
+                
+        elif model_name == 'transformer_2' and hasattr(self, 'transformer_2'):
+            if self._models_cpu_state.get('transformer_2', False):
+                self.transformer_2.move_to_device_except_swap_blocks(device)
+                self.transformer_2.prepare_block_swap_before_forward()
+                self._models_cpu_state['transformer_2'] = False
+    
+    def _offload_model_from_device(self, model_name: str):
+        """Offload specified model from GPU to free memory."""
+        if not hasattr(self, '_dynamic_loading_enabled') or not self._dynamic_loading_enabled:
+            return
+            
+        import gc
+        
+        if model_name == 'text_encoder' and hasattr(self, 'text_encoder'):
+            if not self._models_cpu_state.get('text_encoder', True):
+                self.text_encoder = self.text_encoder.to('cpu')
+                self._models_cpu_state['text_encoder'] = True
+                
+        elif model_name == 'vae' and hasattr(self, 'vae'):
+            if not self._models_cpu_state.get('vae', True):
+                self.vae = self.vae.to('cpu')
+                self._models_cpu_state['vae'] = True
+                
+        elif model_name == 'transformer' and hasattr(self, 'transformer'):
+            if not self._models_cpu_state.get('transformer', True):
+                self.transformer.move_to_device_except_swap_blocks('cpu')
+                self._models_cpu_state['transformer'] = True
+                
+        elif model_name == 'transformer_2' and hasattr(self, 'transformer_2'):
+            if not self._models_cpu_state.get('transformer_2', True):
+                self.transformer_2.move_to_device_except_swap_blocks('cpu')
+                self._models_cpu_state['transformer_2'] = True
+        
+        # Clean up GPU memory
+        gc.collect()
+        if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def encode_prompt(self, *args, **kwargs):
+        """Override encode_prompt to handle dynamic text encoder loading."""
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Load text encoder for prompt encoding
+            self._load_model_to_device('text_encoder')
+            
+            # Call original encode_prompt
+            result = super().encode_prompt(*args, **kwargs)
+            
+            # Offload text encoder after use
+            self._offload_model_from_device('text_encoder')
+            
+            return result
+        else:
+            # Normal operation
+            return super().encode_prompt(*args, **kwargs)
+
+    def _encode_vae_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance):
+        """Override VAE image encoding with dynamic loading."""
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Load VAE for encoding
+            self._load_model_to_device('vae')
+            
+        # Perform normal encoding
+        dtype = next(iter(self.vae.parameters())).dtype
+        image = image.to(device=device, dtype=dtype)
+        image_latents = self.vae.encode(image).latent_dist.sample()
+        image_latents = image_latents * self.vae.config.scaling_factor
+
+        if do_classifier_free_guidance:
+            uncond_image_latents = torch.zeros_like(image_latents)
+            image_latents = torch.cat([uncond_image_latents, image_latents], dim=0)
+
+        if num_videos_per_prompt > 1:
+            image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
+
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Offload VAE after encoding
+            self._offload_model_from_device('vae')
+            
+        return image_latents
+
+    def decode_latents(self, latents):
+        """Override latent decoding with dynamic VAE loading."""
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Load VAE for decoding
+            self._load_model_to_device('vae')
+        
+        # Perform normal decoding
+        latents = 1 / self.vae.config.scaling_factor * latents
+        batch_size, channels, num_frames, height, width = latents.shape
+        latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+
+        image = self.vae.decode(latents).sample
+        video = image[None, :].reshape((batch_size, num_frames, -1) + image.shape[2:]).permute(0, 2, 1, 3, 4)
+        
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Offload VAE after decoding
+            self._offload_model_from_device('vae')
+            
+        return video
+
+    def _run_transformer_inference(self, transformer_name, *args, **kwargs):
+        """Run transformer inference with dynamic loading."""
+        if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled:
+            # Offload the other transformer before loading this one
+            other_transformer = 'transformer_2' if transformer_name == 'transformer' else 'transformer'
+            self._offload_model_from_device(other_transformer)
+            
+            # Load the target transformer
+            self._load_model_to_device(transformer_name)
+        
+        # Get the transformer model
+        transformer = getattr(self, transformer_name)
+        
+        # Run inference
+        result = transformer(*args, **kwargs)
+        
+        return result
 
     def _get_t5_prompt_embeds(
         self,

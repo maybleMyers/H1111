@@ -260,9 +260,9 @@ if compile_dit:
     print("Add Compile")
 
 if GPU_memory_mode == "block_swap":
-    # Use block swapping with specified number of blocks
+    # Use enhanced block swapping with dynamic model loading
     pipeline.enable_block_swap(blocks_to_swap, device=device)
-    pipeline.to(device=device)
+    # Note: Models are loaded dynamically, so no pipeline.to(device) call needed
 elif GPU_memory_mode == "sequential_cpu_offload":
     replace_parameters_by_name(transformer, ["modulation",], device=device)
     replace_parameters_by_name(transformer_2, ["modulation",], device=device)
