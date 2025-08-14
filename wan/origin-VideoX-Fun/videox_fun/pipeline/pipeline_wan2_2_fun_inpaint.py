@@ -215,7 +215,7 @@ class Wan2_2FunInpaintPipeline(DiffusionPipeline):
         print(f"Enhanced block swap enabled: {blocks_to_swap} blocks to swap, dynamic model loading active")
 
     def _offload_all_models(self):
-        """Move all models to CPU to free GPU memory."""
+        """Move all models to CPU to free GPU memory, but keep VAE on target device initially for pipeline compatibility."""
         import gc
         
         # Offload text encoder
@@ -223,10 +223,11 @@ class Wan2_2FunInpaintPipeline(DiffusionPipeline):
             self.text_encoder = self.text_encoder.to('cpu')
             self._models_cpu_state['text_encoder'] = True
         
-        # Offload VAE
+        # Keep VAE on target device initially - it will be managed manually in encode/decode methods
+        # This is necessary for pipeline's prepare_latents() to detect the correct device
         if hasattr(self, 'vae') and self.vae is not None:
-            self.vae = self.vae.to('cpu')
-            self._models_cpu_state['vae'] = True
+            self.vae = self.vae.to(self._target_device)
+            self._models_cpu_state['vae'] = False  # Track that VAE is on GPU
             
         # Offload transformers (except their non-swapped blocks which are managed by block swap)
         if hasattr(self, 'transformer') and self.transformer is not None:
