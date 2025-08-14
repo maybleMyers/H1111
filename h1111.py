@@ -365,6 +365,7 @@ def wan22_fun_batch_handler(
     # --- Initial Checks ---
     os.makedirs(save_path, exist_ok=True)
 
+    # Initialize gallery for tracking generated videos
     all_generated_videos = []
     
     for i in range(int(batch_size)):
@@ -778,6 +779,7 @@ print(f"Saved to {{video_path}}")
             )
 
             # Monitor process output in real-time
+            current_video_file_for_item = None
             for line in iter(process.stdout.readline, ''):
                 if stop_event.is_set():
                     process.terminate()
@@ -788,54 +790,150 @@ print(f"Saved to {{video_path}}")
                     # Print to console for debugging (all output)
                     print(f"[wan2.2-FUN] {line.strip()}")
                     
+                    # Check for saved video path in the output
+                    if "Saved to" in line:
+                        # Extract video path from "Saved to outputs/wan22fun_1755195008_8181_s42.mp4"
+                        import re
+                        match = re.search(r"Saved to (.+\.mp4)", line)
+                        if match:
+                            video_path = match.group(1).strip()
+                            # Convert relative path to absolute if needed
+                            if not os.path.isabs(video_path):
+                                video_path = os.path.join(project_root, video_path)
+                            
+                            if os.path.exists(video_path):
+                                current_video_file_for_item = video_path
+                                # Add to gallery immediately when detected
+                                all_generated_videos.append((video_path, f"WAN2.2-Fun - Seed: {current_seed}"))
+                                yield all_generated_videos.copy(), None, status_text, f"Video saved: {os.path.basename(video_path)}"
+                            else:
+                                print(f"Warning: Video path extracted but file doesn't exist: {video_path}")
+                                yield all_generated_videos.copy(), None, status_text, "Video saved (path validation failed)..."
+                        else:
+                            yield all_generated_videos.copy(), None, status_text, "Video saved (parsing video path)..."
                     # Update progress based on output
-                    if "Enable TeaCache" in line or "Enable cfg_skip" in line or "Loading" in line or "loaded" in line:
+                    elif "Enable TeaCache" in line or "Enable cfg_skip" in line or "Loading" in line or "loaded" in line:
                         yield all_generated_videos.copy(), None, status_text, line.strip()
                     elif "%" in line or "it/s" in line:  # Progress indicator
                         yield all_generated_videos.copy(), None, status_text, line.strip()
-                    elif "Saved to" in line:
-                        yield all_generated_videos.copy(), None, status_text, "Finalizing video..."
                     elif "Error" in line or "Traceback" in line or "Exception" in line or "missing keys" in line:
                         yield all_generated_videos.copy(), None, status_text, f"Info: {line.strip()}"
 
             process.wait()
             
             if process.returncode == 0:
-                # Find the generated video - look for pattern matching the seed
-                video_path = None
-                
-                # First try the expected exact path
-                expected_path = save_file_prefix + ".mp4"
-                if os.path.exists(expected_path):
-                    video_path = expected_path
-                else:
-                    expected_path = save_file_prefix + ".png"
+                # Check if video was already added during real-time monitoring
+                if not current_video_file_for_item:
+                    # Find the generated video - look for pattern matching the seed
+                    video_path = None
+                    
+                    # First try the expected exact path
+                    expected_path = save_file_prefix + ".mp4"
                     if os.path.exists(expected_path):
                         video_path = expected_path
-                
-                # If exact path doesn't exist, search for files with the seed pattern in the save directory
-                if not video_path:
-                    import glob
-                    save_dir = os.path.dirname(save_file_prefix)
-                    pattern = os.path.join(save_dir, f"*s{current_seed}.mp4")
-                    matching_files = glob.glob(pattern)
-                    if matching_files:
-                        # Get the most recent matching file
-                        video_path = max(matching_files, key=os.path.getmtime)
                     else:
-                        # Try PNG pattern
-                        pattern = os.path.join(save_dir, f"*s{current_seed}.png") 
+                        expected_path = save_file_prefix + ".png"
+                        if os.path.exists(expected_path):
+                            video_path = expected_path
+                    
+                    # If exact path doesn't exist, search for files with the seed pattern in the save directory
+                    if not video_path:
+                        import glob
+                        save_dir = os.path.dirname(save_file_prefix)
+                        pattern = os.path.join(save_dir, f"*s{current_seed}.mp4")
                         matching_files = glob.glob(pattern)
                         if matching_files:
+                            # Get the most recent matching file
                             video_path = max(matching_files, key=os.path.getmtime)
-                
-                if video_path and os.path.exists(video_path):
-                    all_generated_videos.append((video_path, f"Item {i+1}"))
-                    yield all_generated_videos.copy(), None, f"Item {i+1}/{batch_size} complete", ""
+                        else:
+                            # Try PNG pattern
+                            pattern = os.path.join(save_dir, f"*s{current_seed}.png") 
+                            matching_files = glob.glob(pattern)
+                            if matching_files:
+                                video_path = max(matching_files, key=os.path.getmtime)
+                    
+                    if video_path and os.path.exists(video_path):
+                        # Only add if not already in gallery (avoid duplicates)
+                        if not any(item[0] == video_path for item in all_generated_videos):
+                            all_generated_videos.append((video_path, f"WAN2.2-Fun - Seed: {current_seed}"))
+                        current_video_file_for_item = video_path
+                        yield all_generated_videos.copy(), None, f"Item {i+1}/{batch_size} complete", f"Final video: {os.path.basename(video_path)}"
+                    else:
+                        yield all_generated_videos, None, f"Error: Output file not found for item {i+1}", ""
                 else:
-                    yield all_generated_videos, None, f"Error: Output file not found for item {i+1}", ""
+                    # Video was already added during real-time monitoring
+                    yield all_generated_videos.copy(), None, f"Item {i+1}/{batch_size} complete", f"Video completed: {os.path.basename(current_video_file_for_item)}"
+                
+                # Add comprehensive metadata to the video if it exists
+                if current_video_file_for_item and os.path.exists(current_video_file_for_item):
+                    try:
+                        # Prepare comprehensive metadata parameters
+                        params_for_meta = {
+                            "model_type": "WAN2.2-Fun",
+                            "prompt": prompt, 
+                            "negative_prompt": negative_prompt,
+                            "task": task,
+                            "width": width, "height": height,
+                            "frame_num": frame_num, "fps": fps,
+                            "seed": current_seed,
+                            "sample_solver": sample_solver,
+                            "sample_steps": sample_steps,
+                            "flow_shift": flow_shift,
+                            "sample_guide_scale": sample_guide_scale,
+                            "dual_dit_boundary": dual_dit_boundary,
+                            "batch_size": batch_size,
+                            # Input files metadata
+                            "control_video": os.path.basename(control_video) if control_video and os.path.exists(control_video) else None,
+                            "control_camera_txt": os.path.basename(control_camera_txt) if control_camera_txt and os.path.exists(control_camera_txt) else None,
+                            "ref_image": os.path.basename(ref_image) if ref_image and os.path.exists(ref_image) else None,
+                            "start_image": os.path.basename(start_image) if start_image and os.path.exists(start_image) else None,
+                            "end_image": os.path.basename(end_image) if end_image and os.path.exists(end_image) else None,
+                            # Performance settings
+                            "gpu_memory_mode": gpu_memory_mode,
+                            "blocks_to_swap": blocks_to_swap,
+                            "ulysses_degree": ulysses_degree,
+                            "ring_degree": ring_degree,
+                            "fsdp_dit": fsdp_dit,
+                            "fsdp_text_encoder": fsdp_text_encoder,
+                            "compile_dit": compile_dit,
+                            # TeaCache settings
+                            "enable_teacache": enable_teacache,
+                            "teacache_threshold": teacache_threshold,
+                            "num_skip_start_steps": num_skip_start_steps,
+                            "teacache_offload": teacache_offload,
+                            # Other performance settings
+                            "cfg_skip_ratio": cfg_skip_ratio,
+                            "enable_riflex": enable_riflex,
+                            "riflex_k": riflex_k,
+                            # Model paths
+                            "model_name": model_name,
+                            "transformer_path": transformer_path if transformer_path else None,
+                            "transformer_high_path": transformer_high_path if transformer_high_path else None,
+                            "vae_path": vae_path if vae_path else None,
+                            # LoRA information
+                            "lora_folder": lora_folder,
+                            "loras_used": [
+                                {"name": lora1_str, "multiplier": lora1_mult, "apply_low": lora1_apply_low, "apply_high": lora1_apply_high} if lora1_str != "None" else None,
+                                {"name": lora2_str, "multiplier": lora2_mult, "apply_low": lora2_apply_low, "apply_high": lora2_apply_high} if lora2_str != "None" else None,
+                                {"name": lora3_str, "multiplier": lora3_mult, "apply_low": lora3_apply_low, "apply_high": lora3_apply_high} if lora3_str != "None" else None,
+                                {"name": lora4_str, "multiplier": lora4_mult, "apply_low": lora4_apply_low, "apply_high": lora4_apply_high} if lora4_str != "None" else None,
+                                {"name": lora5_str, "multiplier": lora5_mult, "apply_low": lora5_apply_low, "apply_high": lora5_apply_high} if lora5_str != "None" else None,
+                                {"name": lora6_str, "multiplier": lora6_mult, "apply_low": lora6_apply_low, "apply_high": lora6_apply_high} if lora6_str != "None" else None,
+                                {"name": lora7_str, "multiplier": lora7_mult, "apply_low": lora7_apply_low, "apply_high": lora7_apply_high} if lora7_str != "None" else None,
+                                {"name": lora8_str, "multiplier": lora8_mult, "apply_low": lora8_apply_low, "apply_high": lora8_apply_high} if lora8_str != "None" else None,
+                            ],
+                            # Preview settings
+                            "enable_preview": enable_preview,
+                            "preview_steps": preview_steps,
+                        }
+                        # Remove None values from loras_used list
+                        params_for_meta["loras_used"] = [lora for lora in params_for_meta["loras_used"] if lora is not None]
+                        
+                        add_metadata_to_video(current_video_file_for_item, params_for_meta)
+                    except Exception as meta_err:
+                        print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
             else:
-                yield all_generated_videos, None, f"Error in item {i+1}: Process failed", ""
+                yield all_generated_videos, None, f"Error in item {i+1}: Process failed (return code: {process.returncode})", ""
                 
         except Exception as e:
             yield all_generated_videos, None, f"Error in item {i+1}: {str(e)}", ""
