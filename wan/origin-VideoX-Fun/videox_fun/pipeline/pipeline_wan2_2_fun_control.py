@@ -196,7 +196,8 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             device: Target device for computation
         """
         device = device or self._execution_device
-        self._target_device = device
+        # Ensure device is a torch.device object, not a string
+        self._target_device = torch.device(device) if isinstance(device, str) else device
         self._blocks_to_swap = blocks_to_swap
         self._dynamic_loading_enabled = True
         
@@ -219,7 +220,9 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
     def _execution_device(self):
         """Override execution device detection when dynamic loading is enabled."""
         if hasattr(self, '_dynamic_loading_enabled') and self._dynamic_loading_enabled and hasattr(self, '_target_device'):
-            return self._target_device
+            # Ensure we return a torch.device object, not a string
+            device = self._target_device
+            return torch.device(device) if isinstance(device, str) else device
         return super()._execution_device
 
     def _offload_all_models(self):
