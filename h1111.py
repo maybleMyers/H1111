@@ -801,12 +801,35 @@ print(f"Saved to {{video_path}}")
             process.wait()
             
             if process.returncode == 0:
-                # Find the generated video
-                video_path = save_file_prefix + ".mp4"
-                if not os.path.exists(video_path):
-                    video_path = save_file_prefix + ".png"
+                # Find the generated video - look for pattern matching the seed
+                video_path = None
                 
-                if os.path.exists(video_path):
+                # First try the expected exact path
+                expected_path = save_file_prefix + ".mp4"
+                if os.path.exists(expected_path):
+                    video_path = expected_path
+                else:
+                    expected_path = save_file_prefix + ".png"
+                    if os.path.exists(expected_path):
+                        video_path = expected_path
+                
+                # If exact path doesn't exist, search for files with the seed pattern in the save directory
+                if not video_path:
+                    import glob
+                    save_dir = os.path.dirname(save_file_prefix)
+                    pattern = os.path.join(save_dir, f"*s{current_seed}.mp4")
+                    matching_files = glob.glob(pattern)
+                    if matching_files:
+                        # Get the most recent matching file
+                        video_path = max(matching_files, key=os.path.getmtime)
+                    else:
+                        # Try PNG pattern
+                        pattern = os.path.join(save_dir, f"*s{current_seed}.png") 
+                        matching_files = glob.glob(pattern)
+                        if matching_files:
+                            video_path = max(matching_files, key=os.path.getmtime)
+                
+                if video_path and os.path.exists(video_path):
                     all_generated_videos.append((video_path, f"Item {i+1}"))
                     yield all_generated_videos.copy(), None, f"Item {i+1}/{batch_size} complete", ""
                 else:
