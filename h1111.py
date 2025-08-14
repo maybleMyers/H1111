@@ -7693,7 +7693,7 @@ with gr.Blocks(
                                         label="Apply to High Noise", value=False, scale=1
                                     ))
             
-            with gr.Accordion("Performance Settings", open=False):
+            with gr.Accordion("Performance Settings", open=True):
                 with gr.Row():
                     wan22_fun_gpu_memory_mode = gr.Radio(
                         choices=["model_full_load", "model_cpu_offload", "model_cpu_offload_and_qfloat8", 
@@ -7703,7 +7703,7 @@ with gr.Blocks(
                 with gr.Row():
                     wan22_fun_blocks_to_swap = gr.Slider(
                         label="Blocks to Swap (only for block_swap mode)", 
-                        minimum=0, maximum=30, step=1, value=0,
+                        minimum=0, maximum=40, step=1, value=0,
                         info="Number of transformer blocks to swap to CPU. 0=all on GPU, higher=more on CPU"
                     )
                 with gr.Row():
