@@ -240,14 +240,14 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             self.vae = self.vae.to(self._target_device)
             self._models_cpu_state['vae'] = False  # Track that VAE is on GPU
             
-        # Offload transformers (except their non-swapped blocks which are managed by block swap)
+        # Move transformers to target device, keeping only blocks for swapping on CPU
         if hasattr(self, 'transformer') and self.transformer is not None:
-            self.transformer.move_to_device_except_swap_blocks('cpu')
-            self._models_cpu_state['transformer'] = True
+            self.transformer.move_to_device_except_swap_blocks(self._target_device)
+            self._models_cpu_state['transformer'] = False  # Non-block components are on GPU
         
         if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
-            self.transformer_2.move_to_device_except_swap_blocks('cpu')
-            self._models_cpu_state['transformer_2'] = True
+            self.transformer_2.move_to_device_except_swap_blocks(self._target_device)
+            self._models_cpu_state['transformer_2'] = False  # Non-block components are on GPU
         
         # Force garbage collection and empty cache
         gc.collect()
