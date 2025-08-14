@@ -110,16 +110,21 @@ class Offloader:
     common offloading class
     """
 
-    def __init__(self, block_type: str, num_blocks: int, blocks_to_swap: int, device: torch.device, debug: bool = False):
+    def __init__(self, block_type: str, num_blocks: int, blocks_to_swap: int, device, debug: bool = False):
         self.block_type = block_type
         self.num_blocks = num_blocks
         self.blocks_to_swap = blocks_to_swap
-        self.device = device
+        
+        # Convert device to torch.device if it's a string
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
         self.debug = debug
 
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
-        self.cuda_available = device.type == "cuda"
+        self.cuda_available = self.device.type == "cuda"
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
@@ -177,17 +182,19 @@ class ModelOffloader(Offloader):
         num_blocks: int,
         blocks_to_swap: int,
         supports_backward: bool,
-        device: torch.device,
+        device,
         debug: bool = False,
     ):
+        # Initialize attributes first to avoid __del__ errors
+        self.supports_backward = supports_backward
+        self.remove_handles = []
+        
         super().__init__(block_type, num_blocks, blocks_to_swap, device, debug)
 
-        self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
 
         if self.supports_backward:
             # register backward hooks
-            self.remove_handles = []
             for i, block in enumerate(blocks):
                 hook = self.create_backward_hook(blocks, i)
                 if hook is not None:
@@ -198,9 +205,10 @@ class ModelOffloader(Offloader):
         self.forward_only = forward_only
 
     def __del__(self):
-        if self.supports_backward:
-            for handle in self.remove_handles:
-                handle.remove()
+        if hasattr(self, 'supports_backward') and self.supports_backward:
+            if hasattr(self, 'remove_handles'):
+                for handle in self.remove_handles:
+                    handle.remove()
 
     def create_backward_hook(self, blocks: list[nn.Module], block_index: int) -> Optional[callable]:
         # -1 for 0-based index
