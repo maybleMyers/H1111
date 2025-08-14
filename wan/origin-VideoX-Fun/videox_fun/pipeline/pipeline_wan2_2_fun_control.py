@@ -240,10 +240,9 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             self.vae = self.vae.to(self._target_device)
             self._models_cpu_state['vae'] = False  # Track that VAE is on GPU
             
-        # Move transformers to target device, keeping only blocks for swapping on CPU
+        # Setup automatic block swapping for transformers (they manage themselves during forward pass)
         if hasattr(self, 'transformer') and self.transformer is not None:
             self.transformer.move_to_device_except_swap_blocks(self._target_device)
-            self._models_cpu_state['transformer'] = False  # Non-block components are on GPU
             
             # Move special parameters to target device (like sequential_cpu_offload does)
             from ..utils.fp8_optimization import replace_parameters_by_name
@@ -251,12 +250,11 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             if hasattr(self.transformer, 'freqs'):
                 self.transformer.freqs = self.transformer.freqs.to(device=self._target_device)
             
-            # Prepare block swap before forward
+            # Prepare block swap before forward - this sets up automatic swapping
             self.transformer.prepare_block_swap_before_forward()
         
         if hasattr(self, 'transformer_2') and self.transformer_2 is not None:
             self.transformer_2.move_to_device_except_swap_blocks(self._target_device)
-            self._models_cpu_state['transformer_2'] = False  # Non-block components are on GPU
             
             # Move special parameters to target device (like sequential_cpu_offload does)  
             from ..utils.fp8_optimization import replace_parameters_by_name
@@ -264,7 +262,7 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
             if hasattr(self.transformer_2, 'freqs'):
                 self.transformer_2.freqs = self.transformer_2.freqs.to(device=self._target_device)
             
-            # Prepare block swap before forward
+            # Prepare block swap before forward - this sets up automatic swapping
             self.transformer_2.prepare_block_swap_before_forward()
         
         # Force garbage collection and empty cache
@@ -289,17 +287,7 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
                 self.vae = self.vae.to(device)
                 self._models_cpu_state['vae'] = False
                 
-        elif model_name == 'transformer' and hasattr(self, 'transformer'):
-            if self._models_cpu_state.get('transformer', False):
-                self.transformer.move_to_device_except_swap_blocks(device)
-                self.transformer.prepare_block_swap_before_forward()
-                self._models_cpu_state['transformer'] = False
-                
-        elif model_name == 'transformer_2' and hasattr(self, 'transformer_2'):
-            if self._models_cpu_state.get('transformer_2', False):
-                self.transformer_2.move_to_device_except_swap_blocks(device)
-                self.transformer_2.prepare_block_swap_before_forward()
-                self._models_cpu_state['transformer_2'] = False
+        # Note: Transformers use automatic block swapping, not manual dynamic loading
     
     def _offload_model_from_device(self, model_name: str):
         """Offload specified model from GPU to free memory."""
@@ -318,15 +306,7 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
                 self.vae = self.vae.to('cpu')
                 self._models_cpu_state['vae'] = True
                 
-        elif model_name == 'transformer' and hasattr(self, 'transformer'):
-            if not self._models_cpu_state.get('transformer', True):
-                self.transformer.move_to_device_except_swap_blocks('cpu')
-                self._models_cpu_state['transformer'] = True
-                
-        elif model_name == 'transformer_2' and hasattr(self, 'transformer_2'):
-            if not self._models_cpu_state.get('transformer_2', True):
-                self.transformer_2.move_to_device_except_swap_blocks('cpu')
-                self._models_cpu_state['transformer_2'] = True
+        # Note: Transformers use automatic block swapping, not manual dynamic loading
         
         # Clean up GPU memory
         gc.collect()
