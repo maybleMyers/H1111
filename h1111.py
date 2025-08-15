@@ -701,6 +701,12 @@ with torch.no_grad():
     # Process inputs
     inpaint_video, inpaint_video_mask, clip_image = get_image_to_video_latent(start_image, end_image, video_length=video_length, sample_size=sample_size)
 
+    # Process start_image separately for the pipeline (required for proper image-to-video generation)
+    if start_image is not None:
+        start_image_tensor = get_image_latent(start_image, sample_size=sample_size)
+    else:
+        start_image_tensor = None
+
     if ref_image is not None:
         ref_image = get_image_latent(ref_image, sample_size=sample_size)
     
@@ -728,6 +734,7 @@ with torch.no_grad():
         mask_video = inpaint_video_mask,
         control_video = input_video,
         control_camera_video = control_camera_video,
+        start_image = start_image_tensor,  # Add the start_image parameter
         ref_image = ref_image,
         boundary = boundary,
         shift = shift,
