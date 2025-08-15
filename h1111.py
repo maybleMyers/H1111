@@ -703,12 +703,23 @@ with torch.no_grad():
 
     # Process start_image separately for the pipeline (required for proper image-to-video generation)
     if start_image is not None:
+        print(f"Processing start image from: {{start_image if isinstance(start_image, str) else 'tensor'}}")
         start_image_tensor = get_image_latent(start_image, sample_size=sample_size)
+        print(f"Start image tensor shape: {{start_image_tensor.shape if start_image_tensor is not None else 'None'}}")
     else:
         start_image_tensor = None
 
     if ref_image is not None:
-        ref_image = get_image_latent(ref_image, sample_size=sample_size)
+        print(f"Processing reference image from: {{ref_image if isinstance(ref_image, str) else 'tensor'}}")
+        ref_image_tensor = get_image_latent(ref_image, sample_size=sample_size)
+        # Ensure it has the right shape for a single frame reference
+        if ref_image_tensor is not None:
+            if ref_image_tensor.dim() == 4:  # [B, C, H, W]
+                ref_image_tensor = ref_image_tensor.unsqueeze(2)  # Add frame dimension [B, C, 1, H, W]
+            print(f"Reference image tensor shape: {{ref_image_tensor.shape}}")
+        ref_image = ref_image_tensor
+    else:
+        ref_image = None
     
     if control_camera_txt is not None:
         input_video, input_video_mask = None, None
