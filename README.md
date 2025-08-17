@@ -12,5 +12,8 @@ wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
 wan/Wan2.1_VAE.pth  
 wan/models_t5_umt5-xxl-enc-bf16.pth  
 
+You need to install some extra packages probably:
+pip install imageio librosa pyloudnorm soundfile xfuser
+
 v2v seems to be working well now with the t2v model.
 Most warnings are safe to ignore and will probably be removed later.
