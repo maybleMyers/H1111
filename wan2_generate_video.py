@@ -472,10 +472,15 @@ class DynamicModelManager:
         if self.current_model is not None:
             logger.info(f"Unloading {self.current_model_type} noise model (GPU + CPU blocks)...")
             
-            # Get memory usage before unloading
+            # Get memory usage before unloading (GPU + CPU monitoring)
             if torch.cuda.is_available():
                 memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
                 logger.info(f"GPU memory before unload: {memory_before:.2f} GB")
+            
+            # Monitor CPU memory for debugging model deletion
+            import psutil
+            cpu_memory_before = psutil.Process().memory_info().rss / 1024**3
+            logger.info(f"CPU memory before model unload: {cpu_memory_before:.2f} GB")
             
             # Handle block swapping cleanup if enabled
             if hasattr(self.current_model, 'blocks_to_swap') and self.current_model.blocks_to_swap is not None:
@@ -499,9 +504,15 @@ class DynamicModelManager:
                             except Exception as e:
                                 logger.warning(f"Error moving block {idx} to CPU: {e}")
                         
-                        # Clean up the offloader properly
+                        # Clean up the offloader properly - FIX BACKWARD HOOK CLOSURE LEAK
                         try:
-                            # Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
+                            # 1. Clear backward hook handles (prevents closure reference leak)
+                            if hasattr(self.current_model.offloader, 'remove_handles'):
+                                for handle in self.current_model.offloader.remove_handles:
+                                    handle.remove()
+                                self.current_model.offloader.remove_handles.clear()
+                            
+                            # 2. Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
                             if hasattr(self.current_model.offloader, 'thread_pool'):
                                 self.current_model.offloader.thread_pool.shutdown(wait=True)
                             if hasattr(self.current_model.offloader, 'futures'):
@@ -511,14 +522,26 @@ class DynamicModelManager:
                         except Exception as e:
                             logger.warning(f"Error cleaning up offloader: {e}")
             
-            # Move any remaining parameters to CPU
-            # This includes non-block parameters like embeddings, norms, etc.
+            # Enhanced block reference clearing before deletion
             try:
+                # 1. Clear torch.compile cache if model was compiled
+                if self.args.compile:
+                    logger.info("Clearing torch.compile cache for model deletion")
+                    torch._dynamo.reset()
+                
+                # 2. Clear individual block references (prevents compiled block retention)
+                if hasattr(self.current_model, 'blocks') and self.current_model.blocks is not None:
+                    for i in range(len(self.current_model.blocks)):
+                        self.current_model.blocks[i] = None
+                    self.current_model.blocks.clear()
+                    self.current_model.blocks = None
+                
+                # 3. Move any remaining parameters to CPU
                 self.current_model = self.current_model.cpu()
             except Exception as e:
-                logger.warning(f"Error moving model to CPU: {e}")
+                logger.warning(f"Error during enhanced cleanup: {e}")
             
-            # Now delete the model
+            # 4. Force model deletion with verification
             del self.current_model
             self.current_model = None
             self.current_model_type = None
@@ -534,10 +557,15 @@ class DynamicModelManager:
             if torch.cuda.is_available():
                 torch.cuda.ipc_collect()
             
-            # Log memory usage after unloading
+            # Log memory usage after unloading (GPU + CPU verification)
             if torch.cuda.is_available():
                 memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
                 logger.info(f"GPU memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
+            
+            # Verify CPU memory cleanup
+            cpu_memory_after = psutil.Process().memory_info().rss / 1024**3
+            cpu_freed = cpu_memory_before - cpu_memory_after
+            logger.info(f"CPU memory after model unload: {cpu_memory_after:.2f} GB (freed: {cpu_freed:.2f} GB)")
             
         # Load new model
         logger.info(f"Loading {model_type} noise model...")
@@ -611,7 +639,13 @@ class DynamicModelManager:
                                 logger.warning(f"Error moving block {idx} to CPU: {e}")
                         
                         try:
-                            # Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
+                            # 1. Clear backward hook handles (prevents closure reference leak)
+                            if hasattr(self.current_model.offloader, 'remove_handles'):
+                                for handle in self.current_model.offloader.remove_handles:
+                                    handle.remove()
+                                self.current_model.offloader.remove_handles.clear()
+                            
+                            # 2. Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
                             if hasattr(self.current_model.offloader, 'thread_pool'):
                                 self.current_model.offloader.thread_pool.shutdown(wait=True)
                             if hasattr(self.current_model.offloader, 'futures'):
@@ -621,12 +655,26 @@ class DynamicModelManager:
                         except Exception as e:
                             logger.warning(f"Error cleaning up offloader: {e}")
             
-            # Move model to CPU before deletion
+            # Enhanced block reference clearing before final deletion
             try:
+                # 1. Clear torch.compile cache if model was compiled
+                if self.args.compile:
+                    logger.info("Final cleanup: Clearing torch.compile cache")
+                    torch._dynamo.reset()
+                
+                # 2. Clear individual block references (prevents compiled block retention)
+                if hasattr(self.current_model, 'blocks') and self.current_model.blocks is not None:
+                    for i in range(len(self.current_model.blocks)):
+                        self.current_model.blocks[i] = None
+                    self.current_model.blocks.clear()
+                    self.current_model.blocks = None
+                
+                # 3. Move model to CPU before deletion
                 self.current_model = self.current_model.cpu()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during final enhanced cleanup: {e}")
             
+            # 4. Force final model deletion
             del self.current_model
             self.current_model = None
             self.current_model_type = None
