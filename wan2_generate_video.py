@@ -499,8 +499,13 @@ class DynamicModelManager:
                             except Exception as e:
                                 logger.warning(f"Error moving block {idx} to CPU: {e}")
                         
-                        # Clean up the offloader
+                        # Clean up the offloader properly
                         try:
+                            # Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
+                            if hasattr(self.current_model.offloader, 'thread_pool'):
+                                self.current_model.offloader.thread_pool.shutdown(wait=True)
+                            if hasattr(self.current_model.offloader, 'futures'):
+                                self.current_model.offloader.futures.clear()
                             del self.current_model.offloader
                             self.current_model.offloader = None
                         except Exception as e:
@@ -606,6 +611,11 @@ class DynamicModelManager:
                                 logger.warning(f"Error moving block {idx} to CPU: {e}")
                         
                         try:
+                            # Shutdown ThreadPoolExecutor and clear futures to prevent memory leaks
+                            if hasattr(self.current_model.offloader, 'thread_pool'):
+                                self.current_model.offloader.thread_pool.shutdown(wait=True)
+                            if hasattr(self.current_model.offloader, 'futures'):
+                                self.current_model.offloader.futures.clear()
                             del self.current_model.offloader
                             self.current_model.offloader = None
                         except Exception as e:
@@ -627,6 +637,10 @@ class DynamicModelManager:
             gc.collect()
             torch.cuda.empty_cache()
             clean_memory_on_device(self.device)
+            
+    def unload_all(self):
+        """Alias for cleanup method to ensure compatibility."""
+        self.cleanup()
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
