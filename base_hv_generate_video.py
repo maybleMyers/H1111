@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+import gc
 from pathlib import Path
 import random
 import sys
@@ -60,6 +61,10 @@ def synchronize_device(device: torch.device):
         torch.xpu.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def get_time_flag():
+    return datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S-%f")[:-3]
 
 
 def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, fps=24):
@@ -125,7 +130,7 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
 
 def save_images_grid(
     videos: torch.Tensor, parent_dir: str, image_name: str, rescale: bool = False, n_rows: int = 1, create_subdir=True
-):
+) -> list[str]:
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
     for x in videos:
@@ -143,10 +148,14 @@ def save_images_grid(
         output_dir = parent_dir
 
     os.makedirs(output_dir, exist_ok=True)
+    image_paths = []
     for i, x in enumerate(outputs):
         image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png")
+        image_paths.append(image_path)
         image = Image.fromarray(x)
         image.save(image_path)
+
+    return image_paths
 
 
 # region Encoding prompt
@@ -294,6 +303,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     else:
         prompt_embeds, prompt_mask = encode_prompt(prompt, device, num_videos, text_encoder)
     text_encoder = None
+    gc.collect()  # transformers==4.54.1 needs this
     clean_memory_on_device(device)
 
     logger.info(f"Encoding prompt with text encoder 2")
@@ -306,6 +316,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     prompt_mask_2 = prompt_mask_2.to("cpu")
 
     text_encoder_2 = None
+    gc.collect()
     clean_memory_on_device(device)
 
     return prompt_embeds, prompt_mask, prompt_embeds_2, prompt_mask_2
@@ -884,7 +895,7 @@ def main():
     output_type = args.output_type
     save_path = args.save_path  # if args.save_path_suffix == "" else f"{args.save_path}_{args.save_path_suffix}"
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    time_flag = get_time_flag()
 
     if output_type == "latent" or output_type == "both":
         # save latent

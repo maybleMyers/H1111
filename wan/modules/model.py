@@ -950,6 +950,7 @@ def load_wan_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
+    use_scaled_mm: bool = False,
 ) -> WanModel:
     # dit_weight_dtype is None for fp8_scaled
     assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
@@ -1036,7 +1037,7 @@ def load_wan_model(
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info(f"Optimizing model weights to fp8. This may take a while.")
-        sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu")
+        sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu", use_scaled_mm=use_scaled_mm)
 
         if loading_device.type != "cpu":
             # make sure all the model weights are on the loading_device
