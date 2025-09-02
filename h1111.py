@@ -8118,11 +8118,23 @@ with gr.Blocks(
 
         def get_wan_of_low_noise_models(dit_folder: str) -> List[str]:
             """Get low noise DiT models"""
-            return get_wan_of_dit_models(dit_folder, "low_noise")
+            if not os.path.exists(dit_folder):
+                return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+            models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+            # Look for models with 'low' in the name (more flexible matching)
+            low_models = [m for m in models if 'low' in m.lower()]
+            low_models.sort(key=str.lower)
+            return low_models if low_models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
 
         def get_wan_of_high_noise_models(dit_folder: str) -> List[str]:
             """Get high noise DiT models"""
-            return get_wan_of_dit_models(dit_folder, "high_noise")
+            if not os.path.exists(dit_folder):
+                return ["wan22_i2v_14B_high_noise_bf16.safetensors"]
+            models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+            # Look for models with 'high' in the name (more flexible matching)
+            high_models = [m for m in models if 'high' in m.lower()]
+            high_models.sort(key=str.lower)
+            return high_models if high_models else ["wan22_i2v_14B_high_noise_bf16.safetensors"]
             
         def get_wan_of_clip_models(dit_folder: str) -> List[str]:
             """Get CLIP models"""
