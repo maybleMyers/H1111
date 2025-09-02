@@ -8156,9 +8156,35 @@ with gr.Blocks(
             """Get T5 models"""
             if not os.path.exists(dit_folder):
                 return ["models_t5_umt5-xxl-enc-bf16.pth"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 't5' in f.lower()]
+            models = [f for f in os.listdir(dit_folder) if (f.endswith('.pth') or f.endswith('.safetensors')) and 't5' in f.lower()]
             models.sort(key=str.lower)
             return models if models else ["models_t5_umt5-xxl-enc-bf16.pth"]
+
+        # Helper functions to get default (first available) model
+        def get_default_low_noise_model(dit_folder: str = "wan") -> str:
+            """Get the first available low noise model as default"""
+            models = get_wan_of_low_noise_models(dit_folder)
+            return models[0] if models else "wan22_i2v_14B_low_noise_bf16.safetensors"
+            
+        def get_default_high_noise_model(dit_folder: str = "wan") -> str:
+            """Get the first available high noise model as default"""
+            models = get_wan_of_high_noise_models(dit_folder)
+            return models[0] if models else "wan22_i2v_14B_high_noise_bf16.safetensors"
+            
+        def get_default_clip_model(dit_folder: str = "wan") -> str:
+            """Get the first available CLIP model as default"""
+            models = get_wan_of_clip_models(dit_folder)
+            return models[0] if models else "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+            
+        def get_default_vae_model(dit_folder: str = "wan") -> str:
+            """Get the first available VAE model as default"""
+            models = get_wan_of_vae_models(dit_folder)
+            return models[0] if models else "Wan2.1_VAE.pth"
+            
+        def get_default_t5_model(dit_folder: str = "wan") -> str:
+            """Get the first available T5 model as default"""
+            models = get_wan_of_t5_models(dit_folder)
+            return models[0] if models else "models_t5_umt5-xxl-enc-bf16.pth"
 
         # Wan One Frame Inference Tab
         with gr.Tab(id=13, label="Wan One Frame") as wan_one_frame_tab:
@@ -8312,14 +8338,14 @@ with gr.Blocks(
                     wan_of_dit_low_noise_path = gr.Dropdown(
                         label="DiT Low Noise Model (.safetensors)",
                         choices=get_wan_of_low_noise_models("wan"),
-                        value="wan22_i2v_14B_low_noise_bf16.safetensors",
+                        value=get_default_low_noise_model("wan"),
                         allow_custom_value=True,
                         interactive=True
                     )
                     wan_of_dit_high_noise_path = gr.Dropdown(
                         label="DiT High Noise Model (.safetensors)",
                         choices=get_wan_of_high_noise_models("wan"),
-                        value="wan22_i2v_14B_high_noise_bf16.safetensors",
+                        value=get_default_high_noise_model("wan"),
                         allow_custom_value=True,
                         interactive=True
                     )
@@ -8327,14 +8353,14 @@ with gr.Blocks(
                     wan_of_clip_path = gr.Dropdown(
                         label="CLIP Model (.pth)",
                         choices=get_wan_of_clip_models("wan"),
-                        value="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                        value=get_default_clip_model("wan"),
                         allow_custom_value=True,
                         interactive=True
                     )
                     wan_of_vae_path = gr.Dropdown(
                         label="VAE Model (.pth)",
                         choices=get_wan_of_vae_models("wan"),
-                        value="Wan2.1_VAE.pth",
+                        value=get_default_vae_model("wan"),
                         allow_custom_value=True,
                         interactive=True
                     )
@@ -8342,7 +8368,7 @@ with gr.Blocks(
                     wan_of_t5_path = gr.Dropdown(
                         label="T5 Model (.pth)",
                         choices=get_wan_of_t5_models("wan"),
-                        value="models_t5_umt5-xxl-enc-bf16.pth",
+                        value=get_default_t5_model("wan"),
                         allow_custom_value=True,
                         interactive=True
                     )
