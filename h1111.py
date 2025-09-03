@@ -36,6 +36,130 @@ logger = logging.getLogger(__name__)
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 
+# Helper functions for model detection (moved to global scope)
+def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
+    """Get filtered DiT models for Wan One Frame tab"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    if filter_name:
+        models = [m for m in models if filter_name.lower() in m.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+
+def get_wan_of_low_noise_models(dit_folder: str) -> List[str]:
+    """Get low noise DiT models"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    # Look for models with 'low' in the name (more flexible matching)
+    low_models = [m for m in models if 'low' in m.lower()]
+    low_models.sort(key=str.lower)
+    return low_models if low_models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+
+def get_wan_of_high_noise_models(dit_folder: str) -> List[str]:
+    """Get high noise DiT models"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_high_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    # Look for models with 'high' in the name (more flexible matching)
+    high_models = [m for m in models if 'high' in m.lower()]
+    high_models.sort(key=str.lower)
+    return high_models if high_models else ["wan22_i2v_14B_high_noise_bf16.safetensors"]
+    
+def get_wan_of_clip_models(dit_folder: str) -> List[str]:
+    """Get CLIP models"""
+    if not os.path.exists(dit_folder):
+        return ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'clip' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
+
+def get_wan_of_vae_models(dit_folder: str) -> List[str]:
+    """Get VAE models"""
+    if not os.path.exists(dit_folder):
+        return ["Wan2.1_VAE.pth"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'vae' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["Wan2.1_VAE.pth"]
+
+def get_wan_of_t5_models(dit_folder: str) -> List[str]:
+    """Get T5 models"""
+    if not os.path.exists(dit_folder):
+        return ["models_t5_umt5-xxl-enc-bf16.pth"]
+    models = [f for f in os.listdir(dit_folder) if (f.endswith('.pth') or f.endswith('.safetensors')) and 't5' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["models_t5_umt5-xxl-enc-bf16.pth"]
+
+# Helper functions to get default (first available) model
+def get_default_low_noise_model(dit_folder: str = "wan") -> str:
+    """Get the first available low noise model as default"""
+    models = get_wan_of_low_noise_models(dit_folder)
+    return models[0] if models else "wan22_i2v_14B_low_noise_bf16.safetensors"
+    
+def get_default_high_noise_model(dit_folder: str = "wan") -> str:
+    """Get the first available high noise model as default"""
+    models = get_wan_of_high_noise_models(dit_folder)
+    return models[0] if models else "wan22_i2v_14B_high_noise_bf16.safetensors"
+    
+def get_default_clip_model(dit_folder: str = "wan") -> str:
+    """Get the first available CLIP model as default"""
+    models = get_wan_of_clip_models(dit_folder)
+    return models[0] if models else "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    
+def get_default_vae_model(dit_folder: str = "wan") -> str:
+    """Get the first available VAE model as default"""
+    models = get_wan_of_vae_models(dit_folder)
+    return models[0] if models else "Wan2.1_VAE.pth"
+    
+def get_default_t5_model(dit_folder: str = "wan") -> str:
+    """Get the first available T5 model as default"""
+    models = get_wan_of_t5_models(dit_folder)
+    return models[0] if models else "models_t5_umt5-xxl-enc-bf16.pth"
+
+# Task-specific model detection functions
+def get_task_specific_low_noise_model(dit_folder: str = "wan", task_type: str = "i2v") -> str:
+    """Get task-specific low noise model (prefers models matching the task type)"""
+    if not os.path.exists(dit_folder):
+        return get_default_low_noise_model(dit_folder)
+    
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    low_models = [m for m in models if 'low' in m.lower()]
+    
+    # Prefer models that match the task type
+    task_specific = [m for m in low_models if task_type.lower() in m.lower()]
+    if task_specific:
+        task_specific.sort(key=str.lower)
+        return task_specific[0]
+    
+    # Fall back to any low noise model
+    if low_models:
+        low_models.sort(key=str.lower)
+        return low_models[0]
+    
+    return get_default_low_noise_model(dit_folder)
+
+def get_task_specific_high_noise_model(dit_folder: str = "wan", task_type: str = "i2v") -> str:
+    """Get task-specific high noise model (prefers models matching the task type)"""
+    if not os.path.exists(dit_folder):
+        return get_default_high_noise_model(dit_folder)
+    
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    high_models = [m for m in models if 'high' in m.lower()]
+    
+    # Prefer models that match the task type
+    task_specific = [m for m in high_models if task_type.lower() in m.lower()]
+    if task_specific:
+        task_specific.sort(key=str.lower)
+        return task_specific[0]
+    
+    # Fall back to any high noise model
+    if high_models:
+        high_models.sort(key=str.lower)
+        return high_models[0]
+    
+    return get_default_high_noise_model(dit_folder)
+
 # Wan One Frame Inference Handler
 def wan_one_frame_handler(
     prompt: str,
@@ -7276,15 +7400,56 @@ with gr.Blocks(
                         value=True,
                     )
                 with gr.Row():
+                    wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
-                        wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_bf16.safetensors")
-                        wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_bf16.safetensors")
-                        wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
+                        wan22_dit_low_noise_path = gr.Dropdown(
+                            label="DiT Low Noise Model (.safetensors)",
+                            choices=get_wan_of_low_noise_models("wan"),
+                            value=get_default_low_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        wan22_dit_high_noise_path = gr.Dropdown(
+                            label="DiT High Noise Model (.safetensors)",
+                            choices=get_wan_of_high_noise_models("wan"),
+                            value=get_default_high_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        wan22_clip_path = gr.Dropdown(
+                            label="CLIP Model (.pth, for i2v)",
+                            choices=get_wan_of_clip_models("wan"),
+                            value=get_default_clip_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True,
+                            visible=True
+                        )
                     with gr.Group(visible=False) as wan22_ti2v5b_paths:
-                        wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/Wan2.2-TI2V-5B_fp16.safetensors")
-                    wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
-                    wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                    wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
+                        wan22_dit_path = gr.Dropdown(
+                            label="DiT Model (.safetensors, for ti2v-5B)",
+                            choices=get_wan_of_dit_models("wan"),
+                            value="Wan2.2-TI2V-5B_fp16.safetensors",
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                with gr.Row():
+                    wan22_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wan22_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
         
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -8105,86 +8270,6 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
-        # Helper functions for Wan One Frame tab
-        def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
-            """Get filtered DiT models for Wan One Frame tab"""
-            if not os.path.exists(dit_folder):
-                return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
-            if filter_name:
-                models = [m for m in models if filter_name.lower() in m.lower()]
-            models.sort(key=str.lower)
-            return models if models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
-
-        def get_wan_of_low_noise_models(dit_folder: str) -> List[str]:
-            """Get low noise DiT models"""
-            if not os.path.exists(dit_folder):
-                return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
-            # Look for models with 'low' in the name (more flexible matching)
-            low_models = [m for m in models if 'low' in m.lower()]
-            low_models.sort(key=str.lower)
-            return low_models if low_models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
-
-        def get_wan_of_high_noise_models(dit_folder: str) -> List[str]:
-            """Get high noise DiT models"""
-            if not os.path.exists(dit_folder):
-                return ["wan22_i2v_14B_high_noise_bf16.safetensors"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
-            # Look for models with 'high' in the name (more flexible matching)
-            high_models = [m for m in models if 'high' in m.lower()]
-            high_models.sort(key=str.lower)
-            return high_models if high_models else ["wan22_i2v_14B_high_noise_bf16.safetensors"]
-            
-        def get_wan_of_clip_models(dit_folder: str) -> List[str]:
-            """Get CLIP models"""
-            if not os.path.exists(dit_folder):
-                return ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'clip' in f.lower()]
-            models.sort(key=str.lower)
-            return models if models else ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
-
-        def get_wan_of_vae_models(dit_folder: str) -> List[str]:
-            """Get VAE models"""
-            if not os.path.exists(dit_folder):
-                return ["Wan2.1_VAE.pth"]
-            models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'vae' in f.lower()]
-            models.sort(key=str.lower)
-            return models if models else ["Wan2.1_VAE.pth"]
-
-        def get_wan_of_t5_models(dit_folder: str) -> List[str]:
-            """Get T5 models"""
-            if not os.path.exists(dit_folder):
-                return ["models_t5_umt5-xxl-enc-bf16.pth"]
-            models = [f for f in os.listdir(dit_folder) if (f.endswith('.pth') or f.endswith('.safetensors')) and 't5' in f.lower()]
-            models.sort(key=str.lower)
-            return models if models else ["models_t5_umt5-xxl-enc-bf16.pth"]
-
-        # Helper functions to get default (first available) model
-        def get_default_low_noise_model(dit_folder: str = "wan") -> str:
-            """Get the first available low noise model as default"""
-            models = get_wan_of_low_noise_models(dit_folder)
-            return models[0] if models else "wan22_i2v_14B_low_noise_bf16.safetensors"
-            
-        def get_default_high_noise_model(dit_folder: str = "wan") -> str:
-            """Get the first available high noise model as default"""
-            models = get_wan_of_high_noise_models(dit_folder)
-            return models[0] if models else "wan22_i2v_14B_high_noise_bf16.safetensors"
-            
-        def get_default_clip_model(dit_folder: str = "wan") -> str:
-            """Get the first available CLIP model as default"""
-            models = get_wan_of_clip_models(dit_folder)
-            return models[0] if models else "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
-            
-        def get_default_vae_model(dit_folder: str = "wan") -> str:
-            """Get the first available VAE model as default"""
-            models = get_wan_of_vae_models(dit_folder)
-            return models[0] if models else "Wan2.1_VAE.pth"
-            
-        def get_default_t5_model(dit_folder: str = "wan") -> str:
-            """Get the first available T5 model as default"""
-            models = get_wan_of_t5_models(dit_folder)
-            return models[0] if models else "models_t5_umt5-xxl-enc-bf16.pth"
 
         # Wan One Frame Inference Tab
         with gr.Tab(id=13, label="Wan One Frame") as wan_one_frame_tab:
@@ -8475,6 +8560,24 @@ with gr.Blocks(
         outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_vae_path, wan_of_t5_path]
     )
 
+    # Model refresh functionality for Wan2.2 tab
+    def update_wan22_model_dropdowns(model_folder: str):
+        """Update all Wan2.2 model dropdowns based on folder contents"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_high_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_clip_models(model_folder)),
+            gr.update(choices=get_wan_of_dit_models(model_folder)),
+            gr.update(choices=get_wan_of_vae_models(model_folder)),
+            gr.update(choices=get_wan_of_t5_models(model_folder))
+        ]
+
+    wan22_refresh_models_btn.click(
+        fn=update_wan22_model_dropdowns,
+        inputs=[wan22_model_folder],
+        outputs=[wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path, wan22_vae_path, wan22_t5_path]
+    )
+
     # Task-based model path switching for Wan One Frame tab
     def update_wan_of_model_paths_and_settings(task):
         """Update model paths and settings based on selected task"""
@@ -8483,27 +8586,27 @@ with gr.Blocks(
         is_t2v_a14b = "t2v-A14B" in task
         is_ti2v5b = "ti2v-5B" in task
         
-        # Set model paths based on task
+        # Set model paths based on task using task-specific model detection
         if is_i2v_a14b:
-            dit_low = "wan22_i2v_14B_low_noise_bf16.safetensors"
-            dit_high = "wan22_i2v_14B_high_noise_bf16.safetensors"
-            clip_model = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+            dit_low = get_task_specific_low_noise_model("wan", "i2v")
+            dit_high = get_task_specific_high_noise_model("wan", "i2v")
+            clip_model = get_default_clip_model("wan")
             clip_visible = True
         elif is_t2v_a14b:
-            dit_low = "wan22_t2v_14B_low_noise_bf16.safetensors"
-            dit_high = "wan22_t2v_14B_high_noise_bf16.safetensors"  
-            clip_model = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+            dit_low = get_task_specific_low_noise_model("wan", "t2v")
+            dit_high = get_task_specific_high_noise_model("wan", "t2v")
+            clip_model = get_default_clip_model("wan")
             clip_visible = False  # T2V doesn't need CLIP
         elif is_ti2v5b:
-            dit_low = "Wan2.2-TI2V-5B_fp16.safetensors"
+            dit_low = "Wan2.2-TI2V-5B_fp16.safetensors"  # Keep specific for ti2v-5B
             dit_high = "Wan2.2-TI2V-5B_fp16.safetensors"  # Same model for both
-            clip_model = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+            clip_model = get_default_clip_model("wan")
             clip_visible = False
         else:
             # Default to i2v
-            dit_low = "wan22_i2v_14B_low_noise_bf16.safetensors"
-            dit_high = "wan22_i2v_14B_high_noise_bf16.safetensors"
-            clip_model = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+            dit_low = get_task_specific_low_noise_model("wan", "i2v")
+            dit_high = get_task_specific_high_noise_model("wan", "i2v")
+            clip_model = get_default_clip_model("wan")
             clip_visible = True
 
         # Show conditioning strength slider for T2V tasks only
@@ -9770,13 +9873,13 @@ with gr.Blocks(
                     params.get("fp8", False),
                     params.get("fp8_scaled", False),
                     params.get("fp8_t5", False),
-                    # Model paths - keep defaults, don't transfer from metadata
-                    "wan/wan22_i2v_14B_low_noise_bf16.safetensors",
-                    "wan/wan22_i2v_14B_high_noise_bf16.safetensors",
-                    "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-                    "wan/Wan2.2-TI2V-5B_fp16.safetensors",
-                    "wan/Wan2.1_VAE.pth",
-                    "wan/models_t5_umt5-xxl-enc-bf16.pth",
+                    # Model paths - use dynamic defaults, don't transfer from metadata
+                    get_default_low_noise_model('wan'),
+                    get_default_high_noise_model('wan'),
+                    get_default_clip_model('wan'),
+                    "Wan2.2-TI2V-5B_fp16.safetensors",
+                    get_default_vae_model('wan'),
+                    get_default_t5_model('wan'),
                     # LoRAs
                     "lora",  # lora_folder
                     *padded_weights,          # Unpack 8 LoRA weights
@@ -10684,25 +10787,25 @@ with gr.Blocks(
         is_t2v_a14b = "t2v-A14B" in task
         is_ti2v5b = "ti2v-5B" in task
         
-        # Set model paths based on task
+        # Set model paths based on task using task-specific model detection
         if is_t2v_a14b:
-            dit_low_path = "wan/wan22_t2v_14B_low_noise_bf16.safetensors"
-            dit_high_path = "wan/wan22_t2v_14B_high_noise_bf16.safetensors"
+            dit_low_path = get_task_specific_low_noise_model('wan', 't2v')
+            dit_high_path = get_task_specific_high_noise_model('wan', 't2v')
             boundary_value = 0.875  # Default for t2v-A14B
             boundary_visible = True
         elif is_i2v_a14b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')
             boundary_value = 0.900  # Default for i2v-A14B
             boundary_visible = True
         elif is_ti2v5b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')  # Use i2v models for ti2v-5B
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')  # Use i2v models for ti2v-5B
             boundary_value = 0.875  # Default value
             boundary_visible = False  # Hide for ti2v-5B as it's not dual-dit
         else:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')  # Default to i2v
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')  # Default to i2v
             boundary_value = 0.875
             boundary_visible = False
         
