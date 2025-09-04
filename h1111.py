@@ -509,8 +509,8 @@ def wan22_batch_handler(
             "--save_path", str(save_path),
             "--attn_mode", str(attn_mode),
             "--blocks_to_swap", str(block_swap),
-            "--vae", vae_path,
-            "--t5", t5_path,
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
         ]
 
         if negative_prompt:
@@ -518,11 +518,11 @@ def wan22_batch_handler(
         
         # --- Model Path Logic based on Task ---
         if "A14B" in task:
-            command.extend(["--dit_low_noise", dit_low_noise_path, "--dit_high_noise", dit_high_noise_path])
+            command.extend(["--dit_low_noise", os.path.join("wan", dit_low_noise_path), "--dit_high_noise", os.path.join("wan", dit_high_noise_path)])
             if "i2v" in task:
-                command.extend(["--clip", clip_path])
+                command.extend(["--clip", os.path.join("wan", clip_path)])
         elif "ti2v-5B" in task:
-            command.extend(["--dit", dit_path])
+            command.extend(["--dit", os.path.join("wan", dit_path)])
 
         # Handle V2V vs I2V mode
         if enable_v2v and input_video:
