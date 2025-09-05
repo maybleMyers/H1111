@@ -3073,7 +3073,7 @@ def run_extension_sampling(
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
             # Replace the motion frames in latent
-            latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
+            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         
         # Prepare input for the model
         latent_on_device = latent.to(device)
@@ -3139,7 +3139,7 @@ def run_extension_sampling(
                 next_t,
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
-            latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
+            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
     
     logger.info("Extension sampling loop finished.")
     return latent
