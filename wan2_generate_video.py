@@ -403,8 +403,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
     parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
     parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
-    # Ensure dual-dit model is forced to low noise for extension
+    # Model selection for extension
     parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
+    parser.add_argument("--force_high_noise", action="store_true", help="Force use of high noise model for video extension")
+    parser.add_argument("--extension_dual_dit_boundary", type=float, default=None, help="Custom dual-dit boundary for video extension (0.0-1.0). Overrides force_low_noise/force_high_noise")
+    # Latent injection timing controls
+    parser.add_argument("--inject_motion_timesteps", type=str, default="all", choices=["all", "high_only", "low_only", "none"], 
+                       help="When to inject motion frames: 'all'=every timestep, 'high_only'=high noise timesteps only, 'low_only'=low noise timesteps only, 'none'=no injection")
+    parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
 
     args = parser.parse_args()
 
@@ -1083,6 +1089,24 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
         # Only applicable for dual-dit models
         if "A14B" not in args.task:
             logger.warning(f"--dual_dit_boundary specified but task '{args.task}' is not a dual-dit model. This setting will be ignored.")
+    
+    # Validate video extension arguments
+    if args.extend_video is not None:
+        # Check for conflicting model selection options
+        conflicting_options = sum([args.force_low_noise, args.force_high_noise, args.extension_dual_dit_boundary is not None])
+        if conflicting_options > 1:
+            raise ValueError("Only one of --force_low_noise, --force_high_noise, or --extension_dual_dit_boundary can be specified")
+        
+        # Validate extension_dual_dit_boundary
+        if args.extension_dual_dit_boundary is not None:
+            if not (0.0 <= args.extension_dual_dit_boundary <= 1.0):
+                raise ValueError(f"--extension_dual_dit_boundary must be between 0.0 and 1.0, got {args.extension_dual_dit_boundary}")
+            if "A14B" not in args.task:
+                logger.warning(f"--extension_dual_dit_boundary specified but task '{args.task}' is not a dual-dit model. This setting will be ignored.")
+        
+        # Validate injection_strength
+        if not (0.0 <= args.injection_strength <= 1.0):
+            raise ValueError(f"--injection_strength must be between 0.0 and 1.0, got {args.injection_strength}")
 
     return args
 
@@ -3062,8 +3086,22 @@ def run_extension_sampling(
     logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
     
     for i, t in enumerate(tqdm(timesteps)):
+        # Determine if we should inject motion frames at this timestep
+        should_inject = False
+        if motion_latent is not None and args.inject_motion_timesteps != "none":
+            if args.inject_motion_timesteps == "all":
+                should_inject = True
+            elif args.inject_motion_timesteps == "high_only":
+                # Inject only during high noise timesteps (t >= boundary)
+                boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900  # Default i2v boundary
+                should_inject = t.item() >= boundary
+            elif args.inject_motion_timesteps == "low_only":
+                # Inject only during low noise timesteps (t < boundary)
+                boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900  # Default i2v boundary
+                should_inject = t.item() < boundary
+        
         # Inject motion frames BEFORE model forward (from multitalk logic)
-        if motion_latent is not None:
+        if should_inject:
             motion_add_noise = torch.randn_like(motion_latent).to(device)
             # Use add_noise method to properly noise the motion frames at current timestep
             noised_motion = add_noise_for_extension(
@@ -3072,8 +3110,17 @@ def run_extension_sampling(
                 t,
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
-            # Replace the motion frames in latent
-            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            
+            # Apply injection with configurable strength
+            if args.injection_strength < 1.0:
+                # Blend between current latent and noised motion
+                current_motion = latent[:, :motion_frames_latent_num]
+                blended_motion = (args.injection_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                (1.0 - args.injection_strength) * current_motion)
+                latent[:, :motion_frames_latent_num] = blended_motion
+            else:
+                # Full replacement (original behavior)
+                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         
         # Prepare input for the model
         latent_on_device = latent.to(device)
@@ -3132,14 +3179,38 @@ def run_extension_sampling(
         # Re-inject motion frames AFTER scheduler step (for next iteration)
         if motion_latent is not None and i < len(timesteps) - 1:
             next_t = timesteps[i + 1]
-            motion_add_noise = torch.randn_like(motion_latent).to(device)
-            noised_motion = add_noise_for_extension(
-                motion_latent,
-                motion_add_noise,
-                next_t,
-                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
-            )
-            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            
+            # Determine if we should inject motion frames at next timestep
+            should_inject_next = False
+            if args.inject_motion_timesteps != "none":
+                if args.inject_motion_timesteps == "all":
+                    should_inject_next = True
+                elif args.inject_motion_timesteps == "high_only":
+                    boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900
+                    should_inject_next = next_t.item() >= boundary
+                elif args.inject_motion_timesteps == "low_only":
+                    boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900
+                    should_inject_next = next_t.item() < boundary
+            
+            if should_inject_next:
+                motion_add_noise = torch.randn_like(motion_latent).to(device)
+                noised_motion = add_noise_for_extension(
+                    motion_latent,
+                    motion_add_noise,
+                    next_t,
+                    scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+                )
+                
+                # Apply injection with configurable strength
+                if args.injection_strength < 1.0:
+                    # Blend between current latent and noised motion
+                    current_motion = latent[:, :motion_frames_latent_num]
+                    blended_motion = (args.injection_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                    (1.0 - args.injection_strength) * current_motion)
+                    latent[:, :motion_frames_latent_num] = blended_motion
+                else:
+                    # Full replacement (original behavior)
+                    latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
     
     logger.info("Extension sampling loop finished.")
     return latent
@@ -3206,8 +3277,24 @@ def generate_extended_video(
     del clip
     clean_memory_on_device(device)
     
-    # Load DiT model (force low noise model only for extension)
-    args.dual_dit_boundary = 1.0  # Force low noise model
+    # Configure model selection for video extension
+    if args.extension_dual_dit_boundary is not None:
+        # Use custom boundary for extension
+        args.dual_dit_boundary = args.extension_dual_dit_boundary
+        logger.info(f"Using custom extension dual-dit boundary: {args.extension_dual_dit_boundary}")
+    elif args.force_high_noise:
+        # Force high noise model (boundary = 0.0 means high noise model used for all timesteps)
+        args.dual_dit_boundary = 0.0
+        logger.info("Forcing high noise model for video extension")
+    elif args.force_low_noise:
+        # Force low noise model (boundary = 1.0 means low noise model used for all timesteps)
+        args.dual_dit_boundary = 1.0
+        logger.info("Forcing low noise model for video extension")
+    else:
+        # Default: use high noise model (better for extension based on user feedback)
+        args.dual_dit_boundary = 0.0
+        logger.info("Using high noise model for video extension (default)")
+    
     model_result = load_dit_model(args, cfg, device, torch.float16, torch.float16, True)
     
     # Handle dual-dit dynamic loading
@@ -3218,7 +3305,11 @@ def generate_extended_video(
         model_manager.set_model_paths(model_low_path, model_high_path)
         if len(lora_weights) >= 4:
             model_manager.set_lora_weights(*lora_weights)
-        model = model_manager.get_model('low')  # Force low noise model
+        # Select model based on boundary setting (already configured above)
+        if args.dual_dit_boundary >= 1.0:
+            model = model_manager.get_model('low')  # Use low noise model
+        else:
+            model = model_manager.get_model('high')  # Use high noise model
     else:
         model = model_result
     

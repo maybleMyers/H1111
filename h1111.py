@@ -466,7 +466,9 @@ def wan22_batch_handler(
     unload_text_encoders: bool,
     vae_fp32: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
-    enable_extension: bool, extend_frames: int, motion_frames: int  # Extension parameters
+    enable_extension: bool, extend_frames: int, motion_frames: int,  # Extension parameters
+    force_high_noise: bool, force_low_noise: bool, extension_dual_dit_boundary: float,  # Extension model selection
+    inject_motion_timesteps: str, injection_strength: float  # Extension injection controls
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -532,7 +534,20 @@ def wan22_batch_handler(
                 command.extend(["--extend_video", str(input_video)])
                 command.extend(["--extend_frames", str(extend_frames)])
                 command.extend(["--motion_frames", str(motion_frames)])
-                command.append("--force_low_noise")  # Force low noise model for extension
+                
+                # Model selection for extension
+                if extension_dual_dit_boundary is not None and extension_dual_dit_boundary != 0:
+                    command.extend(["--extension_dual_dit_boundary", str(extension_dual_dit_boundary)])
+                elif force_high_noise:
+                    command.append("--force_high_noise")
+                elif force_low_noise:
+                    command.append("--force_low_noise")
+                # Default will use high noise model (set in wan2_generate_video.py)
+                
+                # Injection controls
+                command.extend(["--inject_motion_timesteps", str(inject_motion_timesteps)])
+                command.extend(["--injection_strength", str(injection_strength)])
+                
                 # Force i2v-A14B task for extension
                 if "i2v" not in task:
                     yield [], None, f"Warning: Extension mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
@@ -7332,6 +7347,40 @@ with gr.Blocks(
                                 maximum=100,
                                 info="Number of frames to use for motion conditioning in each chunk"
                             )
+                        with gr.Row(visible=False) as wan22_extension_model_controls:
+                            wan22_force_high_noise = gr.Checkbox(
+                                label="Force High Noise Model", 
+                                value=True,
+                                info="Force high noise model for extension (recommended for better results)"
+                            )
+                            wan22_force_low_noise = gr.Checkbox(
+                                label="Force Low Noise Model", 
+                                value=False,
+                                info="Force low noise model for extension (original behavior)"
+                            )
+                            wan22_extension_dual_dit_boundary = gr.Slider(
+                                minimum=0.0, 
+                                maximum=1.0, 
+                                step=0.001, 
+                                label="Custom Extension Boundary", 
+                                value=None,
+                                info="Custom dual-dit boundary for extension (overrides force options)"
+                            )
+                        with gr.Row(visible=False) as wan22_extension_injection_controls:
+                            wan22_inject_motion_timesteps = gr.Dropdown(
+                                label="Motion Injection Timing",
+                                choices=["all", "high_only", "low_only", "none"],
+                                value="high_only",
+                                info="When to inject motion frames: all=every step, high_only=high noise steps only, low_only=low noise steps only, none=no injection"
+                            )
+                            wan22_injection_strength = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                step=0.01,
+                                label="Injection Strength",
+                                value=1.0,
+                                info="Strength of motion frame injection (1.0=full replacement, 0.0=no injection)"
+                            )
                     
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
@@ -10776,9 +10825,32 @@ with gr.Blocks(
     
     # Extension visibility toggle
     wan22_enable_extension.change(
-        fn=lambda enabled: gr.update(visible=enabled),
+        fn=lambda enabled: [gr.update(visible=enabled), gr.update(visible=enabled), gr.update(visible=enabled)],
         inputs=[wan22_enable_extension],
-        outputs=[wan22_extension_controls]
+        outputs=[wan22_extension_controls, wan22_extension_model_controls, wan22_extension_injection_controls]
+    )
+    
+    # Mutual exclusivity for extension model selection
+    def handle_force_high_noise_change(high_noise_checked):
+        if high_noise_checked:
+            return gr.update(value=False)  # Uncheck force_low_noise
+        return gr.update()
+    
+    def handle_force_low_noise_change(low_noise_checked):
+        if low_noise_checked:
+            return gr.update(value=False)  # Uncheck force_high_noise
+        return gr.update()
+    
+    wan22_force_high_noise.change(
+        fn=handle_force_high_noise_change,
+        inputs=[wan22_force_high_noise],
+        outputs=[wan22_force_low_noise]
+    )
+    
+    wan22_force_low_noise.change(
+        fn=handle_force_low_noise_change,
+        inputs=[wan22_force_low_noise],
+        outputs=[wan22_force_high_noise]
     )
     
     # Image input handling for wan22
@@ -10941,6 +11013,13 @@ with gr.Blocks(
             wan22_enable_extension,
             wan22_extend_frames,
             wan22_motion_frames,
+            # Extension model selection
+            wan22_force_high_noise,
+            wan22_force_low_noise,
+            wan22_extension_dual_dit_boundary,
+            # Extension injection controls
+            wan22_inject_motion_timesteps,
+            wan22_injection_strength,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
