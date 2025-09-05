@@ -3243,11 +3243,14 @@ def generate_extended_video(
             decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
         
         # Append new frames (skip the motion frames that were conditioning)
-        new_frames = decoded_chunk[:, motion_frames:]
+        new_frames = decoded_chunk[:, motion_frames:]  # [C, remaining_frames, H, W]
         generated_chunks.append(new_frames)
         
+        # Convert new_frames to [F, C, H, W] format to match all_frames
+        new_frames_transposed = new_frames.permute(1, 0, 2, 3)  # [remaining_frames, C, H, W]
+        
         # Update all_frames for next iteration
-        all_frames = torch.cat([all_frames, new_frames], dim=0)
+        all_frames = torch.cat([all_frames, new_frames_transposed], dim=0)
         current_frame += (frames_per_chunk - motion_frames)
     
     # Combine all chunks
