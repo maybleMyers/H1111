@@ -465,7 +465,8 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
-    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool  # Add these
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
+    enable_extension: bool, extend_frames: int, motion_frames: int  # Extension parameters
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -524,14 +525,26 @@ def wan22_batch_handler(
         elif "ti2v-5B" in task:
             command.extend(["--dit", os.path.join("wan", dit_path)])
 
-        # Handle V2V vs I2V mode
+        # Handle V2V vs Extension mode
         if enable_v2v and input_video:
-            command.extend(["--video_path", str(input_video)])
-            command.extend(["--strength", str(v2v_strength)])
-            if v2v_low_noise_only:
-                command.append("--v2v_low_noise_only")
-            if v2v_use_i2v:
-                command.append("--v2v_use_i2v")
+            if enable_extension:
+                # Use extension mode instead of regular V2V
+                command.extend(["--extend_video", str(input_video)])
+                command.extend(["--extend_frames", str(extend_frames)])
+                command.extend(["--motion_frames", str(motion_frames)])
+                command.append("--force_low_noise")  # Force low noise model for extension
+                # Force i2v-A14B task for extension
+                if "i2v" not in task:
+                    yield [], None, f"Warning: Extension mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
+                    return
+            else:
+                # Regular V2V mode
+                command.extend(["--video_path", str(input_video)])
+                command.extend(["--strength", str(v2v_strength)])
+                if v2v_low_noise_only:
+                    command.append("--v2v_low_noise_only")
+                if v2v_use_i2v:
+                    command.append("--v2v_use_i2v")
         elif "i2v" in task and image_path:
             command.extend(["--image_path", str(image_path)])
 
@@ -7297,6 +7310,28 @@ with gr.Blocks(
                         wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="V2V Strength", value=0.5, info="How much to modify the input video (0=keep original, 1=full rewrite)")
                         wan22_v2v_low_noise_only = gr.Checkbox(label="Use Low Noise Model Only", value=False, info="For V2V with dual-dit models, use only the low noise model")
                         wan22_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Extract first frame for CLIP conditioning. Recommended for i2v-A14B.")
+                        
+                        # Multitalk video extension option
+                        wan22_enable_extension = gr.Checkbox(
+                            label="Enable Multitalk Video Extension", 
+                            value=False,
+                            info="Extend input video using multitalk-style iterative generation"
+                        )
+                        with gr.Row(visible=False) as wan22_extension_controls:
+                            wan22_extend_frames = gr.Number(
+                                label="Total Frames to Generate", 
+                                value=200, 
+                                minimum=1, 
+                                maximum=1000,
+                                info="Total number of frames in the extended video"
+                            )
+                            wan22_motion_frames = gr.Number(
+                                label="Motion Conditioning Frames", 
+                                value=25, 
+                                minimum=1, 
+                                maximum=100,
+                                info="Number of frames to use for motion conditioning in each chunk"
+                            )
                     
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
@@ -10739,6 +10774,13 @@ with gr.Blocks(
         outputs=[wan22_v2v_controls]
     )
     
+    # Extension visibility toggle
+    wan22_enable_extension.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_extension],
+        outputs=[wan22_extension_controls]
+    )
+    
     # Image input handling for wan22
     wan22_input_image.change(
         fn=update_wanx_image_dimensions,  # Reuse the same function
@@ -10895,6 +10937,10 @@ with gr.Blocks(
             wan22_v2v_strength,
             wan22_v2v_low_noise_only,
             wan22_v2v_use_i2v,
+            # Extension arguments
+            wan22_enable_extension,
+            wan22_extend_frames,
+            wan22_motion_frames,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

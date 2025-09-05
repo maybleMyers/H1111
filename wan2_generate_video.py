@@ -15,6 +15,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import torch
 import accelerate
 from accelerate import Accelerator
+from functools import partial
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from PIL import Image
@@ -397,6 +398,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
+
+    # Video extension arguments (multitalk-style)
+    parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
+    parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
+    parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
+    # Ensure dual-dit model is forced to low noise for extension
+    parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
 
     args = parser.parse_args()
 
@@ -2892,6 +2900,376 @@ def run_sampling(
     logger.info("Sampling loop finished.")
     return latent
 
+def prepare_video_extension_inputs(
+    args: argparse.Namespace,
+    config,
+    accelerator: Accelerator,
+    device: torch.device,
+    vae: WanVAE,
+    cond_frames: torch.Tensor,  # Last frames from previous generation [C, F, H, W]
+    clip_context: torch.Tensor,  # CLIP encoding of first frame
+    frame_num: int,  # Number of frames to generate
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+    """Prepare inputs for video extension (multitalk-style iterative generation)
+    
+    Args:
+        args: command line arguments
+        config: model configuration
+        accelerator: Accelerator instance
+        device: device to use
+        vae: VAE model instance
+        cond_frames: Conditioning frames from previous generation [C, F, H, W]
+        clip_context: CLIP context from first frame
+        frame_num: Number of frames to generate in this chunk
+        
+    Returns:
+        Tuple containing noise, context, context_null, y, (arg_c, arg_null)
+    """
+    logger.info(f"Preparing video extension inputs for {frame_num} frames")
+    
+    # Get dimensions
+    _, cond_f, pixel_h, pixel_w = cond_frames.shape
+    lat_h = pixel_h // config.vae_stride[1]
+    lat_w = pixel_w // config.vae_stride[2]
+    lat_f = (frame_num - 1) // config.vae_stride[0] + 1
+    
+    # Calculate sequence length
+    seq_len = lat_f * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    
+    # Configure negative prompt
+    n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
+    
+    # Set seed
+    seed = args.seed
+    if not args.cpu_noise:
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
+    else:
+        seed_g = torch.manual_seed(seed)
+    
+    # Generate noise for new frames
+    noise = torch.randn(
+        16, lat_f, lat_h, lat_w,
+        dtype=torch.float32, generator=seed_g,
+        device=device if not args.cpu_noise else "cpu"
+    )
+    noise = noise.to(device)
+    
+    # Load text encoder and encode prompts
+    text_encoder = load_text_encoder(args, config, device)
+    text_encoder.model.to(device)
+    
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                context = text_encoder([args.prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        else:
+            context = text_encoder([args.prompt], device)
+            context_null = text_encoder([n_prompt], device)
+    
+    # Free text encoder
+    del text_encoder
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
+    
+    # Prepare zero padding for future frames
+    padding_frames = frame_num - cond_f
+    if padding_frames > 0:
+        padding_tensor = torch.zeros(
+            cond_frames.shape[0], padding_frames, pixel_h, pixel_w,
+            device=device, dtype=cond_frames.dtype
+        )
+        padded_frames = torch.cat([cond_frames, padding_tensor], dim=1)
+    else:
+        padded_frames = cond_frames[:, :frame_num]
+    
+    # Encode conditioning frames with VAE
+    vae.to_device(device)
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+        y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+    
+    # Create mask for conditioning frames
+    motion_frames_latent_num = (cond_f - 1) // config.vae_stride[0] + 1
+    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
+    msk[:, :motion_frames_latent_num] = 1  # Mask the conditioning frames
+    
+    # Concatenate mask and latent
+    y = torch.cat([msk, y_latent], dim=0)  # [4+C', lat_f, lat_h, lat_w]
+    
+    # Move VAE back to CPU/cache
+    vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+    clean_memory_on_device(device)
+    
+    # Prepare model arguments
+    # A14B models don't have img_emb layer
+    use_clip_fea = clip_context if not ("A14B" in args.task) else None
+    
+    arg_c = {
+        "context": context,
+        "clip_fea": use_clip_fea,
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    arg_null = {
+        "context": context_null,
+        "clip_fea": use_clip_fea,
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    return noise, context, context_null, y, (arg_c, arg_null)
+
+def run_extension_sampling(
+    model: WanModel,
+    noise: torch.Tensor,
+    scheduler: Any,
+    timesteps: torch.Tensor,
+    args: argparse.Namespace,
+    inputs: Tuple[dict, dict],
+    device: torch.device,
+    seed_g: torch.Generator,
+    accelerator: Accelerator,
+    motion_frames_latent: torch.Tensor,  # Latent of conditioning frames
+    motion_frames_num: int,  # Number of conditioning frames
+) -> torch.Tensor:
+    """Run sampling loop with motion frame injection for video extension
+    
+    This follows the multitalk approach of injecting motion frames during denoising
+    """
+    arg_c, arg_null = inputs
+    latent = noise
+    
+    # Calculate how many latent frames correspond to motion frames
+    config = WAN_CONFIGS[args.task]
+    motion_frames_latent_num = (motion_frames_num - 1) // config.vae_stride[0] + 1
+    
+    logger.info(f"Starting extension sampling with {motion_frames_num} motion frames ({motion_frames_latent_num} latent frames)")
+    
+    for i, t in enumerate(tqdm(timesteps)):
+        # Inject motion frames at each timestep (multitalk approach)
+        if motion_frames_latent is not None and i > 0:  # Skip first step
+            # Add noise to motion frames at current timestep
+            motion_add_noise = torch.randn_like(motion_frames_latent).to(device)
+            
+            # Use scheduler to add appropriate noise level
+            noised_motion = scheduler.add_noise(
+                original_samples=motion_frames_latent,
+                noise=motion_add_noise,
+                timesteps=torch.tensor([t], device=device)
+            )
+            
+            # Replace the first motion_frames_latent_num frames
+            latent[:, :motion_frames_latent_num] = noised_motion
+        
+        # Prepare model input
+        if len(latent.shape) == 5:
+            latent_model_input_list = [latent[i] for i in range(latent.shape[0])]
+        elif len(latent.shape) == 4:
+            latent_model_input_list = [latent]
+        else:
+            raise ValueError(f"Unexpected latent shape {latent.shape}")
+        
+        timestep = torch.stack([t]).to(device)
+        
+        with accelerator.autocast(), torch.no_grad():
+            # Predict conditional and unconditional noise
+            noise_pred_cond = model(latent_model_input_list, t=timestep, **arg_c)[0]
+            noise_pred_uncond = model(latent_model_input_list, t=timestep, **arg_null)[0]
+            
+            # Apply CFG
+            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # Ensure dimensions match
+            if len(noise_pred.shape) < len(latent.shape):
+                noise_pred = noise_pred.unsqueeze(0)
+            
+            # Scheduler step
+            scheduler_output = scheduler.step(
+                noise_pred.to(device),
+                t,
+                latent.to(device),
+                return_dict=False,
+                generator=seed_g
+            )
+            latent = scheduler_output[0]
+        
+        # Re-inject motion frames after the step (ensures they stay consistent)
+        if motion_frames_latent is not None:
+            motion_add_noise = torch.randn_like(motion_frames_latent).to(device)
+            noised_motion = scheduler.add_noise(
+                original_samples=motion_frames_latent,
+                noise=motion_add_noise,
+                timesteps=torch.tensor([timesteps[min(i+1, len(timesteps)-1)]], device=device)
+            )
+            latent[:, :motion_frames_latent_num] = noised_motion
+    
+    logger.info("Extension sampling complete")
+    return latent
+
+def generate_extended_video(
+    args: argparse.Namespace,
+    initial_video_path: str,
+    total_frames: int,
+    motion_frames: int = 25,
+) -> torch.Tensor:
+    """Generate extended video using multitalk-style iterative generation
+    
+    Args:
+        args: Command line arguments
+        initial_video_path: Path to initial video to extend
+        total_frames: Total number of frames to generate
+        motion_frames: Number of frames to use for conditioning each chunk
+        
+    Returns:
+        torch.Tensor: Extended video tensor [1, C, F, H, W]
+    """
+    device = torch.device(args.device)
+    cfg = WAN_CONFIGS[args.task]
+    
+    # Create accelerator for autocast support
+    accelerator = Accelerator()
+    
+    # Ensure we're using i2v-A14B model
+    if args.task != "i2v-A14B":
+        raise ValueError(f"Video extension requires i2v-A14B task, got {args.task}")
+    
+    # Load initial video
+    logger.info(f"Loading initial video from {initial_video_path}")
+    video_frames_np, initial_frames = load_video(
+        initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
+    )
+    
+    if initial_frames < motion_frames:
+        raise ValueError(f"Initial video has {initial_frames} frames, need at least {motion_frames}")
+    
+    # Convert to tensor [1, C, F, H, W]
+    video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))
+    video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+    video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+    
+    # Get dimensions
+    _, _, _, height, width = video_tensor.shape
+    
+    # Load models
+    vae_dtype = torch.float16
+    vae = load_vae(args, cfg, device, vae_dtype)
+    
+    # Load CLIP and encode first frame
+    clip = load_clip_model(args, cfg, device)
+    clip.model.to(device)
+    first_frame = video_tensor[0, :, 0]  # [C, H, W]
+    first_frame_normalized = first_frame.sub_(0.5).div_(0.5)  # [-1, 1]
+    # Convert to correct dtype and device for CLIP
+    first_frame_normalized = first_frame_normalized.to(device=device, dtype=torch.float16)
+    
+    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+        clip_context = clip.visual([first_frame_normalized.unsqueeze(1)])
+    
+    del clip
+    clean_memory_on_device(device)
+    
+    # Load DiT model (force low noise model only for extension)
+    args.dual_dit_boundary = 1.0  # Force low noise model
+    model_result = load_dit_model(args, cfg, device, torch.float16, torch.float16, True)
+    
+    # Handle dual-dit dynamic loading
+    is_dual_dit = isinstance(model_result, tuple)
+    if is_dual_dit:
+        model_low_path, model_high_path, *lora_weights = model_result
+        model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+        model_manager.set_model_paths(model_low_path, model_high_path)
+        if len(lora_weights) >= 4:
+            model_manager.set_lora_weights(*lora_weights)
+        model = model_manager.get_model('low')  # Force low noise model
+    else:
+        model = model_result
+    
+    optimize_model(model, args, device, torch.float16, torch.float16)
+    
+    # Setup scheduler
+    scheduler, _ = setup_scheduler(args, cfg, device)
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(args.seed if args.seed else 42)
+    
+    # Initialize with initial video
+    all_frames = video_tensor.squeeze(0).permute(1, 0, 2, 3)  # [F, C, H, W]
+    all_frames = (all_frames * 2.0 - 1.0).to(device)  # Scale to [-1, 1]
+    
+    # Generate chunks iteratively
+    frames_per_chunk = args.video_length if args.video_length else 81
+    current_frame = initial_frames
+    
+    generated_chunks = [all_frames[:initial_frames]]  # Start with initial video
+    
+    while current_frame < total_frames:
+        logger.info(f"Generating chunk: frames {current_frame} to {min(current_frame + frames_per_chunk, total_frames)}")
+        
+        # Get conditioning frames (last motion_frames from previous generation)
+        cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
+        cond_frames = cond_frames.permute(1, 0, 2, 3)  # [C, F, H, W]
+        
+        # Encode conditioning frames to latent
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            cond_latent = vae.encode([cond_frames])[0]
+        
+        # Prepare inputs for this chunk
+        chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)
+        noise, context, context_null, y, inputs = prepare_video_extension_inputs(
+            args, cfg, None, device, vae,
+            cond_frames, clip_context, chunk_frames
+        )
+        
+        # Get motion frames latent for injection
+        motion_latent = cond_latent[:, :(motion_frames-1)//cfg.vae_stride[0]+1]
+        
+        # Run sampling with motion frame injection
+        scheduler.set_timesteps(args.infer_steps, device=device)
+        timesteps = scheduler.timesteps
+        
+        final_latent = run_extension_sampling(
+            model, noise, scheduler, timesteps, args, inputs,
+            device, seed_g, accelerator,
+            motion_latent, motion_frames
+        )
+        
+        # Decode the generated latent
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
+        
+        # Append new frames (skip the motion frames that were conditioning)
+        new_frames = decoded_chunk[:, motion_frames:]
+        generated_chunks.append(new_frames)
+        
+        # Update all_frames for next iteration
+        all_frames = torch.cat([all_frames, new_frames], dim=0)
+        current_frame += (frames_per_chunk - motion_frames)
+    
+    # Combine all chunks
+    final_video = torch.cat(generated_chunks, dim=1)  # [C, F, H, W]
+    final_video = final_video.unsqueeze(0)  # [1, C, F, H, W]
+    
+    # Cleanup
+    if is_dual_dit:
+        model_manager.cleanup()
+    else:
+        del model
+    del vae
+    
+    clean_memory_on_device(device)
+    
+    # Scale to [0, 1] for saving
+    final_video = (final_video + 1.0) / 2.0
+    final_video = torch.clamp(final_video, 0.0, 1.0)
+    
+    logger.info(f"Generated extended video: {final_video.shape}")
+    return final_video
+
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     """main function for generation pipeline (T2V, I2V, V2V)
 
@@ -2911,6 +3289,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     is_v2v = args.video_path is not None
     is_fun_control = args.control_path is not None and cfg.is_fun_control
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
+    is_extension = args.extend_video is not None
     is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
 
     if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
@@ -2918,6 +3297,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
+    elif is_extension: logger.info(f"Running Video Extension (multitalk-style) to {args.extend_frames} frames")
     else: 
         if args.task == "ti2v-5B" and args.image_path is None:
             logger.info(f"Running Text-to-Video (T2V) inference for ti2v-5B (no image provided)")
@@ -2985,6 +3365,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
     needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
     if needs_vae_early:
+        vae = load_vae(args, cfg, device, vae_dtype)
+        # Keep VAE on specified device for now, will be moved as needed
+
+    # Handle video extension mode
+    if is_extension:
+        logger.info(f"Extending video from {args.extend_video} to {args.extend_frames} frames")
+        extended_video = generate_extended_video(
+            args, args.extend_video, args.extend_frames, args.motion_frames
+        )
+        return extended_video  # Return the extended video directly
+
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
 
