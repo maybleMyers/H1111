@@ -3279,25 +3279,25 @@ def generate_extended_video(
     
     # Configure model selection for video extension
     if args.extension_dual_dit_boundary is not None:
-        # Use custom boundary for extension
+        # Use custom boundary for extension with BOTH models
         args.dual_dit_boundary = args.extension_dual_dit_boundary
-        logger.info(f"Using custom extension dual-dit boundary: {args.extension_dual_dit_boundary}")
+        logger.info(f"Using custom extension dual-dit boundary: {args.extension_dual_dit_boundary} (both models will be used)")
     elif args.force_high_noise:
-        # Force high noise model (boundary = 0.0 means high noise model used for all timesteps)
+        # Force high noise model ONLY (boundary = 0.0 means high noise model used for all timesteps)
         args.dual_dit_boundary = 0.0
-        logger.info("Forcing high noise model for video extension")
+        logger.info("Forcing high noise model ONLY for video extension")
     elif args.force_low_noise:
-        # Force low noise model (boundary = 1.0 means low noise model used for all timesteps)
+        # Force low noise model ONLY (boundary = 1.0 means low noise model used for all timesteps)
         args.dual_dit_boundary = 1.0
-        logger.info("Forcing low noise model for video extension")
+        logger.info("Forcing low noise model ONLY for video extension")
     else:
-        # Default: use high noise model (better for extension based on user feedback)
-        args.dual_dit_boundary = 0.0
-        logger.info("Using high noise model for video extension (default)")
+        # Default: use both models with default boundary (better for quality)
+        args.dual_dit_boundary = cfg.boundary  # Use default i2v-A14B boundary (0.9)
+        logger.info(f"Using default dual-dit boundary for extension: {cfg.boundary} (both models will be used)")
     
     model_result = load_dit_model(args, cfg, device, torch.float16, torch.float16, True)
     
-    # Handle dual-dit dynamic loading
+    # Handle dual-dit dynamic loading - DO NOT force single model selection for extension
     is_dual_dit = isinstance(model_result, tuple)
     if is_dual_dit:
         model_low_path, model_high_path, *lora_weights = model_result
@@ -3305,11 +3305,8 @@ def generate_extended_video(
         model_manager.set_model_paths(model_low_path, model_high_path)
         if len(lora_weights) >= 4:
             model_manager.set_lora_weights(*lora_weights)
-        # Select model based on boundary setting (already configured above)
-        if args.dual_dit_boundary >= 1.0:
-            model = model_manager.get_model('low')  # Use low noise model
-        else:
-            model = model_manager.get_model('high')  # Use high noise model
+        # For extension, start with high noise model but allow dynamic switching
+        model = model_manager.get_model('high')  # Initial model, will switch dynamically
     else:
         model = model_result
     
@@ -3361,7 +3358,8 @@ def generate_extended_video(
         final_latent = run_extension_sampling(
             model, noise, scheduler, timesteps, args, inputs,
             device, seed_g, accelerator,
-            motion_latent, motion_frames
+            motion_latent, motion_frames,
+            model_manager=model_manager
         )
         
         # Decode the generated latent

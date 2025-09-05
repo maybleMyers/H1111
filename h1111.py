@@ -536,13 +536,13 @@ def wan22_batch_handler(
                 command.extend(["--motion_frames", str(motion_frames)])
                 
                 # Model selection for extension
-                if extension_dual_dit_boundary is not None and extension_dual_dit_boundary != 0:
-                    command.extend(["--extension_dual_dit_boundary", str(extension_dual_dit_boundary)])
-                elif force_high_noise:
+                if force_high_noise:
                     command.append("--force_high_noise")
                 elif force_low_noise:
                     command.append("--force_low_noise")
-                # Default will use high noise model (set in wan2_generate_video.py)
+                elif extension_dual_dit_boundary is not None:
+                    command.extend(["--extension_dual_dit_boundary", str(extension_dual_dit_boundary)])
+                # Default will use both models with default i2v-A14B boundary (set in wan2_generate_video.py)
                 
                 # Injection controls
                 command.extend(["--inject_motion_timesteps", str(inject_motion_timesteps)])
@@ -7349,22 +7349,22 @@ with gr.Blocks(
                             )
                         with gr.Row(visible=False) as wan22_extension_model_controls:
                             wan22_force_high_noise = gr.Checkbox(
-                                label="Force High Noise Model", 
-                                value=True,
-                                info="Force high noise model for extension (recommended for better results)"
+                                label="Force High Noise Model ONLY", 
+                                value=False,
+                                info="Force ONLY high noise model for extension (may cause blocky output)"
                             )
                             wan22_force_low_noise = gr.Checkbox(
-                                label="Force Low Noise Model", 
+                                label="Force Low Noise Model ONLY", 
                                 value=False,
-                                info="Force low noise model for extension (original behavior)"
+                                info="Force ONLY low noise model for extension (original behavior, may be worse)"
                             )
                             wan22_extension_dual_dit_boundary = gr.Slider(
                                 minimum=0.0, 
                                 maximum=1.0, 
                                 step=0.001, 
                                 label="Custom Extension Boundary", 
-                                value=None,
-                                info="Custom dual-dit boundary for extension (overrides force options)"
+                                value=0.9,
+                                info="Dual-dit boundary for extension - BOTH models will be used (0.9 = default i2v-A14B boundary)"
                             )
                         with gr.Row(visible=False) as wan22_extension_injection_controls:
                             wan22_inject_motion_timesteps = gr.Dropdown(
