@@ -3203,7 +3203,9 @@ def generate_extended_video(
     frames_per_chunk = args.video_length if args.video_length else 81
     current_frame = initial_frames
     
-    generated_chunks = [all_frames[:initial_frames]]  # Start with initial video
+    # Start with initial video, convert to [C, F, H, W] format to match other chunks
+    initial_chunk = all_frames[:initial_frames].permute(1, 0, 2, 3)  # [C, F, H, W]
+    generated_chunks = [initial_chunk]  # Start with initial video
     
     while current_frame < total_frames:
         logger.info(f"Generating chunk: frames {current_frame} to {min(current_frame + frames_per_chunk, total_frames)}")
@@ -3244,7 +3246,7 @@ def generate_extended_video(
         
         # Append new frames (skip the motion frames that were conditioning)
         new_frames = decoded_chunk[:, motion_frames:]  # [C, remaining_frames, H, W]
-        generated_chunks.append(new_frames)
+        generated_chunks.append(new_frames.cpu())  # Move to CPU to save GPU memory
         
         # Convert new_frames to [F, C, H, W] format to match all_frames and move to CPU
         new_frames_transposed = new_frames.permute(1, 0, 2, 3).cpu()  # [remaining_frames, C, H, W], move to CPU
