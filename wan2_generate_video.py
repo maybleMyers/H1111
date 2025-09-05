@@ -4518,14 +4518,24 @@ def main():
             torch.cuda.empty_cache()
         
         # Decode latent to video tensor [B, C, F, H, W], range [0, 1]
-        decoded_video = decode_latent(generated_latent, args, cfg)
+        # Skip VAE decode for extension mode since it already returns decoded pixels
+        if hasattr(args, 'extend_video') and args.extend_video is not None:
+            logger.info("Extension mode detected - using already decoded video")
+            decoded_video = generated_latent  # Already decoded pixels
+        else:
+            decoded_video = decode_latent(generated_latent, args, cfg)
 
         # Save the output (latent and/or video/images)
+        # Don't save "latents" for extension mode since generated_latent contains pixels
+        latent_to_save = None
+        if not (hasattr(args, 'extend_video') and args.extend_video is not None):
+            latent_to_save = generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
+        
         save_output(
             decoded_video,
             args,
             original_base_names=original_base_names,
-            latent_to_save=generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
+            latent_to_save=latent_to_save
         )
     else:
         logger.error("No latent available for decoding and saving.")
