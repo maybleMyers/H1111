@@ -3037,17 +3037,134 @@ def add_noise_for_extension(
     timesteps = timesteps.view(timesteps.shape + (1,) * (len(noise.shape)-1))
     return (1 - timesteps) * original_samples + timesteps * noise
 
+def run_extension_sampling(
+    model: WanModel,
+    noise: torch.Tensor,
+    scheduler: Any,
+    timesteps: torch.Tensor,
+    args: argparse.Namespace,
+    inputs: Tuple[dict, dict],
+    device: torch.device,
+    seed_g: torch.Generator,
+    accelerator: Accelerator,
+    motion_latent: torch.Tensor,
+    motion_frames: int,
+    model_manager: Optional[DynamicModelManager] = None,
+) -> torch.Tensor:
+    """Run sampling loop for video extension with motion frame injection"""
+    
+    arg_c, arg_null = inputs
+    latent = noise
+    
+    # Calculate motion frame latent count
+    motion_frames_latent_num = (motion_frames - 1) // 4 + 1  # VAE stride of 4 in temporal dimension
+    
+    logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
+    
+    for i, t in enumerate(tqdm(timesteps)):
+        # Inject motion frames BEFORE model forward (from multitalk logic)
+        if motion_latent is not None:
+            motion_add_noise = torch.randn_like(motion_latent).to(device)
+            # Use add_noise method to properly noise the motion frames at current timestep
+            noised_motion = add_noise_for_extension(
+                motion_latent,
+                motion_add_noise, 
+                t,
+                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+            )
+            # Replace the motion frames in latent
+            latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
+        
+        # Prepare input for the model
+        latent_on_device = latent.to(device)
+        
+        # The model expects the latent input 'x' as a list: [tensor]
+        if len(latent_on_device.shape) == 5:
+            # Has batch dimension [B, C, F, H, W]
+            latent_model_input_list = [latent_on_device[i] for i in range(latent_on_device.shape[0])]
+        elif len(latent_on_device.shape) == 4:
+            # No batch dimension [C, F, H, W]
+            latent_model_input_list = [latent_on_device]
+        else:
+            raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
+        
+        timestep = torch.stack([t]).to(device)
+        
+        with accelerator.autocast(), torch.no_grad():
+            # Select appropriate model for dual-dit architectures
+            if model_manager is not None:
+                cfg = WAN_CONFIGS[args.task]
+                if args.dual_dit_boundary is not None:
+                    boundary = args.dual_dit_boundary * 1000
+                else:
+                    boundary = cfg.boundary * 1000
+                
+                if t.item() >= boundary:
+                    current_model = model_manager.get_model('high')
+                else:
+                    current_model = model_manager.get_model('low')
+            else:
+                current_model = model
+            
+            # Filter out non-model parameters
+            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
+            
+            # Predict conditional and unconditional noise
+            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # Ensure noise_pred and latent_on_device have matching batch dimensions
+            if len(noise_pred.shape) < len(latent_on_device.shape):
+                noise_pred = noise_pred.unsqueeze(0)
+            
+            # Scheduler step
+            scheduler_output = scheduler.step(
+                noise_pred.to(device),
+                t,
+                latent_on_device,
+                return_dict=False,
+                generator=seed_g
+            )
+            latent = scheduler_output[0]
+        
+        # Re-inject motion frames AFTER scheduler step (for next iteration)
+        if motion_latent is not None and i < len(timesteps) - 1:
+            next_t = timesteps[i + 1]
+            motion_add_noise = torch.randn_like(motion_latent).to(device)
+            noised_motion = add_noise_for_extension(
+                motion_latent,
+                motion_add_noise,
+                next_t,
+                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+            )
+            latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
+    
+    logger.info("Extension sampling loop finished.")
+    return latent
+
 def generate_extended_video(
     args: argparse.Namespace,
     initial_video_path: str,
     total_frames: int,
     motion_frames: int = 25,
 ) -> torch.Tensor:
-    """Generate extended video using multitalk-style iterative generation"""
+    """Generate extended video using multitalk-style iterative generation
+    
+    Args:
+        args: Command line arguments
+        initial_video_path: Path to initial video to extend
+        total_frames: Total number of frames to generate
+        motion_frames: Number of frames to use for conditioning each chunk
+        
+    Returns:
+        torch.Tensor: Extended video tensor [1, C, F, H, W]
+    """
     device = torch.device(args.device)
     cfg = WAN_CONFIGS[args.task]
     
-    # Create accelerator
+    # Create accelerator for autocast support
     accelerator = Accelerator()
     
     # Ensure we're using i2v-A14B model
@@ -3072,14 +3189,15 @@ def generate_extended_video(
     _, _, _, height, width = video_tensor.shape
     
     # Load models
-    vae_dtype = str_to_dtype(args.vae_dtype) if args.vae_dtype else torch.float16
+    vae_dtype = torch.float16
     vae = load_vae(args, cfg, device, vae_dtype)
     
-    # Load CLIP and encode first frame ONCE
+    # Load CLIP and encode first frame
     clip = load_clip_model(args, cfg, device)
     clip.model.to(device)
     first_frame = video_tensor[0, :, 0]  # [C, H, W]
     first_frame_normalized = first_frame.sub_(0.5).div_(0.5)  # [-1, 1]
+    # Convert to correct dtype and device for CLIP
     first_frame_normalized = first_frame_normalized.to(device=device, dtype=torch.float16)
     
     with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
@@ -3088,24 +3206,7 @@ def generate_extended_video(
     del clip
     clean_memory_on_device(device)
     
-    # Load T5 and encode text ONCE
-    text_encoder = load_text_encoder(args, cfg, device)
-    text_encoder.model.to(device)
-    n_prompt = args.negative_prompt if args.negative_prompt else cfg.sample_neg_prompt
-    
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=cfg.t5_dtype):
-                context = text_encoder([args.prompt], device)
-                context_null = text_encoder([n_prompt], device)
-        else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
-    
-    del text_encoder
-    clean_memory_on_device(device)
-    
-    # Load DiT model (force low noise model for extension)
+    # Load DiT model (force low noise model only for extension)
     args.dual_dit_boundary = 1.0  # Force low noise model
     model_result = load_dit_model(args, cfg, device, torch.float16, torch.float16, True)
     
@@ -3117,7 +3218,7 @@ def generate_extended_video(
         model_manager.set_model_paths(model_low_path, model_high_path)
         if len(lora_weights) >= 4:
             model_manager.set_lora_weights(*lora_weights)
-        model = model_manager.get_model('low')
+        model = model_manager.get_model('low')  # Force low noise model
     else:
         model = model_result
     
@@ -3128,172 +3229,71 @@ def generate_extended_video(
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(args.seed if args.seed else 42)
     
-    # Initialize with initial video (convert to [-1, 1] for VAE)
+    # Initialize with initial video
     all_frames = video_tensor.squeeze(0).permute(1, 0, 2, 3)  # [F, C, H, W]
-    all_frames = (all_frames * 2.0 - 1.0).cpu()  # Scale to [-1, 1] and keep on CPU
+    all_frames = (all_frames * 2.0 - 1.0)  # Scale to [-1, 1], keep on CPU to save GPU memory
     
     # Generate chunks iteratively
     frames_per_chunk = args.video_length if args.video_length else 81
     current_frame = initial_frames
     
-    # Store generated chunks
-    generated_chunks = []
-    # Add initial frames as first chunk
+    # Start with initial video, convert to [C, F, H, W] format to match other chunks
     initial_chunk = all_frames[:initial_frames].permute(1, 0, 2, 3)  # [C, F, H, W]
-    generated_chunks.append(initial_chunk.cpu())
+    generated_chunks = [initial_chunk]  # Start with initial video
     
     while current_frame < total_frames:
-        remaining_frames = total_frames - current_frame
-        chunk_frames = min(frames_per_chunk, remaining_frames + motion_frames)  # Include motion frames
+        logger.info(f"Generating chunk: frames {current_frame} to {min(current_frame + frames_per_chunk, total_frames)}")
         
-        logger.info(f"Generating chunk: frames {current_frame} to {current_frame + chunk_frames - motion_frames}")
+        # Get conditioning frames (last motion_frames from previous generation)
+        cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
+        cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W], move to device
         
-        # Get conditioning frames (last motion_frames from all generated frames so far)
-        cond_start_idx = max(0, len(torch.cat([c.permute(1, 0, 2, 3) for c in generated_chunks], dim=0)) - motion_frames)
-        all_generated_so_far = torch.cat([c.permute(1, 0, 2, 3) for c in generated_chunks], dim=0)  # [F, C, H, W]
-        cond_frames = all_generated_so_far[cond_start_idx:].clone()  # Get last motion_frames
-        
-        # Ensure we have exactly motion_frames
-        if len(cond_frames) < motion_frames:
-            # Pad with last frame if needed
-            padding_needed = motion_frames - len(cond_frames)
-            last_frame = cond_frames[-1:] if len(cond_frames) > 0 else all_frames[0:1]
-            cond_frames = torch.cat([cond_frames] + [last_frame] * padding_needed, dim=0)
-        
-        cond_frames = cond_frames[-motion_frames:]  # Ensure exactly motion_frames
-        cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W]
-        
-        # Prepare zero padding for future frames
-        padding_frames = chunk_frames - motion_frames
-        if padding_frames > 0:
-            padding_tensor = torch.zeros(
-                cond_frames.shape[0], padding_frames, height, width,
-                device=device, dtype=cond_frames.dtype
-            )
-            padded_frames = torch.cat([cond_frames, padding_tensor], dim=1)
-        else:
-            padded_frames = cond_frames[:, :chunk_frames]
-        
-        # Encode conditioning frames with VAE
+        # Encode conditioning frames to latent
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
-            # Also encode just the motion frames for injection
-            motion_latent = vae.encode([cond_frames])[0]  # [C', motion_lat_f, lat_h, lat_w]
+            cond_latent = vae.encode([cond_frames])[0]
         
-        # Calculate latent dimensions
-        lat_f = y_latent.shape[1]
-        lat_h = y_latent.shape[2]
-        lat_w = y_latent.shape[3]
-        motion_frames_latent_num = motion_latent.shape[1]
-        
-        # Calculate sequence length
-        seq_len = lat_f * lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-        
-        # Generate noise
-        noise = torch.randn(
-            16, lat_f, lat_h, lat_w,
-            dtype=torch.float32, generator=seed_g,
-            device=device if not args.cpu_noise else "cpu"
+        # Prepare inputs for this chunk
+        chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)
+        noise, context, context_null, y, inputs = prepare_video_extension_inputs(
+            args, cfg, None, device, vae,
+            cond_frames, clip_context, chunk_frames
         )
-        noise = noise.to(device)
         
-        # Create mask for conditioning frames
-        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
-        msk[:, :motion_frames_latent_num] = 1  # Mask the conditioning frames
-        
-        # Concatenate mask and latent
-        y = torch.cat([msk, y_latent], dim=0)  # [4+C', lat_f, lat_h, lat_w]
-        
-        # Move VAE to CPU to save memory
-        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
-        clean_memory_on_device(device)
-        
-        # Prepare model arguments (reuse text encodings)
-        use_clip_fea = clip_context if not ("A14B" in args.task) else None
-        
-        arg_c = {
-            "context": context,
-            "clip_fea": use_clip_fea,
-            "seq_len": seq_len,
-            "y": [y],
-        }
-        
-        arg_null = {
-            "context": context_null,
-            "clip_fea": use_clip_fea,
-            "seq_len": seq_len,
-            "y": [y],
-        }
+        # Get motion frames latent for injection
+        motion_latent = cond_latent[:, :(motion_frames-1)//cfg.vae_stride[0]+1]
         
         # Run sampling with motion frame injection
         scheduler.set_timesteps(args.infer_steps, device=device)
         timesteps = scheduler.timesteps
         
-        # Run the corrected sampling loop
-        latent = noise
-        for i, t in enumerate(tqdm(timesteps)):
-            # Inject motion frames BEFORE model forward
-            if motion_latent is not None:
-                motion_add_noise = torch.randn_like(motion_latent).to(device)
-                noised_motion = add_noise_for_extension(
-                    motion_latent,
-                    motion_add_noise,
-                    t,  # Current timestep
-                    cfg.num_train_timesteps
-                )
-                # Replace the motion frames in latent
-                latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
-            
-            # Prepare model input
-            latent_model_input_list = [latent]
-            timestep = torch.stack([t]).to(device)
-            
-            with accelerator.autocast(), torch.no_grad():
-                # Model predictions
-                noise_pred_cond = model(latent_model_input_list, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(latent_model_input_list, t=timestep, **arg_null)[0]
-                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                
-                # Scheduler step
-                scheduler_output = scheduler.step(
-                    noise_pred.to(device),
-                    t,
-                    latent.to(device),
-                    return_dict=False,
-                    generator=seed_g
-                )
-                latent = scheduler_output[0]
-            
-            # Re-inject motion frames AFTER scheduler step (for next iteration)
-            if motion_latent is not None and i < len(timesteps) - 1:
-                next_t = timesteps[i + 1]
-                motion_add_noise = torch.randn_like(motion_latent).to(device)
-                noised_motion = add_noise_for_extension(
-                    motion_latent,
-                    motion_add_noise,
-                    next_t,  # Next timestep
-                    cfg.num_train_timesteps
-                )
-                latent[:motion_frames_latent_num] = noised_motion[:motion_frames_latent_num]
+        final_latent = run_extension_sampling(
+            model, noise, scheduler, timesteps, args, inputs,
+            device, seed_g, accelerator,
+            motion_latent, motion_frames
+        )
         
         # Decode the generated latent
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            decoded_chunk = vae.decode([latent])[0]
+            decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
         
-        # Store only the NEW frames (skip the motion frames)
-        new_frames = decoded_chunk[:, motion_frames:]  # [C, new_frames, H, W]
-        if new_frames.shape[1] > 0:  # Only add if there are new frames
-            generated_chunks.append(new_frames.cpu())
+        # Append new frames (skip the motion frames that were conditioning)
+        new_frames = decoded_chunk[:, motion_frames:]  # [C, remaining_frames, H, W]
+        generated_chunks.append(new_frames.cpu())  # Move to CPU to save GPU memory
         
-        # Update frame counter
-        current_frame += new_frames.shape[1]
+        # Convert new_frames to [F, C, H, W] format to match all_frames and move to CPU
+        new_frames_transposed = new_frames.permute(1, 0, 2, 3).cpu()  # [remaining_frames, C, H, W], move to CPU
         
-        # Clean up GPU memory
-        del cond_frames, padded_frames, y_latent, motion_latent, noise, y, latent, decoded_chunk, new_frames
+        # Update all_frames for next iteration
+        all_frames = torch.cat([all_frames, new_frames_transposed], dim=0)
+        current_frame += (frames_per_chunk - motion_frames)
+        
+        # Clean up GPU memory after each chunk
+        del cond_frames, cond_latent, noise, context, context_null, y, inputs, motion_latent, final_latent, decoded_chunk, new_frames, new_frames_transposed
         clean_memory_on_device(device)
         torch.cuda.empty_cache()
+        logger.info(f"Cleaned up GPU memory after chunk {current_frame // frames_per_chunk}")
     
     # Combine all chunks
     final_video = torch.cat(generated_chunks, dim=1)  # [C, F, H, W]
