@@ -3023,6 +3023,19 @@ def prepare_video_extension_inputs(
     
     return noise, context, context_null, y, (arg_c, arg_null)
 
+def add_noise_for_extension(
+    original_samples: torch.FloatTensor,
+    noise: torch.FloatTensor,
+    timestep: torch.FloatTensor,
+    num_timesteps: int = 1000
+) -> torch.FloatTensor:
+    """Add noise using the MultiTalk approach (linear interpolation)"""
+    timesteps = timestep.float() / num_timesteps
+    if len(timesteps.shape) == 0:
+        timesteps = timesteps.unsqueeze(0)
+    timesteps = timesteps.view(timesteps.shape + (1,) * (len(noise.shape)-1))
+    return (1 - timesteps) * original_samples + timesteps * noise
+
 def run_extension_sampling(
     model: WanModel,
     noise: torch.Tensor,
@@ -3033,37 +3046,37 @@ def run_extension_sampling(
     device: torch.device,
     seed_g: torch.Generator,
     accelerator: Accelerator,
-    motion_frames_latent: torch.Tensor,  # Latent of conditioning frames
-    motion_frames_num: int,  # Number of conditioning frames
+    motion_frames_latent: torch.Tensor,
+    motion_frames_num: int,
 ) -> torch.Tensor:
-    """Run sampling loop with motion frame injection for video extension
-    
-    This follows the multitalk approach of injecting motion frames during denoising
-    """
+    """Run sampling loop with motion frame injection for video extension"""
     arg_c, arg_null = inputs
     latent = noise
     
-    # Calculate how many latent frames correspond to motion frames
+    # Calculate latent frame count for motion frames
     config = WAN_CONFIGS[args.task]
     motion_frames_latent_num = (motion_frames_num - 1) // config.vae_stride[0] + 1
     
     logger.info(f"Starting extension sampling with {motion_frames_num} motion frames ({motion_frames_latent_num} latent frames)")
     
     for i, t in enumerate(tqdm(timesteps)):
-        # Inject motion frames at each timestep (multitalk approach)
-        if motion_frames_latent is not None and i > 0:  # Skip first step
-            # Add noise to motion frames at current timestep
+        # Inject motion frames at each timestep
+        if motion_frames_latent is not None:
             motion_add_noise = torch.randn_like(motion_frames_latent).to(device)
             
-            # Use scheduler to add appropriate noise level
-            noised_motion = scheduler.add_noise(
-                original_samples=motion_frames_latent,
-                noise=motion_add_noise,
-                timesteps=torch.tensor([t], device=device)
+            # Use custom add_noise function (NOT scheduler.add_noise)
+            noised_motion = add_noise_for_extension(
+                motion_frames_latent,
+                motion_add_noise,
+                t,
+                config.num_train_timesteps
             )
             
             # Replace the first motion_frames_latent_num frames
-            latent[:, :motion_frames_latent_num] = noised_motion
+            if len(latent.shape) == 4:  # [C, F, H, W]
+                latent[:, :motion_frames_latent_num] = noised_motion.squeeze(0)[:, :motion_frames_latent_num]
+            else:  # [1, C, F, H, W]
+                latent[:, :, :motion_frames_latent_num] = noised_motion[:, :, :motion_frames_latent_num]
         
         # Prepare model input
         if len(latent.shape) == 5:
@@ -3097,15 +3110,20 @@ def run_extension_sampling(
             )
             latent = scheduler_output[0]
         
-        # Re-inject motion frames after the step (ensures they stay consistent)
-        if motion_frames_latent is not None:
+        # Re-inject motion frames after the step
+        if motion_frames_latent is not None and i < len(timesteps) - 1:
+            next_t = timesteps[i + 1]
             motion_add_noise = torch.randn_like(motion_frames_latent).to(device)
-            noised_motion = scheduler.add_noise(
-                original_samples=motion_frames_latent,
-                noise=motion_add_noise,
-                timesteps=torch.tensor([timesteps[min(i+1, len(timesteps)-1)]], device=device)
+            noised_motion = add_noise_for_extension(
+                motion_frames_latent,
+                motion_add_noise,
+                next_t,
+                config.num_train_timesteps
             )
-            latent[:, :motion_frames_latent_num] = noised_motion
+            if len(latent.shape) == 4:
+                latent[:, :motion_frames_latent_num] = noised_motion.squeeze(0)[:, :motion_frames_latent_num]
+            else:
+                latent[:, :, :motion_frames_latent_num] = noised_motion[:, :, :motion_frames_latent_num]
     
     logger.info("Extension sampling complete")
     return latent
