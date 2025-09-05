@@ -3197,7 +3197,7 @@ def generate_extended_video(
     
     # Initialize with initial video
     all_frames = video_tensor.squeeze(0).permute(1, 0, 2, 3)  # [F, C, H, W]
-    all_frames = (all_frames * 2.0 - 1.0).to(device)  # Scale to [-1, 1]
+    all_frames = (all_frames * 2.0 - 1.0)  # Scale to [-1, 1], keep on CPU to save GPU memory
     
     # Generate chunks iteratively
     frames_per_chunk = args.video_length if args.video_length else 81
@@ -3210,7 +3210,7 @@ def generate_extended_video(
         
         # Get conditioning frames (last motion_frames from previous generation)
         cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
-        cond_frames = cond_frames.permute(1, 0, 2, 3)  # [C, F, H, W]
+        cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W], move to device
         
         # Encode conditioning frames to latent
         vae.to_device(device)
@@ -3246,12 +3246,18 @@ def generate_extended_video(
         new_frames = decoded_chunk[:, motion_frames:]  # [C, remaining_frames, H, W]
         generated_chunks.append(new_frames)
         
-        # Convert new_frames to [F, C, H, W] format to match all_frames
-        new_frames_transposed = new_frames.permute(1, 0, 2, 3)  # [remaining_frames, C, H, W]
+        # Convert new_frames to [F, C, H, W] format to match all_frames and move to CPU
+        new_frames_transposed = new_frames.permute(1, 0, 2, 3).cpu()  # [remaining_frames, C, H, W], move to CPU
         
         # Update all_frames for next iteration
         all_frames = torch.cat([all_frames, new_frames_transposed], dim=0)
         current_frame += (frames_per_chunk - motion_frames)
+        
+        # Clean up GPU memory after each chunk
+        del cond_frames, cond_latent, noise, context, context_null, y, inputs, motion_latent, final_latent, decoded_chunk, new_frames, new_frames_transposed
+        clean_memory_on_device(device)
+        torch.cuda.empty_cache()
+        logger.info(f"Cleaned up GPU memory after chunk {current_frame // frames_per_chunk}")
     
     # Combine all chunks
     final_video = torch.cat(generated_chunks, dim=1)  # [C, F, H, W]
