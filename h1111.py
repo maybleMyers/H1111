@@ -7253,10 +7253,10 @@ with gr.Blocks(
                 with gr.Column():
                     gr.Markdown("### InfiniteTalk-Specific Paths")
                     infinitetalk_dit_path = gr.Textbox(label="DiT Model Path (optional)", value="", placeholder="Path to DiT model checkpoint")
-                    infinitetalk_infinitetalk_dir = gr.Textbox(label="InfiniteTalk Checkpoint Directory (optional)", value="", placeholder="Path to InfiniteTalk checkpoint")
+                    infinitetalk_infinitetalk_dir = gr.Textbox(label="InfiniteTalk Model", value="", placeholder="Directory or safetensors file (e.g., infinitetalk_single.safetensors or infinitetalk_multi.safetensors)")
             
             with gr.Row():
-                infinitetalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
+                infinitetalk_ckpt_dir = gr.Textbox(label="Base Wan Model", value="wan", placeholder="Directory or safetensors file (e.g., wan2.1_i2v_480p_14B_fp16.safetensors)")
                 infinitetalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
                 infinitetalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
                 infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")

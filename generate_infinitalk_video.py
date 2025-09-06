@@ -1017,7 +1017,7 @@ def _parse_args():
         "--ckpt_dir",
         type=str,
         default=None,
-        help="The path to the Wan checkpoint directory.")
+        help="The path to the Wan checkpoint directory or single safetensors file (e.g., wan2.1_i2v_480p_14B_fp16.safetensors).")
     parser.add_argument(
         "--wav2vec_dir",
         type=str,
@@ -1027,7 +1027,7 @@ def _parse_args():
         "--infinitetalk_dir",
         type=str,
         default=None,
-        help="The path to the InfiniteTalk checkpoint directory.")
+        help="The path to the InfiniteTalk checkpoint directory or single safetensors file (e.g., infinitetalk_single.safetensors or infinitetalk_multi.safetensors).")
     parser.add_argument(
         "--dit_path",
         type=str,
@@ -4289,16 +4289,24 @@ class InfiniteTalkPipeline:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
+        
+        # Handle paths when checkpoint_dir is a single safetensors file
+        if checkpoint_dir and checkpoint_dir.endswith('.safetensors'):
+            # Use parent directory for auxiliary models
+            base_dir = os.path.dirname(checkpoint_dir)
+        else:
+            base_dir = checkpoint_dir
+            
         if t5_tokenizer_path_override:
             final_tokenizer_path = t5_tokenizer_path_override
         else:
-            final_tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
+            final_tokenizer_path = os.path.join(base_dir, config.t5_tokenizer)
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+            checkpoint_path=os.path.join(base_dir, config.t5_checkpoint),
             tokenizer_path=final_tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None,
         )
@@ -4306,24 +4314,64 @@ class InfiniteTalkPipeline:
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=os.path.join(base_dir, config.vae_checkpoint),
             device=self.device)
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
+            checkpoint_path=os.path.join(base_dir,
                                          config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+            tokenizer_path=os.path.join(base_dir, config.clip_tokenizer))
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        # Check if checkpoint_dir is a single safetensors file or a directory
+        if checkpoint_dir and checkpoint_dir.endswith('.safetensors'):
+            # Load WanModel from single safetensors file
+            logging.info(f"Loading WanModel from single safetensors file: {checkpoint_dir}")
+            # First, we need to get the config from the parent directory or use default
+            config_dir = os.path.dirname(checkpoint_dir)
+            config_path = os.path.join(config_dir, 'config.json')
+            
+            if os.path.exists(config_path):
+                # Load config from file
+                import json
+                with open(config_path, 'r') as f:
+                    model_config = json.load(f)
+                self.model = WanModel(**model_config)
+            else:
+                # Use default config for wan2.1_i2v_480p_14B
+                # These are typical parameters for the 14B model
+                self.model = WanModel(
+                    model_type='i2v',
+                    dim=2048,
+                    text_dim=4096,
+                    num_heads=32,
+                    depth=48,
+                    ffn_dim=8192,
+                    text_len=512,
+                    freq_dim=256,
+                )
+            
+            # Load the weights from the safetensors file
+            wan_weights = load_file(checkpoint_dir)
+            self.model.load_state_dict(wan_weights, strict=False)
+        else:
+            # Load from directory as before
+            logging.info(f"Creating WanModel from {checkpoint_dir}")
+            self.model = WanModel.from_pretrained(checkpoint_dir)
         
         # Load InfiniteTalk-specific weights if provided
         if infinitetalk_dir:
-            logging.info(f"Loading InfiniteTalk weights from {infinitetalk_dir}")
-            infinitetalk_weights = load_file(infinitetalk_dir)
-            self.model.load_state_dict(infinitetalk_weights, strict=False)
+            # Check if it's a single safetensors file or directory
+            if infinitetalk_dir.endswith('.safetensors'):
+                logging.info(f"Loading InfiniteTalk weights from single safetensors file: {infinitetalk_dir}")
+                infinitetalk_weights = load_file(infinitetalk_dir)
+                self.model.load_state_dict(infinitetalk_weights, strict=False)
+            else:
+                # Assume it's a directory with safetensors file inside
+                logging.info(f"Loading InfiniteTalk weights from {infinitetalk_dir}")
+                infinitetalk_weights = load_file(infinitetalk_dir)
+                self.model.load_state_dict(infinitetalk_weights, strict=False)
         elif dit_path:
             logging.info(f"Loading DIT weights from {dit_path}")
             dit_weights = torch.load(dit_path, map_location='cpu')
