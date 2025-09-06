@@ -1023,6 +1023,278 @@ def multitalk_batch_handler(
         
     yield all_generated_videos, None, "MultiTalk Batch complete.", ""
 
+### InfiniteTalk
+def infinitetalk_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    cond_video: str,  # Changed from cond_image_data to video path
+    audio_person1: Optional[str],
+    audio_person2: Optional[str],
+    batch_size: int,
+    # Generation params
+    size: str,
+    mode: str,
+    frame_num: int,
+    motion_frame: int,
+    sample_steps: int,
+    sample_shift: float,
+    text_guide_scale: float,
+    audio_guide_scale: float,
+    seed: int,
+    # Advanced & Performance
+    audio_type: str,
+    num_persistent: float,
+    use_teacache: bool,
+    teacache_thresh: float,
+    use_apg: bool,
+    apg_momentum: float,
+    apg_norm_thresh: float,
+    use_full_video_preview: bool,
+    # InfiniteTalk-specific params
+    scene_seg: bool,
+    dit_path: Optional[str],
+    infinitetalk_dir: Optional[str],
+    # Paths
+    ckpt_dir: str,
+    wav2vec_dir: str,
+    t5_tokenizer_path: str,
+    save_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    if not cond_video or not os.path.exists(cond_video):
+        yield [], None, "Error: Reference Video not provided or not found.", ""
+        return
+    
+    if not audio_person1:
+        yield [], None, "Error: At least one audio file is required.", ""
+        return
+        
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+    
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"infinitetalk_{run_id}"
+        save_file_prefix = os.path.join(save_path, f"infinitetalk_{run_id}_s{current_seed}")
+        num_persistent_backend = int(num_persistent * 1_000_000_000)
+
+        command = [
+            sys.executable,
+            "H1111/generate_infinitetalk_video.py",
+            "--ckpt_dir", str(ckpt_dir),
+            "--wav2vec_dir", str(wav2vec_dir),
+            "--t5_tokenizer_path", str(t5_tokenizer_path),
+            "--prompt", str(prompt),
+            "--n_prompt", str(negative_prompt),
+            "--cond_video", str(cond_video),  # Changed from cond_image
+            "--cond_audio_person1", str(audio_person1),
+            "--base_seed", str(current_seed),
+            "--save_file", save_file_prefix,
+            "--size", str(size),
+            "--mode", str(mode),
+            "--frame_num", str(frame_num),
+            "--motion_frame", str(motion_frame),
+            "--sample_steps", str(sample_steps),
+            "--sample_shift", str(sample_shift),
+            "--sample_text_guide_scale", str(text_guide_scale),
+            "--sample_audio_guide_scale", str(audio_guide_scale),
+            "--audio_type", str(audio_type),
+            "--num_persistent_param_in_dit", str(num_persistent_backend),
+        ]
+        
+        if audio_person2 and os.path.exists(audio_person2):
+            command.extend(["--cond_audio_person2", str(audio_person2)])
+
+        # Add InfiniteTalk-specific parameters
+        if scene_seg:
+            command.append("--scene_seg")
+            
+        if dit_path and os.path.exists(dit_path):
+            command.extend(["--dit_path", str(dit_path)])
+            
+        if infinitetalk_dir and os.path.exists(infinitetalk_dir):
+            command.extend(["--infinitetalk_dir", str(infinitetalk_dir)])
+
+        if use_teacache:
+            command.append("--use_teacache")
+            command.extend(["--teacache_thresh", str(teacache_thresh)])
+
+        if use_apg:
+            command.append("--use_apg")
+            command.extend(["--apg_momentum", str(apg_momentum)])
+            command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
+
+        if use_full_video_preview:
+            command.append("--full_preview")
+            command.extend(["--preview_suffix", unique_preview_suffix])
+            
+        # LoRA Handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult), (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+            
+        # --- Execute Subprocess ---
+        print(f"Running InfiniteTalk Command: {' '.join(command)}")
+        
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_path = None
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(os.path.dirname(save_file_prefix), "previews")
+        preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, None, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"INFINITETALK_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+            clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
+            scene_progress_match = re.search(r"Processing scene (\d+/\d+)", line_strip)
+            saving_video_match = re.search(r'Saving video:.*', line_strip)
+            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
+            
+            if final_save_match:
+                found_path = final_save_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif saving_video_match:
+                progress_text_update = "Saving final video..."
+            elif scene_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Scene {scene_progress_match.group(1)}"
+            elif clip_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
+                tqdm_match_on_clip_line = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+                if tqdm_match_on_clip_line:
+                    percentage = tqdm_match_on_clip_line.group(1)
+                    steps_iter = tqdm_match_on_clip_line.group(2)
+                    time_details = tqdm_match_on_clip_line.group(3)
+                    progress_text_update = f"Clip: {percentage}% | {steps_iter} | {time_details}"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_details = tqdm_match.group(3)
+                progress_text_update = f"{percentage}% | {steps_iter} | {time_details}"
+
+            # Check for preview updates
+            if use_full_video_preview and os.path.exists(preview_mp4_gen_path):
+                if os.path.getmtime(preview_mp4_gen_path) > last_preview_mtime:
+                    current_preview_yield_path = preview_mp4_gen_path
+                    last_preview_mtime = os.path.getmtime(preview_mp4_gen_path)
+
+            yield all_generated_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+
+        process.wait()
+
+        if current_video_file_for_item:
+            # --- START METADATA SAVING ---
+            params_for_meta = {
+                "model_type": "InfiniteTalk",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "cond_video": cond_video,
+                "audio_person1": audio_person1,
+                "audio_person2": audio_person2,
+                "size": size,
+                "mode": mode,
+                "frame_num": frame_num,
+                "motion_frame": motion_frame,
+                "sample_steps": sample_steps,
+                "sample_shift": sample_shift,
+                "text_guide_scale": text_guide_scale,
+                "audio_guide_scale": audio_guide_scale,
+                "seed": current_seed,
+                "audio_type": audio_type,
+                "scene_seg": scene_seg,
+                "dit_path": dit_path,
+                "infinitetalk_dir": infinitetalk_dir,
+                "use_teacache": use_teacache,
+                "teacache_thresh": teacache_thresh,
+                "use_apg": use_apg,
+                "apg_momentum": apg_momentum,
+                "apg_norm_thresh": apg_norm_thresh,
+            }
+            
+            if lora_weights_paths:
+                params_for_meta["lora_weights"] = lora_weights_paths
+                params_for_meta["lora_multipliers"] = lora_multipliers_values
+            
+            metadata_filename = current_video_file_for_item.replace('.mp4', '_params.json')
+            try:
+                with open(metadata_filename, 'w') as meta_file:
+                    json.dump(params_for_meta, meta_file, indent=2)
+            except Exception as e:
+                print(f"Error saving metadata: {e}")
+            # --- END METADATA SAVING ---
+            
+            all_generated_videos.append((current_video_file_for_item, f"InfiniteTalk - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+            
+            # Yield current generated videos and clear preview
+            yield all_generated_videos.copy(), None, status_text, progress_text_update
+        else:
+            status_text = f"Item {i+1}/{batch_size} - No output detected"
+            progress_text_update = "Check console for errors"
+            yield all_generated_videos.copy(), None, status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+        
+    yield all_generated_videos, None, "InfiniteTalk Batch complete.", ""
+
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
     settings_to_save = {}
@@ -6870,6 +7142,125 @@ with gr.Blocks(
                 multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
                 multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
 
+### InfiniteTalk Tab
+        with gr.Tab(id=11, label="InfiniteTalk") as infinitetalk_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    infinitetalk_prompt = gr.Textbox(
+                        label="Prompt",
+                        value="A conversation between two people in a studio.",
+                        lines=5,
+                    )
+                    infinitetalk_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        lines=3,
+                        value="bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."
+                    )                    
+                with gr.Column(scale=1):
+                    infinitetalk_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    infinitetalk_status = gr.Textbox(label="Status", interactive=False, value="")
+                    infinitetalk_progress = gr.Textbox(label="Progress", interactive=False, value="", elem_id="infinitetalk_progress_text")
+
+            with gr.Row():
+                infinitetalk_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                infinitetalk_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                # Left Column for inputs and core settings
+                with gr.Column():
+                    infinitetalk_cond_video = gr.Video(
+                        label="Reference Video",
+                        sources=["upload"],
+                        format="mp4",
+                        height=300
+                    )
+                    with gr.Row():
+                        infinitetalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
+                        infinitetalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
+                    
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        infinitetalk_size = gr.Dropdown(label="Resolution", choices=["infinitetalk-480", "infinitetalk-720"], value="infinitetalk-480")
+                    with gr.Row():
+                        infinitetalk_mode = gr.Dropdown(label="Mode", choices=["clip", "streaming"], value="streaming", info="'streaming' for long video, 'clip' for a single chunk.")
+                        infinitetalk_frame_num = gr.Slider(label="Frames per Chunk", minimum=41, maximum=201, value=81, step=4, info="Must be 4n+1. Default is 81.")
+                        infinitetalk_motion_frame = gr.Slider(label="Motion Frame (for streaming)", minimum=1, maximum=40, value=9, step=1, info="Frames from previous chunk to condition the next. Default: 9 for InfiniteTalk.")
+                    
+                    with gr.Row():
+                        infinitetalk_sample_steps = gr.Slider(label="Sampling Steps", minimum=1, maximum=100, value=40, step=1)
+                        infinitetalk_sample_shift = gr.Slider(label="Sample Shift", minimum=1.0, maximum=20.0, value=7.0, step=0.1)
+                    
+                    with gr.Row():
+                        infinitetalk_text_guide_scale = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=10.0, value=5.0, step=0.1)
+                        infinitetalk_audio_guide_scale = gr.Slider(label="Audio Guidance Scale", minimum=1.0, maximum=10.0, value=4.0, step=0.1)
+
+                    with gr.Row():
+                        infinitetalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        infinitetalk_random_seed_btn = gr.Button("🎲️")
+                    
+                    with gr.Accordion("Advanced & Performance", open=True):
+                        infinitetalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        infinitetalk_scene_seg = gr.Checkbox(label="Enable Scene Segmentation", value=False, info="Detect and process scenes separately (requires scenedetect)")
+                        infinitetalk_num_persistent = gr.Slider(
+                            minimum=0, 
+                            maximum=26, 
+                            step=0.01, 
+                            value=5.0, 
+                            label="Low VRAM (Persistent Params in Billions)", 
+                            info="Slider value in billions. 0=very low VRAM (slower), 5=default(24gb vram)."
+                        )
+                        with gr.Row():
+                            infinitetalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
+                            infinitetalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
+                        with gr.Row():
+                            infinitetalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
+                            infinitetalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
+                            infinitetalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
+
+                # Right column for outputs and advanced settings
+                with gr.Column():
+                    infinitetalk_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[1], rows=[1], object_fit="contain", height=480,
+                        allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Live Preview (During Generation)", open=True):
+                        infinitetalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews Every Section", value=True)
+                        infinitetalk_preview_output = gr.Video(
+                            label="Latest Preview", height=300,
+                            interactive=False, elem_id="infinitetalk_preview_video"
+                        )
+                    
+                    with gr.Accordion("LoRA", open=True):                        
+                        with gr.Row():
+                            infinitetalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            infinitetalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        
+                        infinitetalk_lora_weights_ui = []
+                        infinitetalk_lora_multipliers_ui = []
+                        for i in range(4):
+                            with gr.Row():
+                                infinitetalk_lora_weights_ui.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                infinitetalk_lora_multipliers_ui.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### InfiniteTalk-Specific Paths")
+                    infinitetalk_dit_path = gr.Textbox(label="DiT Model Path (optional)", value="", placeholder="Path to DiT model checkpoint")
+                    infinitetalk_infinitetalk_dir = gr.Textbox(label="InfiniteTalk Checkpoint Directory (optional)", value="", placeholder="Path to InfiniteTalk checkpoint")
+            
+            with gr.Row():
+                infinitetalk_ckpt_dir = gr.Textbox(label="Base Model Directory", value="wan")
+                infinitetalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
+                infinitetalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
+                infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")
+
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
@@ -8763,6 +9154,66 @@ with gr.Blocks(
         fn=refresh_lora_dropdowns_simple,
         inputs=[multitalk_lora_folder],
         outputs=multitalk_lora_refresh_outputs_list
+    )
+    
+    # InfiniteTalk connections
+    infinitetalk_generate_btn.click(
+        fn=infinitetalk_batch_handler,
+        inputs=[
+            infinitetalk_prompt,
+            infinitetalk_negative_prompt,
+            infinitetalk_cond_video,  # Direct video path instead of annotations
+            infinitetalk_audio_person1,
+            infinitetalk_audio_person2,
+            infinitetalk_batch_size,
+            infinitetalk_size,
+            infinitetalk_mode,
+            infinitetalk_frame_num,
+            infinitetalk_motion_frame,
+            infinitetalk_sample_steps,
+            infinitetalk_sample_shift,
+            infinitetalk_text_guide_scale,
+            infinitetalk_audio_guide_scale,
+            infinitetalk_seed,
+            infinitetalk_audio_type,
+            infinitetalk_num_persistent,
+            infinitetalk_use_teacache,
+            infinitetalk_teacache_thresh,
+            infinitetalk_use_apg,
+            infinitetalk_apg_momentum,
+            infinitetalk_apg_norm_thresh,
+            infinitetalk_use_full_video_preview,
+            infinitetalk_scene_seg,
+            infinitetalk_dit_path,
+            infinitetalk_infinitetalk_dir,
+            infinitetalk_ckpt_dir,
+            infinitetalk_wav2vec_dir,
+            infinitetalk_t5_tokenizer_path,
+            infinitetalk_save_path,
+            infinitetalk_lora_folder,
+            *infinitetalk_lora_weights_ui,
+            *infinitetalk_lora_multipliers_ui
+        ],
+        outputs=[infinitetalk_output, infinitetalk_preview_output, infinitetalk_status, infinitetalk_progress],
+        queue=True
+    )
+    
+    infinitetalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    
+    infinitetalk_random_seed_btn.click(
+        fn=set_random_seed,
+        inputs=None,
+        outputs=[infinitetalk_seed]
+    )
+    
+    infinitetalk_lora_refresh_outputs_list = []
+    for i in range(len(infinitetalk_lora_weights_ui)):
+        infinitetalk_lora_refresh_outputs_list.extend([infinitetalk_lora_weights_ui[i], infinitetalk_lora_multipliers_ui[i]])
+    
+    infinitetalk_lora_refresh_btn.click(
+        fn=refresh_lora_dropdowns_simple,
+        inputs=[infinitetalk_lora_folder],
+        outputs=infinitetalk_lora_refresh_outputs_list
     )
 # Toggle visibility of End Frame controls and DiT path based on fpe_use_normal_framepack
     def toggle_fpe_normal_framepack_options(use_normal_fp):
