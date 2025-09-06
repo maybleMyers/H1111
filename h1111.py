@@ -1027,7 +1027,7 @@ def multitalk_batch_handler(
 def infinitetalk_batch_handler(
     prompt: str,
     negative_prompt: str,
-    cond_video: str,  # Changed from cond_image_data to video path
+    cond_image: str,  # Changed from cond_video to image path
     audio_person1: Optional[str],
     audio_person2: Optional[str],
     batch_size: int,
@@ -1068,8 +1068,8 @@ def infinitetalk_batch_handler(
     stop_event.clear()
 
     # --- Initial Checks ---
-    if not cond_video or not os.path.exists(cond_video):
-        yield [], None, "Error: Reference Video not provided or not found.", ""
+    if not cond_image or not os.path.exists(cond_image):
+        yield [], None, "Error: Reference Image not provided or not found.", ""
         return
     
     if not audio_person1:
@@ -1109,7 +1109,7 @@ def infinitetalk_batch_handler(
             "--t5_tokenizer_path", str(t5_tokenizer_path),
             "--prompt", str(prompt),
             "--n_prompt", str(negative_prompt),
-            "--cond_video", str(cond_video),  # Changed from cond_image
+            "--cond_image", str(cond_image),  # Changed from cond_video
             "--cond_audio_person1", str(audio_person1),
             "--base_seed", str(current_seed),
             "--save_file", save_file_prefix,
@@ -1244,7 +1244,7 @@ def infinitetalk_batch_handler(
                 "model_type": "InfiniteTalk",
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "cond_video": cond_video,
+                "cond_image": cond_image,
                 "audio_person1": audio_person1,
                 "audio_person2": audio_person2,
                 "size": size,
@@ -7169,10 +7169,10 @@ with gr.Blocks(
             with gr.Row():
                 # Left Column for inputs and core settings
                 with gr.Column():
-                    infinitetalk_cond_video = gr.Video(
-                        label="Reference Video",
+                    infinitetalk_cond_image = gr.Image(
+                        label="Reference Image",
                         sources=["upload"],
-                        format="mp4",
+                        type="filepath",
                         height=300
                     )
                     with gr.Row():
@@ -9162,7 +9162,7 @@ with gr.Blocks(
         inputs=[
             infinitetalk_prompt,
             infinitetalk_negative_prompt,
-            infinitetalk_cond_video,  # Direct video path instead of annotations
+            infinitetalk_cond_image,  # Direct image path instead of video
             infinitetalk_audio_person1,
             infinitetalk_audio_person2,
             infinitetalk_batch_size,
