@@ -3118,8 +3118,18 @@ def run_extension_sampling(
                 t,
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
-            # Full replacement for first iteration
-            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            
+            # Apply injection with configurable strength
+            injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
+            if injection_strength < 1.0:
+                # Blend between current latent and noised motion
+                current_motion = latent[:, :motion_frames_latent_num]
+                blended_motion = (injection_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                (1.0 - injection_strength) * current_motion)
+                latent[:, :motion_frames_latent_num] = blended_motion
+            else:
+                # Full replacement
+                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         
         # Prepare input for the model
         latent_on_device = latent.to(device)
@@ -3200,8 +3210,18 @@ def run_extension_sampling(
                 next_t,
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
-            # Full replacement (matching multitalk)
-            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            
+            # Apply injection with configurable strength
+            injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
+            if injection_strength < 1.0:
+                # Blend between current latent and noised motion
+                current_motion = latent[:, :motion_frames_latent_num]
+                blended_motion = (injection_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                (1.0 - injection_strength) * current_motion)
+                latent[:, :motion_frames_latent_num] = blended_motion
+            else:
+                # Full replacement
+                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
     
     logger.info("Extension sampling loop finished.")
     return latent
