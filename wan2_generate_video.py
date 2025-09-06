@@ -2983,14 +2983,17 @@ def prepare_video_extension_inputs(
     text_encoder = load_text_encoder(args, config, device)
     text_encoder.model.to(device)
     
+    # Generate three contexts for proper CFG (multitalk-style)
     with torch.no_grad():
         if args.fp8_t5:
             with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
-                context = text_encoder([args.prompt], device)
-                context_null = text_encoder([n_prompt], device)
+                context = text_encoder([args.prompt], device)  # Full conditional
+                context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
+                context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
         else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
+            context = text_encoder([args.prompt], device)  # Full conditional
+            context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
+            context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
     
     # Free text encoder
     del text_encoder
@@ -3038,14 +3041,33 @@ def prepare_video_extension_inputs(
         "y": [y],
     }
     
-    arg_null = {
-        "context": context_null,
-        "clip_fea": use_clip_fea,
+    arg_text_dropped = {
+        "context": context_text_dropped,
+        "clip_fea": use_clip_fea,  # Keep CLIP for text-dropped
         "seq_len": seq_len,
         "y": [y],
     }
     
-    return noise, context, context_null, y, (arg_c, arg_null)
+    arg_null = {
+        "context": context_null,
+        "clip_fea": use_clip_fea,  # Keep CLIP for unconditional too
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    return noise, context, context_null, y, (arg_c, arg_text_dropped, arg_null)
+
+def timestep_transform(
+    t: torch.Tensor,
+    shift: float = 5.0,
+    num_timesteps: int = 1000,
+) -> torch.Tensor:
+    """Transform timesteps with shift parameter for better temporal dynamics"""
+    t = t / num_timesteps
+    # shift the timestep based on ratio
+    new_t = shift * t / (1 + (shift - 1) * t)
+    new_t = new_t * num_timesteps
+    return new_t
 
 def add_noise_for_extension(
     original_samples: torch.FloatTensor,
@@ -3067,7 +3089,7 @@ def run_extension_sampling(
     scheduler: Any,
     timesteps: torch.Tensor,
     args: argparse.Namespace,
-    inputs: Tuple[dict, dict],
+    inputs: Tuple[dict, dict, dict],
     device: torch.device,
     seed_g: torch.Generator,
     accelerator: Accelerator,
@@ -3077,7 +3099,7 @@ def run_extension_sampling(
 ) -> torch.Tensor:
     """Run sampling loop for video extension with motion frame injection"""
     
-    arg_c, arg_null = inputs
+    arg_c, arg_text_dropped, arg_null = inputs
     latent = noise
     
     # Calculate motion frame latent count
@@ -3086,22 +3108,8 @@ def run_extension_sampling(
     logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
     
     for i, t in enumerate(tqdm(timesteps)):
-        # Determine if we should inject motion frames at this timestep
-        should_inject = False
-        if motion_latent is not None and args.inject_motion_timesteps != "none":
-            if args.inject_motion_timesteps == "all":
-                should_inject = True
-            elif args.inject_motion_timesteps == "high_only":
-                # Inject only during high noise timesteps (t >= boundary)
-                boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900  # Default i2v boundary
-                should_inject = t.item() >= boundary
-            elif args.inject_motion_timesteps == "low_only":
-                # Inject only during low noise timesteps (t < boundary)
-                boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900  # Default i2v boundary
-                should_inject = t.item() < boundary
-        
-        # Inject motion frames BEFORE model forward (from multitalk logic)
-        if should_inject:
+        # Always inject motion frames (from multitalk logic - they inject at every timestep)
+        if motion_latent is not None and i == 0:  # Only for first iteration, special handling
             motion_add_noise = torch.randn_like(motion_latent).to(device)
             # Use add_noise method to properly noise the motion frames at current timestep
             noised_motion = add_noise_for_extension(
@@ -3110,17 +3118,8 @@ def run_extension_sampling(
                 t,
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
-            
-            # Apply injection with configurable strength
-            if args.injection_strength < 1.0:
-                # Blend between current latent and noised motion
-                current_motion = latent[:, :motion_frames_latent_num]
-                blended_motion = (args.injection_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                (1.0 - args.injection_strength) * current_motion)
-                latent[:, :motion_frames_latent_num] = blended_motion
-            else:
-                # Full replacement (original behavior)
-                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            # Full replacement for first iteration
+            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         
         # Prepare input for the model
         latent_on_device = latent.to(device)
@@ -3155,62 +3154,54 @@ def run_extension_sampling(
             
             # Filter out non-model parameters
             model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            model_arg_text_dropped = {k: v for k, v in arg_text_dropped.items() if not k.startswith('_')}
             model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
             
-            # Predict conditional and unconditional noise
+            # Three-way CFG (multitalk-style)
+            # 1. Full conditional (text + CLIP)
             noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            # 2. Text-dropped (CLIP only)
+            noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+            # 3. Unconditional (negative prompt)
             noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # Apply three-way CFG formula (simplified from multitalk, no audio)
+            # Formula: uncond + text_scale * (cond - text_dropped)
+            # Since we don't have audio, we simplify the formula
+            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_text_dropped)
+            
+            # CRITICAL: Negate the noise prediction (from multitalk)
+            noise_pred = -noise_pred
             
             # Ensure noise_pred and latent_on_device have matching batch dimensions
             if len(noise_pred.shape) < len(latent_on_device.shape):
                 noise_pred = noise_pred.unsqueeze(0)
             
-            # Scheduler step
-            scheduler_output = scheduler.step(
-                noise_pred.to(device),
-                t,
-                latent_on_device,
-                return_dict=False,
-                generator=seed_g
-            )
-            latent = scheduler_output[0]
+            # Manual latent update (from multitalk) instead of scheduler.step
+            if i < len(timesteps) - 1:
+                # Calculate dt based on timestep difference
+                dt = (timesteps[i] - timesteps[i + 1]) / 1000.0  # Assuming num_timesteps = 1000
+                dt = dt.view(dt.shape + (1,) * (len(noise_pred.shape) - 1))  # Reshape for broadcasting
+                latent = latent_on_device + noise_pred * dt
+            else:
+                # Last step - just add the final noise prediction
+                dt = timesteps[i] / 1000.0
+                dt = dt.view(dt.shape + (1,) * (len(noise_pred.shape) - 1))
+                latent = latent_on_device + noise_pred * dt
         
-        # Re-inject motion frames AFTER scheduler step (for next iteration)
+        # Re-inject motion frames AFTER latent update (for next iteration)
+        # This matches multitalk's approach - always inject motion frames
         if motion_latent is not None and i < len(timesteps) - 1:
             next_t = timesteps[i + 1]
-            
-            # Determine if we should inject motion frames at next timestep
-            should_inject_next = False
-            if args.inject_motion_timesteps != "none":
-                if args.inject_motion_timesteps == "all":
-                    should_inject_next = True
-                elif args.inject_motion_timesteps == "high_only":
-                    boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900
-                    should_inject_next = next_t.item() >= boundary
-                elif args.inject_motion_timesteps == "low_only":
-                    boundary = args.dual_dit_boundary * 1000 if args.dual_dit_boundary is not None else 900
-                    should_inject_next = next_t.item() < boundary
-            
-            if should_inject_next:
-                motion_add_noise = torch.randn_like(motion_latent).to(device)
-                noised_motion = add_noise_for_extension(
-                    motion_latent,
-                    motion_add_noise,
-                    next_t,
-                    scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
-                )
-                
-                # Apply injection with configurable strength
-                if args.injection_strength < 1.0:
-                    # Blend between current latent and noised motion
-                    current_motion = latent[:, :motion_frames_latent_num]
-                    blended_motion = (args.injection_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                    (1.0 - args.injection_strength) * current_motion)
-                    latent[:, :motion_frames_latent_num] = blended_motion
-                else:
-                    # Full replacement (original behavior)
-                    latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+            motion_add_noise = torch.randn_like(motion_latent).to(device)
+            noised_motion = add_noise_for_extension(
+                motion_latent,
+                motion_add_noise,
+                next_t,
+                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+            )
+            # Full replacement (matching multitalk)
+            latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
     
     logger.info("Extension sampling loop finished.")
     return latent
@@ -3354,6 +3345,15 @@ def generate_extended_video(
         # Run sampling with motion frame injection
         scheduler.set_timesteps(args.infer_steps, device=device)
         timesteps = scheduler.timesteps
+        
+        # Apply timestep transformation for better temporal dynamics
+        # Use flow_shift parameter (default 5.0, or 3.0 for 480p as per multitalk)
+        shift = args.flow_shift if args.flow_shift else (3.0 if "480" in str(args.video_size) else 5.0)
+        transformed_timesteps = []
+        for t in timesteps:
+            transformed_t = timestep_transform(t, shift=shift, num_timesteps=1000)
+            transformed_timesteps.append(transformed_t)
+        timesteps = torch.stack(transformed_timesteps) if transformed_timesteps else timesteps
         
         final_latent = run_extension_sampling(
             model, noise, scheduler, timesteps, args, inputs,
