@@ -1183,6 +1183,8 @@ def infinitetalk_batch_handler(
         last_preview_mtime = 0
         preview_base_dir = os.path.join(os.path.dirname(save_file_prefix), "previews")
         preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+        # Also try the absolute path in case the working directory is different
+        preview_mp4_gen_path_abs = os.path.abspath(preview_mp4_gen_path)
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
@@ -1206,8 +1208,18 @@ def infinitetalk_batch_handler(
             
             if final_save_match:
                 found_path = final_save_match.group(1).strip()
+                print(f"DEBUG: Final save detected, found_path: {found_path}")
+                # Try both relative and absolute paths
                 if os.path.exists(found_path):
                     current_video_file_for_item = found_path
+                    print(f"DEBUG: Found video file at: {found_path}")
+                elif os.path.exists(os.path.abspath(found_path)):
+                    current_video_file_for_item = os.path.abspath(found_path)
+                    print(f"DEBUG: Found video file at absolute path: {os.path.abspath(found_path)}")
+                else:
+                    # Sometimes the path might be relative to the script location
+                    current_video_file_for_item = found_path  # Store the path anyway for later verification
+                    print(f"DEBUG: Video file not immediately found, storing path for later verification: {found_path}")
                 progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
             elif saving_video_match:
@@ -1229,14 +1241,69 @@ def infinitetalk_batch_handler(
                 progress_text_update = f"{percentage}% | {steps_iter} | {time_details}"
 
             # Check for preview updates
-            if use_full_video_preview and os.path.exists(preview_mp4_gen_path):
-                if os.path.getmtime(preview_mp4_gen_path) > last_preview_mtime:
-                    current_preview_yield_path = preview_mp4_gen_path
-                    last_preview_mtime = os.path.getmtime(preview_mp4_gen_path)
+            if use_full_video_preview:
+                # Try both relative and absolute paths for preview
+                preview_found = False
+                if os.path.exists(preview_mp4_gen_path):
+                    if os.path.getmtime(preview_mp4_gen_path) > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path
+                        last_preview_mtime = os.path.getmtime(preview_mp4_gen_path)
+                        preview_found = True
+                        print(f"DEBUG: Preview found at: {preview_mp4_gen_path}")
+                elif os.path.exists(preview_mp4_gen_path_abs):
+                    if os.path.getmtime(preview_mp4_gen_path_abs) > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path_abs
+                        last_preview_mtime = os.path.getmtime(preview_mp4_gen_path_abs)
+                        preview_found = True
+                        print(f"DEBUG: Preview found at absolute path: {preview_mp4_gen_path_abs}")
+                        
+                # Also check if there's any preview message in the logs
+                if "Saved full preview to" in line_strip:
+                    preview_path_match = re.search(r'Saved full preview to (.+\.mp4)', line_strip)
+                    if preview_path_match:
+                        detected_preview_path = preview_path_match.group(1).strip()
+                        print(f"DEBUG: Preview save detected in logs: {detected_preview_path}")
+                        if os.path.exists(detected_preview_path):
+                            current_preview_yield_path = detected_preview_path
+                            last_preview_mtime = os.path.getmtime(detected_preview_path)
+                            print(f"DEBUG: Using preview from log detection: {detected_preview_path}")
+                        elif os.path.exists(os.path.abspath(detected_preview_path)):
+                            abs_preview_path = os.path.abspath(detected_preview_path)
+                            current_preview_yield_path = abs_preview_path
+                            last_preview_mtime = os.path.getmtime(abs_preview_path)
+                            print(f"DEBUG: Using preview from log detection (absolute): {abs_preview_path}")
 
             yield all_generated_videos.copy(), current_preview_yield_path, status_text, progress_text_update
 
         process.wait()
+
+        # Final verification of output file if not detected during streaming
+        if not current_video_file_for_item:
+            print(f"DEBUG: No video file detected during streaming, attempting final verification...")
+            # Try to find the expected output file based on save_file_prefix
+            expected_output = f"{save_file_prefix}.mp4"
+            print(f"DEBUG: Looking for expected output: {expected_output}")
+            if os.path.exists(expected_output):
+                current_video_file_for_item = expected_output
+                print(f"DEBUG: Found expected output at: {expected_output}")
+            elif os.path.exists(os.path.abspath(expected_output)):
+                current_video_file_for_item = os.path.abspath(expected_output)
+                print(f"DEBUG: Found expected output at absolute path: {os.path.abspath(expected_output)}")
+            else:
+                # Last resort: look for any .mp4 files in the output directory with matching timestamp
+                output_dir = os.path.dirname(save_file_prefix)
+                print(f"DEBUG: Searching output directory: {output_dir}")
+                if os.path.exists(output_dir):
+                    for f in os.listdir(output_dir):
+                        if f.endswith('.mp4') and run_id in f:
+                            potential_path = os.path.join(output_dir, f)
+                            print(f"DEBUG: Found potential match: {potential_path}")
+                            if os.path.exists(potential_path):
+                                current_video_file_for_item = potential_path
+                                print(f"DEBUG: Using fallback file: {potential_path}")
+                                break
+                else:
+                    print(f"DEBUG: Output directory does not exist: {output_dir}")
 
         if current_video_file_for_item:
             # --- START METADATA SAVING ---
