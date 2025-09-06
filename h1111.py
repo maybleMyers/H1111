@@ -1103,7 +1103,7 @@ def infinitetalk_batch_handler(
 
         command = [
             sys.executable,
-            "generate_infinitetalk_video.py",
+            "generate_infinitalk_video.py",
             "--ckpt_dir", str(ckpt_dir),
             "--wav2vec_dir", str(wav2vec_dir),
             "--t5_tokenizer_path", str(t5_tokenizer_path),
