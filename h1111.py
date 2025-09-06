@@ -7143,7 +7143,7 @@ with gr.Blocks(
                 multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
 
 ### InfiniteTalk Tab
-        with gr.Tab(id=11, label="InfiniteTalk") as infinitetalk_tab:
+        with gr.Tab(id=14, label="InfiniteTalk") as infinitetalk_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     infinitetalk_prompt = gr.Textbox(
