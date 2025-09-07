@@ -468,7 +468,7 @@ def wan22_batch_handler(
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, motion_frames: int,  # Extension parameters
     force_high_noise: bool, force_low_noise: bool, extension_dual_dit_boundary: float,  # Extension model selection
-    inject_motion_timesteps: str, injection_strength: float  # Extension injection controls
+    inject_motion_timesteps: str, injection_strength: float, motion_noise_ratio: float  # Extension injection controls
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -547,6 +547,7 @@ def wan22_batch_handler(
                 # Injection controls
                 command.extend(["--inject_motion_timesteps", str(inject_motion_timesteps)])
                 command.extend(["--injection_strength", str(injection_strength)])
+                command.extend(["--motion_noise_ratio", str(motion_noise_ratio)])
                 
                 # Force i2v-A14B task for extension
                 if "i2v" not in task:
@@ -7839,6 +7840,14 @@ with gr.Blocks(
                                 value=1.0,
                                 info="Strength of motion frame injection (1.0=full replacement, 0.0=no injection)"
                             )
+                            wan22_motion_noise_ratio = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                step=0.05,
+                                label="Motion Noise Ratio",
+                                value=0.3,
+                                info="Noise level for motion frames (0.0=preserve fully, 1.0=full noise). Lower values = smoother transitions"
+                            )
                     
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
@@ -11538,6 +11547,7 @@ with gr.Blocks(
             # Extension injection controls
             wan22_inject_motion_timesteps,
             wan22_injection_strength,
+            wan22_motion_noise_ratio,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

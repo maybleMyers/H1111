@@ -411,6 +411,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inject_motion_timesteps", type=str, default="all", choices=["all", "high_only", "low_only", "none"], 
                        help="When to inject motion frames: 'all'=every timestep, 'high_only'=high noise timesteps only, 'low_only'=low noise timesteps only, 'none'=no injection")
     parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
+    parser.add_argument("--motion_noise_ratio", type=float, default=0.3, 
+                       help="Noise ratio for motion frames in extension (0.0-1.0, lower=less noise/more preservation)")
     parser.add_argument("--color_match", type=str, default="hm", 
                        choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
                        help="Color matching method for video extension (default: histogram matching)")
@@ -3111,17 +3113,58 @@ def run_extension_sampling(
     logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
     
     if motion_latent is not None:
-        # Only inject at the start of denoising, not every timestep
+        num_train_timesteps = scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+        
+        # Implement graduated noise injection for smoother video extension
+        # Motion frames get less noise to preserve continuity
+        # Transition zone gets gradually increasing noise
+        # New frames get full noise
+        
+        # Calculate zones
+        transition_frames = min(8, motion_frames_latent_num // 2)  # Transition zone size
+        
+        # Generate noise for motion frames with LESS noise (preserve more of original)
+        # Use configurable noise ratio (default 30% noise, 70% preservation)
+        motion_noise_ratio = args.motion_noise_ratio if hasattr(args, 'motion_noise_ratio') else 0.3
+        motion_noise_level = timesteps[0] * motion_noise_ratio
         motion_add_noise = torch.randn_like(motion_latent).to(device)
-        # Use first timestep for initial noise level
         noised_motion = add_noise_for_extension(
             motion_latent,
             motion_add_noise, 
-            timesteps[0],
-            scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+            motion_noise_level,  # Much less noise for motion frames
+            num_train_timesteps
         )
-        # Simple replacement at start, no progressive injection
+        
+        # Apply the lightly noised motion frames
         latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+        
+        # Create smooth transition zone with graduated noise levels
+        if transition_frames > 0 and latent.shape[1] > motion_frames_latent_num:
+            for i in range(transition_frames):
+                frame_idx = motion_frames_latent_num + i
+                if frame_idx < latent.shape[1]:
+                    # Gradually increase noise level from 30% to 100%
+                    alpha = i / transition_frames  # 0 to 1
+                    noise_level = motion_noise_level + (timesteps[0] - motion_noise_level) * alpha
+                    
+                    # Create graduated noise for this frame
+                    frame_noise = torch.randn_like(latent[:, frame_idx:frame_idx+1]).to(device)
+                    
+                    # Use the last motion frame as a base and add graduated noise
+                    base_frame = noised_motion[:, -1:].clone()
+                    
+                    # Mix base frame with noise based on transition position
+                    noised_frame = add_noise_for_extension(
+                        base_frame * (1 - alpha),  # Fade out motion influence
+                        frame_noise,
+                        noise_level,
+                        num_train_timesteps
+                    )
+                    latent[:, frame_idx:frame_idx+1] = noised_frame
+        
+        logger.info(f"Applied graduated noise: motion frames at {motion_noise_ratio*100:.0f}% noise, "
+                   f"transition zone of {transition_frames} frames, "
+                   f"new frames at 100% noise")
     
     for i, t in enumerate(tqdm(timesteps)):
         
