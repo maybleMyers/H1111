@@ -4366,12 +4366,19 @@ class InfiniteTalkPipeline:
             if infinitetalk_dir.endswith('.safetensors'):
                 logging.info(f"Loading InfiniteTalk weights from single safetensors file: {infinitetalk_dir}")
                 infinitetalk_weights = load_file(infinitetalk_dir)
-                self.model.load_state_dict(infinitetalk_weights, strict=False)
+                # Get current model state dict and merge with InfiniteTalk weights
+                current_state_dict = self.model.state_dict()
+                current_state_dict.update(infinitetalk_weights)
+                self.model.load_state_dict(current_state_dict, strict=True)
+                logging.info(f"Successfully merged {len(infinitetalk_weights)} InfiniteTalk weights")
             else:
                 # Assume it's a directory with safetensors file inside
                 logging.info(f"Loading InfiniteTalk weights from {infinitetalk_dir}")
                 infinitetalk_weights = load_file(infinitetalk_dir)
-                self.model.load_state_dict(infinitetalk_weights, strict=False)
+                current_state_dict = self.model.state_dict()
+                current_state_dict.update(infinitetalk_weights)
+                self.model.load_state_dict(current_state_dict, strict=True)
+                logging.info(f"Successfully merged {len(infinitetalk_weights)} InfiniteTalk weights")
         elif dit_path:
             logging.info(f"Loading DIT weights from {dit_path}")
             dit_weights = torch.load(dit_path, map_location='cpu')
@@ -4838,6 +4845,15 @@ class InfiniteTalkPipeline:
                 }
 
 
+                arg_null_audio = {
+                    'context': [context],
+                    'clip_fea': clip_context,
+                    'seq_len': max_seq_len,
+                    'y': y,
+                    'audio': torch.zeros_like(audio_embs)[-1:],
+                    'ref_target_masks': ref_target_masks
+                }
+                
                 arg_null = {
                     'context': [context_null],
                     'clip_fea': clip_context,
@@ -4877,30 +4893,46 @@ class InfiniteTalkPipeline:
                     noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                     torch_gc()
-                    noise_pred_drop_text = self.model(
-                        latent_model_input, t=timestep, **arg_null_text)[0]
-                    torch_gc()
-                    noise_pred_uncond = self.model(
-                        latent_model_input, t=timestep, **arg_null)[0]
-                    torch_gc()
+                    
+                    if math.isclose(text_guide_scale, 1.0):
+                        noise_pred_drop_audio = self.model(
+                            latent_model_input, t=timestep, **arg_null_audio)[0]
+                        torch_gc()
+                    else:
+                        noise_pred_drop_text = self.model(
+                            latent_model_input, t=timestep, **arg_null_text)[0]
+                        torch_gc()
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0]
+                        torch_gc()
 
                     if extra_args.use_apg:
                         # correct update direction
-                        diff_uncond_text  = noise_pred_cond - noise_pred_drop_text
-                        diff_uncond_audio = noise_pred_drop_text - noise_pred_uncond
-                        noise_pred = noise_pred_cond + (text_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_text,
-                                                                                                            noise_pred_cond,
-                                                                                                            momentum_buffer=text_momentumbuffer,
-                                                                                                            norm_threshold=extra_args.apg_norm_threshold) \
-                               + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio,
-                                                                                        noise_pred_cond,
-                                                                                        momentum_buffer=audio_momentumbuffer,
-                                                                                        norm_threshold=extra_args.apg_norm_threshold)
+                        if math.isclose(text_guide_scale, 1.0):
+                            diff_uncond_audio = noise_pred_cond - noise_pred_drop_audio
+                            noise_pred = noise_pred_cond + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio,
+                                                                                                                noise_pred_cond,
+                                                                                                                momentum_buffer=audio_momentumbuffer,
+                                                                                                                norm_threshold=extra_args.apg_norm_threshold)
+                        else:
+                            diff_uncond_text  = noise_pred_cond - noise_pred_drop_text
+                            diff_uncond_audio = noise_pred_drop_text - noise_pred_uncond
+                            noise_pred = noise_pred_cond + (text_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_text,
+                                                                                                                noise_pred_cond,
+                                                                                                                momentum_buffer=text_momentumbuffer,
+                                                                                                                norm_threshold=extra_args.apg_norm_threshold) \
+                                   + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio,
+                                                                                            noise_pred_cond,
+                                                                                            momentum_buffer=audio_momentumbuffer,
+                                                                                            norm_threshold=extra_args.apg_norm_threshold)
                     else:
                         # vanilla CFG strategy
-                        noise_pred = noise_pred_uncond + text_guide_scale * (
-                            noise_pred_cond - noise_pred_drop_text) + \
-                            audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
+                        if math.isclose(text_guide_scale, 1.0):
+                            noise_pred = noise_pred_drop_audio + audio_guide_scale * (noise_pred_cond - noise_pred_drop_audio)
+                        else:
+                            noise_pred = noise_pred_uncond + text_guide_scale * (
+                                noise_pred_cond - noise_pred_drop_text) + \
+                                audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
                     noise_pred = -noise_pred
 
                     # update latent
