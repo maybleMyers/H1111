@@ -3307,6 +3307,7 @@ def generate_extended_video_i2v_based(
     # Store original arguments
     original_image_path = args.image_path
     original_video_length = args.video_length
+    original_extend_video = args.extend_video
     
     # Generate extension chunks using i2v
     all_videos = [initial_video]
@@ -3333,6 +3334,7 @@ def generate_extended_video_i2v_based(
             # Modify args for i2v generation
             args.image_path = temp_image_path
             args.video_length = frames_to_generate
+            args.extend_video = None  # Prevent recursive extension calls
             
             # Generate new chunk using the main generation function
             new_chunk = generate(args)
@@ -3367,6 +3369,7 @@ def generate_extended_video_i2v_based(
         # Restore original arguments
         args.image_path = original_image_path
         args.video_length = original_video_length
+        args.extend_video = original_extend_video
 
 def generate_extended_video(
     args: argparse.Namespace,
