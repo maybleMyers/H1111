@@ -411,6 +411,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inject_motion_timesteps", type=str, default="all", choices=["all", "high_only", "low_only", "none"], 
                        help="When to inject motion frames: 'all'=every timestep, 'high_only'=high noise timesteps only, 'low_only'=low noise timesteps only, 'none'=no injection")
     parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
+    parser.add_argument("--color_match", type=str, default="hm", 
+                       choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
+                       help="Color matching method for video extension (default: histogram matching)")
 
     args = parser.parse_args()
 
