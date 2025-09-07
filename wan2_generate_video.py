@@ -3112,59 +3112,17 @@ def run_extension_sampling(
     
     logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
     
+    # Inject motion frames at the beginning (standard approach)
     if motion_latent is not None:
-        num_train_timesteps = scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
-        
-        # Implement graduated noise injection for smoother video extension
-        # Motion frames get less noise to preserve continuity
-        # Transition zone gets gradually increasing noise
-        # New frames get full noise
-        
-        # Calculate zones
-        transition_frames = min(8, motion_frames_latent_num // 2)  # Transition zone size
-        
-        # Generate noise for motion frames with LESS noise (preserve more of original)
-        # Use configurable noise ratio (default 30% noise, 70% preservation)
-        motion_noise_ratio = args.motion_noise_ratio if hasattr(args, 'motion_noise_ratio') else 0.3
-        motion_noise_level = timesteps[0] * motion_noise_ratio
         motion_add_noise = torch.randn_like(motion_latent).to(device)
         noised_motion = add_noise_for_extension(
             motion_latent,
             motion_add_noise, 
-            motion_noise_level,  # Much less noise for motion frames
-            num_train_timesteps
+            timesteps[0],
+            scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
         )
-        
-        # Apply the lightly noised motion frames
         latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
-        
-        # Create smooth transition zone with graduated noise levels
-        if transition_frames > 0 and latent.shape[1] > motion_frames_latent_num:
-            for i in range(transition_frames):
-                frame_idx = motion_frames_latent_num + i
-                if frame_idx < latent.shape[1]:
-                    # Gradually increase noise level from 30% to 100%
-                    alpha = i / transition_frames  # 0 to 1
-                    noise_level = motion_noise_level + (timesteps[0] - motion_noise_level) * alpha
-                    
-                    # Create graduated noise for this frame
-                    frame_noise = torch.randn_like(latent[:, frame_idx:frame_idx+1]).to(device)
-                    
-                    # Use the last motion frame as a base and add graduated noise
-                    base_frame = noised_motion[:, -1:].clone()
-                    
-                    # Mix base frame with noise based on transition position
-                    noised_frame = add_noise_for_extension(
-                        base_frame * (1 - alpha),  # Fade out motion influence
-                        frame_noise,
-                        noise_level,
-                        num_train_timesteps
-                    )
-                    latent[:, frame_idx:frame_idx+1] = noised_frame
-        
-        logger.info(f"Applied graduated noise: motion frames at {motion_noise_ratio*100:.0f}% noise, "
-                   f"transition zone of {transition_frames} frames, "
-                   f"new frames at 100% noise")
+        logger.info(f"Injected {motion_frames_latent_num} motion frames at timestep {timesteps[0]}")
     
     for i, t in enumerate(tqdm(timesteps)):
         
@@ -3238,6 +3196,176 @@ def run_extension_sampling(
             
     logger.info("Extension sampling loop finished.")
     return latent
+
+def variance_of_laplacian(image):
+    """Calculate image sharpness using Laplacian variance"""
+    import cv2
+    return cv2.Laplacian(image, cv2.CV_64F).var()
+
+def extract_best_transition_frame(video_path: str, frames_to_check: int = 30) -> int:
+    """Extract the sharpest frame from the last N frames for smooth transition"""
+    import cv2
+    from tqdm import tqdm
+    
+    logger.info(f"Extracting best transition frame from last {frames_to_check} frames of {video_path}")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("Failed to open video file")
+        return -1
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_frame = max(0, total_frames - frames_to_check)
+    
+    best_frame_idx = -1
+    max_sharpness = -1
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+    for frame_idx in range(start_frame, total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Calculate sharpness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+        
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+    
+    cap.release()
+    
+    logger.info(f"Best transition frame: {best_frame_idx} with sharpness {max_sharpness:.2f}")
+    return best_frame_idx
+
+def blend_video_transition(video1: torch.Tensor, video2: torch.Tensor, blend_frames: int = 8) -> torch.Tensor:
+    """Blend transition between two video segments"""
+    if blend_frames <= 0 or video2.shape[2] < blend_frames:
+        return torch.cat([video1, video2], dim=2)
+    
+    # Get overlapping regions
+    v1_end = video1[:, :, -blend_frames:]  # Last frames of video1
+    v2_start = video2[:, :, :blend_frames]  # First frames of video2
+    
+    # Create smooth blending weights (cosine interpolation)
+    weights = torch.linspace(0, np.pi, blend_frames).to(video1.device)
+    blend_weights = (1.0 - torch.cos(weights)) / 2.0  # 0 to 1
+    blend_weights = blend_weights.view(1, 1, blend_frames, 1, 1)
+    
+    # Blend the overlapping region
+    blended_transition = v1_end * (1 - blend_weights) + v2_start * blend_weights
+    
+    # Combine: video1[:-blend_frames] + blended_transition + video2[blend_frames:]
+    result = torch.cat([
+        video1[:, :, :-blend_frames],  # Video1 without the blended part
+        blended_transition,            # Smooth transition
+        video2[:, :, blend_frames:]    # Video2 without the blended part
+    ], dim=2)
+    
+    return result
+
+def generate_extended_video_i2v_based(
+    args: argparse.Namespace,
+    initial_video_path: str,
+    total_frames: int,
+) -> torch.Tensor:
+    """Generate extended video using clean i2v approach with smooth blending"""
+    import tempfile
+    import cv2
+    
+    device = torch.device(args.device)
+    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to {total_frames} frames")
+    
+    # Extract the best transition frame
+    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=30)
+    
+    # Load initial video up to the best frame
+    if best_frame_idx > 0:
+        video_frames_np, initial_frames = load_video(
+            initial_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
+        )
+    else:
+        # Use entire video as fallback
+        video_frames_np, initial_frames = load_video(
+            initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
+        )
+    
+    # Convert initial video to tensor [1, C, F, H, W]
+    initial_video = torch.from_numpy(np.stack(video_frames_np, axis=0))
+    initial_video = initial_video.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+    initial_video = initial_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+    
+    logger.info(f"Initial video loaded: {initial_video.shape[2]} frames")
+    
+    if initial_frames >= total_frames:
+        logger.info("Video already has desired length")
+        return initial_video[:, :, :total_frames]
+    
+    # Store original arguments
+    original_image_path = args.image_path
+    original_video_length = args.video_length
+    
+    # Generate extension chunks using i2v
+    all_videos = [initial_video]
+    current_frames = initial_frames
+    chunk_size = 81  # Standard i2v length
+    
+    # Get the best transition frame as starting image
+    best_frame_tensor = initial_video[0, :, -1]  # [C, H, W] - last frame
+    best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
+    best_frame_np = best_frame_np.astype(np.uint8)
+    
+    try:
+        while current_frames < total_frames:
+            remaining_frames = total_frames - current_frames
+            frames_to_generate = min(chunk_size, remaining_frames)
+            
+            logger.info(f"Generating chunk: {frames_to_generate} frames (progress: {current_frames}/{total_frames})")
+            
+            # Save the frame as temporary image
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                cv2.imwrite(tmp_file.name, cv2.cvtColor(best_frame_np, cv2.COLOR_RGB2BGR))
+                temp_image_path = tmp_file.name
+            
+            # Modify args for i2v generation
+            args.image_path = temp_image_path
+            args.video_length = frames_to_generate
+            
+            # Generate new chunk using the main generation function
+            new_chunk = generate(args)
+            
+            # Clean up temp file
+            os.unlink(temp_image_path)
+            
+            if new_chunk is not None:
+                all_videos.append(new_chunk)
+                current_frames += frames_to_generate
+                
+                # Use the last frame of the new chunk as the next starting frame
+                best_frame_tensor = new_chunk[0, :, -1]
+                best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
+                best_frame_np = best_frame_np.astype(np.uint8)
+            else:
+                logger.error("Failed to generate video chunk")
+                break
+        
+        # Blend all video segments smoothly
+        logger.info(f"Blending {len(all_videos)} video segments")
+        result = all_videos[0]
+        
+        for i in range(1, len(all_videos)):
+            result = blend_video_transition(result, all_videos[i], blend_frames=8)
+            logger.info(f"Blended segment {i+1}, current length: {result.shape[2]} frames")
+        
+        logger.info(f"Final extended video: {result.shape}")
+        return result
+        
+    finally:
+        # Restore original arguments
+        args.image_path = original_image_path
+        args.video_length = original_video_length
 
 def generate_extended_video(
     args: argparse.Namespace,
@@ -3624,10 +3752,22 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # Handle video extension mode
     if is_extension:
         logger.info(f"Extending video from {args.extend_video} to {args.extend_frames} frames")
-        extended_video = generate_extended_video(
-            args, args.extend_video, args.extend_frames, args.motion_frames
-        )
-        return extended_video  # Return the extended video directly
+        
+        # Use clean i2v-based extension approach (much better than multitalk-style)
+        # This approach extracts the best frame and generates smooth extensions
+        try:
+            extended_video = generate_extended_video_i2v_based(
+                args, args.extend_video, args.extend_frames
+            )
+            return extended_video  # Return the extended video directly
+        except Exception as e:
+            logger.error(f"i2v-based extension failed: {e}")
+            logger.info("Falling back to multitalk-style extension")
+            # Fallback to original method
+            extended_video = generate_extended_video(
+                args, args.extend_video, args.extend_frames, args.motion_frames
+            )
+            return extended_video
 
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
