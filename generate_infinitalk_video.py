@@ -4360,7 +4360,20 @@ class InfiniteTalkPipeline:
             logging.info(f"Creating WanModel from {checkpoint_dir}")
             self.model = WanModel.from_pretrained(checkpoint_dir)
         
-        # Load InfiniteTalk-specific weights if provided
+        # Load DIT weights first if provided
+        if dit_path:
+            logging.info(f"Loading DIT weights from {dit_path}")
+            if dit_path.endswith('.safetensors'):
+                dit_weights = load_file(dit_path)
+                self.model.load_state_dict(dit_weights, strict=False)
+            else:
+                dit_weights = torch.load(dit_path, map_location='cpu')
+                if 'state_dict' in dit_weights:
+                    self.model.load_state_dict(dit_weights['state_dict'], strict=False)
+                else:
+                    self.model.load_state_dict(dit_weights, strict=False)
+        
+        # Then load InfiniteTalk-specific weights on top if provided
         if infinitetalk_dir:
             # Check if it's a single safetensors file or directory
             if infinitetalk_dir.endswith('.safetensors'):
@@ -4379,13 +4392,6 @@ class InfiniteTalkPipeline:
                 current_state_dict.update(infinitetalk_weights)
                 self.model.load_state_dict(current_state_dict, strict=True)
                 logging.info(f"Successfully merged {len(infinitetalk_weights)} InfiniteTalk weights")
-        elif dit_path:
-            logging.info(f"Loading DIT weights from {dit_path}")
-            dit_weights = torch.load(dit_path, map_location='cpu')
-            if 'state_dict' in dit_weights:
-                self.model.load_state_dict(dit_weights['state_dict'], strict=False)
-            else:
-                self.model.load_state_dict(dit_weights, strict=False)
 
         if args and hasattr(args, 'lora_weight') and args.lora_weight:
             merge_lora_weights(self.model, args, self.device)
@@ -4753,7 +4759,13 @@ class InfiniteTalkPipeline:
                 y = self.vae.encode(padding_frames_pixels_values)
                 y = torch.stack(y).to(self.param_dtype) # B C T H W
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
-                latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
+                
+                if is_first_clip:
+                    latent_motion_frames = self.vae.encode(cond_image)[0]
+                else:
+                    # For subsequent clips, cond_image has been updated to the last frames from previous clip
+                    latent_motion_frames = self.vae.encode(cond_image)[0]
+                
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
                 torch_gc()
 
