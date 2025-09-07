@@ -11301,33 +11301,11 @@ with gr.Blocks(
     
     # Extension visibility toggle
     wan22_enable_extension.change(
-        fn=lambda enabled: [gr.update(visible=enabled), gr.update(visible=enabled), gr.update(visible=enabled)],
+        fn=lambda enabled: gr.update(visible=enabled),
         inputs=[wan22_enable_extension],
-        outputs=[wan22_extension_controls, wan22_extension_model_controls, wan22_extension_injection_controls]
+        outputs=[wan22_extension_controls]
     )
     
-    # Mutual exclusivity for extension model selection
-    def handle_force_high_noise_change(high_noise_checked):
-        if high_noise_checked:
-            return gr.update(value=False)  # Uncheck force_low_noise
-        return gr.update()
-    
-    def handle_force_low_noise_change(low_noise_checked):
-        if low_noise_checked:
-            return gr.update(value=False)  # Uncheck force_high_noise
-        return gr.update()
-    
-    wan22_force_high_noise.change(
-        fn=handle_force_high_noise_change,
-        inputs=[wan22_force_high_noise],
-        outputs=[wan22_force_low_noise]
-    )
-    
-    wan22_force_low_noise.change(
-        fn=handle_force_low_noise_change,
-        inputs=[wan22_force_low_noise],
-        outputs=[wan22_force_high_noise]
-    )
     
     # Image input handling for wan22
     wan22_input_image.change(
