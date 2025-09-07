@@ -3343,11 +3343,15 @@ def generate_extended_video_i2v_based(
             os.unlink(temp_image_path)
             
             if new_chunk is not None:
-                all_videos.append(new_chunk)
+                logger.info(f"Generated chunk shape: {new_chunk.shape}")
+                # Decode the latent chunk to pixel space for blending
+                decoded_chunk = decode_latent(new_chunk, args, WAN_CONFIGS[args.task])
+                logger.info(f"Decoded chunk shape: {decoded_chunk.shape}")
+                all_videos.append(decoded_chunk)
                 current_frames += frames_to_generate
                 
-                # Use the last frame of the new chunk as the next starting frame
-                best_frame_tensor = new_chunk[0, :, -1]
+                # Use the last frame of the decoded chunk as the next starting frame
+                best_frame_tensor = decoded_chunk[0, :, -1]
                 best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
                 best_frame_np = best_frame_np.astype(np.uint8)
             else:
