@@ -3119,13 +3119,17 @@ def run_extension_sampling(
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
             
-            # Apply injection with configurable strength
+            # Apply injection with progressive strength (stronger at early timesteps)
             injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
-            if injection_strength < 1.0:
+            # Progressive decay: stronger injection at early timesteps
+            timestep_factor = 1.0 - (i / len(timesteps))  # Decreases from 1.0 to 0.0
+            effective_strength = injection_strength * (0.5 + 0.5 * timestep_factor)  # Range from 0.5 to 1.0 of base strength
+            
+            if effective_strength < 1.0:
                 # Blend between current latent and noised motion
                 current_motion = latent[:, :motion_frames_latent_num]
-                blended_motion = (injection_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                (1.0 - injection_strength) * current_motion)
+                blended_motion = (effective_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                (1.0 - effective_strength) * current_motion)
                 latent[:, :motion_frames_latent_num] = blended_motion
             else:
                 # Full replacement
@@ -3211,13 +3215,17 @@ def run_extension_sampling(
                 scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
             )
             
-            # Apply injection with configurable strength
+            # Apply injection with progressive strength (stronger at early timesteps)
             injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
-            if injection_strength < 1.0:
+            # Progressive decay: stronger injection at early timesteps
+            timestep_factor = 1.0 - (i / len(timesteps))  # Decreases from 1.0 to 0.0
+            effective_strength = injection_strength * (0.5 + 0.5 * timestep_factor)  # Range from 0.5 to 1.0 of base strength
+            
+            if effective_strength < 1.0:
                 # Blend between current latent and noised motion
                 current_motion = latent[:, :motion_frames_latent_num]
-                blended_motion = (injection_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                (1.0 - injection_strength) * current_motion)
+                blended_motion = (effective_strength * noised_motion[:, :motion_frames_latent_num] + 
+                                (1.0 - effective_strength) * current_motion)
                 latent[:, :motion_frames_latent_num] = blended_motion
             else:
                 # Full replacement
@@ -3278,7 +3286,8 @@ def generate_extended_video(
     clip = load_clip_model(args, cfg, device)
     clip.model.to(device)
     first_frame = video_tensor[0, :, 0]  # [C, H, W]
-    first_frame_normalized = first_frame.sub_(0.5).div_(0.5)  # [-1, 1]
+    # Avoid in-place modification - use explicit operation
+    first_frame_normalized = (first_frame - 0.5) / 0.5  # [-1, 1]
     # Convert to correct dtype and device for CLIP
     first_frame_normalized = first_frame_normalized.to(device=device, dtype=torch.float16)
     
@@ -3331,6 +3340,11 @@ def generate_extended_video(
     # Initialize with initial video
     all_frames = video_tensor.squeeze(0).permute(1, 0, 2, 3)  # [F, C, H, W]
     all_frames = (all_frames * 2.0 - 1.0)  # Scale to [-1, 1], keep on CPU to save GPU memory
+    
+    # Compute color statistics of initial video for normalization
+    initial_mean = all_frames.mean(dim=(0, 2, 3), keepdim=True)  # [1, C, 1, 1]
+    initial_std = all_frames.std(dim=(0, 2, 3), keepdim=True)  # [1, C, 1, 1]
+    logger.info(f"Initial video statistics - Mean: {initial_mean.squeeze().tolist()}, Std: {initial_std.squeeze().tolist()}")
     
     # Generate chunks iteratively
     frames_per_chunk = args.video_length if args.video_length else 81
@@ -3387,8 +3401,43 @@ def generate_extended_video(
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
             decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
         
+        # Normalize decoded chunk to match initial video statistics
+        decoded_mean = decoded_chunk.mean(dim=(1, 2, 3), keepdim=True)  # [C, 1, 1, 1]
+        decoded_std = decoded_chunk.std(dim=(1, 2, 3), keepdim=True)  # [C, 1, 1, 1]
+        
+        # Apply color normalization to match initial video
+        decoded_chunk_normalized = (decoded_chunk - decoded_mean) / (decoded_std + 1e-6)
+        decoded_chunk_normalized = decoded_chunk_normalized * initial_std.unsqueeze(1).to(device) + initial_mean.unsqueeze(1).to(device)
+        
+        # Ensure values stay in valid range
+        decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
+        
+        # Apply chunk blending for smooth transition
+        if len(generated_chunks) > 0 and motion_frames > 0:
+            # Blend overlapping motion frames region
+            blend_frames = min(8, motion_frames // 2)  # Blend up to 8 frames
+            if blend_frames > 0:
+                # Get last frames from all_frames (previous chunk)
+                prev_motion_end = all_frames[-blend_frames:].permute(1, 0, 2, 3).to(device)  # [C, blend_frames, H, W]
+                # Get corresponding frames from new chunk
+                new_motion_start = decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames]  # [C, blend_frames, H, W]
+                
+                # Create blending weights (linear interpolation)
+                blend_weights = torch.linspace(1.0, 0.0, blend_frames).to(device)
+                blend_weights = blend_weights.view(1, blend_frames, 1, 1)  # [1, blend_frames, 1, 1]
+                
+                # Blend the overlapping region
+                blended_region = prev_motion_end * blend_weights + new_motion_start * (1.0 - blend_weights)
+                
+                # Replace the beginning of new frames with blended version
+                decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames] = blended_region
+        
+        # Log statistics for debugging
+        logger.info(f"Chunk {len(generated_chunks)+1} - Original mean: {decoded_mean.squeeze().cpu().tolist()}, std: {decoded_std.squeeze().cpu().tolist()}")
+        logger.info(f"Chunk {len(generated_chunks)+1} - After normalization mean: {decoded_chunk_normalized.mean(dim=(1,2,3)).cpu().tolist()}")
+        
         # Append new frames (skip the motion frames that were conditioning)
-        new_frames = decoded_chunk[:, motion_frames:]  # [C, remaining_frames, H, W]
+        new_frames = decoded_chunk_normalized[:, motion_frames:]  # [C, remaining_frames, H, W]
         generated_chunks.append(new_frames.cpu())  # Move to CPU to save GPU memory
         
         # Convert new_frames to [F, C, H, W] format to match all_frames and move to CPU
