@@ -3407,7 +3407,10 @@ def generate_extended_video(
         
         # Apply color normalization to match initial video
         decoded_chunk_normalized = (decoded_chunk - decoded_mean) / (decoded_std + 1e-6)
-        decoded_chunk_normalized = decoded_chunk_normalized * initial_std.unsqueeze(1).to(device) + initial_mean.unsqueeze(1).to(device)
+        # Reshape initial statistics to match decoded chunk dimensions [C, 1, 1, 1]
+        initial_std_reshaped = initial_std.view(-1, 1, 1, 1).to(device)  # [C, 1, 1, 1]
+        initial_mean_reshaped = initial_mean.view(-1, 1, 1, 1).to(device)  # [C, 1, 1, 1]
+        decoded_chunk_normalized = decoded_chunk_normalized * initial_std_reshaped + initial_mean_reshaped
         
         # Ensure values stay in valid range
         decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
