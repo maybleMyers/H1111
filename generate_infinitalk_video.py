@@ -4899,6 +4899,7 @@ class InfiniteTalkPipeline:
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
                 for i in range(len(timesteps)-1):
                     timestep = timesteps[i]
+                    latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
                     latent_model_input = [latent.to(self.device)]
 
                     # inference with CFG strategy
@@ -4960,6 +4961,7 @@ class InfiniteTalkPipeline:
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
 
+                    latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
                     x0 = [latent.to(self.device)]
                     pbar.update(1)
                     del latent_model_input, timestep
