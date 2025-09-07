@@ -270,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
-        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
+        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with trash). Default is False."
     )
     parser.add_argument(
         "--guidance_scale",
@@ -1662,7 +1662,7 @@ def prepare_t2v_inputs(
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
     else:
-        # ComfyUI compatible noise
+        # trash compatible noise
         seed_g = torch.manual_seed(seed)
 
     # load text encoder
@@ -3110,33 +3110,20 @@ def run_extension_sampling(
     
     logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
     
+    if motion_latent is not None:
+        # Only inject at the start of denoising, not every timestep
+        motion_add_noise = torch.randn_like(motion_latent).to(device)
+        # Use first timestep for initial noise level
+        noised_motion = add_noise_for_extension(
+            motion_latent,
+            motion_add_noise, 
+            timesteps[0],
+            scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+        )
+        # Simple replacement at start, no progressive injection
+        latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+    
     for i, t in enumerate(tqdm(timesteps)):
-        # Always inject motion frames (from multitalk logic - they inject at every timestep)
-        if motion_latent is not None and i == 0:  # Only for first iteration, special handling
-            motion_add_noise = torch.randn_like(motion_latent).to(device)
-            # Use add_noise method to properly noise the motion frames at current timestep
-            noised_motion = add_noise_for_extension(
-                motion_latent,
-                motion_add_noise, 
-                t,
-                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
-            )
-            
-            # Apply injection with progressive strength (stronger at early timesteps)
-            injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
-            # Progressive decay: stronger injection at early timesteps
-            timestep_factor = 1.0 - (i / len(timesteps))  # Decreases from 1.0 to 0.0
-            effective_strength = injection_strength * (0.5 + 0.5 * timestep_factor)  # Range from 0.5 to 1.0 of base strength
-            
-            if effective_strength < 1.0:
-                # Blend between current latent and noised motion
-                current_motion = latent[:, :motion_frames_latent_num]
-                blended_motion = (effective_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                (1.0 - effective_strength) * current_motion)
-                latent[:, :motion_frames_latent_num] = blended_motion
-            else:
-                # Full replacement
-                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         
         # Prepare input for the model
         latent_on_device = latent.to(device)
@@ -3205,35 +3192,7 @@ def run_extension_sampling(
                 dt = timesteps[i] / 1000.0
                 dt = dt.view(dt.shape + (1,) * (len(noise_pred.shape) - 1))
                 latent = latent_on_device + noise_pred * dt
-        
-        # Re-inject motion frames AFTER latent update (for next iteration)
-        # This matches multitalk's approach - always inject motion frames
-        if motion_latent is not None and i < len(timesteps) - 1:
-            next_t = timesteps[i + 1]
-            motion_add_noise = torch.randn_like(motion_latent).to(device)
-            noised_motion = add_noise_for_extension(
-                motion_latent,
-                motion_add_noise,
-                next_t,
-                scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
-            )
             
-            # Apply injection with progressive strength (stronger at early timesteps)
-            injection_strength = args.injection_strength if hasattr(args, 'injection_strength') else 1.0
-            # Progressive decay: stronger injection at early timesteps
-            timestep_factor = 1.0 - (i / len(timesteps))  # Decreases from 1.0 to 0.0
-            effective_strength = injection_strength * (0.5 + 0.5 * timestep_factor)  # Range from 0.5 to 1.0 of base strength
-            
-            if effective_strength < 1.0:
-                # Blend between current latent and noised motion
-                current_motion = latent[:, :motion_frames_latent_num]
-                blended_motion = (effective_strength * noised_motion[:, :motion_frames_latent_num] + 
-                                (1.0 - effective_strength) * current_motion)
-                latent[:, :motion_frames_latent_num] = blended_motion
-            else:
-                # Full replacement
-                latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
-    
     logger.info("Extension sampling loop finished.")
     return latent
 
@@ -3404,16 +3363,56 @@ def generate_extended_video(
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
             decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
         
-        # Normalize decoded chunk to match initial video statistics
-        decoded_mean = decoded_chunk.mean(dim=(1, 2, 3), keepdim=True)  # [C, 1, 1, 1]
-        decoded_std = decoded_chunk.std(dim=(1, 2, 3), keepdim=True)  # [C, 1, 1, 1]
-        
-        # Apply color normalization to match initial video
-        decoded_chunk_normalized = (decoded_chunk - decoded_mean) / (decoded_std + 1e-6)
-        # Reshape initial statistics to match decoded chunk dimensions [C, 1, 1, 1]
-        initial_std_reshaped = initial_std.view(-1, 1, 1, 1).to(device)  # [C, 1, 1, 1]
-        initial_mean_reshaped = initial_mean.view(-1, 1, 1, 1).to(device)  # [C, 1, 1, 1]
-        decoded_chunk_normalized = decoded_chunk_normalized * initial_std_reshaped + initial_mean_reshaped
+        if args.color_match != "disabled":
+            try:
+                from color_matcher import ColorMatcher
+                cm = ColorMatcher()
+                
+                # Convert decoded chunk to numpy format [F, H, W, C] for ColorMatcher
+                # decoded_chunk is [C, F, H, W] in range [-1, 1]
+                decoded_np = decoded_chunk.permute(1, 2, 3, 0).cpu().float().numpy()  # [F, H, W, C]
+                
+                # Get reference frame from initial video (first frame)
+                # Use the very first frame of the initial video as reference for ALL chunks
+                # This prevents drift accumulation
+                ref_frame = initial_chunk[:, 0].permute(1, 2, 0).cpu().float().numpy()  # [H, W, C]
+                
+                # Apply color matching frame by frame
+                matched_frames = []
+                for frame_idx in range(decoded_np.shape[0]):
+                    frame = decoded_np[frame_idx]  # [H, W, C]
+                    # ColorMatcher expects values in range [0, 1] or [0, 255]
+                    # Convert from [-1, 1] to [0, 1]
+                    frame_01 = (frame + 1.0) / 2.0
+                    ref_01 = (ref_frame + 1.0) / 2.0
+                    
+                    # Apply color matching
+                    matched_01 = cm.transfer(src=frame_01, ref=ref_01, method=args.color_match)
+                    
+                    # Convert back to [-1, 1]
+                    matched = matched_01 * 2.0 - 1.0
+                    matched_frames.append(torch.from_numpy(matched))
+                
+                # Stack and convert back to [C, F, H, W]
+                decoded_chunk_normalized = torch.stack(matched_frames).permute(3, 0, 1, 2).to(device)
+                
+                logger.info(f"Applied {args.color_match} color matching to chunk {len(generated_chunks)+1}")
+            
+            except ImportError:
+                logger.warning("color_matcher library not installed. Install with: pip install color-matcher")
+                logger.warning("Falling back to internal statistics matching")
+                
+                # Fallback to internal normalization
+                decoded_mean = decoded_chunk.mean(dim=(1, 2, 3), keepdim=True)
+                decoded_std = decoded_chunk.std(dim=(1, 2, 3), keepdim=True)
+                decoded_chunk_normalized = (decoded_chunk - decoded_mean) / (decoded_std + 1e-6)
+                initial_std_reshaped = initial_std.view(-1, 1, 1, 1).to(device)
+                initial_mean_reshaped = initial_mean.view(-1, 1, 1, 1).to(device)
+                decoded_chunk_normalized = decoded_chunk_normalized * initial_std_reshaped + initial_mean_reshaped
+                decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
+        else:
+            # No color matching - keep decoded chunk as is
+            decoded_chunk_normalized = decoded_chunk
         
         # Ensure values stay in valid range
         decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
@@ -3428,8 +3427,11 @@ def generate_extended_video(
                 # Get corresponding frames from new chunk
                 new_motion_start = decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames]  # [C, blend_frames, H, W]
                 
-                # Create blending weights (linear interpolation)
-                blend_weights = torch.linspace(1.0, 0.0, blend_frames).to(device)
+                # Create blending weights using cosine interpolation for smoother transition
+                # Cosine blending provides smoother transition than linear
+                t = torch.linspace(0, np.pi, blend_frames).to(device)
+                blend_weights = (1.0 - torch.cos(t)) / 2.0  # Smoothstep from 0 to 1
+                blend_weights = (1.0 - blend_weights)  # Reverse to go from 1 to 0 for prev frames
                 blend_weights = blend_weights.view(1, blend_frames, 1, 1)  # [1, blend_frames, 1, 1]
                 
                 # Blend the overlapping region
@@ -3439,8 +3441,7 @@ def generate_extended_video(
                 decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames] = blended_region
         
         # Log statistics for debugging
-        logger.info(f"Chunk {len(generated_chunks)+1} - Original mean: {decoded_mean.squeeze().cpu().tolist()}, std: {decoded_std.squeeze().cpu().tolist()}")
-        logger.info(f"Chunk {len(generated_chunks)+1} - After normalization mean: {decoded_chunk_normalized.mean(dim=(1,2,3)).cpu().tolist()}")
+        logger.info(f"Chunk {len(generated_chunks)+1} - After processing mean: {decoded_chunk_normalized.mean(dim=(1,2,3)).cpu().tolist()}")
         
         # Append new frames (skip the motion frames that were conditioning)
         new_frames = decoded_chunk_normalized[:, motion_frames:]  # [C, remaining_frames, H, W]
