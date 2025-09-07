@@ -402,6 +402,7 @@ def parse_args() -> argparse.Namespace:
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
     parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
+    parser.add_argument("--frames_to_check", type=int, default=30, help="Number of frames from the end to analyze for best transition point (clean i2v-based extension)")
     parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
     # Model selection for extension
     parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
@@ -3279,7 +3280,7 @@ def generate_extended_video_i2v_based(
     logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to {total_frames} frames")
     
     # Extract the best transition frame
-    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=30)
+    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=args.frames_to_check)
     
     # Load initial video up to the best frame
     if best_frame_idx > 0:
