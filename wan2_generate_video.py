@@ -3235,27 +3235,12 @@ def run_sampling(
 
             # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
             # latent_on_device should already have the batch dim handled by the logic above
-            
-            # Prepare scheduler step arguments
-            step_kwargs = {
-                "return_dict": False,
-                "generator": seed_g
-            }
-            
-            # Add Pusa-specific parameters if using Pusa scheduler
-            if args.sample_solver == "pusa" and hasattr(scheduler, '__class__') and scheduler.__class__.__name__ == 'FlowMatchSchedulerPusa':
-                # Check if we should apply noise for this step
-                current_step = len(timesteps) - i - 1  # Convert to step index
-                should_apply_noise = (args.pusa_noisy_steps == -1) or (current_step < args.pusa_noisy_steps)
-                
-                if should_apply_noise and args.pusa_noise_multipliers > 0:
-                    step_kwargs["noise_multipliers"] = args.pusa_noise_multipliers
-                    
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
                 t,
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
-                **step_kwargs
+                return_dict=False,
+                generator=seed_g
             )
             prev_latent = scheduler_output[0] # Get the new latent state [B, C, F, H, W]
 
