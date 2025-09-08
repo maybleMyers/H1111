@@ -2954,6 +2954,12 @@ def run_sampling(
                 context = cond_dict.get('context')
                 seq_len = cond_dict.get('seq_len')
                 
+                # Ensure seq_len is not None
+                if seq_len is None:
+                    logger.error(f"seq_len is None in calc_cond_batch - context window resizing may have failed")
+                    logger.error(f"cond_dict keys: {cond_dict.keys()}")
+                    raise ValueError("seq_len is None in calc_cond_batch - context window resizing failed")
+                
                 # Filter out context and seq_len from the dict to get other parameters
                 model_cond_dict = {k: v for k, v in cond_dict.items() 
                                  if k not in ['context', 'seq_len'] and not k.startswith('_')}
@@ -2977,6 +2983,10 @@ def run_sampling(
             # 1. Predict conditional noise estimate
             # Filter out non-model parameters before passing to model
             model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            
+            # Debug logging for seq_len
+            if 'seq_len' in model_arg_c:
+                logger.debug(f"Original seq_len before context windows: {model_arg_c['seq_len']}")
             
             if context_handler is not None:
                 # Use context windows for processing
@@ -3050,6 +3060,10 @@ def run_sampling(
                             # Extract required arguments
                             context = cond_dict.get('context')
                             seq_len = cond_dict.get('seq_len')
+                            # Ensure seq_len is not None
+                            if seq_len is None:
+                                logger.error(f"seq_len is None in calc_slg_batch")
+                                raise ValueError("seq_len is None in calc_slg_batch")
                             # Filter for other parameters
                             model_cond_dict = {k: v for k, v in cond_dict.items() 
                                              if k not in ['context', 'seq_len'] and not k.startswith('_')}
@@ -3090,6 +3104,10 @@ def run_sampling(
                             # Extract required arguments
                             context = cond_dict.get('context')
                             seq_len = cond_dict.get('seq_len')
+                            # Ensure seq_len is not None
+                            if seq_len is None:
+                                logger.error(f"seq_len is None in calc_slg_batch")
+                                raise ValueError("seq_len is None in calc_slg_batch")
                             # Filter for other parameters
                             model_cond_dict = {k: v for k, v in cond_dict.items() 
                                              if k not in ['context', 'seq_len'] and not k.startswith('_')}

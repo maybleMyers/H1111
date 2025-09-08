@@ -12,6 +12,7 @@ import collections
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import logging
+import math
 
 if TYPE_CHECKING:
     from wan.modules.model import WanModel
@@ -152,15 +153,26 @@ class IndexListContextHandler(ContextHandlerABC):
                         # For WAN models, seq_len is calculated as:
                         # seq_len = math.ceil((lat_h * lat_w) / (patch_h * patch_w) * lat_f)
                         # We need to adjust lat_f based on the window size
-                        if isinstance(cond_item, (int, float)):
-                            # Get original full length and window length
+                        if cond_item is not None:
+                            # Get window size from the actual indices
+                            window_frames = len(window.index_list)
                             full_frames = x_in.size(self.dim)
-                            window_frames = window.context_length
+                            
+                            # Handle all numeric types including numpy and tensor
+                            if hasattr(cond_item, 'item'):  # Handle tensors
+                                original_seq_len = cond_item.item()
+                            elif isinstance(cond_item, (int, float, np.integer, np.floating)):
+                                original_seq_len = int(cond_item)
+                            else:
+                                original_seq_len = cond_item
+                            
                             # Scale seq_len proportionally
-                            import math
-                            resized_actual_cond[key] = math.ceil(cond_item * window_frames / full_frames)
+                            new_seq_len = math.ceil(original_seq_len * window_frames / full_frames)
+                            resized_actual_cond[key] = new_seq_len
+                            logger.debug(f"Resized seq_len from {original_seq_len} to {new_seq_len} (window {window_frames}/{full_frames} frames)")
                         else:
                             resized_actual_cond[key] = cond_item
+                            logger.warning(f"seq_len is None in conditioning")
                     elif isinstance(cond_item, torch.Tensor):
                         # Check if tensor matches expected dimensions
                         if self.dim < cond_item.ndim and cond_item.size(self.dim) == x_in.size(self.dim):
