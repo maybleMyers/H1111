@@ -2939,6 +2939,7 @@ def run_sampling(
                 """Helper to calculate conditional predictions, optionally with context windows."""
                 # Debug what we're receiving
                 logger.debug(f"calc_cond_batch received conds_list type: {type(conds_list)}")
+                logger.debug(f"calc_cond_batch x_input shape: {x_input.shape if isinstance(x_input, torch.Tensor) else type(x_input)}")
                 if isinstance(conds_list, list):
                     logger.debug(f"  Length: {len(conds_list)}")
                     if len(conds_list) > 0:
@@ -2991,9 +2992,13 @@ def run_sampling(
                     x_input_list = x_input
                 
                 # Call model with required positional arguments
+                logger.debug(f"Calling model with x_input_list length: {len(x_input_list) if isinstance(x_input_list, list) else 'not list'}")
+                if isinstance(x_input_list, list) and len(x_input_list) > 0:
+                    logger.debug(f"  First tensor shape: {x_input_list[0].shape}")
                 result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
                 # Return just the tensor for WAN models (not wrapped in list)
                 # The context handler expects a single tensor for single condition
+                logger.debug(f"Model returned shape: {result[0].shape if isinstance(result, tuple) else result.shape if isinstance(result, torch.Tensor) else 'unknown'}")
                 return result[0] if isinstance(result, tuple) else result
             
             # 1. Predict conditional noise estimate
@@ -3010,12 +3015,11 @@ def run_sampling(
                 conds_for_handler = [model_arg_c]  # Context handler expects list of dicts
                 
                 # Get the latent tensor for context window processing
-                # If latent_model_input_list has one element, it's [C, F, H, W]
-                # If it has multiple elements (batch), concatenate them
+                # Context handler will slice this into windows
+                # Keep it without batch dimension for proper slicing
                 if len(latent_model_input_list) == 1:
-                    context_input = latent_model_input_list[0]
-                    # Add batch dimension for consistency [C, F, H, W] -> [1, C, F, H, W]
-                    context_input = context_input.unsqueeze(0)
+                    context_input = latent_model_input_list[0]  # [C, F, H, W]
+                    # Don't add batch dimension - context handler handles windowing on frame dimension
                 else:
                     # Stack batch elements [B x [C, F, H, W]] -> [B, C, F, H, W]
                     context_input = torch.stack(latent_model_input_list)
@@ -3030,6 +3034,10 @@ def run_sampling(
                     model_options or {}
                 )
                 noise_pred_cond = noise_pred_results[0]
+                # Squeeze batch dimension if present (context windows may add it)
+                if noise_pred_cond.dim() == 5 and noise_pred_cond.shape[0] == 1:
+                    noise_pred_cond = noise_pred_cond.squeeze(0)
+                    logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
             else:
                 # Standard model call without context windows
                 noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
@@ -3049,9 +3057,10 @@ def run_sampling(
                     # Use context windows for unconditional predictions
                     conds_null_for_handler = [model_arg_null]
                     
-                    # Prepare context input with proper batch dimension
+                    # Prepare context input - keep consistent with conditional prediction
+                    # Don't add batch dimension for proper windowing
                     if len(latent_model_input_list) == 1:
-                        context_input = latent_model_input_list[0].unsqueeze(0)  # [C, F, H, W] -> [1, C, F, H, W]
+                        context_input = latent_model_input_list[0]  # [C, F, H, W]
                     else:
                         context_input = torch.stack(latent_model_input_list)  # [B, C, F, H, W]
                     
@@ -3062,7 +3071,11 @@ def run_sampling(
                             context_input,
                             timestep, model_options or {}
                         )
-                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
                         
                         # SLG prediction (with skip layers)
                         def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
@@ -3146,7 +3159,11 @@ def run_sampling(
                             context_input,
                             timestep, model_options or {}
                         )
-                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     
                     else:  # Regular CFG with context windows
@@ -3155,7 +3172,11 @@ def run_sampling(
                             context_input,
                             timestep, model_options or {}
                         )
-                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
                     # Standard calls without context windows (original code)

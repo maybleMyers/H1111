@@ -221,16 +221,23 @@ class IndexListContextHandler(ContextHandlerABC):
                            model_options: Dict[str, Any]) -> List[IndexListContextWindow]:
         """Get list of context windows for processing."""
         full_length = x_in.size(self.dim)
+        logger.info(f"Creating context windows for {full_length} latent frames (dim={self.dim})")
         context_windows = self.context_schedule.func(full_length, self, model_options)
+        logger.info(f"Created {len(context_windows)} windows with schedule '{self.context_schedule.name}'")
+        for i, window in enumerate(context_windows):
+            logger.debug(f"  Window {i}: frames {window[0]}-{window[-1]} ({len(window)} frames)")
         context_windows = [IndexListContextWindow(window, dim=self.dim) for window in context_windows]
         return context_windows
     
     def execute(self, calc_cond_batch: Callable, model: Any, conds: List[List[Dict]],
                x_in: torch.Tensor, timestep: torch.Tensor, model_options: Dict[str, Any]):
         """Execute context window processing for WAN models."""
+        logger.info(f"=== Context Window Execution Started ===")
+        logger.info(f"Input shape: {x_in.shape}, dim={self.dim}")
         self.set_step(timestep, model_options)
         context_windows = self.get_context_windows(model, x_in, model_options)
         enumerated_context_windows = list(enumerate(context_windows))
+        logger.info(f"Will process {len(enumerated_context_windows)} windows")
         
         # For WAN models, we work with a single condition, not multiple
         # Initialize accumulation tensor (single, not list)
@@ -252,6 +259,8 @@ class IndexListContextHandler(ContextHandlerABC):
                                                    conds_final, counts_final, biases_final)
         
         # Finalize results - return single tensor for WAN
+        logger.info(f"=== Context Window Execution Complete ===")
+        logger.info(f"Final output shape: {conds_final.shape}")
         if self.fuse_method.name == ContextFuseMethods.RELATIVE:
             return [conds_final]  # Wrap in list for compatibility with caller
         else:
@@ -267,12 +276,18 @@ class IndexListContextHandler(ContextHandlerABC):
         results = []
         
         for window_idx, window in enumerated_context_windows:
+            logger.info(f"Processing window {window_idx}/{len(enumerated_context_windows)}: "
+                       f"frames {window.index_list[0]}-{window.index_list[-1]} "
+                       f"({len(window.index_list)} frames)")
+            
             # Update model options with current window
             model_options["transformer_options"] = model_options.get("transformer_options", {})
             model_options["transformer_options"]["context_window"] = window
             
             # Get subsections of inputs
+            logger.debug(f"Input x_in shape before window extraction: {x_in.shape}")
             sub_x = window.get_tensor(x_in, device)
+            logger.debug(f"Window extracted sub_x shape: {sub_x.shape}")
             sub_timestep = window.get_tensor(timestep, device, dim=0) if timestep.ndim > 0 else timestep
             
             # For WAN models, resize the single condition
@@ -280,7 +295,9 @@ class IndexListContextHandler(ContextHandlerABC):
             
             # Calculate conditions for this window
             # calc_cond_batch now returns a single tensor for WAN
+            logger.debug(f"Calling calc_cond_batch with sub_x shape: {sub_x.shape}")
             sub_conds_out = calc_cond_batch(model, sub_conds, sub_x, sub_timestep, model_options)
+            logger.debug(f"calc_cond_batch returned shape: {sub_conds_out.shape if isinstance(sub_conds_out, torch.Tensor) else 'not a tensor'}")
             
             # Ensure it's a tensor (not wrapped)
             if not isinstance(sub_conds_out, torch.Tensor):
@@ -617,6 +634,10 @@ class WanContextWindowsHandler:
         schedule = get_matching_context_schedule(context_schedule)
         method = get_matching_fuse_method(fuse_method)
         
+        # Set dim based on whether we expect batch dimension
+        # For [C, F, H, W] tensor, F is at index 1
+        # For [B, C, F, H, W] tensor, F is at index 2
+        # We'll use dim=1 for unbatched tensors
         self.handler = IndexListContextHandler(
             context_schedule=schedule,
             fuse_method=method,
@@ -624,7 +645,7 @@ class WanContextWindowsHandler:
             context_overlap=self.context_overlap,
             context_stride=context_stride,
             closed_loop=closed_loop,
-            dim=2  # Temporal dimension for WAN models
+            dim=1  # Temporal dimension for [C, F, H, W] tensors
         )
         
         logger.info(f"WAN Context Windows initialized: {self.context_length_frames} frames "
