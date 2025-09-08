@@ -3533,30 +3533,9 @@ def extract_best_transition_frame(video_path: str, frames_to_check: int = 30) ->
     return best_frame_idx
 
 def blend_video_transition(video1: torch.Tensor, video2: torch.Tensor, blend_frames: int = 8) -> torch.Tensor:
-    """Blend transition between two video segments"""
-    if blend_frames <= 0 or video2.shape[2] < blend_frames:
-        return torch.cat([video1, video2], dim=2)
-    
-    # Get overlapping regions
-    v1_end = video1[:, :, -blend_frames:]  # Last frames of video1
-    v2_start = video2[:, :, :blend_frames]  # First frames of video2
-    
-    # Create smooth blending weights (cosine interpolation)
-    weights = torch.linspace(0, np.pi, blend_frames).to(video1.device)
-    blend_weights = (1.0 - torch.cos(weights)) / 2.0  # 0 to 1
-    blend_weights = blend_weights.view(1, 1, blend_frames, 1, 1)
-    
-    # Blend the overlapping region
-    blended_transition = v1_end * (1 - blend_weights) + v2_start * blend_weights
-    
-    # Combine: video1[:-blend_frames] + blended_transition + video2[blend_frames:]
-    result = torch.cat([
-        video1[:, :, :-blend_frames],  # Video1 without the blended part
-        blended_transition,            # Smooth transition
-        video2[:, :, blend_frames:]    # Video2 without the blended part
-    ], dim=2)
-    
-    return result
+    """Simple concatenation of video segments without blending to avoid glitches"""
+    # Simply concatenate the videos without any blending
+    return torch.cat([video1, video2], dim=2)
 
 def generate_extended_video_i2v_based(
     args: argparse.Namespace,
