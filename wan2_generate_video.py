@@ -4841,19 +4841,22 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 
                 # Encode image to latent space
                 with torch.no_grad():
-                    # VAE expects [B, C, T, H, W] for video or [B, C, H, W] for image
+                    # VAE expects a list containing [C, F, H, W] tensor
                     # We'll treat each frame as a single-frame video
-                    img_tensor_video = img_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
-                    cond_latent = vae.encode(img_tensor_video).to(device)  # [1, C, 1, H_lat, W_lat]
+                    img_tensor_video = img_tensor.squeeze(0).unsqueeze(1)  # [3, 1, H, W] - remove batch, add frame dim
+                    
+                    # vae.encode expects a list, returns a list
+                    cond_latent_list = vae.encode([img_tensor_video])  # Returns list with [C', 1, H_lat, W_lat]
+                    cond_latent = cond_latent_list[0].to(device)  # Get first element from list
                     
                     # Remove the temporal dimension since we encoded a single frame
-                    cond_latent = cond_latent.squeeze(2)  # [1, C, H_lat, W_lat]
+                    cond_latent = cond_latent.squeeze(1)  # [C', H_lat, W_lat]
                     
                     # Inject into the latent at the specified frame position
                     if latent.dim() == 4:  # [C, F, H, W]
-                        latent[:, frame_idx, :, :] = cond_latent.squeeze(0)
+                        latent[:, frame_idx, :, :] = cond_latent
                     elif latent.dim() == 5:  # [B, C, F, H, W]
-                        latent[:, :, frame_idx, :, :] = cond_latent
+                        latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
                     
                     logger.info(f"Injected conditioning latent at frame {frame_idx} (noise_mult={noise_mult})")
         
