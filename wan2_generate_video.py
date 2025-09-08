@@ -2949,8 +2949,14 @@ def run_sampling(
                 else:
                     cond_dict = {}
                 
-                # Filter non-model parameters
-                model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                # The model needs context and seq_len - these should NOT be filtered out
+                # Extract required arguments
+                context = cond_dict.get('context')
+                seq_len = cond_dict.get('seq_len')
+                
+                # Filter out context and seq_len from the dict to get other parameters
+                model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                 if k not in ['context', 'seq_len'] and not k.startswith('_')}
                 
                 # Prepare input for model - it expects a list of tensors
                 if isinstance(x_input, torch.Tensor):
@@ -2964,8 +2970,8 @@ def run_sampling(
                 else:
                     x_input_list = x_input
                 
-                # Call model
-                result = model_to_use(x_input_list, t=ts, **model_cond_dict)
+                # Call model with required positional arguments
+                result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
                 return [result[0]] if isinstance(result, tuple) else [result]
             
             # 1. Predict conditional noise estimate
@@ -3041,7 +3047,12 @@ def run_sampling(
                                 cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
                             else:
                                 cond_dict = {}
-                            model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                            # Extract required arguments
+                            context = cond_dict.get('context')
+                            seq_len = cond_dict.get('seq_len')
+                            # Filter for other parameters
+                            model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                             if k not in ['context', 'seq_len'] and not k.startswith('_')}
                             # Prepare input for model
                             if isinstance(x_input, torch.Tensor):
                                 if x_input.dim() == 5:  # [B, C, F, H, W]
@@ -3052,7 +3063,8 @@ def run_sampling(
                                     x_input_list = x_input if isinstance(x_input, list) else [x_input]
                             else:
                                 x_input_list = x_input
-                            result = model_to_use(x_input_list, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, 
+                                                skip_block_indices=slg_indices_for_call, **model_cond_dict)
                             return [result[0]] if isinstance(result, tuple) else [result]
                         
                         skip_layer_results = context_handler.execute(
@@ -3075,7 +3087,12 @@ def run_sampling(
                                 cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
                             else:
                                 cond_dict = {}
-                            model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                            # Extract required arguments
+                            context = cond_dict.get('context')
+                            seq_len = cond_dict.get('seq_len')
+                            # Filter for other parameters
+                            model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                             if k not in ['context', 'seq_len'] and not k.startswith('_')}
                             # Prepare input for model
                             if isinstance(x_input, torch.Tensor):
                                 if x_input.dim() == 5:  # [B, C, F, H, W]
@@ -3086,7 +3103,8 @@ def run_sampling(
                                     x_input_list = x_input if isinstance(x_input, list) else [x_input]
                             else:
                                 x_input_list = x_input
-                            result = model_to_use(x_input_list, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len,
+                                                skip_block_indices=slg_indices_for_call, **model_cond_dict)
                             return [result[0]] if isinstance(result, tuple) else [result]
                         
                         noise_pred_uncond_results = context_handler.execute(
