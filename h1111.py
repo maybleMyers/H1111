@@ -539,14 +539,10 @@ def wan22_batch_handler(
                     
                 elif pusa_mode == "multi_images" and pusa_cond_images:
                     # Multi-frame image conditioning
+                    # Gallery component passes image paths as a list of strings
                     if isinstance(pusa_cond_images, list) and len(pusa_cond_images) > 0:
-                        # Handle multiple image files
-                        image_paths = []
-                        for img_file in pusa_cond_images:
-                            if img_file and hasattr(img_file, 'name'):
-                                image_paths.append(img_file.name)
-                            elif isinstance(img_file, str) and img_file:
-                                image_paths.append(img_file)
+                        # Gallery format - image paths are already strings
+                        image_paths = [img for img in pusa_cond_images if img]
                         
                         if image_paths:
                             command.extend(["--cond_images"] + image_paths)
@@ -7956,21 +7952,30 @@ with gr.Blocks(
                                 with gr.Group(visible=False) as wan22_pusa_start_end_controls:
                                     gr.Markdown("**Start-End Frame Interpolation** - Generate smooth transitions between two images")
                                     wan22_pusa_end_image = gr.Image(
-                                        label="End Frame Image",
-                                        type="filepath",
-                                        info="Upload the end frame for interpolation (start frame uses main input image)"
+                                        label="End Frame Image (start frame uses main input image)",
+                                        type="filepath"
                                     )
                                 
                                 # Multi-Frame Image Controls  
                                 with gr.Group(visible=False) as wan22_pusa_multi_controls:
                                     gr.Markdown("**Multi-Frame Image Conditioning** - Control specific frames with different images")
                                     with gr.Row():
-                                        wan22_pusa_cond_images = gr.File(
-                                            label="Conditioning Images", 
-                                            file_count="multiple",
-                                            file_types=["image"],
-                                            info="Upload multiple images for frame conditioning"
-                                        )
+                                        with gr.Column():
+                                            wan22_pusa_cond_images = gr.Gallery(
+                                                label="Conditioning Images", 
+                                                show_label=True,
+                                                elem_id="pusa_conditioning_gallery",
+                                                columns=3,
+                                                rows=2,
+                                                object_fit="contain",
+                                                height="200px"
+                                            )
+                                            wan22_pusa_upload_images = gr.File(
+                                                label="Upload Images",
+                                                file_count="multiple",
+                                                file_types=["image"],
+                                                visible=True
+                                            )
                                         with gr.Column():
                                             wan22_pusa_cond_positions = gr.Textbox(
                                                 label="Frame Positions",
@@ -7987,8 +7992,7 @@ with gr.Blocks(
                                 with gr.Group(visible=False) as wan22_pusa_v2v_controls:
                                     gr.Markdown("**Video-to-Video Conditioning** - Use frames from an existing video as conditioning")
                                     wan22_pusa_cond_video = gr.Video(
-                                        label="Conditioning Video",
-                                        info="Upload a video to use frames from as conditioning"
+                                        label="Conditioning Video (frames will be extracted based on positions)"
                                     )
                                     with gr.Row():
                                         wan22_pusa_v2v_positions = gr.Textbox(
@@ -9380,6 +9384,28 @@ with gr.Blocks(
         fn=update_wan22_pusa_mode_visibility,
         inputs=[wan22_pusa_mode],
         outputs=[wan22_pusa_start_end_controls, wan22_pusa_multi_controls, wan22_pusa_v2v_controls]
+    )
+    
+    # Handler to populate gallery when images are uploaded
+    def populate_pusa_gallery(files):
+        """Populate the Pusa conditioning gallery with uploaded images"""
+        if not files:
+            return gr.update(value=[])
+        
+        # Extract file paths from the uploaded files
+        image_paths = []
+        for file in files:
+            if hasattr(file, 'name'):
+                image_paths.append(file.name)
+            elif isinstance(file, str):
+                image_paths.append(file)
+        
+        return gr.update(value=image_paths)
+    
+    wan22_pusa_upload_images.change(
+        fn=populate_pusa_gallery,
+        inputs=[wan22_pusa_upload_images],
+        outputs=[wan22_pusa_cond_images]
     )
 
 #multitalk event handlers
