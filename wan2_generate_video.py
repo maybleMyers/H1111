@@ -2937,12 +2937,17 @@ def run_sampling(
             # Define helper function for model calls with optional context windows
             def calc_cond_batch(model_to_use, conds_list, x_input, ts, opts):
                 """Helper to calculate conditional predictions, optionally with context windows."""
-                # For context windows, conds_list would be list of dicts
-                # For normal operation, we just use the dict directly
-                if isinstance(conds_list, list) and len(conds_list) > 0:
-                    cond_dict = conds_list[0]
+                # Handle different input formats
+                # conds_list could be:
+                # - A list of dicts (from context handler)
+                # - A single dict (shouldn't happen but handle it)
+                if isinstance(conds_list, dict):
+                    cond_dict = conds_list
+                elif isinstance(conds_list, list) and len(conds_list) > 0:
+                    # Get first element if it's a list
+                    cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
                 else:
-                    cond_dict = conds_list if isinstance(conds_list, dict) else {}
+                    cond_dict = {}
                 
                 # Filter non-model parameters
                 model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
@@ -3029,7 +3034,13 @@ def run_sampling(
                         
                         # SLG prediction (with skip layers)
                         def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
-                            cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
+                            # Handle different input formats
+                            if isinstance(conds_list, dict):
+                                cond_dict = conds_list
+                            elif isinstance(conds_list, list) and len(conds_list) > 0:
+                                cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
+                            else:
+                                cond_dict = {}
                             model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
                             # Prepare input for model
                             if isinstance(x_input, torch.Tensor):
@@ -3057,7 +3068,13 @@ def run_sampling(
                     elif apply_slg_step and args.slg_mode == "uncond":
                         # Uncond with SLG
                         def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
-                            cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
+                            # Handle different input formats
+                            if isinstance(conds_list, dict):
+                                cond_dict = conds_list
+                            elif isinstance(conds_list, list) and len(conds_list) > 0:
+                                cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
+                            else:
+                                cond_dict = {}
                             model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
                             # Prepare input for model
                             if isinstance(x_input, torch.Tensor):
