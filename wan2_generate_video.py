@@ -2992,7 +2992,9 @@ def run_sampling(
                 
                 # Call model with required positional arguments
                 result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
-                return [result[0]] if isinstance(result, tuple) else [result]
+                # Return just the tensor for WAN models (not wrapped in list)
+                # The context handler expects a single tensor for single condition
+                return result[0] if isinstance(result, tuple) else result
             
             # 1. Predict conditional noise estimate
             # Filter out non-model parameters before passing to model

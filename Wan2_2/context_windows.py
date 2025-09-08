@@ -137,12 +137,21 @@ class IndexListContextHandler(ContextHandlerABC):
     
     def get_resized_cond(self, cond_in: List[Dict], x_in: torch.Tensor,
                         window: IndexListContextWindow, device=None) -> List:
-        """Resize conditioning to match context window."""
+        """Resize conditioning to match context window for WAN models."""
         if cond_in is None:
             return None
         
+        # For WAN, cond_in is a list with a single dict
+        if not cond_in:
+            logger.warning("Empty condition list passed to get_resized_cond")
+            return []
+        
         resized_cond = []
         for actual_cond in cond_in:
+            if not isinstance(actual_cond, dict):
+                logger.warning(f"Expected dict in cond_in, got {type(actual_cond)}")
+                continue
+                
             resized_actual_cond = actual_cond.copy()
             
             for key in actual_cond:
@@ -218,18 +227,19 @@ class IndexListContextHandler(ContextHandlerABC):
     
     def execute(self, calc_cond_batch: Callable, model: Any, conds: List[List[Dict]],
                x_in: torch.Tensor, timestep: torch.Tensor, model_options: Dict[str, Any]):
-        """Execute context window processing."""
+        """Execute context window processing for WAN models."""
         self.set_step(timestep, model_options)
         context_windows = self.get_context_windows(model, x_in, model_options)
         enumerated_context_windows = list(enumerate(context_windows))
         
-        # Initialize accumulation tensors
-        conds_final = [torch.zeros_like(x_in) for _ in conds]
+        # For WAN models, we work with a single condition, not multiple
+        # Initialize accumulation tensor (single, not list)
+        conds_final = torch.zeros_like(x_in)
         if self.fuse_method.name == ContextFuseMethods.RELATIVE:
-            counts_final = [torch.ones(get_shape_for_dim(x_in, self.dim), device=x_in.device) for _ in conds]
+            counts_final = torch.ones(get_shape_for_dim(x_in, self.dim), device=x_in.device)
         else:
-            counts_final = [torch.zeros(get_shape_for_dim(x_in, self.dim), device=x_in.device) for _ in conds]
-        biases_final = [([0.0] * x_in.shape[self.dim]) for _ in conds]
+            counts_final = torch.zeros(get_shape_for_dim(x_in, self.dim), device=x_in.device)
+        biases_final = [0.0] * x_in.shape[self.dim]
         
         # Process each window
         for enum_window in enumerated_context_windows:
@@ -241,20 +251,19 @@ class IndexListContextHandler(ContextHandlerABC):
                                                    len(enumerated_context_windows), timestep,
                                                    conds_final, counts_final, biases_final)
         
-        # Finalize results
+        # Finalize results - return single tensor for WAN
         if self.fuse_method.name == ContextFuseMethods.RELATIVE:
-            return conds_final
+            return [conds_final]  # Wrap in list for compatibility with caller
         else:
             # Normalize by counts
-            for i in range(len(conds_final)):
-                conds_final[i] /= counts_final[i]
-            return conds_final
+            conds_final /= counts_final
+            return [conds_final]  # Wrap in list for compatibility with caller
     
     def evaluate_context_windows(self, calc_cond_batch: Callable, model: Any, x_in: torch.Tensor,
                                 conds: List[List[Dict]], timestep: torch.Tensor,
                                 enumerated_context_windows: List[Tuple[int, IndexListContextWindow]],
                                 model_options: Dict[str, Any], device=None, first_device=None) -> List:
-        """Evaluate model on context windows."""
+        """Evaluate WAN model on context windows."""
         results = []
         
         for window_idx, window in enumerated_context_windows:
@@ -266,34 +275,32 @@ class IndexListContextHandler(ContextHandlerABC):
             sub_x = window.get_tensor(x_in, device)
             sub_timestep = window.get_tensor(timestep, device, dim=0) if timestep.ndim > 0 else timestep
             
-            # Debug logging
-            logger.debug(f"Processing window {window_idx}, conds structure: {[type(c) for c in conds]}")
-            logger.debug(f"Number of conditions: {len(conds)}")
-            
+            # For WAN models, resize the single condition
             sub_conds = [self.get_resized_cond(cond, x_in, window, device) for cond in conds]
             
-            # More debug logging
-            logger.debug(f"After resize, sub_conds: {[len(sc) if sc else 'None' for sc in sub_conds]}")
-            if sub_conds and len(sub_conds) > 0 and sub_conds[0]:
-                logger.debug(f"First sub_cond keys: {sub_conds[0][0].keys() if len(sub_conds[0]) > 0 else 'empty'}")
-            
             # Calculate conditions for this window
+            # calc_cond_batch now returns a single tensor for WAN
             sub_conds_out = calc_cond_batch(model, sub_conds, sub_x, sub_timestep, model_options)
             
+            # Ensure it's a tensor (not wrapped)
+            if not isinstance(sub_conds_out, torch.Tensor):
+                if isinstance(sub_conds_out, (list, tuple)) and len(sub_conds_out) > 0:
+                    sub_conds_out = sub_conds_out[0]
+            
             if device is not None:
-                for i in range(len(sub_conds_out)):
-                    sub_conds_out[i] = sub_conds_out[i].to(x_in.device)
+                sub_conds_out = sub_conds_out.to(x_in.device)
             
             results.append(ContextResults(window_idx, sub_conds_out, sub_conds, window))
         
         return results
     
-    def combine_context_window_results(self, x_in: torch.Tensor, sub_conds_out: List[torch.Tensor],
+    def combine_context_window_results(self, x_in: torch.Tensor, sub_conds_out: torch.Tensor,
                                       sub_conds: List[Dict], window: IndexListContextWindow,
                                       window_idx: int, total_windows: int, timestep: torch.Tensor,
-                                      conds_final: List[torch.Tensor], counts_final: List[torch.Tensor],
-                                      biases_final: List[List[float]]):
-        """Combine results from context windows."""
+                                      conds_final: torch.Tensor, counts_final: torch.Tensor,
+                                      biases_final: List[float]):
+        """Combine results from context windows for WAN models."""
+        # sub_conds_out is now a single tensor, not a list
         if self.fuse_method.name == ContextFuseMethods.RELATIVE:
             # Relative weighting based on position
             for pos, idx in enumerate(window.index_list):
@@ -301,26 +308,25 @@ class IndexListContextHandler(ContextHandlerABC):
                        ((window.index_list[-1] - window.index_list[0] + 1e-2) / 2)
                 bias = max(1e-2, bias)
                 
-                for i in range(len(sub_conds_out)):
-                    bias_total = biases_final[i][idx]
-                    prev_weight = (bias_total / (bias_total + bias))
-                    new_weight = (bias / (bias_total + bias))
-                    
-                    idx_window = [slice(None)] * self.dim + [idx]
-                    pos_window = [slice(None)] * self.dim + [pos]
-                    
-                    conds_final[i][idx_window] = conds_final[i][idx_window] * prev_weight + \
-                                                 sub_conds_out[i][pos_window] * new_weight
-                    biases_final[i][idx] = bias_total + bias
+                bias_total = biases_final[idx]
+                prev_weight = (bias_total / (bias_total + bias))
+                new_weight = (bias / (bias_total + bias))
+                
+                idx_window = [slice(None)] * self.dim + [idx]
+                pos_window = [slice(None)] * self.dim + [pos]
+                
+                conds_final[idx_window] = conds_final[idx_window] * prev_weight + \
+                                         sub_conds_out[pos_window] * new_weight
+                biases_final[idx] = bias_total + bias
         else:
             # Weight-based fusion
             weights = get_context_weights(window.context_length, x_in.shape[self.dim],
                                          window.index_list, self, sigma=timestep)
             weights_tensor = match_weights_to_dim(weights, x_in, self.dim, device=x_in.device)
             
-            for i in range(len(sub_conds_out)):
-                window.add_window(conds_final[i], sub_conds_out[i] * weights_tensor)
-                window.add_window(counts_final[i], weights_tensor)
+            # Apply to single tensor (not list)
+            window.add_window(conds_final, sub_conds_out * weights_tensor)
+            window.add_window(counts_final, weights_tensor)
 
 
 def match_weights_to_dim(weights: List[float], x_in: torch.Tensor, dim: int,
