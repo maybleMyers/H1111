@@ -38,6 +38,7 @@ from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from flowmatch_pusa_scheduler import FlowMatchSchedulerPusa
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -238,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-A14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     parser.add_argument(
-        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla"], help="The solver used to sample."
+        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla", "pusa"], help="The solver used to sample."
     )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
@@ -374,6 +375,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Shift factor for flow matching schedulers. Default depends on task.",
+    )
+    
+    # Pusa Extension arguments
+    parser.add_argument(
+        "--pusa_noise_multipliers",
+        type=float,
+        default=0.0,
+        help="Noise multipliers for Pusa extension (0.0-100.0). Only used with --sample_solver pusa.",
+    )
+    parser.add_argument(
+        "--pusa_noisy_steps",
+        type=int,
+        default=-1,
+        help="Number of steps to apply Pusa noise (-1 for all steps). Only used with --sample_solver pusa.",
     )
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
@@ -2754,6 +2769,18 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
 
 
         scheduler.step = step_wrapper
+    elif args.sample_solver == "pusa":
+        scheduler = FlowMatchSchedulerPusa(
+            num_train_timesteps=config.num_train_timesteps, 
+            shift=args.flow_shift,
+            extra_one_step=True  # Following ComfyUI Pusa implementation
+        )
+        scheduler.set_timesteps(
+            num_inference_steps=args.infer_steps,
+            device=device,
+            shift=args.flow_shift
+        )
+        timesteps = scheduler.timesteps
     else:
         raise NotImplementedError(f"Unsupported solver: {args.sample_solver}")
 
@@ -3208,12 +3235,27 @@ def run_sampling(
 
             # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
             # latent_on_device should already have the batch dim handled by the logic above
+            
+            # Prepare scheduler step arguments
+            step_kwargs = {
+                "return_dict": False,
+                "generator": seed_g
+            }
+            
+            # Add Pusa-specific parameters if using Pusa scheduler
+            if args.sample_solver == "pusa" and hasattr(scheduler, '__class__') and scheduler.__class__.__name__ == 'FlowMatchSchedulerPusa':
+                # Check if we should apply noise for this step
+                current_step = len(timesteps) - i - 1  # Convert to step index
+                should_apply_noise = (args.pusa_noisy_steps == -1) or (current_step < args.pusa_noisy_steps)
+                
+                if should_apply_noise and args.pusa_noise_multipliers > 0:
+                    step_kwargs["noise_multipliers"] = args.pusa_noise_multipliers
+                    
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
                 t,
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
-                return_dict=False,
-                generator=seed_g
+                **step_kwargs
             )
             prev_latent = scheduler_output[0] # Get the new latent state [B, C, F, H, W]
 

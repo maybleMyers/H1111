@@ -468,7 +468,9 @@ def wan22_batch_handler(
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
-    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str,
+    # Pusa Extension parameters
+    pusa_noise_multipliers: float, pusa_noisy_steps: int
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -518,6 +520,11 @@ def wan22_batch_handler(
 
         if negative_prompt:
             command.extend(["--negative_prompt", str(negative_prompt)])
+        
+        # --- Pusa Extension Parameters (only when using pusa solver) ---
+        if sample_solver == "pusa":
+            command.extend(["--pusa_noise_multipliers", str(pusa_noise_multipliers)])
+            command.extend(["--pusa_noisy_steps", str(pusa_noisy_steps)])
         
         # --- Model Path Logic based on Task ---
         if "A14B" in task:
@@ -7864,6 +7871,33 @@ with gr.Blocks(
                                     info="Method for fusing context window results"
                                 )
                     
+                    # Pusa Extension Controls
+                    with gr.Accordion("Pusa Extension (Advanced Flow Matching)", open=False):
+                        gr.Markdown("**Note:** These options only apply when Sample Solver is set to 'pusa'")
+                        with gr.Group(visible=False) as wan22_pusa_controls:
+                            with gr.Row():
+                                wan22_pusa_noise_multipliers = gr.Slider(
+                                    label="Noise Multipliers", 
+                                    minimum=0.0, 
+                                    maximum=100.0, 
+                                    step=0.1, 
+                                    value=0.0,
+                                    info="Noise multipliers for Pusa extension (0.0-100.0). Higher values add more noise."
+                                )
+                                wan22_pusa_noisy_steps = gr.Number(
+                                    label="Noisy Steps", 
+                                    value=-1, 
+                                    minimum=-1, 
+                                    maximum=1000,
+                                    step=1,
+                                    info="Number of steps to apply Pusa noise (-1 for all steps)"
+                                )
+                            with gr.Row():
+                                gr.Markdown(
+                                    "💡 **Tip:** Default LoRA locations for Pusa are `lora/high_noise_pusa.safetensors` and `lora/low_noise_pusa.safetensors`. "
+                                    "Load them using the normal LoRA system above."
+                                )
+                    
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
@@ -7883,7 +7917,7 @@ with gr.Blocks(
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
                     wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
                     wan22_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
-                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "pusa"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         wan22_random_seed_btn = gr.Button("🎲")
@@ -9189,6 +9223,16 @@ with gr.Blocks(
         fn=update_wan_of_model_paths_and_settings,
         inputs=[wan_of_task],
         outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_conditioning_strength]
+    )
+
+    # Wan2.2 Pusa controls visibility handler
+    def update_wan22_pusa_visibility(solver):
+        return gr.update(visible=solver == "pusa")
+    
+    wan22_sample_solver.change(
+        fn=update_wan22_pusa_visibility,
+        inputs=[wan22_sample_solver],
+        outputs=[wan22_pusa_controls]
     )
 
 #multitalk event handlers
@@ -11548,6 +11592,9 @@ with gr.Blocks(
             wan22_context_stride,
             wan22_context_closed_loop,
             wan22_context_fuse_method,
+            # Pusa Extension arguments
+            wan22_pusa_noise_multipliers,
+            wan22_pusa_noisy_steps,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
