@@ -2947,8 +2947,20 @@ def run_sampling(
                 # Filter non-model parameters
                 model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
                 
+                # Prepare input for model - it expects a list of tensors
+                if isinstance(x_input, torch.Tensor):
+                    if x_input.dim() == 5:  # [B, C, F, H, W]
+                        # Split batch into list
+                        x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                    elif x_input.dim() == 4:  # [C, F, H, W]
+                        x_input_list = [x_input]
+                    else:
+                        x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                else:
+                    x_input_list = x_input
+                
                 # Call model
-                result = model_to_use(x_input, t=ts, **model_cond_dict)
+                result = model_to_use(x_input_list, t=ts, **model_cond_dict)
                 return [result[0]] if isinstance(result, tuple) else [result]
             
             # 1. Predict conditional noise estimate
@@ -2960,12 +2972,23 @@ def run_sampling(
                 # Prepare inputs for context handler
                 conds_for_handler = [model_arg_c]  # Context handler expects list of dicts
                 
+                # Get the latent tensor for context window processing
+                # If latent_model_input_list has one element, it's [C, F, H, W]
+                # If it has multiple elements (batch), concatenate them
+                if len(latent_model_input_list) == 1:
+                    context_input = latent_model_input_list[0]
+                    # Add batch dimension for consistency [C, F, H, W] -> [1, C, F, H, W]
+                    context_input = context_input.unsqueeze(0)
+                else:
+                    # Stack batch elements [B x [C, F, H, W]] -> [B, C, F, H, W]
+                    context_input = torch.stack(latent_model_input_list)
+                
                 # Execute with context windows
                 noise_pred_results = context_handler.execute(
                     calc_cond_batch,
                     current_model,
                     [conds_for_handler],  # List of condition lists
-                    latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                    context_input,
                     timestep,
                     model_options or {}
                 )
@@ -2989,11 +3012,17 @@ def run_sampling(
                     # Use context windows for unconditional predictions
                     conds_null_for_handler = [model_arg_null]
                     
+                    # Prepare context input with proper batch dimension
+                    if len(latent_model_input_list) == 1:
+                        context_input = latent_model_input_list[0].unsqueeze(0)  # [C, F, H, W] -> [1, C, F, H, W]
+                    else:
+                        context_input = torch.stack(latent_model_input_list)  # [B, C, F, H, W]
+                    
                     if apply_slg_step and args.slg_mode == "original":
                         # Uncond prediction
                         noise_pred_uncond_results = context_handler.execute(
                             calc_cond_batch, current_model, [conds_null_for_handler],
-                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            context_input,
                             timestep, model_options or {}
                         )
                         noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
@@ -3002,12 +3031,22 @@ def run_sampling(
                         def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
                             cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
                             model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
-                            result = model_to_use(x_input, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            # Prepare input for model
+                            if isinstance(x_input, torch.Tensor):
+                                if x_input.dim() == 5:  # [B, C, F, H, W]
+                                    x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                                elif x_input.dim() == 4:  # [C, F, H, W]
+                                    x_input_list = [x_input]
+                                else:
+                                    x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                            else:
+                                x_input_list = x_input
+                            result = model_to_use(x_input_list, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
                             return [result[0]] if isinstance(result, tuple) else [result]
                         
                         skip_layer_results = context_handler.execute(
                             calc_slg_batch, current_model, [conds_null_for_handler],
-                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            context_input,
                             timestep, model_options or {}
                         )
                         skip_layer_out = skip_layer_results[0].to(latent_storage_device)
@@ -3020,12 +3059,22 @@ def run_sampling(
                         def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
                             cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
                             model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
-                            result = model_to_use(x_input, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            # Prepare input for model
+                            if isinstance(x_input, torch.Tensor):
+                                if x_input.dim() == 5:  # [B, C, F, H, W]
+                                    x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                                elif x_input.dim() == 4:  # [C, F, H, W]
+                                    x_input_list = [x_input]
+                                else:
+                                    x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                            else:
+                                x_input_list = x_input
+                            result = model_to_use(x_input_list, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
                             return [result[0]] if isinstance(result, tuple) else [result]
                         
                         noise_pred_uncond_results = context_handler.execute(
                             calc_slg_batch, current_model, [conds_null_for_handler],
-                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            context_input,
                             timestep, model_options or {}
                         )
                         noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
@@ -3034,7 +3083,7 @@ def run_sampling(
                     else:  # Regular CFG with context windows
                         noise_pred_uncond_results = context_handler.execute(
                             calc_cond_batch, current_model, [conds_null_for_handler],
-                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            context_input,
                             timestep, model_options or {}
                         )
                         noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
