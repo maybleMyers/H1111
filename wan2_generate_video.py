@@ -5222,6 +5222,17 @@ def main():
                 noise_multipliers = parse_noise_multipliers(args.cond_noise_multipliers)
                 video_frames = process_conditioning_video(args.cond_video, width, height)
                 
+                # Automatically use first frame as input image if no input image provided
+                if not args.image_path and len(video_frames) > 0:
+                    import tempfile
+                    import os
+                    # Save first frame as temporary input image
+                    temp_dir = tempfile.mkdtemp()
+                    temp_image_path = os.path.join(temp_dir, "pusa_input_frame.png")
+                    video_frames[0].save(temp_image_path)
+                    args.image_path = temp_image_path
+                    logger.info(f"Auto-extracted first frame as input image: {temp_image_path}")
+                
                 # Select specific frames based on positions
                 conditioning_images = []
                 for pos in cond_positions:
