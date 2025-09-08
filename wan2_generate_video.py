@@ -3299,10 +3299,32 @@ def run_sampling(
                     "noise_multipliers": args.pusa_frame_noise_mapping
                 })
                 logger.debug(f"Step {i}: Applying V2V conditioning to positions {args.pusa_cond_positions}")
+                
+                # Create 2D timestep tensor for V2V scheduler (expects shape [B, F])
+                # Convert scalar timestep to frame-aware tensor
+                num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
+                # Ensure t is a tensor (sometimes it might be extracted as a Python scalar)
+                if not isinstance(t, torch.Tensor):
+                    t_tensor = torch.tensor(t, device=device)
+                else:
+                    t_tensor = t.to(device)
+                timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
+                
+                # Apply frame-specific timestep modifications for conditioning frames
+                for frame_idx in args.pusa_cond_positions:
+                    if frame_idx < num_frames:
+                        noise_mult = args.pusa_frame_noise_mapping.get(frame_idx, 1.0)
+                        timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
+                
+                # Use 2D timestep for V2V scheduler
+                timestep_for_scheduler = timestep_2d
+            else:
+                # Use scalar timestep for regular schedulers
+                timestep_for_scheduler = t
             
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
-                t,
+                timestep_for_scheduler,
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
                 **scheduler_kwargs
             )

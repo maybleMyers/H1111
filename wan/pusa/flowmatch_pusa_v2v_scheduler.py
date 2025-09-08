@@ -166,15 +166,25 @@ class FlowMatchSchedulerPusaV2V:
             if cond_frame_latent_indices is not None and noise_multipliers is not None:
                 for latent_idx in cond_frame_latent_indices:
                     # Handle zero timestep (clean conditioning frames)
-                    if timestep_full[:, latent_idx] == 0:
-                        sigma[:, :, latent_idx] = 0
-                        sigma_[latent_idx] = 0
-                        continue
+                    # timestep_full should be shape [B, F] where B=1 typically
+                    if len(timestep_full.shape) == 2 and latent_idx < timestep_full.shape[1]:
+                        if timestep_full[:, latent_idx] == 0:
+                            sigma[:, :, latent_idx] = 0
+                            sigma_[latent_idx] = 0
+                            continue
+                    elif len(timestep_full.shape) == 1:
+                        # Handle case where timestep_full might be 1D
+                        if timestep_full[latent_idx if latent_idx < len(timestep_full) else 0] == 0:
+                            sigma[:, :, latent_idx] = 0
+                            sigma_[latent_idx] = 0
+                            continue
                     
                     # Apply noise multiplier for this frame
                     multiplier = noise_multipliers.get(latent_idx, 1.0)
-                    sigma[:, :, latent_idx] = sigma[:, :, latent_idx] * multiplier
-                    sigma_[latent_idx] = sigma_[latent_idx] * multiplier
+                    if latent_idx < sigma.shape[2]:  # Ensure index is valid
+                        sigma[:, :, latent_idx] = sigma[:, :, latent_idx] * multiplier
+                    if isinstance(sigma_, torch.Tensor) and len(sigma_.shape) > 0 and latent_idx < len(sigma_):
+                        sigma_[latent_idx] = sigma_[latent_idx] * multiplier
                     
             # Reshape sigma_ to match sigma's dimensions
             sigma_ = sigma_.unsqueeze(0).unsqueeze(1).unsqueeze(3).unsqueeze(4).to(sample.device)
