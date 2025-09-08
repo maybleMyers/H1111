@@ -474,7 +474,8 @@ def wan22_batch_handler(
     # New Pusa Multi-Frame parameters
     pusa_mode: str, pusa_end_image: str, pusa_cond_images: List[str], 
     pusa_cond_positions: str, pusa_cond_noise_multipliers: str,
-    pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str
+    pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
+    pusa_auto_join: bool
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -740,9 +741,62 @@ def wan22_batch_handler(
             except Exception as meta_err:
                 print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
             
-            all_generated_videos.append((current_video_file_for_item, f"Wan2.2 - Seed: {current_seed}"))
+            # Handle Pusa V2V auto-join functionality
+            final_video_path = current_video_file_for_item
+            video_label = f"Wan2.2 - Seed: {current_seed}"
+            
+            if (sample_solver == "pusa" and pusa_mode == "v2v" and pusa_auto_join and 
+                pusa_cond_video and os.path.exists(current_video_file_for_item)):
+                
+                print(f"🔗 Pusa auto-join enabled - concatenating videos...")
+                
+                # Get input video path
+                input_video_path = pusa_cond_video.name if hasattr(pusa_cond_video, 'name') else str(pusa_cond_video)
+                
+                if os.path.exists(input_video_path):
+                    # Create joined video filename
+                    timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+                    base_name = os.path.splitext(os.path.basename(current_video_file_for_item))[0]
+                    joined_filename = f"joined_{timestamp}_{base_name}.mp4"
+                    joined_path = os.path.join(os.path.dirname(current_video_file_for_item), joined_filename)
+                    
+                    try:
+                        # Create temporary concat list file
+                        list_file = os.path.join(os.path.dirname(current_video_file_for_item), f"temp_join_list_{current_seed}.txt")
+                        with open(list_file, "w") as f:
+                            f.write(f"file '{os.path.abspath(input_video_path)}'\n")
+                            f.write(f"file '{os.path.abspath(current_video_file_for_item)}'\n")
+                        
+                        # Run ffmpeg concatenation
+                        concat_command = [
+                            "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file,
+                            "-c", "copy", "-y", joined_path
+                        ]
+                        
+                        print(f"Running FFmpeg join: {input_video_path} + {current_video_file_for_item} -> {joined_path}")
+                        result = subprocess.run(concat_command, check=True, capture_output=True, text=True)
+                        
+                        # Clean up temp file
+                        if os.path.exists(list_file):
+                            os.remove(list_file)
+                        
+                        if os.path.exists(joined_path):
+                            final_video_path = joined_path
+                            video_label = f"Wan2.2 Joined - Seed: {current_seed}"
+                            print(f"✅ Successfully created joined video: {joined_path}")
+                        else:
+                            print(f"❌ Failed to create joined video at {joined_path}")
+                            
+                    except subprocess.CalledProcessError as e:
+                        print(f"❌ FFmpeg concatenation failed: {e.stderr}")
+                    except Exception as e:
+                        print(f"❌ Error during video joining: {str(e)}")
+                else:
+                    print(f"⚠️ Input video not found for joining: {input_video_path}")
+            
+            all_generated_videos.append((final_video_path, video_label))
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
-            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+            progress_text_update = f"Saved: {os.path.basename(final_video_path)}"
         else:
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
@@ -8005,6 +8059,12 @@ with gr.Blocks(
                                             placeholder="0.2,0.4,0.4,0.4", 
                                             info="Noise levels for each conditioning frame"
                                         )
+                                    
+                                    wan22_pusa_auto_join = gr.Checkbox(
+                                        label="Auto-join with input video",
+                                        value=True,
+                                        info="Automatically concatenate input video + generated video for seamless extension"
+                                    )
                                 
                                 # Example Configurations
                                 with gr.Accordion("Example Configurations", open=False):
@@ -11777,6 +11837,7 @@ with gr.Blocks(
             wan22_pusa_cond_video,
             wan22_pusa_v2v_positions,
             wan22_pusa_v2v_noise_multipliers,
+            wan22_pusa_auto_join,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
