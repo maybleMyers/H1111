@@ -563,9 +563,11 @@ class WanContextWindowsHandler:
             closed_loop: Whether to close loop for cyclic videos
             fuse_method: Method for fusing window results
         """
-        # Adjust for VAE stride (4x temporal compression)
+        # Store original frame counts
         self.context_length_frames = context_length
         self.context_overlap_frames = context_overlap
+        
+        # Adjust for VAE stride (4x temporal compression)
         self.context_length = max(((context_length - 1) // 4) + 1, 1)
         self.context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
         
@@ -583,8 +585,8 @@ class WanContextWindowsHandler:
             dim=2  # Temporal dimension for WAN models
         )
         
-        logger.info(f"WAN Context Windows initialized: {context_length_frames} frames "
-                   f"({self.context_length} latent), {context_overlap_frames} overlap "
+        logger.info(f"WAN Context Windows initialized: {self.context_length_frames} frames "
+                   f"({self.context_length} latent), {self.context_overlap_frames} overlap "
                    f"({self.context_overlap} latent), schedule={context_schedule}, "
                    f"fuse={fuse_method}")
     
