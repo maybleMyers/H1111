@@ -167,6 +167,12 @@ class IndexListContextHandler(ContextHandlerABC):
                             window_frames = len(window.index_list)
                             full_frames = x_in.size(self.dim)
                             
+                            # For I2V subsequent windows, we add frame 0, so need to account for that
+                            is_i2v_subsequent = 'y' in actual_cond and 0 not in window.index_list
+                            if is_i2v_subsequent:
+                                # We'll add frame 0 to this window, so effective window is 1 frame larger
+                                window_frames += 1
+                            
                             # Handle all numeric types including numpy and tensor
                             if hasattr(cond_item, 'item'):  # Handle tensors
                                 original_seq_len = cond_item.item()
@@ -187,9 +193,52 @@ class IndexListContextHandler(ContextHandlerABC):
                         resized_list = []
                         for item in cond_item:
                             if isinstance(item, torch.Tensor):
-                                # Check if this tensor has frames that need slicing
-                                if self.dim < item.ndim and item.size(self.dim) == x_in.size(self.dim):
-                                    # Slice the tensor to match the window
+                                # Special handling for 'y' in I2V mode
+                                if key == 'y' and self.dim < item.ndim and item.size(self.dim) == x_in.size(self.dim):
+                                    # This is I2V conditioning - needs special handling
+                                    # y contains [mask_channels (4) + image_channels (16), frames, H, W]
+                                    
+                                    # Check if this window naturally contains frame 0 or if it's a looped window
+                                    if 0 in window.index_list:
+                                        # Window contains frame 0 (either first window or looped window)
+                                        # Use normal slicing - this preserves the looped_uniform behavior
+                                        # For looped windows like [28, 29, 30, 31, 0, 1, 2, 3], this will
+                                        # correctly grab those frames including the wrapped frame 0
+                                        sliced_item = window.get_tensor(item, device)
+                                        logger.debug(f"I2V window with frame 0: sliced 'y' from shape {item.shape} to {sliced_item.shape}")
+                                    else:
+                                        # Windows that don't contain frame 0 - need to preserve frame 0 for I2V
+                                        # This applies to standard schedules where we need to maintain conditioning
+                                        # Split mask and image channels
+                                        mask_channels = item[:4]  # [4, frames, H, W]
+                                        image_channels = item[4:]  # [16, frames, H, W]
+                                        
+                                        # Keep frame 0 from original
+                                        frame_0_mask = mask_channels[:, 0:1]  # [4, 1, H, W]
+                                        frame_0_image = image_channels[:, 0:1]  # [16, 1, H, W]
+                                        
+                                        # Get the window frames (excluding frame 0 if it's in the window)
+                                        window_indices = [i for i in window.index_list if i != 0]
+                                        
+                                        # Slice the mask and image for window frames
+                                        sliced_mask = mask_channels[:, window_indices]  # [4, window_frames-1, H, W]
+                                        sliced_image = image_channels[:, window_indices]  # [16, window_frames-1, H, W]
+                                        
+                                        # Reconstruct with frame 0 at the beginning
+                                        new_mask = torch.cat([frame_0_mask, sliced_mask], dim=1)
+                                        new_image = torch.cat([frame_0_image, sliced_image], dim=1)
+                                        
+                                        # Combine mask and image channels
+                                        sliced_item = torch.cat([new_mask, new_image], dim=0)
+                                        
+                                        if device:
+                                            sliced_item = sliced_item.to(device)
+                                        
+                                        logger.debug(f"I2V subsequent window: reconstructed 'y' with frame 0, shape {sliced_item.shape}")
+                                    
+                                    resized_list.append(sliced_item)
+                                elif self.dim < item.ndim and item.size(self.dim) == x_in.size(self.dim):
+                                    # Regular tensor that needs slicing (not 'y')
                                     sliced_item = window.get_tensor(item, device)
                                     resized_list.append(sliced_item)
                                     logger.debug(f"Sliced list item in '{key}' from shape {item.shape} to {sliced_item.shape}")
