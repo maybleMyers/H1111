@@ -4815,6 +4815,53 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # `latent` here is the initial state *before* the sampling loop starts
     latent = noise # Start with noise (already shaped correctly for T2V/I2V/V2V)
     
+    # --- Apply Pusa Multi-Frame Conditioning Before Sampling ---
+    # This must happen BEFORE the sampling loop to inject conditioning frames into the initial latent
+    if hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and vae is not None:
+        logger.info("Encoding Pusa conditioning images to latent space...")
+        
+        # Ensure VAE is on the correct device
+        vae.to_device(device)
+        
+        # Process each conditioning image
+        for frame_idx, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
+            if frame_idx < latent.shape[-3]:  # Check frame index is valid (shape is [B,C,F,H,W] or [C,F,H,W])
+                logger.debug(f"Encoding conditioning image for frame {frame_idx}")
+                
+                # Convert PIL image to tensor and prepare for VAE encoding
+                # The cond_image is a PIL Image from the pusa utils
+                import torchvision.transforms as transforms
+                transform = transforms.Compose([
+                    transforms.ToTensor(),  # Converts to [C, H, W] with values [0, 1]
+                ])
+                img_tensor = transform(cond_image).unsqueeze(0).to(device)  # [1, 3, H, W]
+                
+                # Normalize to [-1, 1] for VAE
+                img_tensor = 2.0 * img_tensor - 1.0
+                
+                # Encode image to latent space
+                with torch.no_grad():
+                    # VAE expects [B, C, T, H, W] for video or [B, C, H, W] for image
+                    # We'll treat each frame as a single-frame video
+                    img_tensor_video = img_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+                    cond_latent = vae.encode(img_tensor_video).to(device)  # [1, C, 1, H_lat, W_lat]
+                    
+                    # Remove the temporal dimension since we encoded a single frame
+                    cond_latent = cond_latent.squeeze(2)  # [1, C, H_lat, W_lat]
+                    
+                    # Inject into the latent at the specified frame position
+                    if latent.dim() == 4:  # [C, F, H, W]
+                        latent[:, frame_idx, :, :] = cond_latent.squeeze(0)
+                    elif latent.dim() == 5:  # [B, C, F, H, W]
+                        latent[:, :, frame_idx, :, :] = cond_latent
+                    
+                    logger.info(f"Injected conditioning latent at frame {frame_idx} (noise_mult={noise_mult})")
+        
+        # Move VAE back to CPU to save memory
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+        clean_memory_on_device(device)
+        logger.info("Pusa conditioning images encoded and injected into initial latent")
+    
     # Create masks for TI2V before sampling loop (following official implementation)
     ti2v_mask1, ti2v_mask2 = None, None
     if is_ti2v and "_image_latent" in inputs[0]:
