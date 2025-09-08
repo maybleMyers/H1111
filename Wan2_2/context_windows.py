@@ -147,7 +147,21 @@ class IndexListContextHandler(ContextHandlerABC):
             for key in actual_cond:
                 try:
                     cond_item = actual_cond[key]
-                    if isinstance(cond_item, torch.Tensor):
+                    if key == 'seq_len':
+                        # Special handling for seq_len - recalculate based on window size
+                        # For WAN models, seq_len is calculated as:
+                        # seq_len = math.ceil((lat_h * lat_w) / (patch_h * patch_w) * lat_f)
+                        # We need to adjust lat_f based on the window size
+                        if isinstance(cond_item, (int, float)):
+                            # Get original full length and window length
+                            full_frames = x_in.size(self.dim)
+                            window_frames = window.context_length
+                            # Scale seq_len proportionally
+                            import math
+                            resized_actual_cond[key] = math.ceil(cond_item * window_frames / full_frames)
+                        else:
+                            resized_actual_cond[key] = cond_item
+                    elif isinstance(cond_item, torch.Tensor):
                         # Check if tensor matches expected dimensions
                         if self.dim < cond_item.ndim and cond_item.size(self.dim) == x_in.size(self.dim):
                             actual_cond_item = window.get_tensor(cond_item)
