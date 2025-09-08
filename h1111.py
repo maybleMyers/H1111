@@ -466,7 +466,9 @@ def wan22_batch_handler(
     unload_text_encoders: bool,
     vae_fp32: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
-    enable_extension: bool, extend_frames: int, frames_to_check: int  # Extension parameters
+    enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -563,6 +565,17 @@ def wan22_batch_handler(
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # --- Context Windows Handling ---
+        if use_context_windows:
+            command.append("--use_context_windows")
+            command.extend(["--context_length", str(context_length)])
+            command.extend(["--context_overlap", str(context_overlap)])
+            command.extend(["--context_schedule", str(context_schedule)])
+            command.extend(["--context_stride", str(context_stride)])
+            if context_closed_loop:
+                command.append("--context_closed_loop")
+            command.extend(["--context_fuse_method", str(context_fuse_method)])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -7798,6 +7811,59 @@ with gr.Blocks(
                                 label="Extension Info"
                             )
                     
+                    # Context Windows Controls
+                    with gr.Accordion("Enable Sliding Context Windows", open=False):
+                        wan22_use_context_windows = gr.Checkbox(
+                            label="Enable Sliding Context Windows", 
+                            value=False,
+                            info="Enable sliding context windows for long video generation"
+                        )
+                        with gr.Group(visible=False) as wan22_context_controls:
+                            with gr.Row():
+                                wan22_context_length = gr.Number(
+                                    label="Context Length", 
+                                    value=81, 
+                                    minimum=9,
+                                    maximum=611,
+                                    step=4,
+                                    info="Length of context window in frames (default: 81)"
+                                )
+                                wan22_context_overlap = gr.Number(
+                                    label="Context Overlap", 
+                                    value=30, 
+                                    minimum=0,
+                                    maximum=300,
+                                    step=1,
+                                    info="Overlap between context windows in frames (default: 30)"
+                                )
+                            with gr.Row():
+                                wan22_context_schedule = gr.Dropdown(
+                                    label="Context Schedule",
+                                    choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
+                                    value="standard_static",
+                                    info="Context window scheduling method"
+                                )
+                                wan22_context_stride = gr.Number(
+                                    label="Context Stride",
+                                    value=1,
+                                    minimum=1,
+                                    maximum=10,
+                                    step=1,
+                                    info="Stride for uniform context schedules (default: 1)"
+                                )
+                            with gr.Row():
+                                wan22_context_closed_loop = gr.Checkbox(
+                                    label="Enable Closed Loop",
+                                    value=False,
+                                    info="Enable closed loop for cyclic videos"
+                                )
+                                wan22_context_fuse_method = gr.Dropdown(
+                                    label="Fuse Method",
+                                    choices=["pyramid", "flat", "overlap-linear", "relative"],
+                                    value="pyramid",
+                                    info="Method for fusing context window results"
+                                )
+                    
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
@@ -7811,7 +7877,7 @@ with gr.Blocks(
                         wan22_calc_height_btn = gr.Button("→")
                         wan22_calc_width_btn = gr.Button("←")
                         wan22_height = gr.Number(label="Height", value=480, interactive=True)
-                    wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan22_frame_num = gr.Slider(minimum=9, maximum=611, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
@@ -11299,6 +11365,13 @@ with gr.Blocks(
         outputs=[wan22_v2v_controls]
     )
     
+    # Context Windows visibility toggle
+    wan22_use_context_windows.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_use_context_windows],
+        outputs=[wan22_context_controls]
+    )
+    
     # Extension visibility toggle
     wan22_enable_extension.change(
         fn=lambda enabled: gr.update(visible=enabled),
@@ -11467,6 +11540,14 @@ with gr.Blocks(
             wan22_enable_extension,
             wan22_extend_frames,
             wan22_frames_to_check,
+            # Context Windows arguments
+            wan22_use_context_windows,
+            wan22_context_length,
+            wan22_context_overlap,
+            wan22_context_schedule,
+            wan22_context_stride,
+            wan22_context_closed_loop,
+            wan22_context_fuse_method,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

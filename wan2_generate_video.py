@@ -48,6 +48,20 @@ except:
 
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
+
+# Context Windows imports
+try:
+    from Wan2_2.context_windows import (
+        WanContextWindowsHandler,
+        IndexListContextHandler,
+        ContextSchedules,
+        ContextFuseMethods,
+    )
+    CONTEXT_WINDOWS_AVAILABLE = True
+except ImportError:
+    CONTEXT_WINDOWS_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.info("Context windows module not available. Install required dependencies to enable context windows.")
 # Local implementations to avoid xformers/flash-attention dependency
 import av
 import cv2
@@ -417,6 +431,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--color_match", type=str, default="hm", 
                        choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
                        help="Color matching method for video extension (default: histogram matching)")
+    
+    # Context Windows Arguments
+    parser.add_argument("--use_context_windows", action="store_true", 
+                       help="Enable sliding context windows for long video generation")
+    parser.add_argument("--context_length", type=int, default=81, 
+                       help="Length of context window in frames (default: 81)")
+    parser.add_argument("--context_overlap", type=int, default=30, 
+                       help="Overlap between context windows in frames (default: 30)")
+    parser.add_argument("--context_schedule", type=str, default="standard_static",
+                       choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
+                       help="Context window scheduling method (default: standard_static)")
+    parser.add_argument("--context_stride", type=int, default=1,
+                       help="Stride for uniform context schedules (default: 1)")
+    parser.add_argument("--context_closed_loop", action="store_true",
+                       help="Enable closed loop for cyclic videos")
+    parser.add_argument("--context_fuse_method", type=str, default="pyramid",
+                       choices=["pyramid", "flat", "overlap-linear", "relative"],
+                       help="Method for fusing context window results (default: pyramid)")
+    parser.add_argument("--context_dim", type=int, default=2,
+                       help="Dimension to apply context windows (2=temporal for video, default: 2)")
 
     args = parser.parse_args()
 
@@ -1541,6 +1575,58 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
             network.merge_to(text_encoders=None, unet=model, weights_sd=weights_sd, device=device)
             logging.info(f"Successfully merged LoRA: {os.path.basename(lora_path)}")
             del network, weights_sd
+
+
+def apply_context_windows(args: argparse.Namespace, model_options: dict = None) -> Optional[dict]:
+    """Apply context windows configuration to model options if enabled.
+    
+    Args:
+        args: Command line arguments containing context window settings
+        model_options: Existing model options dict (will be created if None)
+    
+    Returns:
+        Updated model options dict with context handler, or None if not enabled
+    """
+    if not args.use_context_windows:
+        return model_options
+    
+    if not CONTEXT_WINDOWS_AVAILABLE:
+        logger.warning("Context windows requested but module not available. Proceeding without context windows.")
+        return model_options
+    
+    # Create model options if not provided
+    if model_options is None:
+        model_options = {}
+    
+    # Initialize transformer options
+    if "transformer_options" not in model_options:
+        model_options["transformer_options"] = {}
+    
+    # Create WAN context windows handler
+    try:
+        context_handler = WanContextWindowsHandler(
+            context_length=args.context_length,
+            context_overlap=args.context_overlap,
+            context_schedule=args.context_schedule,
+            context_stride=args.context_stride,
+            closed_loop=args.context_closed_loop,
+            fuse_method=args.context_fuse_method
+        )
+        
+        # Store handler in model options
+        model_options["context_handler"] = context_handler.handler
+        model_options["transformer_options"]["context_handler"] = context_handler.handler
+        
+        logger.info(f"Context windows enabled: length={args.context_length} frames, "
+                   f"overlap={args.context_overlap} frames, schedule={args.context_schedule}, "
+                   f"fuse={args.context_fuse_method}")
+        
+        return model_options
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize context windows: {e}")
+        return model_options
+
 
 def optimize_model(
     model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype, dit_weight_dtype: torch.dtype
@@ -2689,7 +2775,8 @@ def run_sampling(
     model_manager: Optional[DynamicModelManager] = None,  # Dynamic model manager for dual-dit
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
-    preview_suffix: Optional[str] = None # <<< ADD suffix argument
+    preview_suffix: Optional[str] = None, # <<< ADD suffix argument
+    model_options: Optional[dict] = None  # Context windows and other model options
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
     Args:
@@ -2705,12 +2792,22 @@ def run_sampling(
         previewer: LatentPreviewer instance or None # Added description
         use_cpu_offload: Whether to offload tensors to CPU during processing (example)
         preview_suffix: Unique suffix for preview files to avoid conflicts in concurrent runs.
+        model_options: Optional model options including context window handler
     Returns:
         torch.Tensor: generated latent
     """
     arg_c, arg_null = inputs
 
     latent = noise # Initialize latent state
+    
+    # Check if we should use context windows
+    context_handler = None
+    if model_options and "context_handler" in model_options:
+        context_handler = model_options["context_handler"]
+        if context_handler and context_handler.should_use_context(model, [], latent, torch.tensor(0), model_options):
+            logger.info("Context windows will be used for this generation")
+        else:
+            context_handler = None  # Don't use if not needed
     # Determine storage device (CPU if offloading, otherwise compute device)
     latent_storage_device = torch.device("cpu") if use_cpu_offload else device
     latent = latent.to(latent_storage_device) # Move initial state to storage device
@@ -2837,10 +2934,46 @@ def run_sampling(
                 current_model = model
             
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
-            # 1. Predict conditional noise estimate  
+            # Define helper function for model calls with optional context windows
+            def calc_cond_batch(model_to_use, conds_list, x_input, ts, opts):
+                """Helper to calculate conditional predictions, optionally with context windows."""
+                # For context windows, conds_list would be list of dicts
+                # For normal operation, we just use the dict directly
+                if isinstance(conds_list, list) and len(conds_list) > 0:
+                    cond_dict = conds_list[0]
+                else:
+                    cond_dict = conds_list if isinstance(conds_list, dict) else {}
+                
+                # Filter non-model parameters
+                model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                
+                # Call model
+                result = model_to_use(x_input, t=ts, **model_cond_dict)
+                return [result[0]] if isinstance(result, tuple) else [result]
+            
+            # 1. Predict conditional noise estimate
             # Filter out non-model parameters before passing to model
             model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
-            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            
+            if context_handler is not None:
+                # Use context windows for processing
+                # Prepare inputs for context handler
+                conds_for_handler = [model_arg_c]  # Context handler expects list of dicts
+                
+                # Execute with context windows
+                noise_pred_results = context_handler.execute(
+                    calc_cond_batch,
+                    current_model,
+                    [conds_for_handler],  # List of condition lists
+                    latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                    timestep,
+                    model_options or {}
+                )
+                noise_pred_cond = noise_pred_results[0]
+            else:
+                # Standard model call without context windows
+                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
@@ -2852,19 +2985,75 @@ def run_sampling(
                 # Filter out non-model parameters for uncond args too
                 model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
 
-                if apply_slg_step and args.slg_mode == "original":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                    skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                    noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
+                if context_handler is not None:
+                    # Use context windows for unconditional predictions
+                    conds_null_for_handler = [model_arg_null]
+                    
+                    if apply_slg_step and args.slg_mode == "original":
+                        # Uncond prediction
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_cond_batch, current_model, [conds_null_for_handler],
+                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        
+                        # SLG prediction (with skip layers)
+                        def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
+                            cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
+                            model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                            result = model_to_use(x_input, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            return [result[0]] if isinstance(result, tuple) else [result]
+                        
+                        skip_layer_results = context_handler.execute(
+                            calc_slg_batch, current_model, [conds_null_for_handler],
+                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            timestep, model_options or {}
+                        )
+                        skip_layer_out = skip_layer_results[0].to(latent_storage_device)
+                        
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
+                    
+                    elif apply_slg_step and args.slg_mode == "uncond":
+                        # Uncond with SLG
+                        def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
+                            cond_dict = conds_list[0] if isinstance(conds_list, list) and len(conds_list) > 0 else {}
+                            model_cond_dict = {k: v for k, v in cond_dict.items() if not k.startswith('_')}
+                            result = model_to_use(x_input, t=ts, skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            return [result[0]] if isinstance(result, tuple) else [result]
+                        
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_slg_batch, current_model, [conds_null_for_handler],
+                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    
+                    else:  # Regular CFG with context windows
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_cond_batch, current_model, [conds_null_for_handler],
+                            latent_model_input_list[0] if len(latent_model_input_list) == 1 else torch.cat(latent_model_input_list),
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    # Standard calls without context windows (original code)
+                    if apply_slg_step and args.slg_mode == "original":
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
-                elif apply_slg_step and args.slg_mode == "uncond":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    elif apply_slg_step and args.slg_mode == "uncond":
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                else: # Regular CFG
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    else: # Regular CFG
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
                 noise_pred = noise_pred_cond
@@ -4432,6 +4621,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
              logger.error(f"Failed to initialize Latent Previewer: {e}", exc_info=True)
              previewer = None # Ensure it's None if init fails
 
+    # --- Apply Context Windows if Enabled ---
+    model_options = apply_context_windows(args)
+    
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
     
@@ -4459,7 +4651,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         model_manager=model_manager,  # New parameter
         previewer=previewer, # MODIFIED: Pass the previewer instance
         use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
-        preview_suffix=args.preview_suffix # Pass the preview suffix to run_sampling
+        preview_suffix=args.preview_suffix, # Pass the preview suffix to run_sampling
+        model_options=model_options  # Pass context window options
     )
 
     # --- Cleanup ---
