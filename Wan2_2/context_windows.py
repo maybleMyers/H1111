@@ -265,7 +265,17 @@ class IndexListContextHandler(ContextHandlerABC):
             # Get subsections of inputs
             sub_x = window.get_tensor(x_in, device)
             sub_timestep = window.get_tensor(timestep, device, dim=0) if timestep.ndim > 0 else timestep
+            
+            # Debug logging
+            logger.debug(f"Processing window {window_idx}, conds structure: {[type(c) for c in conds]}")
+            logger.debug(f"Number of conditions: {len(conds)}")
+            
             sub_conds = [self.get_resized_cond(cond, x_in, window, device) for cond in conds]
+            
+            # More debug logging
+            logger.debug(f"After resize, sub_conds: {[len(sc) if sc else 'None' for sc in sub_conds]}")
+            if sub_conds and len(sub_conds) > 0 and sub_conds[0]:
+                logger.debug(f"First sub_cond keys: {sub_conds[0][0].keys() if len(sub_conds[0]) > 0 else 'empty'}")
             
             # Calculate conditions for this window
             sub_conds_out = calc_cond_batch(model, sub_conds, sub_x, sub_timestep, model_options)

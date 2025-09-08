@@ -2937,17 +2937,31 @@ def run_sampling(
             # Define helper function for model calls with optional context windows
             def calc_cond_batch(model_to_use, conds_list, x_input, ts, opts):
                 """Helper to calculate conditional predictions, optionally with context windows."""
+                # Debug what we're receiving
+                logger.debug(f"calc_cond_batch received conds_list type: {type(conds_list)}")
+                if isinstance(conds_list, list):
+                    logger.debug(f"  Length: {len(conds_list)}")
+                    if len(conds_list) > 0:
+                        logger.debug(f"  First element type: {type(conds_list[0])}")
+                        if isinstance(conds_list[0], list) and len(conds_list[0]) > 0:
+                            logger.debug(f"    First-first element type: {type(conds_list[0][0])}")
+                
                 # Handle different input formats
-                # conds_list could be:
-                # - A list of dicts (from context handler)
-                # - A single dict (shouldn't happen but handle it)
+                # The context handler passes a list of resized condition dicts
+                # We need to extract the actual condition dict
+                cond_dict = {}
                 if isinstance(conds_list, dict):
                     cond_dict = conds_list
                 elif isinstance(conds_list, list) and len(conds_list) > 0:
-                    # Get first element if it's a list
-                    cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
-                else:
-                    cond_dict = {}
+                    # Unwrap nested lists until we find a dict
+                    current = conds_list[0]
+                    while isinstance(current, list) and len(current) > 0:
+                        current = current[0]
+                    if isinstance(current, dict):
+                        cond_dict = current
+                    else:
+                        logger.error(f"Could not find dict in conds_list structure")
+                        cond_dict = {}
                 
                 # The model needs context and seq_len - these should NOT be filtered out
                 # Extract required arguments
