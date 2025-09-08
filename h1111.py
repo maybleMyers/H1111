@@ -36,6 +36,388 @@ logger = logging.getLogger(__name__)
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 
+# Helper functions for model detection (moved to global scope)
+def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
+    """Get filtered DiT models for Wan One Frame tab"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    if filter_name:
+        models = [m for m in models if filter_name.lower() in m.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+
+def get_wan_of_low_noise_models(dit_folder: str) -> List[str]:
+    """Get low noise DiT models"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    # Look for models with 'low' in the name (more flexible matching)
+    low_models = [m for m in models if 'low' in m.lower()]
+    low_models.sort(key=str.lower)
+    return low_models if low_models else ["wan22_i2v_14B_low_noise_bf16.safetensors"]
+
+def get_wan_of_high_noise_models(dit_folder: str) -> List[str]:
+    """Get high noise DiT models"""
+    if not os.path.exists(dit_folder):
+        return ["wan22_i2v_14B_high_noise_bf16.safetensors"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    # Look for models with 'high' in the name (more flexible matching)
+    high_models = [m for m in models if 'high' in m.lower()]
+    high_models.sort(key=str.lower)
+    return high_models if high_models else ["wan22_i2v_14B_high_noise_bf16.safetensors"]
+    
+def get_wan_of_clip_models(dit_folder: str) -> List[str]:
+    """Get CLIP models"""
+    if not os.path.exists(dit_folder):
+        return ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'clip' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"]
+
+def get_wan_of_vae_models(dit_folder: str) -> List[str]:
+    """Get VAE models"""
+    if not os.path.exists(dit_folder):
+        return ["Wan2.1_VAE.pth"]
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.pth') and 'vae' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["Wan2.1_VAE.pth"]
+
+def get_wan_of_t5_models(dit_folder: str) -> List[str]:
+    """Get T5 models"""
+    if not os.path.exists(dit_folder):
+        return ["models_t5_umt5-xxl-enc-bf16.pth"]
+    models = [f for f in os.listdir(dit_folder) if (f.endswith('.pth') or f.endswith('.safetensors')) and 't5' in f.lower()]
+    models.sort(key=str.lower)
+    return models if models else ["models_t5_umt5-xxl-enc-bf16.pth"]
+
+# Helper functions to get default (first available) model
+def get_default_low_noise_model(dit_folder: str = "wan") -> str:
+    """Get the first available low noise model as default"""
+    models = get_wan_of_low_noise_models(dit_folder)
+    return models[0] if models else "wan22_i2v_14B_low_noise_bf16.safetensors"
+    
+def get_default_high_noise_model(dit_folder: str = "wan") -> str:
+    """Get the first available high noise model as default"""
+    models = get_wan_of_high_noise_models(dit_folder)
+    return models[0] if models else "wan22_i2v_14B_high_noise_bf16.safetensors"
+    
+def get_default_clip_model(dit_folder: str = "wan") -> str:
+    """Get the first available CLIP model as default"""
+    models = get_wan_of_clip_models(dit_folder)
+    return models[0] if models else "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    
+def get_default_vae_model(dit_folder: str = "wan") -> str:
+    """Get the first available VAE model as default"""
+    models = get_wan_of_vae_models(dit_folder)
+    return models[0] if models else "Wan2.1_VAE.pth"
+    
+def get_default_t5_model(dit_folder: str = "wan") -> str:
+    """Get the first available T5 model as default"""
+    models = get_wan_of_t5_models(dit_folder)
+    return models[0] if models else "models_t5_umt5-xxl-enc-bf16.pth"
+
+# Task-specific model detection functions
+def get_task_specific_low_noise_model(dit_folder: str = "wan", task_type: str = "i2v") -> str:
+    """Get task-specific low noise model (prefers models matching the task type)"""
+    if not os.path.exists(dit_folder):
+        return get_default_low_noise_model(dit_folder)
+    
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    low_models = [m for m in models if 'low' in m.lower()]
+    
+    # Prefer models that match the task type
+    task_specific = [m for m in low_models if task_type.lower() in m.lower()]
+    if task_specific:
+        task_specific.sort(key=str.lower)
+        return task_specific[0]
+    
+    # Fall back to any low noise model
+    if low_models:
+        low_models.sort(key=str.lower)
+        return low_models[0]
+    
+    return get_default_low_noise_model(dit_folder)
+
+def get_task_specific_high_noise_model(dit_folder: str = "wan", task_type: str = "i2v") -> str:
+    """Get task-specific high noise model (prefers models matching the task type)"""
+    if not os.path.exists(dit_folder):
+        return get_default_high_noise_model(dit_folder)
+    
+    models = [f for f in os.listdir(dit_folder) if f.endswith('.safetensors')]
+    high_models = [m for m in models if 'high' in m.lower()]
+    
+    # Prefer models that match the task type
+    task_specific = [m for m in high_models if task_type.lower() in m.lower()]
+    if task_specific:
+        task_specific.sort(key=str.lower)
+        return task_specific[0]
+    
+    # Fall back to any high noise model
+    if high_models:
+        high_models.sort(key=str.lower)
+        return high_models[0]
+    
+    return get_default_high_noise_model(dit_folder)
+
+# Wan One Frame Inference Handler
+def wan_one_frame_handler(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    task: str,
+    conditioning_strength: float,
+    target_index: int,
+    control_index: str,
+    inference_options: List[str],
+    control_images: List,
+    control_masks: List,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    seed: int,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    timestep_boundary: float,
+    sample_solver: str,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_t5: bool,
+    mixed_dtype: bool,
+    vae_fp32: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+    
+    os.makedirs(save_path, exist_ok=True)
+    
+    all_generated_images = []
+    
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_images, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_images.copy(), status_text, "Starting item..."
+
+        # Use explicit task selection
+        has_main_image = image_path and image_path.strip()
+        
+        # For T2V task with image provided, use image as control for one-frame inference
+        # For I2V task, use image as main input as usual
+
+        # Construct the command
+        cmd = [
+            sys.executable, "base_wan_generate_video.py",
+            "--task", task,  # Use explicit task selection
+            "--prompt", prompt,
+            "--video_size", str(int(height)), str(int(width)),
+            "--video_length", str(int(frame_num)),
+            "--fps", str(int(fps)),
+            "--seed", str(current_seed),
+            "--infer_steps", str(int(sample_steps)),
+            "--flow_shift", str(flow_shift),
+            "--guidance_scale", str(sample_guide_scale),
+            "--timestep_boundary", str(timestep_boundary),
+            "--sample_solver", sample_solver,
+            "--output_type", "images",
+            "--save_path", save_path,
+            "--conditioning_strength", str(conditioning_strength),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--dit", os.path.join("wan", dit_low_noise_path),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path)
+        ]
+        
+        # Only add CLIP for i2v tasks
+        if task == "i2v-A14B":
+            cmd.extend(["--clip", os.path.join("wan", clip_path)])
+        
+        if negative_prompt.strip():
+            cmd.extend(["--negative_prompt", negative_prompt])
+        
+        # Handle image input based on task
+        if has_main_image:
+            if task == "i2v-A14B":
+                # For I2V tasks, use image as main input
+                cmd.extend(["--image_path", image_path])
+            elif task == "t2v-A14B":
+                # For T2V tasks, use image as control image for conditioning
+                if not control_images:
+                    control_images = [image_path]
+                else:
+                    # Prepend main image to control images list
+                    control_images.insert(0, image_path)
+            
+        # Add control images if provided
+        if control_images and len(control_images) > 0:
+            control_paths = []
+            for ctrl_img in control_images:
+                if hasattr(ctrl_img, 'name') and ctrl_img.name:
+                    control_paths.append(ctrl_img.name)
+                elif isinstance(ctrl_img, str) and ctrl_img.strip():
+                    control_paths.append(ctrl_img)
+            if control_paths:
+                cmd.extend(["--control_image_path"] + control_paths)
+                
+        # Add control masks if provided
+        if control_masks and len(control_masks) > 0:
+            mask_paths = []
+            for mask in control_masks:
+                if hasattr(mask, 'name') and mask.name:
+                    mask_paths.append(mask.name)
+                elif isinstance(mask, str) and mask.strip():
+                    mask_paths.append(mask)
+            if mask_paths:
+                cmd.extend(["--control_image_mask_path"] + mask_paths)
+        
+        # Build one_frame_inference parameter
+        of_params = []
+        of_params.append(f"target_index={target_index}")
+        of_params.append(f"control_index={control_index}")
+        
+        for option in inference_options:
+            of_params.append(option)
+        
+        if of_params:
+            cmd.extend(["--one_frame_inference", ",".join(of_params)])
+        
+        # Performance flags
+        if fp8:
+            cmd.append("--fp8")
+        if fp8_scaled:
+            cmd.append("--fp8_scaled") 
+        if fp8_t5:
+            cmd.append("--fp8_t5")
+        if mixed_dtype:
+            cmd.append("--mixed_dtype")
+        if vae_fp32:
+            cmd.extend(["--vae_dtype", "float32"])
+        
+        cmd.extend(["--blocks_to_swap", str(int(block_swap))])
+        
+        # LoRA Handling
+        lora_weights_low = []
+        lora_multipliers_low = []
+        lora_weights_high = []
+        lora_multipliers_high = []
+        
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high)
+        ]
+        
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    full_path = os.path.join(lora_folder, name)
+                    if os.path.exists(full_path):
+                        if apply_low:
+                            lora_weights_low.append(full_path)
+                            lora_multipliers_low.append(mult)
+                        if apply_high:
+                            lora_weights_high.append(full_path)
+                            lora_multipliers_high.append(mult)
+        
+        if lora_weights_low:
+            cmd.extend(["--lora_weight"] + lora_weights_low)
+            cmd.extend(["--lora_multiplier"] + [str(m) for m in lora_multipliers_low])
+        
+        if lora_weights_high:
+            cmd.extend(["--lora_weight_high_noise"] + lora_weights_high)
+            cmd.extend(["--lora_multiplier_high_noise"] + [str(m) for m in lora_multipliers_high])
+        
+        # --- Execute Subprocess ---
+        print(f"Running Wan One Frame Command: {' '.join(cmd)}")
+        
+        try:
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace', bufsize=1
+            )
+            
+            progress_text_update = "Subprocess started..."
+            
+            for line in iter(process.stdout.readline, ''):
+                if stop_event.is_set():
+                    try: 
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except: 
+                        process.kill()
+                        process.wait()
+                    yield all_generated_images, "Generation stopped by user.", ""
+                    return
+                    
+                line_strip = line.strip()
+                if not line_strip: 
+                    continue
+                    
+                print(f"WAN_OF_SUBPROCESS: {line_strip}")
+                
+                progress_text_update = line_strip
+                yield all_generated_images, status_text, progress_text_update
+                
+                # Check for saved files
+                if "Saved" in line_strip or "saved" in line_strip.lower():
+                    # Try to find generated files
+                    if os.path.exists(save_path):
+                        for file in os.listdir(save_path):
+                            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                full_path = os.path.join(save_path, file)
+                                if (full_path, file) not in all_generated_images:
+                                    all_generated_images.append((full_path, file))
+                                    yield all_generated_images, status_text, f"Found generated image: {file}"
+            
+            process.wait()
+            print(f"WAN_OF_SUBPROCESS: Process completed with return code {process.returncode}")
+            
+            # Final check for output files
+            if os.path.exists(save_path):
+                for file in sorted(os.listdir(save_path)):
+                    if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        full_path = os.path.join(save_path, file)
+                        if (full_path, file) not in all_generated_images:
+                            all_generated_images.append((full_path, file))
+            
+            item_status = f"Item {i+1}/{batch_size} completed!" if process.returncode == 0 else f"Item {i+1}/{batch_size} failed with code {process.returncode}"
+            yield all_generated_images, item_status, ""
+            
+        except Exception as e:
+            error_msg = f"Error executing item {i+1}/{batch_size}: {str(e)}"
+            print(f"WAN_OF_SUBPROCESS: {error_msg}")
+            yield all_generated_images, error_msg, ""
+            return
+    
+    yield all_generated_images, "All generations completed!", ""
+
 #wan2.2
 def wan22_batch_handler(
     prompt: str,
@@ -83,7 +465,10 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
-    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool  # Add these
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
+    enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -127,8 +512,8 @@ def wan22_batch_handler(
             "--save_path", str(save_path),
             "--attn_mode", str(attn_mode),
             "--blocks_to_swap", str(block_swap),
-            "--vae", vae_path,
-            "--t5", t5_path,
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
         ]
 
         if negative_prompt:
@@ -136,20 +521,32 @@ def wan22_batch_handler(
         
         # --- Model Path Logic based on Task ---
         if "A14B" in task:
-            command.extend(["--dit_low_noise", dit_low_noise_path, "--dit_high_noise", dit_high_noise_path])
+            command.extend(["--dit_low_noise", os.path.join("wan", dit_low_noise_path), "--dit_high_noise", os.path.join("wan", dit_high_noise_path)])
             if "i2v" in task:
-                command.extend(["--clip", clip_path])
+                command.extend(["--clip", os.path.join("wan", clip_path)])
         elif "ti2v-5B" in task:
-            command.extend(["--dit", dit_path])
+            command.extend(["--dit", os.path.join("wan", dit_path)])
 
-        # Handle V2V vs I2V mode
+        # Handle V2V vs Extension mode
         if enable_v2v and input_video:
-            command.extend(["--video_path", str(input_video)])
-            command.extend(["--strength", str(v2v_strength)])
-            if v2v_low_noise_only:
-                command.append("--v2v_low_noise_only")
-            if v2v_use_i2v:
-                command.append("--v2v_use_i2v")
+            if enable_extension:
+                # Use extension mode instead of regular V2V
+                command.extend(["--extend_video", str(input_video)])
+                command.extend(["--extend_frames", str(extend_frames)])
+                command.extend(["--frames_to_check", str(frames_to_check)])
+                
+                # Force i2v-A14B task for extension
+                if "i2v" not in task:
+                    yield [], None, f"Warning: Extension mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
+                    return
+            else:
+                # Regular V2V mode
+                command.extend(["--video_path", str(input_video)])
+                command.extend(["--strength", str(v2v_strength)])
+                if v2v_low_noise_only:
+                    command.append("--v2v_low_noise_only")
+                if v2v_use_i2v:
+                    command.append("--v2v_use_i2v")
         elif "i2v" in task and image_path:
             command.extend(["--image_path", str(image_path)])
 
@@ -168,6 +565,17 @@ def wan22_batch_handler(
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # --- Context Windows Handling ---
+        if use_context_windows:
+            command.append("--use_context_windows")
+            command.extend(["--context_length", str(context_length)])
+            command.extend(["--context_overlap", str(context_overlap)])
+            command.extend(["--context_schedule", str(context_schedule)])
+            command.extend(["--context_stride", str(context_stride)])
+            if context_closed_loop:
+                command.append("--context_closed_loop")
+            command.extend(["--context_fuse_method", str(context_fuse_method)])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -612,6 +1020,345 @@ def multitalk_batch_handler(
         time.sleep(0.2)
         
     yield all_generated_videos, None, "MultiTalk Batch complete.", ""
+
+### InfiniteTalk
+def infinitetalk_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    cond_image: str,  # Changed from cond_video to image path
+    audio_person1: Optional[str],
+    audio_person2: Optional[str],
+    batch_size: int,
+    # Generation params
+    size: str,
+    mode: str,
+    frame_num: int,
+    motion_frame: int,
+    sample_steps: int,
+    sample_shift: float,
+    text_guide_scale: float,
+    audio_guide_scale: float,
+    seed: int,
+    # Advanced & Performance
+    audio_type: str,
+    num_persistent: float,
+    use_teacache: bool,
+    teacache_thresh: float,
+    use_apg: bool,
+    apg_momentum: float,
+    apg_norm_thresh: float,
+    use_full_video_preview: bool,
+    # InfiniteTalk-specific params
+    scene_seg: bool,
+    dit_path: Optional[str],
+    infinitetalk_dir: Optional[str],
+    # Paths
+    ckpt_dir: str,
+    wav2vec_dir: str,
+    t5_tokenizer_path: str,
+    save_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    if not cond_image or not os.path.exists(cond_image):
+        yield [], None, "Error: Reference Image not provided or not found.", ""
+        return
+    
+    if not audio_person1:
+        yield [], None, "Error: At least one audio file is required.", ""
+        return
+        
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+    
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"infinitetalk_{run_id}"
+        save_file_prefix = os.path.join(save_path, f"infinitetalk_{run_id}_s{current_seed}")
+        num_persistent_backend = int(num_persistent * 1_000_000_000)
+
+        command = [
+            sys.executable,
+            "generate_infinitalk_video.py",
+            "--ckpt_dir", str(ckpt_dir),
+            "--wav2vec_dir", str(wav2vec_dir),
+            "--t5_tokenizer_path", str(t5_tokenizer_path),
+            "--prompt", str(prompt),
+            "--n_prompt", str(negative_prompt),
+            "--cond_image", str(cond_image),  # Changed from cond_video
+            "--cond_audio_person1", str(audio_person1),
+            "--base_seed", str(current_seed),
+            "--save_file", save_file_prefix,
+            "--size", str(size),
+            "--mode", str(mode),
+            "--frame_num", str(frame_num),
+            "--motion_frame", str(motion_frame),
+            "--sample_steps", str(sample_steps),
+            "--sample_shift", str(sample_shift),
+            "--sample_text_guide_scale", str(text_guide_scale),
+            "--sample_audio_guide_scale", str(audio_guide_scale),
+            "--audio_type", str(audio_type),
+            "--num_persistent_param_in_dit", str(num_persistent_backend),
+        ]
+        
+        if audio_person2 and os.path.exists(audio_person2):
+            command.extend(["--cond_audio_person2", str(audio_person2)])
+
+        # Add InfiniteTalk-specific parameters
+        if scene_seg:
+            command.append("--scene_seg")
+            
+        if dit_path and os.path.exists(dit_path):
+            command.extend(["--dit_path", str(dit_path)])
+            
+        if infinitetalk_dir and os.path.exists(infinitetalk_dir):
+            command.extend(["--infinitetalk_dir", str(infinitetalk_dir)])
+
+        if use_teacache:
+            command.append("--use_teacache")
+            command.extend(["--teacache_thresh", str(teacache_thresh)])
+
+        if use_apg:
+            command.append("--use_apg")
+            command.extend(["--apg_momentum", str(apg_momentum)])
+            command.extend(["--apg_norm_threshold", str(apg_norm_thresh)])
+
+        if use_full_video_preview:
+            command.append("--full_preview")
+            command.extend(["--preview_suffix", unique_preview_suffix])
+            
+        # LoRA Handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult), (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult), (lora4_str, lora4_mult)
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+            
+        # --- Execute Subprocess ---
+        print(f"Running InfiniteTalk Command: {' '.join(command)}")
+        
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_path = None
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(os.path.dirname(save_file_prefix), "previews")
+        preview_mp4_gen_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+        # Also try the absolute path in case the working directory is different
+        preview_mp4_gen_path_abs = os.path.abspath(preview_mp4_gen_path)
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, None, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"INFINITETALK_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+            clip_progress_match = re.search(r"Generating clip (\d+/\d+)", line_strip)
+            scene_progress_match = re.search(r"Processing scene (\d+/\d+)", line_strip)
+            saving_video_match = re.search(r'Saving video:.*', line_strip)
+            final_save_match = re.search(r'Saving generated video to (.*\.mp4)', line_strip)
+            
+            if final_save_match:
+                found_path = final_save_match.group(1).strip()
+                print(f"DEBUG: Final save detected, found_path: {found_path}")
+                # Try both relative and absolute paths
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                    print(f"DEBUG: Found video file at: {found_path}")
+                elif os.path.exists(os.path.abspath(found_path)):
+                    current_video_file_for_item = os.path.abspath(found_path)
+                    print(f"DEBUG: Found video file at absolute path: {os.path.abspath(found_path)}")
+                else:
+                    # Sometimes the path might be relative to the script location
+                    current_video_file_for_item = found_path  # Store the path anyway for later verification
+                    print(f"DEBUG: Video file not immediately found, storing path for later verification: {found_path}")
+                progress_text_update = f"Finalized: {os.path.basename(current_video_file_for_item or found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif saving_video_match:
+                progress_text_update = "Saving final video..."
+            elif scene_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Scene {scene_progress_match.group(1)}"
+            elif clip_progress_match:
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Clip {clip_progress_match.group(1)}"
+                tqdm_match_on_clip_line = re.search(r"(\d+)\s*%\|.*?\|\s*(\d+/\d+)\s*\[([^\]]+)\]", line_strip)
+                if tqdm_match_on_clip_line:
+                    percentage = tqdm_match_on_clip_line.group(1)
+                    steps_iter = tqdm_match_on_clip_line.group(2)
+                    time_details = tqdm_match_on_clip_line.group(3)
+                    progress_text_update = f"Clip: {percentage}% | {steps_iter} | {time_details}"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_details = tqdm_match.group(3)
+                progress_text_update = f"{percentage}% | {steps_iter} | {time_details}"
+
+            # Check for preview updates
+            if use_full_video_preview:
+                # Try both relative and absolute paths for preview
+                preview_found = False
+                if os.path.exists(preview_mp4_gen_path):
+                    if os.path.getmtime(preview_mp4_gen_path) > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path
+                        last_preview_mtime = os.path.getmtime(preview_mp4_gen_path)
+                        preview_found = True
+                        print(f"DEBUG: Preview found at: {preview_mp4_gen_path}")
+                elif os.path.exists(preview_mp4_gen_path_abs):
+                    if os.path.getmtime(preview_mp4_gen_path_abs) > last_preview_mtime:
+                        current_preview_yield_path = preview_mp4_gen_path_abs
+                        last_preview_mtime = os.path.getmtime(preview_mp4_gen_path_abs)
+                        preview_found = True
+                        print(f"DEBUG: Preview found at absolute path: {preview_mp4_gen_path_abs}")
+                        
+                # Also check if there's any preview message in the logs
+                if "Saved full preview to" in line_strip:
+                    preview_path_match = re.search(r'Saved full preview to (.+\.mp4)', line_strip)
+                    if preview_path_match:
+                        detected_preview_path = preview_path_match.group(1).strip()
+                        print(f"DEBUG: Preview save detected in logs: {detected_preview_path}")
+                        if os.path.exists(detected_preview_path):
+                            current_preview_yield_path = detected_preview_path
+                            last_preview_mtime = os.path.getmtime(detected_preview_path)
+                            print(f"DEBUG: Using preview from log detection: {detected_preview_path}")
+                        elif os.path.exists(os.path.abspath(detected_preview_path)):
+                            abs_preview_path = os.path.abspath(detected_preview_path)
+                            current_preview_yield_path = abs_preview_path
+                            last_preview_mtime = os.path.getmtime(abs_preview_path)
+                            print(f"DEBUG: Using preview from log detection (absolute): {abs_preview_path}")
+
+            yield all_generated_videos.copy(), current_preview_yield_path, status_text, progress_text_update
+
+        process.wait()
+
+        # Final verification of output file if not detected during streaming
+        if not current_video_file_for_item:
+            print(f"DEBUG: No video file detected during streaming, attempting final verification...")
+            # Try to find the expected output file based on save_file_prefix
+            expected_output = f"{save_file_prefix}.mp4"
+            print(f"DEBUG: Looking for expected output: {expected_output}")
+            if os.path.exists(expected_output):
+                current_video_file_for_item = expected_output
+                print(f"DEBUG: Found expected output at: {expected_output}")
+            elif os.path.exists(os.path.abspath(expected_output)):
+                current_video_file_for_item = os.path.abspath(expected_output)
+                print(f"DEBUG: Found expected output at absolute path: {os.path.abspath(expected_output)}")
+            else:
+                # Last resort: look for any .mp4 files in the output directory with matching timestamp
+                output_dir = os.path.dirname(save_file_prefix)
+                print(f"DEBUG: Searching output directory: {output_dir}")
+                if os.path.exists(output_dir):
+                    for f in os.listdir(output_dir):
+                        if f.endswith('.mp4') and run_id in f:
+                            potential_path = os.path.join(output_dir, f)
+                            print(f"DEBUG: Found potential match: {potential_path}")
+                            if os.path.exists(potential_path):
+                                current_video_file_for_item = potential_path
+                                print(f"DEBUG: Using fallback file: {potential_path}")
+                                break
+                else:
+                    print(f"DEBUG: Output directory does not exist: {output_dir}")
+
+        if current_video_file_for_item:
+            # --- START METADATA SAVING ---
+            params_for_meta = {
+                "model_type": "InfiniteTalk",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "cond_image": cond_image,
+                "audio_person1": audio_person1,
+                "audio_person2": audio_person2,
+                "size": size,
+                "mode": mode,
+                "frame_num": frame_num,
+                "motion_frame": motion_frame,
+                "sample_steps": sample_steps,
+                "sample_shift": sample_shift,
+                "text_guide_scale": text_guide_scale,
+                "audio_guide_scale": audio_guide_scale,
+                "seed": current_seed,
+                "audio_type": audio_type,
+                "scene_seg": scene_seg,
+                "dit_path": dit_path,
+                "infinitetalk_dir": infinitetalk_dir,
+                "use_teacache": use_teacache,
+                "teacache_thresh": teacache_thresh,
+                "use_apg": use_apg,
+                "apg_momentum": apg_momentum,
+                "apg_norm_thresh": apg_norm_thresh,
+            }
+            
+            if lora_weights_paths:
+                params_for_meta["lora_weights"] = lora_weights_paths
+                params_for_meta["lora_multipliers"] = lora_multipliers_values
+            
+            metadata_filename = current_video_file_for_item.replace('.mp4', '_params.json')
+            try:
+                with open(metadata_filename, 'w') as meta_file:
+                    json.dump(params_for_meta, meta_file, indent=2)
+            except Exception as e:
+                print(f"Error saving metadata: {e}")
+            # --- END METADATA SAVING ---
+            
+            all_generated_videos.append((current_video_file_for_item, f"InfiniteTalk - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+            
+            # Yield current generated videos and clear preview
+            yield all_generated_videos.copy(), None, status_text, progress_text_update
+        else:
+            status_text = f"Item {i+1}/{batch_size} - No output detected"
+            progress_text_update = "Check console for errors"
+            yield all_generated_videos.copy(), None, status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+        
+    yield all_generated_videos, None, "InfiniteTalk Batch complete.", ""
 
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
@@ -6460,6 +7207,125 @@ with gr.Blocks(
                 multitalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
                 multitalk_save_path = gr.Textbox(label="Save Path", value="outputs/multitalk")
 
+### InfiniteTalk Tab
+        with gr.Tab(id=14, label="InfiniteTalk") as infinitetalk_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    infinitetalk_prompt = gr.Textbox(
+                        label="Prompt",
+                        value="A conversation between two people in a studio.",
+                        lines=5,
+                    )
+                    infinitetalk_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        lines=3,
+                        value="bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."
+                    )                    
+                with gr.Column(scale=1):
+                    infinitetalk_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    infinitetalk_status = gr.Textbox(label="Status", interactive=False, value="")
+                    infinitetalk_progress = gr.Textbox(label="Progress", interactive=False, value="", elem_id="infinitetalk_progress_text")
+
+            with gr.Row():
+                infinitetalk_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                infinitetalk_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                # Left Column for inputs and core settings
+                with gr.Column():
+                    infinitetalk_cond_image = gr.Image(
+                        label="Reference Image",
+                        sources=["upload"],
+                        type="filepath",
+                        height=300
+                    )
+                    with gr.Row():
+                        infinitetalk_audio_person1 = gr.Audio(label="Audio for Person 1 (or single person)", type="filepath")
+                        infinitetalk_audio_person2 = gr.Audio(label="Audio for Person 2 (optional)", type="filepath")
+                    
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        infinitetalk_size = gr.Dropdown(label="Resolution", choices=["infinitetalk-480", "infinitetalk-720"], value="infinitetalk-480")
+                    with gr.Row():
+                        infinitetalk_mode = gr.Dropdown(label="Mode", choices=["clip", "streaming"], value="streaming", info="'streaming' for long video, 'clip' for a single chunk.")
+                        infinitetalk_frame_num = gr.Slider(label="Frames per Chunk", minimum=41, maximum=201, value=81, step=4, info="Must be 4n+1. Default is 81.")
+                        infinitetalk_motion_frame = gr.Slider(label="Motion Frame (for streaming)", minimum=1, maximum=40, value=9, step=1, info="Frames from previous chunk to condition the next. Default: 9 for InfiniteTalk.")
+                    
+                    with gr.Row():
+                        infinitetalk_sample_steps = gr.Slider(label="Sampling Steps", minimum=1, maximum=100, value=40, step=1)
+                        infinitetalk_sample_shift = gr.Slider(label="Sample Shift", minimum=1.0, maximum=20.0, value=7.0, step=0.1)
+                    
+                    with gr.Row():
+                        infinitetalk_text_guide_scale = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=10.0, value=5.0, step=0.1)
+                        infinitetalk_audio_guide_scale = gr.Slider(label="Audio Guidance Scale", minimum=1.0, maximum=10.0, value=4.0, step=0.1)
+
+                    with gr.Row():
+                        infinitetalk_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        infinitetalk_random_seed_btn = gr.Button("🎲️")
+                    
+                    with gr.Accordion("Advanced & Performance", open=True):
+                        infinitetalk_audio_type = gr.Radio(label="Audio Mixing Type", choices=["para", "add"], value="para", info="'para' for parallel talking, 'add' for sequential.")
+                        infinitetalk_scene_seg = gr.Checkbox(label="Enable Scene Segmentation", value=False, info="Detect and process scenes separately (requires scenedetect)")
+                        infinitetalk_num_persistent = gr.Slider(
+                            minimum=0, 
+                            maximum=26, 
+                            step=0.01, 
+                            value=5.0, 
+                            label="Low VRAM (Persistent Params in Billions)", 
+                            info="Slider value in billions. 0=very low VRAM (slower), 5=default(24gb vram)."
+                        )
+                        with gr.Row():
+                            infinitetalk_use_teacache = gr.Checkbox(label="Use TeaCache (Acceleration)", value=False)
+                            infinitetalk_teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.1, maximum=1.0, value=0.2, step=0.05, info="Higher is faster but may reduce quality.")
+                        with gr.Row():
+                            infinitetalk_use_apg = gr.Checkbox(label="Use APG (Reduces Color Shift)", value=False)
+                            infinitetalk_apg_momentum = gr.Slider(label="APG Momentum", minimum=-1.0, maximum=1.0, value=-0.75, step=0.05)
+                            infinitetalk_apg_norm_thresh = gr.Slider(label="APG Norm Threshold", minimum=10, maximum=100, value=55, step=1)
+
+                # Right column for outputs and advanced settings
+                with gr.Column():
+                    infinitetalk_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[1], rows=[1], object_fit="contain", height=480,
+                        allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Live Preview (During Generation)", open=True):
+                        infinitetalk_use_full_video_preview = gr.Checkbox(label="Use Full Video Previews Every Section", value=True)
+                        infinitetalk_preview_output = gr.Video(
+                            label="Latest Preview", height=300,
+                            interactive=False, elem_id="infinitetalk_preview_video"
+                        )
+                    
+                    with gr.Accordion("LoRA", open=True):                        
+                        with gr.Row():
+                            infinitetalk_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            infinitetalk_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        
+                        infinitetalk_lora_weights_ui = []
+                        infinitetalk_lora_multipliers_ui = []
+                        for i in range(4):
+                            with gr.Row():
+                                infinitetalk_lora_weights_ui.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                infinitetalk_lora_multipliers_ui.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### InfiniteTalk-Specific Paths")
+                    infinitetalk_dit_path = gr.Textbox(label="DiT Model Path (optional)", value="", placeholder="Path to DiT model checkpoint")
+                    infinitetalk_infinitetalk_dir = gr.Textbox(label="InfiniteTalk Model", value="", placeholder="Directory or safetensors file (e.g., infinitetalk_single.safetensors or infinitetalk_multi.safetensors)")
+            
+            with gr.Row():
+                infinitetalk_ckpt_dir = gr.Textbox(label="Base Wan Model", value="wan", placeholder="Directory or safetensors file (e.g., wan2.1_i2v_480p_14B_fp16.safetensors)")
+                infinitetalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
+                infinitetalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
+                infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")
+
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
             with gr.Row():
@@ -6915,6 +7781,88 @@ with gr.Blocks(
                         wan22_v2v_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="V2V Strength", value=0.5, info="How much to modify the input video (0=keep original, 1=full rewrite)")
                         wan22_v2v_low_noise_only = gr.Checkbox(label="Use Low Noise Model Only", value=False, info="For V2V with dual-dit models, use only the low noise model")
                         wan22_v2v_use_i2v = gr.Checkbox(label="Use I2V Model for V2V", value=False, info="Extract first frame for CLIP conditioning. Recommended for i2v-A14B.")
+                        
+                        # Clean I2V-based video extension
+                        wan22_enable_extension = gr.Checkbox(
+                            label="Enable Video Extension", 
+                            value=False,
+                            info="Extend input video using clean i2v-based generation with smooth blending"
+                        )
+                        with gr.Row(visible=False) as wan22_extension_controls:
+                            wan22_extend_frames = gr.Number(
+                                label="Total Frames to Generate", 
+                                value=200, 
+                                minimum=81, 
+                                maximum=500,
+                                step=1,
+                                info="Total number of frames in the extended video (81-500 frames)"
+                            )
+                            wan22_frames_to_check = gr.Number(
+                                label="Frames to Check from End",
+                                value=30,
+                                minimum=1,
+                                maximum=100,
+                                step=1,
+                                info="Number of frames from the end to analyze for the best transition point"
+                            )
+                        with gr.Row(visible=False) as wan22_extension_info:
+                            wan22_extension_summary = gr.HTML(
+                                value="<p><i>Extension will intelligently find the best transition frame and generate smooth video chunks.</i></p>",
+                                label="Extension Info"
+                            )
+                    
+                    # Context Windows Controls
+                    with gr.Accordion("Enable Sliding Context Windows", open=False):
+                        wan22_use_context_windows = gr.Checkbox(
+                            label="Enable Sliding Context Windows", 
+                            value=False,
+                            info="Enable sliding context windows for long video generation"
+                        )
+                        with gr.Group(visible=False) as wan22_context_controls:
+                            with gr.Row():
+                                wan22_context_length = gr.Number(
+                                    label="Context Length", 
+                                    value=81, 
+                                    minimum=9,
+                                    maximum=611,
+                                    step=4,
+                                    info="Length of context window in frames (default: 81)"
+                                )
+                                wan22_context_overlap = gr.Number(
+                                    label="Context Overlap", 
+                                    value=30, 
+                                    minimum=0,
+                                    maximum=300,
+                                    step=1,
+                                    info="Overlap between context windows in frames (default: 30)"
+                                )
+                            with gr.Row():
+                                wan22_context_schedule = gr.Dropdown(
+                                    label="Context Schedule",
+                                    choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
+                                    value="standard_static",
+                                    info="Context window scheduling method"
+                                )
+                                wan22_context_stride = gr.Number(
+                                    label="Context Stride",
+                                    value=1,
+                                    minimum=1,
+                                    maximum=10,
+                                    step=1,
+                                    info="Stride for uniform context schedules (default: 1)"
+                                )
+                            with gr.Row():
+                                wan22_context_closed_loop = gr.Checkbox(
+                                    label="Enable Closed Loop",
+                                    value=False,
+                                    info="Enable closed loop for cyclic videos"
+                                )
+                                wan22_context_fuse_method = gr.Dropdown(
+                                    label="Fuse Method",
+                                    choices=["pyramid", "flat", "overlap-linear", "relative"],
+                                    value="pyramid",
+                                    info="Method for fusing context window results"
+                                )
                     
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
@@ -6929,7 +7877,7 @@ with gr.Blocks(
                         wan22_calc_height_btn = gr.Button("→")
                         wan22_calc_width_btn = gr.Button("←")
                         wan22_height = gr.Number(label="Height", value=480, interactive=True)
-                    wan22_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan22_frame_num = gr.Slider(minimum=9, maximum=611, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
@@ -7018,15 +7966,56 @@ with gr.Blocks(
                         value=True,
                     )
                 with gr.Row():
+                    wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
-                        wan22_dit_low_noise_path = gr.Textbox(label="DiT Low Noise Path (.safetensors)", value="wan/wan22_i2v_14B_low_noise_bf16.safetensors")
-                        wan22_dit_high_noise_path = gr.Textbox(label="DiT High Noise Path (.safetensors)", value="wan/wan22_i2v_14B_high_noise_bf16.safetensors")
-                        wan22_clip_path = gr.Textbox(label="CLIP Path (.pth, for i2v)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=True)
+                        wan22_dit_low_noise_path = gr.Dropdown(
+                            label="DiT Low Noise Model (.safetensors)",
+                            choices=get_wan_of_low_noise_models("wan"),
+                            value=get_default_low_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        wan22_dit_high_noise_path = gr.Dropdown(
+                            label="DiT High Noise Model (.safetensors)",
+                            choices=get_wan_of_high_noise_models("wan"),
+                            value=get_default_high_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        wan22_clip_path = gr.Dropdown(
+                            label="CLIP Model (.pth, for i2v)",
+                            choices=get_wan_of_clip_models("wan"),
+                            value=get_default_clip_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True,
+                            visible=True
+                        )
                     with gr.Group(visible=False) as wan22_ti2v5b_paths:
-                        wan22_dit_path = gr.Textbox(label="DiT Path (.safetensors, for ti2v-5B)", value="wan/Wan2.2-TI2V-5B_fp16.safetensors")
-                    wan22_vae_path = gr.Textbox(label="VAE Path (.pth)", value="wan/Wan2.1_VAE.pth")
-                    wan22_t5_path = gr.Textbox(label="T5 Path (.pth)", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                    wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
+                        wan22_dit_path = gr.Dropdown(
+                            label="DiT Model (.safetensors, for ti2v-5B)",
+                            choices=get_wan_of_dit_models("wan"),
+                            value="Wan2.2-TI2V-5B_fp16.safetensors",
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                with gr.Row():
+                    wan22_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wan22_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
         
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -7847,7 +8836,361 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
+
+        # Wan One Frame Inference Tab
+        with gr.Tab(id=13, label="Wan One Frame") as wan_one_frame_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wan_of_prompt = gr.Textbox(
+                        scale=3, 
+                        label="Enter your prompt", 
+                        value="A cat wearing a chef hat, cooking pizza.", 
+                        lines=5
+                    )
+                    wan_of_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="low quality, blurry, watermark, text, signature, ugly, deformed",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    wan_of_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wan_of_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    wan_of_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    wan_of_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wan_of_progress_text")
+
+            with gr.Row():
+                wan_of_generate_btn = gr.Button("Generate One Frame", elem_classes="green-btn")
+                wan_of_stop_btn = gr.Button("Stop Generation", variant="stop")
+            
+            with gr.Row():
+                with gr.Column():
+                    wan_of_input_image = gr.Image(label="Control Image (Optional)", type="filepath")
+                    wan_of_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+                    
+                    # One Frame Inference Options
+                    with gr.Group():
+                        gr.Markdown("### One Frame Inference Options")
+                        with gr.Row():
+                            wan_of_target_index = gr.Number(
+                                label="Target Index",
+                                value=1,
+                                minimum=0,
+                                maximum=15,
+                                step=1,
+                                info="Target frame index for generation"
+                            )
+                            wan_of_control_index = gr.Textbox(
+                                label="Control Index",
+                                value="0",
+                                info="Control frame indices (e.g., '0' or '0;2')"
+                            )
+                        wan_of_inference_options = gr.CheckboxGroup(
+                            label="One Frame Options",
+                            choices=["no_post", "no_2x", "no_4x", "default"],
+                            value=["default"],
+                            info="One frame inference options"
+                        )
+                        
+                        # Control Images for One Frame Inference
+                        with gr.Row():
+                            wan_of_control_images = gr.File(
+                                label="Control Images (Optional)",
+                                file_types=["image"],
+                                file_count="multiple"
+                            )
+                        with gr.Row():
+                            wan_of_control_masks = gr.File(
+                                label="Control Image Masks (Optional)", 
+                                file_types=["image"],
+                                file_count="multiple"
+                            )
+                    
+                    gr.Markdown("### Generation Parameters")
+                    wan_of_task = gr.Dropdown(
+                        label="Task", 
+                        choices=["i2v-A14B", "t2v-A14B", "ti2v-5B"], 
+                        value="i2v-A14B",
+                        info="Selects the model architecture and configuration to use."
+                    )
+                    wan_of_conditioning_strength = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.01, 
+                        label="Image Conditioning Strength", 
+                        value=0.3,
+                        info="For T2V with image: 0.0 = preserve original image, 1.0 = ignore image (full generation)",
+                        visible=False
+                    )
+                    # Width and height inputs
+                    with gr.Row():
+                        wan_of_width = gr.Number(label="Width", value=832, interactive=True)
+                        wan_of_calc_height_btn = gr.Button("→")
+                        wan_of_calc_width_btn = gr.Button("←")
+                        wan_of_height = gr.Number(label="Height", value=480, interactive=True)
+                    wan_of_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wan_of_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wan_of_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    wan_of_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    wan_of_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                    wan_of_timestep_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Timestep Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%)")
+                    wan_of_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        wan_of_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        wan_of_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    wan_of_output = gr.Gallery(
+                        label="Generated Images (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_wan_of", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            wan_of_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            wan_of_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        wan_of_lora_weights = []
+                        wan_of_lora_multipliers = []
+                        wan_of_lora_apply_low = []
+                        wan_of_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                wan_of_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                wan_of_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                wan_of_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                wan_of_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+            
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    wan_of_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                    wan_of_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                with gr.Row():
+                    wan_of_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan_of_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                    wan_of_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    wan_of_vae_fp32 = gr.Checkbox(
+                        label="Use FP32 VAE (higher quality, more VRAM)",
+                        value=True,
+                    )
+                with gr.Row():
+                    wan_of_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    wan_of_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    wan_of_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model (.safetensors)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wan_of_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model (.safetensors)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                with gr.Row():
+                    wan_of_clip_path = gr.Dropdown(
+                        label="CLIP Model (.pth)",
+                        choices=get_wan_of_clip_models("wan"),
+                        value=get_default_clip_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wan_of_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                with gr.Row():
+                    wan_of_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wan_of_save_path = gr.Textbox(label="Save Path", value="outputs/wan_one_frame")
+
     #Event handlers etc
+    
+    # Wan One Frame event handlers
+    wan_of_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    wan_of_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan_of_seed])
+    
+    wan_of_generate_btn.click(
+        fn=wan_one_frame_handler,
+        inputs=[
+            wan_of_prompt,
+            wan_of_negative_prompt,
+            wan_of_input_image,
+            wan_of_task,
+            wan_of_conditioning_strength,
+            wan_of_target_index,
+            wan_of_control_index,
+            wan_of_inference_options,
+            wan_of_control_images,
+            wan_of_control_masks,
+            wan_of_width,
+            wan_of_height,
+            wan_of_frame_num,
+            wan_of_fps,
+            wan_of_seed,
+            wan_of_sample_steps,
+            wan_of_flow_shift,
+            wan_of_sample_guide_scale,
+            wan_of_timestep_boundary,
+            wan_of_sample_solver,
+            wan_of_batch_size,
+            wan_of_save_path,
+            # Model Paths & Performance
+            wan_of_attn_mode,
+            wan_of_block_swap,
+            wan_of_fp8,
+            wan_of_fp8_scaled,
+            wan_of_fp8_t5,
+            wan_of_mixed_dtype,
+            wan_of_vae_fp32,
+            wan_of_dit_low_noise_path,
+            wan_of_dit_high_noise_path,
+            wan_of_clip_path,
+            wan_of_vae_path,
+            wan_of_t5_path,
+            # LoRAs
+            wan_of_lora_folder,
+            *wan_of_lora_weights,
+            *wan_of_lora_multipliers,
+            *wan_of_lora_apply_low,
+            *wan_of_lora_apply_high
+        ],
+        outputs=[wan_of_output, wan_of_batch_progress, wan_of_progress_text],
+        queue=True
+    )
+
+    # LoRA refresh functionality for Wan One Frame tab
+    def update_wan_of_lora_dropdowns(lora_folder: str, *current_values) -> List[gr.update]:
+        new_choices = get_lora_options(lora_folder)
+        weights = current_values[:4]
+        multipliers = current_values[4:8]
+
+        results = []
+        for i in range(4):
+            weight = weights[i] if i < len(weights) else "None"
+            multiplier = multipliers[i] if i < len(multipliers) else 1.0
+            if weight not in new_choices:
+                weight = "None"
+            results.extend([
+                gr.update(choices=new_choices, value=weight),
+                gr.update(value=multiplier)
+            ])
+
+        return results
+
+    wan_of_lora_refresh_outputs_list = []
+    for i in range(len(wan_of_lora_weights)):
+        wan_of_lora_refresh_outputs_list.extend([wan_of_lora_weights[i], wan_of_lora_multipliers[i]])
+
+    wan_of_lora_refresh_btn.click(
+        fn=update_wan_of_lora_dropdowns,
+        inputs=[wan_of_lora_folder] + wan_of_lora_weights + wan_of_lora_multipliers,
+        outputs=wan_of_lora_refresh_outputs_list
+    )
+
+    # Model refresh functionality for Wan One Frame tab
+    def update_wan_of_model_dropdowns(model_folder: str):
+        """Update all model dropdowns based on folder contents"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_high_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_clip_models(model_folder)),
+            gr.update(choices=get_wan_of_vae_models(model_folder)),
+            gr.update(choices=get_wan_of_t5_models(model_folder))
+        ]
+
+    wan_of_refresh_models_btn.click(
+        fn=update_wan_of_model_dropdowns,
+        inputs=[wan_of_model_folder],
+        outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_vae_path, wan_of_t5_path]
+    )
+
+    # Model refresh functionality for Wan2.2 tab
+    def update_wan22_model_dropdowns(model_folder: str):
+        """Update all Wan2.2 model dropdowns based on folder contents"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_high_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_clip_models(model_folder)),
+            gr.update(choices=get_wan_of_dit_models(model_folder)),
+            gr.update(choices=get_wan_of_vae_models(model_folder)),
+            gr.update(choices=get_wan_of_t5_models(model_folder))
+        ]
+
+    wan22_refresh_models_btn.click(
+        fn=update_wan22_model_dropdowns,
+        inputs=[wan22_model_folder],
+        outputs=[wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path, wan22_vae_path, wan22_t5_path]
+    )
+
+    # Task-based model path switching for Wan One Frame tab
+    def update_wan_of_model_paths_and_settings(task):
+        """Update model paths and settings based on selected task"""
+        is_a14b = "A14B" in task
+        is_i2v_a14b = "i2v-A14B" in task
+        is_t2v_a14b = "t2v-A14B" in task
+        is_ti2v5b = "ti2v-5B" in task
+        
+        # Set model paths based on task using task-specific model detection
+        if is_i2v_a14b:
+            dit_low = get_task_specific_low_noise_model("wan", "i2v")
+            dit_high = get_task_specific_high_noise_model("wan", "i2v")
+            clip_model = get_default_clip_model("wan")
+            clip_visible = True
+        elif is_t2v_a14b:
+            dit_low = get_task_specific_low_noise_model("wan", "t2v")
+            dit_high = get_task_specific_high_noise_model("wan", "t2v")
+            clip_model = get_default_clip_model("wan")
+            clip_visible = False  # T2V doesn't need CLIP
+        elif is_ti2v5b:
+            dit_low = "Wan2.2-TI2V-5B_fp16.safetensors"  # Keep specific for ti2v-5B
+            dit_high = "Wan2.2-TI2V-5B_fp16.safetensors"  # Same model for both
+            clip_model = get_default_clip_model("wan")
+            clip_visible = False
+        else:
+            # Default to i2v
+            dit_low = get_task_specific_low_noise_model("wan", "i2v")
+            dit_high = get_task_specific_high_noise_model("wan", "i2v")
+            clip_model = get_default_clip_model("wan")
+            clip_visible = True
+
+        # Show conditioning strength slider for T2V tasks only
+        strength_visible = is_t2v_a14b
+        
+        return [
+            gr.update(value=dit_low),
+            gr.update(value=dit_high),
+            gr.update(value=clip_model, visible=clip_visible),
+            gr.update(visible=strength_visible)
+        ]
+
+    wan_of_task.change(
+        fn=update_wan_of_model_paths_and_settings,
+        inputs=[wan_of_task],
+        outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_conditioning_strength]
+    )
+
 #multitalk event handlers
     multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
@@ -7902,6 +9245,66 @@ with gr.Blocks(
         fn=refresh_lora_dropdowns_simple,
         inputs=[multitalk_lora_folder],
         outputs=multitalk_lora_refresh_outputs_list
+    )
+    
+    # InfiniteTalk connections
+    infinitetalk_generate_btn.click(
+        fn=infinitetalk_batch_handler,
+        inputs=[
+            infinitetalk_prompt,
+            infinitetalk_negative_prompt,
+            infinitetalk_cond_image,  # Direct image path instead of video
+            infinitetalk_audio_person1,
+            infinitetalk_audio_person2,
+            infinitetalk_batch_size,
+            infinitetalk_size,
+            infinitetalk_mode,
+            infinitetalk_frame_num,
+            infinitetalk_motion_frame,
+            infinitetalk_sample_steps,
+            infinitetalk_sample_shift,
+            infinitetalk_text_guide_scale,
+            infinitetalk_audio_guide_scale,
+            infinitetalk_seed,
+            infinitetalk_audio_type,
+            infinitetalk_num_persistent,
+            infinitetalk_use_teacache,
+            infinitetalk_teacache_thresh,
+            infinitetalk_use_apg,
+            infinitetalk_apg_momentum,
+            infinitetalk_apg_norm_thresh,
+            infinitetalk_use_full_video_preview,
+            infinitetalk_scene_seg,
+            infinitetalk_dit_path,
+            infinitetalk_infinitetalk_dir,
+            infinitetalk_ckpt_dir,
+            infinitetalk_wav2vec_dir,
+            infinitetalk_t5_tokenizer_path,
+            infinitetalk_save_path,
+            infinitetalk_lora_folder,
+            *infinitetalk_lora_weights_ui,
+            *infinitetalk_lora_multipliers_ui
+        ],
+        outputs=[infinitetalk_output, infinitetalk_preview_output, infinitetalk_status, infinitetalk_progress],
+        queue=True
+    )
+    
+    infinitetalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    
+    infinitetalk_random_seed_btn.click(
+        fn=set_random_seed,
+        inputs=None,
+        outputs=[infinitetalk_seed]
+    )
+    
+    infinitetalk_lora_refresh_outputs_list = []
+    for i in range(len(infinitetalk_lora_weights_ui)):
+        infinitetalk_lora_refresh_outputs_list.extend([infinitetalk_lora_weights_ui[i], infinitetalk_lora_multipliers_ui[i]])
+    
+    infinitetalk_lora_refresh_btn.click(
+        fn=refresh_lora_dropdowns_simple,
+        inputs=[infinitetalk_lora_folder],
+        outputs=infinitetalk_lora_refresh_outputs_list
     )
 # Toggle visibility of End Frame controls and DiT path based on fpe_use_normal_framepack
     def toggle_fpe_normal_framepack_options(use_normal_fp):
@@ -9096,13 +10499,13 @@ with gr.Blocks(
                     params.get("fp8", False),
                     params.get("fp8_scaled", False),
                     params.get("fp8_t5", False),
-                    # Model paths - keep defaults, don't transfer from metadata
-                    "wan/wan22_i2v_14B_low_noise_bf16.safetensors",
-                    "wan/wan22_i2v_14B_high_noise_bf16.safetensors",
-                    "wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-                    "wan/Wan2.2-TI2V-5B_fp16.safetensors",
-                    "wan/Wan2.1_VAE.pth",
-                    "wan/models_t5_umt5-xxl-enc-bf16.pth",
+                    # Model paths - use dynamic defaults, don't transfer from metadata
+                    get_default_low_noise_model('wan'),
+                    get_default_high_noise_model('wan'),
+                    get_default_clip_model('wan'),
+                    "Wan2.2-TI2V-5B_fp16.safetensors",
+                    get_default_vae_model('wan'),
+                    get_default_t5_model('wan'),
                     # LoRAs
                     "lora",  # lora_folder
                     *padded_weights,          # Unpack 8 LoRA weights
@@ -9962,6 +11365,21 @@ with gr.Blocks(
         outputs=[wan22_v2v_controls]
     )
     
+    # Context Windows visibility toggle
+    wan22_use_context_windows.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_use_context_windows],
+        outputs=[wan22_context_controls]
+    )
+    
+    # Extension visibility toggle
+    wan22_enable_extension.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_extension],
+        outputs=[wan22_extension_controls]
+    )
+    
+    
     # Image input handling for wan22
     wan22_input_image.change(
         fn=update_wanx_image_dimensions,  # Reuse the same function
@@ -10010,25 +11428,25 @@ with gr.Blocks(
         is_t2v_a14b = "t2v-A14B" in task
         is_ti2v5b = "ti2v-5B" in task
         
-        # Set model paths based on task
+        # Set model paths based on task using task-specific model detection
         if is_t2v_a14b:
-            dit_low_path = "wan/wan22_t2v_14B_low_noise_bf16.safetensors"
-            dit_high_path = "wan/wan22_t2v_14B_high_noise_bf16.safetensors"
+            dit_low_path = get_task_specific_low_noise_model('wan', 't2v')
+            dit_high_path = get_task_specific_high_noise_model('wan', 't2v')
             boundary_value = 0.875  # Default for t2v-A14B
             boundary_visible = True
         elif is_i2v_a14b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')
             boundary_value = 0.900  # Default for i2v-A14B
             boundary_visible = True
         elif is_ti2v5b:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')  # Use i2v models for ti2v-5B
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')  # Use i2v models for ti2v-5B
             boundary_value = 0.875  # Default value
             boundary_visible = False  # Hide for ti2v-5B as it's not dual-dit
         else:
-            dit_low_path = "wan/wan22_i2v_14B_low_noise_bf16.safetensors"  # Keep current default
-            dit_high_path = "wan/wan22_i2v_14B_high_noise_bf16.safetensors"  # Keep current default
+            dit_low_path = get_task_specific_low_noise_model('wan', 'i2v')  # Default to i2v
+            dit_high_path = get_task_specific_high_noise_model('wan', 'i2v')  # Default to i2v
             boundary_value = 0.875
             boundary_visible = False
         
@@ -10118,6 +11536,18 @@ with gr.Blocks(
             wan22_v2v_strength,
             wan22_v2v_low_noise_only,
             wan22_v2v_use_i2v,
+            # Extension arguments
+            wan22_enable_extension,
+            wan22_extend_frames,
+            wan22_frames_to_check,
+            # Context Windows arguments
+            wan22_use_context_windows,
+            wan22_context_length,
+            wan22_context_overlap,
+            wan22_context_schedule,
+            wan22_context_stride,
+            wan22_context_closed_loop,
+            wan22_context_fuse_method,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

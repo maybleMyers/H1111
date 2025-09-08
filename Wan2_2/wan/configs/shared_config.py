@@ -25,3 +25,5 @@ wan_shared_cfg.in_channels = 16  # Default input channels for latent (overridden
 wan_shared_cfg.out_channels = 16  # Default output channels for latent
 wan_shared_cfg.out_dim = 16  # Same as out_channels for compatibility
 wan_shared_cfg.i2v = False  # Default to T2V, overridden per model
+wan_shared_cfg.flf2v = False  # Default to non-FLF2V, overridden per model
+wan_shared_cfg.v2_2 = True  # Mark this as Wan 2.2 config for base_wan_generate_video.py compatibility

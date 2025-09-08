@@ -15,6 +15,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import torch
 import accelerate
 from accelerate import Accelerator
+from functools import partial
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from PIL import Image
@@ -47,6 +48,20 @@ except:
 
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
+
+# Context Windows imports
+try:
+    from Wan2_2.context_windows import (
+        WanContextWindowsHandler,
+        IndexListContextHandler,
+        ContextSchedules,
+        ContextFuseMethods,
+    )
+    CONTEXT_WINDOWS_AVAILABLE = True
+except ImportError:
+    CONTEXT_WINDOWS_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.info("Context windows module not available. Install required dependencies to enable context windows.")
 # Local implementations to avoid xformers/flash-attention dependency
 import av
 import cv2
@@ -269,7 +284,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
-        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
+        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with trash). Default is False."
     )
     parser.add_argument(
         "--guidance_scale",
@@ -397,6 +412,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
+
+    # Video extension arguments (multitalk-style)
+    parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
+    parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
+    parser.add_argument("--frames_to_check", type=int, default=30, help="Number of frames from the end to analyze for best transition point (clean i2v-based extension)")
+    parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
+    # Model selection for extension
+    parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
+    parser.add_argument("--force_high_noise", action="store_true", help="Force use of high noise model for video extension")
+    parser.add_argument("--extension_dual_dit_boundary", type=float, default=None, help="Custom dual-dit boundary for video extension (0.0-1.0). Overrides force_low_noise/force_high_noise")
+    # Latent injection timing controls
+    parser.add_argument("--inject_motion_timesteps", type=str, default="all", choices=["all", "high_only", "low_only", "none"], 
+                       help="When to inject motion frames: 'all'=every timestep, 'high_only'=high noise timesteps only, 'low_only'=low noise timesteps only, 'none'=no injection")
+    parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
+    parser.add_argument("--motion_noise_ratio", type=float, default=0.3, 
+                       help="Noise ratio for motion frames in extension (0.0-1.0, lower=less noise/more preservation)")
+    parser.add_argument("--color_match", type=str, default="hm", 
+                       choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
+                       help="Color matching method for video extension (default: histogram matching)")
+    
+    # Context Windows Arguments
+    parser.add_argument("--use_context_windows", action="store_true", 
+                       help="Enable sliding context windows for long video generation")
+    parser.add_argument("--context_length", type=int, default=81, 
+                       help="Length of context window in frames (default: 81)")
+    parser.add_argument("--context_overlap", type=int, default=30, 
+                       help="Overlap between context windows in frames (default: 30)")
+    parser.add_argument("--context_schedule", type=str, default="standard_static",
+                       choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
+                       help="Context window scheduling method (default: standard_static)")
+    parser.add_argument("--context_stride", type=int, default=1,
+                       help="Stride for uniform context schedules (default: 1)")
+    parser.add_argument("--context_closed_loop", action="store_true",
+                       help="Enable closed loop for cyclic videos")
+    parser.add_argument("--context_fuse_method", type=str, default="pyramid",
+                       choices=["pyramid", "flat", "overlap-linear", "relative"],
+                       help="Method for fusing context window results (default: pyramid)")
+    parser.add_argument("--context_dim", type=int, default=2,
+                       help="Dimension to apply context windows (2=temporal for video, default: 2)")
 
     args = parser.parse_args()
 
@@ -1075,6 +1129,24 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
         # Only applicable for dual-dit models
         if "A14B" not in args.task:
             logger.warning(f"--dual_dit_boundary specified but task '{args.task}' is not a dual-dit model. This setting will be ignored.")
+    
+    # Validate video extension arguments
+    if args.extend_video is not None:
+        # Check for conflicting model selection options
+        conflicting_options = sum([args.force_low_noise, args.force_high_noise, args.extension_dual_dit_boundary is not None])
+        if conflicting_options > 1:
+            raise ValueError("Only one of --force_low_noise, --force_high_noise, or --extension_dual_dit_boundary can be specified")
+        
+        # Validate extension_dual_dit_boundary
+        if args.extension_dual_dit_boundary is not None:
+            if not (0.0 <= args.extension_dual_dit_boundary <= 1.0):
+                raise ValueError(f"--extension_dual_dit_boundary must be between 0.0 and 1.0, got {args.extension_dual_dit_boundary}")
+            if "A14B" not in args.task:
+                logger.warning(f"--extension_dual_dit_boundary specified but task '{args.task}' is not a dual-dit model. This setting will be ignored.")
+        
+        # Validate injection_strength
+        if not (0.0 <= args.injection_strength <= 1.0):
+            raise ValueError(f"--injection_strength must be between 0.0 and 1.0, got {args.injection_strength}")
 
     return args
 
@@ -1504,6 +1576,58 @@ def merge_lora_weights(model: torch.nn.Module, args: argparse.Namespace, device:
             logging.info(f"Successfully merged LoRA: {os.path.basename(lora_path)}")
             del network, weights_sd
 
+
+def apply_context_windows(args: argparse.Namespace, model_options: dict = None) -> Optional[dict]:
+    """Apply context windows configuration to model options if enabled.
+    
+    Args:
+        args: Command line arguments containing context window settings
+        model_options: Existing model options dict (will be created if None)
+    
+    Returns:
+        Updated model options dict with context handler, or None if not enabled
+    """
+    if not args.use_context_windows:
+        return model_options
+    
+    if not CONTEXT_WINDOWS_AVAILABLE:
+        logger.warning("Context windows requested but module not available. Proceeding without context windows.")
+        return model_options
+    
+    # Create model options if not provided
+    if model_options is None:
+        model_options = {}
+    
+    # Initialize transformer options
+    if "transformer_options" not in model_options:
+        model_options["transformer_options"] = {}
+    
+    # Create WAN context windows handler
+    try:
+        context_handler = WanContextWindowsHandler(
+            context_length=args.context_length,
+            context_overlap=args.context_overlap,
+            context_schedule=args.context_schedule,
+            context_stride=args.context_stride,
+            closed_loop=args.context_closed_loop,
+            fuse_method=args.context_fuse_method
+        )
+        
+        # Store handler in model options
+        model_options["context_handler"] = context_handler.handler
+        model_options["transformer_options"]["context_handler"] = context_handler.handler
+        
+        logger.info(f"Context windows enabled: length={args.context_length} frames, "
+                   f"overlap={args.context_overlap} frames, schedule={args.context_schedule}, "
+                   f"fuse={args.context_fuse_method}")
+        
+        return model_options
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize context windows: {e}")
+        return model_options
+
+
 def optimize_model(
     model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype, dit_weight_dtype: torch.dtype
 ) -> None:
@@ -1627,7 +1751,7 @@ def prepare_t2v_inputs(
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
     else:
-        # ComfyUI compatible noise
+        # trash compatible noise
         seed_g = torch.manual_seed(seed)
 
     # load text encoder
@@ -2651,7 +2775,8 @@ def run_sampling(
     model_manager: Optional[DynamicModelManager] = None,  # Dynamic model manager for dual-dit
     previewer: Optional[LatentPreviewer] = None, # Add previewer argument
     use_cpu_offload: bool = True, # Example parameter, adjust as needed
-    preview_suffix: Optional[str] = None # <<< ADD suffix argument
+    preview_suffix: Optional[str] = None, # <<< ADD suffix argument
+    model_options: Optional[dict] = None  # Context windows and other model options
 ) -> torch.Tensor:
     """run sampling loop (Denoising)
     Args:
@@ -2667,12 +2792,22 @@ def run_sampling(
         previewer: LatentPreviewer instance or None # Added description
         use_cpu_offload: Whether to offload tensors to CPU during processing (example)
         preview_suffix: Unique suffix for preview files to avoid conflicts in concurrent runs.
+        model_options: Optional model options including context window handler
     Returns:
         torch.Tensor: generated latent
     """
     arg_c, arg_null = inputs
 
     latent = noise # Initialize latent state
+    
+    # Check if we should use context windows
+    context_handler = None
+    if model_options and "context_handler" in model_options:
+        context_handler = model_options["context_handler"]
+        if context_handler and context_handler.should_use_context(model, [], latent, torch.tensor(0), model_options):
+            logger.info("Context windows will be used for this generation")
+        else:
+            context_handler = None  # Don't use if not needed
     # Determine storage device (CPU if offloading, otherwise compute device)
     latent_storage_device = torch.device("cpu") if use_cpu_offload else device
     latent = latent.to(latent_storage_device) # Move initial state to storage device
@@ -2799,10 +2934,114 @@ def run_sampling(
                 current_model = model
             
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
-            # 1. Predict conditional noise estimate  
+            # Define helper function for model calls with optional context windows
+            def calc_cond_batch(model_to_use, conds_list, x_input, ts, opts):
+                """Helper to calculate conditional predictions, optionally with context windows."""
+                # Debug what we're receiving
+                logger.debug(f"calc_cond_batch received conds_list type: {type(conds_list)}")
+                logger.debug(f"calc_cond_batch x_input shape: {x_input.shape if isinstance(x_input, torch.Tensor) else type(x_input)}")
+                if isinstance(conds_list, list):
+                    logger.debug(f"  Length: {len(conds_list)}")
+                    if len(conds_list) > 0:
+                        logger.debug(f"  First element type: {type(conds_list[0])}")
+                        if isinstance(conds_list[0], list) and len(conds_list[0]) > 0:
+                            logger.debug(f"    First-first element type: {type(conds_list[0][0])}")
+                
+                # Handle different input formats
+                # The context handler passes a list of resized condition dicts
+                # We need to extract the actual condition dict
+                cond_dict = {}
+                if isinstance(conds_list, dict):
+                    cond_dict = conds_list
+                elif isinstance(conds_list, list) and len(conds_list) > 0:
+                    # Unwrap nested lists until we find a dict
+                    current = conds_list[0]
+                    while isinstance(current, list) and len(current) > 0:
+                        current = current[0]
+                    if isinstance(current, dict):
+                        cond_dict = current
+                    else:
+                        logger.error(f"Could not find dict in conds_list structure")
+                        cond_dict = {}
+                
+                # The model needs context and seq_len - these should NOT be filtered out
+                # Extract required arguments
+                context = cond_dict.get('context')
+                seq_len = cond_dict.get('seq_len')
+                
+                # Ensure seq_len is not None
+                if seq_len is None:
+                    logger.error(f"seq_len is None in calc_cond_batch - context window resizing may have failed")
+                    logger.error(f"cond_dict keys: {cond_dict.keys()}")
+                    raise ValueError("seq_len is None in calc_cond_batch - context window resizing failed")
+                
+                # Filter out context and seq_len from the dict to get other parameters
+                model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                 if k not in ['context', 'seq_len'] and not k.startswith('_')}
+                
+                # Prepare input for model - it expects a list of tensors
+                if isinstance(x_input, torch.Tensor):
+                    if x_input.dim() == 5:  # [B, C, F, H, W]
+                        # Split batch into list
+                        x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                    elif x_input.dim() == 4:  # [C, F, H, W]
+                        x_input_list = [x_input]
+                    else:
+                        x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                else:
+                    x_input_list = x_input
+                
+                # Call model with required positional arguments
+                logger.debug(f"Calling model with x_input_list length: {len(x_input_list) if isinstance(x_input_list, list) else 'not list'}")
+                if isinstance(x_input_list, list) and len(x_input_list) > 0:
+                    logger.debug(f"  First tensor shape: {x_input_list[0].shape}")
+                result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
+                # Return just the tensor for WAN models (not wrapped in list)
+                # The context handler expects a single tensor for single condition
+                logger.debug(f"Model returned shape: {result[0].shape if isinstance(result, tuple) else result.shape if isinstance(result, torch.Tensor) else 'unknown'}")
+                return result[0] if isinstance(result, tuple) else result
+            
+            # 1. Predict conditional noise estimate
             # Filter out non-model parameters before passing to model
             model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
-            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            
+            # Debug logging for seq_len
+            if 'seq_len' in model_arg_c:
+                logger.debug(f"Original seq_len before context windows: {model_arg_c['seq_len']}")
+            
+            if context_handler is not None:
+                # Use context windows for processing
+                # Prepare inputs for context handler
+                conds_for_handler = [model_arg_c]  # Context handler expects list of dicts
+                
+                # Get the latent tensor for context window processing
+                # Context handler will slice this into windows
+                # Keep it without batch dimension for proper slicing
+                if len(latent_model_input_list) == 1:
+                    context_input = latent_model_input_list[0]  # [C, F, H, W]
+                    # Don't add batch dimension - context handler handles windowing on frame dimension
+                else:
+                    # Stack batch elements [B x [C, F, H, W]] -> [B, C, F, H, W]
+                    context_input = torch.stack(latent_model_input_list)
+                
+                # Execute with context windows
+                noise_pred_results = context_handler.execute(
+                    calc_cond_batch,
+                    current_model,
+                    [conds_for_handler],  # List of condition lists
+                    context_input,
+                    timestep,
+                    model_options or {}
+                )
+                noise_pred_cond = noise_pred_results[0]
+                # Squeeze batch dimension if present (context windows may add it)
+                if noise_pred_cond.dim() == 5 and noise_pred_cond.shape[0] == 1:
+                    noise_pred_cond = noise_pred_cond.squeeze(0)
+                    logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
+            else:
+                # Standard model call without context windows
+                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
@@ -2814,19 +3053,146 @@ def run_sampling(
                 # Filter out non-model parameters for uncond args too
                 model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
 
-                if apply_slg_step and args.slg_mode == "original":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                    skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                    noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
+                if context_handler is not None:
+                    # Use context windows for unconditional predictions
+                    conds_null_for_handler = [model_arg_null]
+                    
+                    # Prepare context input - keep consistent with conditional prediction
+                    # Don't add batch dimension for proper windowing
+                    if len(latent_model_input_list) == 1:
+                        context_input = latent_model_input_list[0]  # [C, F, H, W]
+                    else:
+                        context_input = torch.stack(latent_model_input_list)  # [B, C, F, H, W]
+                    
+                    if apply_slg_step and args.slg_mode == "original":
+                        # Uncond prediction
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_cond_batch, current_model, [conds_null_for_handler],
+                            context_input,
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                        
+                        # SLG prediction (with skip layers)
+                        def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
+                            # Handle different input formats
+                            if isinstance(conds_list, dict):
+                                cond_dict = conds_list
+                            elif isinstance(conds_list, list) and len(conds_list) > 0:
+                                cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
+                            else:
+                                cond_dict = {}
+                            # Extract required arguments
+                            context = cond_dict.get('context')
+                            seq_len = cond_dict.get('seq_len')
+                            # Ensure seq_len is not None
+                            if seq_len is None:
+                                logger.error(f"seq_len is None in calc_slg_batch")
+                                raise ValueError("seq_len is None in calc_slg_batch")
+                            # Filter for other parameters
+                            model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                             if k not in ['context', 'seq_len'] and not k.startswith('_')}
+                            # Prepare input for model
+                            if isinstance(x_input, torch.Tensor):
+                                if x_input.dim() == 5:  # [B, C, F, H, W]
+                                    x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                                elif x_input.dim() == 4:  # [C, F, H, W]
+                                    x_input_list = [x_input]
+                                else:
+                                    x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                            else:
+                                x_input_list = x_input
+                            result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, 
+                                                skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            return [result[0]] if isinstance(result, tuple) else [result]
+                        
+                        skip_layer_results = context_handler.execute(
+                            calc_slg_batch, current_model, [conds_null_for_handler],
+                            context_input,
+                            timestep, model_options or {}
+                        )
+                        skip_layer_out = skip_layer_results[0].to(latent_storage_device)
+                        
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
+                    
+                    elif apply_slg_step and args.slg_mode == "uncond":
+                        # Uncond with SLG
+                        def calc_slg_batch(model_to_use, conds_list, x_input, ts, opts):
+                            # Handle different input formats
+                            if isinstance(conds_list, dict):
+                                cond_dict = conds_list
+                            elif isinstance(conds_list, list) and len(conds_list) > 0:
+                                cond_dict = conds_list[0] if isinstance(conds_list[0], dict) else {}
+                            else:
+                                cond_dict = {}
+                            # Extract required arguments
+                            context = cond_dict.get('context')
+                            seq_len = cond_dict.get('seq_len')
+                            # Ensure seq_len is not None
+                            if seq_len is None:
+                                logger.error(f"seq_len is None in calc_slg_batch")
+                                raise ValueError("seq_len is None in calc_slg_batch")
+                            # Filter for other parameters
+                            model_cond_dict = {k: v for k, v in cond_dict.items() 
+                                             if k not in ['context', 'seq_len'] and not k.startswith('_')}
+                            # Prepare input for model
+                            if isinstance(x_input, torch.Tensor):
+                                if x_input.dim() == 5:  # [B, C, F, H, W]
+                                    x_input_list = [x_input[i] for i in range(x_input.shape[0])]
+                                elif x_input.dim() == 4:  # [C, F, H, W]
+                                    x_input_list = [x_input]
+                                else:
+                                    x_input_list = x_input if isinstance(x_input, list) else [x_input]
+                            else:
+                                x_input_list = x_input
+                            result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len,
+                                                skip_block_indices=slg_indices_for_call, **model_cond_dict)
+                            return [result[0]] if isinstance(result, tuple) else [result]
+                        
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_slg_batch, current_model, [conds_null_for_handler],
+                            context_input,
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    
+                    else:  # Regular CFG with context windows
+                        noise_pred_uncond_results = context_handler.execute(
+                            calc_cond_batch, current_model, [conds_null_for_handler],
+                            context_input,
+                            timestep, model_options or {}
+                        )
+                        noise_pred_uncond = noise_pred_uncond_results[0]
+                        # Squeeze batch dimension if present
+                        if noise_pred_uncond.dim() == 5 and noise_pred_uncond.shape[0] == 1:
+                            noise_pred_uncond = noise_pred_uncond.squeeze(0)
+                        noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    # Standard calls without context windows (original code)
+                    if apply_slg_step and args.slg_mode == "original":
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
-                elif apply_slg_step and args.slg_mode == "uncond":
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    elif apply_slg_step and args.slg_mode == "uncond":
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                else: # Regular CFG
-                    noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    else: # Regular CFG
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
                 noise_pred = noise_pred_cond
@@ -2892,6 +3258,714 @@ def run_sampling(
     logger.info("Sampling loop finished.")
     return latent
 
+def prepare_video_extension_inputs(
+    args: argparse.Namespace,
+    config,
+    accelerator: Accelerator,
+    device: torch.device,
+    vae: WanVAE,
+    cond_frames: torch.Tensor,  # Last frames from previous generation [C, F, H, W]
+    clip_context: torch.Tensor,  # CLIP encoding of first frame
+    frame_num: int,  # Number of frames to generate
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+    """Prepare inputs for video extension (multitalk-style iterative generation)
+    
+    Args:
+        args: command line arguments
+        config: model configuration
+        accelerator: Accelerator instance
+        device: device to use
+        vae: VAE model instance
+        cond_frames: Conditioning frames from previous generation [C, F, H, W]
+        clip_context: CLIP context from first frame
+        frame_num: Number of frames to generate in this chunk
+        
+    Returns:
+        Tuple containing noise, context, context_null, y, (arg_c, arg_null)
+    """
+    logger.info(f"Preparing video extension inputs for {frame_num} frames")
+    
+    # Get dimensions
+    _, cond_f, pixel_h, pixel_w = cond_frames.shape
+    lat_h = pixel_h // config.vae_stride[1]
+    lat_w = pixel_w // config.vae_stride[2]
+    lat_f = (frame_num - 1) // config.vae_stride[0] + 1
+    
+    # Calculate sequence length
+    seq_len = lat_f * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    
+    # Configure negative prompt
+    n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
+    
+    # Set seed
+    seed = args.seed
+    if not args.cpu_noise:
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
+    else:
+        seed_g = torch.manual_seed(seed)
+    
+    # Generate noise for new frames
+    noise = torch.randn(
+        16, lat_f, lat_h, lat_w,
+        dtype=torch.float32, generator=seed_g,
+        device=device if not args.cpu_noise else "cpu"
+    )
+    noise = noise.to(device)
+    
+    # Load text encoder and encode prompts
+    text_encoder = load_text_encoder(args, config, device)
+    text_encoder.model.to(device)
+    
+    # Generate three contexts for proper CFG (multitalk-style)
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                context = text_encoder([args.prompt], device)  # Full conditional
+                context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
+                context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
+        else:
+            context = text_encoder([args.prompt], device)  # Full conditional
+            context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
+            context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
+    
+    # Free text encoder
+    del text_encoder
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
+    
+    # Prepare zero padding for future frames
+    padding_frames = frame_num - cond_f
+    if padding_frames > 0:
+        padding_tensor = torch.zeros(
+            cond_frames.shape[0], padding_frames, pixel_h, pixel_w,
+            device=device, dtype=cond_frames.dtype
+        )
+        padded_frames = torch.cat([cond_frames, padding_tensor], dim=1)
+    else:
+        padded_frames = cond_frames[:, :frame_num]
+    
+    # Encode conditioning frames with VAE
+    vae.to_device(device)
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+        y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+    
+    # Create mask for conditioning frames
+    motion_frames_latent_num = (cond_f - 1) // config.vae_stride[0] + 1
+    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
+    msk[:, :motion_frames_latent_num] = 1  # Mask the conditioning frames
+    
+    # Concatenate mask and latent
+    y = torch.cat([msk, y_latent], dim=0)  # [4+C', lat_f, lat_h, lat_w]
+    
+    # Move VAE back to CPU/cache
+    vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+    clean_memory_on_device(device)
+    
+    # Prepare model arguments
+    # A14B models don't have img_emb layer
+    use_clip_fea = clip_context if not ("A14B" in args.task) else None
+    
+    arg_c = {
+        "context": context,
+        "clip_fea": use_clip_fea,
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    arg_text_dropped = {
+        "context": context_text_dropped,
+        "clip_fea": use_clip_fea,  # Keep CLIP for text-dropped
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    arg_null = {
+        "context": context_null,
+        "clip_fea": use_clip_fea,  # Keep CLIP for unconditional too
+        "seq_len": seq_len,
+        "y": [y],
+    }
+    
+    return noise, context, context_null, y, (arg_c, arg_text_dropped, arg_null)
+
+def timestep_transform(
+    t: torch.Tensor,
+    shift: float = 5.0,
+    num_timesteps: int = 1000,
+) -> torch.Tensor:
+    """Transform timesteps with shift parameter for better temporal dynamics"""
+    t = t / num_timesteps
+    # shift the timestep based on ratio
+    new_t = shift * t / (1 + (shift - 1) * t)
+    new_t = new_t * num_timesteps
+    return new_t
+
+def add_noise_for_extension(
+    original_samples: torch.FloatTensor,
+    noise: torch.FloatTensor,
+    timestep: torch.FloatTensor,
+    num_timesteps: int = 1000
+) -> torch.FloatTensor:
+    """Add noise using the MultiTalk approach (linear interpolation)"""
+    # Critical: Use timestep VALUE, not index
+    timesteps = timestep.float() / num_timesteps
+    if len(timesteps.shape) == 0:
+        timesteps = timesteps.unsqueeze(0)
+    timesteps = timesteps.view(timesteps.shape + (1,) * (len(noise.shape)-1))
+    return (1 - timesteps) * original_samples + timesteps * noise
+
+def run_extension_sampling(
+    model: WanModel,
+    noise: torch.Tensor,
+    scheduler: Any,
+    timesteps: torch.Tensor,
+    args: argparse.Namespace,
+    inputs: Tuple[dict, dict, dict],
+    device: torch.device,
+    seed_g: torch.Generator,
+    accelerator: Accelerator,
+    motion_latent: torch.Tensor,
+    motion_frames: int,
+    model_manager: Optional[DynamicModelManager] = None,
+) -> torch.Tensor:
+    """Run sampling loop for video extension with motion frame injection"""
+    
+    arg_c, arg_text_dropped, arg_null = inputs
+    latent = noise
+    
+    # Calculate motion frame latent count
+    motion_frames_latent_num = (motion_frames - 1) // 4 + 1  # VAE stride of 4 in temporal dimension
+    
+    logger.info(f"Starting extension sampling loop for {len(timesteps)} steps with {motion_frames} motion frames")
+    
+    # Inject motion frames at the beginning (standard approach)
+    if motion_latent is not None:
+        motion_add_noise = torch.randn_like(motion_latent).to(device)
+        noised_motion = add_noise_for_extension(
+            motion_latent,
+            motion_add_noise, 
+            timesteps[0],
+            scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+        )
+        latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
+        logger.info(f"Injected {motion_frames_latent_num} motion frames at timestep {timesteps[0]}")
+    
+    for i, t in enumerate(tqdm(timesteps)):
+        
+        # Prepare input for the model
+        latent_on_device = latent.to(device)
+        
+        # The model expects the latent input 'x' as a list: [tensor]
+        if len(latent_on_device.shape) == 5:
+            # Has batch dimension [B, C, F, H, W]
+            latent_model_input_list = [latent_on_device[i] for i in range(latent_on_device.shape[0])]
+        elif len(latent_on_device.shape) == 4:
+            # No batch dimension [C, F, H, W]
+            latent_model_input_list = [latent_on_device]
+        else:
+            raise ValueError(f"Latent tensor has unexpected shape {latent_on_device.shape} for model input.")
+        
+        timestep = torch.stack([t]).to(device)
+        
+        with accelerator.autocast(), torch.no_grad():
+            # Select appropriate model for dual-dit architectures
+            if model_manager is not None:
+                cfg = WAN_CONFIGS[args.task]
+                if args.dual_dit_boundary is not None:
+                    boundary = args.dual_dit_boundary * 1000
+                else:
+                    boundary = cfg.boundary * 1000
+                
+                if t.item() >= boundary:
+                    current_model = model_manager.get_model('high')
+                else:
+                    current_model = model_manager.get_model('low')
+            else:
+                current_model = model
+            
+            # Filter out non-model parameters
+            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            model_arg_text_dropped = {k: v for k, v in arg_text_dropped.items() if not k.startswith('_')}
+            model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
+            
+            # Three-way CFG (multitalk-style)
+            # 1. Full conditional (text + CLIP)
+            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            # 2. Text-dropped (CLIP only)
+            noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+            # 3. Unconditional (negative prompt)
+            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            
+            # Apply three-way CFG formula (simplified from multitalk, no audio)
+            # Formula: uncond + text_scale * (cond - text_dropped)
+            # Since we don't have audio, we simplify the formula
+            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_text_dropped)
+            
+            # CRITICAL: Negate the noise prediction (from multitalk)
+            noise_pred = -noise_pred
+            
+            # Ensure noise_pred and latent_on_device have matching batch dimensions
+            if len(noise_pred.shape) < len(latent_on_device.shape):
+                noise_pred = noise_pred.unsqueeze(0)
+            
+            # Manual latent update (from multitalk) instead of scheduler.step
+            if i < len(timesteps) - 1:
+                # Calculate dt based on timestep difference
+                dt = (timesteps[i] - timesteps[i + 1]) / 1000.0  # Assuming num_timesteps = 1000
+                dt = dt.view(dt.shape + (1,) * (len(noise_pred.shape) - 1))  # Reshape for broadcasting
+                latent = latent_on_device + noise_pred * dt
+            else:
+                # Last step - just add the final noise prediction
+                dt = timesteps[i] / 1000.0
+                dt = dt.view(dt.shape + (1,) * (len(noise_pred.shape) - 1))
+                latent = latent_on_device + noise_pred * dt
+            
+    logger.info("Extension sampling loop finished.")
+    return latent
+
+def variance_of_laplacian(image):
+    """Calculate image sharpness using Laplacian variance"""
+    import cv2
+    return cv2.Laplacian(image, cv2.CV_64F).var()
+
+def extract_best_transition_frame(video_path: str, frames_to_check: int = 30) -> int:
+    """Extract the sharpest frame from the last N frames for smooth transition"""
+    import cv2
+    from tqdm import tqdm
+    
+    logger.info(f"Extracting best transition frame from last {frames_to_check} frames of {video_path}")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("Failed to open video file")
+        return -1
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_frame = max(0, total_frames - frames_to_check)
+    
+    best_frame_idx = -1
+    max_sharpness = -1
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+    for frame_idx in range(start_frame, total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Calculate sharpness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+        
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+    
+    cap.release()
+    
+    logger.info(f"Best transition frame: {best_frame_idx} with sharpness {max_sharpness:.2f}")
+    return best_frame_idx
+
+def blend_video_transition(video1: torch.Tensor, video2: torch.Tensor, blend_frames: int = 8) -> torch.Tensor:
+    """Simple concatenation of video segments without blending to avoid glitches"""
+    # Simply concatenate the videos without any blending
+    return torch.cat([video1, video2], dim=2)
+
+def generate_extended_video_i2v_based(
+    args: argparse.Namespace,
+    initial_video_path: str,
+    total_frames: int,
+) -> torch.Tensor:
+    """Generate extended video using clean i2v approach with smooth blending"""
+    import tempfile
+    import cv2
+    
+    device = torch.device(args.device)
+    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to {total_frames} frames")
+    
+    # Extract the best transition frame
+    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=args.frames_to_check)
+    
+    # Load initial video up to the best frame
+    if best_frame_idx > 0:
+        video_frames_np, initial_frames = load_video(
+            initial_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
+        )
+    else:
+        # Use entire video as fallback
+        video_frames_np, initial_frames = load_video(
+            initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
+        )
+    
+    # Convert initial video to tensor [1, C, F, H, W]
+    initial_video = torch.from_numpy(np.stack(video_frames_np, axis=0))
+    initial_video = initial_video.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+    initial_video = initial_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+    
+    logger.info(f"Initial video loaded: {initial_video.shape[2]} frames")
+    
+    if initial_frames >= total_frames:
+        logger.info("Video already has desired length")
+        return initial_video[:, :, :total_frames]
+    
+    # Store original arguments
+    original_image_path = args.image_path
+    original_video_length = args.video_length
+    original_extend_video = args.extend_video
+    
+    # Generate extension chunks using i2v
+    all_videos = [initial_video]
+    current_frames = initial_frames
+    chunk_size = 81  # Standard i2v length
+    
+    # Get the best transition frame as starting image
+    best_frame_tensor = initial_video[0, :, -1]  # [C, H, W] - last frame
+    best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
+    best_frame_np = best_frame_np.astype(np.uint8)
+    
+    try:
+        while current_frames < total_frames:
+            remaining_frames = total_frames - current_frames
+            frames_to_generate = min(chunk_size, remaining_frames)
+            
+            logger.info(f"Generating chunk: {frames_to_generate} frames (progress: {current_frames}/{total_frames})")
+            
+            # Save the frame as temporary image
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                cv2.imwrite(tmp_file.name, cv2.cvtColor(best_frame_np, cv2.COLOR_RGB2BGR))
+                temp_image_path = tmp_file.name
+            
+            # Modify args for i2v generation
+            args.image_path = temp_image_path
+            args.video_length = frames_to_generate
+            args.extend_video = None  # Prevent recursive extension calls
+            
+            # Generate new chunk using the main generation function
+            new_chunk = generate(args)
+            
+            # Clean up temp file
+            os.unlink(temp_image_path)
+            
+            if new_chunk is not None:
+                logger.info(f"Generated chunk shape: {new_chunk.shape}")
+                # Decode the latent chunk to pixel space for blending
+                decoded_chunk = decode_latent(new_chunk, args, WAN_CONFIGS[args.task])
+                logger.info(f"Decoded chunk shape: {decoded_chunk.shape}")
+                all_videos.append(decoded_chunk)
+                current_frames += frames_to_generate
+                
+                # Use the last frame of the decoded chunk as the next starting frame
+                best_frame_tensor = decoded_chunk[0, :, -1]
+                best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
+                best_frame_np = best_frame_np.astype(np.uint8)
+            else:
+                logger.error("Failed to generate video chunk")
+                break
+        
+        # Blend all video segments smoothly
+        logger.info(f"Blending {len(all_videos)} video segments")
+        result = all_videos[0]
+        
+        for i in range(1, len(all_videos)):
+            result = blend_video_transition(result, all_videos[i], blend_frames=8)
+            logger.info(f"Blended segment {i+1}, current length: {result.shape[2]} frames")
+        
+        logger.info(f"Final extended video: {result.shape}")
+        return result
+        
+    finally:
+        # Restore original arguments
+        args.image_path = original_image_path
+        args.video_length = original_video_length
+        args.extend_video = original_extend_video
+
+def generate_extended_video(
+    args: argparse.Namespace,
+    initial_video_path: str,
+    total_frames: int,
+    motion_frames: int = 25,
+) -> torch.Tensor:
+    """Generate extended video using multitalk-style iterative generation
+    
+    Args:
+        args: Command line arguments
+        initial_video_path: Path to initial video to extend
+        total_frames: Total number of frames to generate
+        motion_frames: Number of frames to use for conditioning each chunk
+        
+    Returns:
+        torch.Tensor: Extended video tensor [1, C, F, H, W]
+    """
+    device = torch.device(args.device)
+    cfg = WAN_CONFIGS[args.task]
+    
+    # Create accelerator for autocast support
+    accelerator = Accelerator()
+    
+    # Ensure we're using i2v-A14B model
+    if args.task != "i2v-A14B":
+        raise ValueError(f"Video extension requires i2v-A14B task, got {args.task}")
+    
+    # Load initial video
+    logger.info(f"Loading initial video from {initial_video_path}")
+    video_frames_np, initial_frames = load_video(
+        initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
+    )
+    
+    if initial_frames < motion_frames:
+        raise ValueError(f"Initial video has {initial_frames} frames, need at least {motion_frames}")
+    
+    # Convert to tensor [1, C, F, H, W]
+    video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))
+    video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
+    video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
+    
+    # Get dimensions
+    _, _, _, height, width = video_tensor.shape
+    
+    # Load models
+    vae_dtype = torch.float16
+    vae = load_vae(args, cfg, device, vae_dtype)
+    
+    # Load CLIP and encode first frame
+    clip = load_clip_model(args, cfg, device)
+    clip.model.to(device)
+    first_frame = video_tensor[0, :, 0]  # [C, H, W]
+    # Avoid in-place modification - use explicit operation
+    first_frame_normalized = (first_frame - 0.5) / 0.5  # [-1, 1]
+    # Convert to correct dtype and device for CLIP
+    first_frame_normalized = first_frame_normalized.to(device=device, dtype=torch.float16)
+    
+    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+        clip_context = clip.visual([first_frame_normalized.unsqueeze(1)])
+    
+    del clip
+    clean_memory_on_device(device)
+    
+    # Configure model selection for video extension
+    if args.extension_dual_dit_boundary is not None:
+        # Use custom boundary for extension with BOTH models
+        args.dual_dit_boundary = args.extension_dual_dit_boundary
+        logger.info(f"Using custom extension dual-dit boundary: {args.extension_dual_dit_boundary} (both models will be used)")
+    elif args.force_high_noise:
+        # Force high noise model ONLY (boundary = 0.0 means high noise model used for all timesteps)
+        args.dual_dit_boundary = 0.0
+        logger.info("Forcing high noise model ONLY for video extension")
+    elif args.force_low_noise:
+        # Force low noise model ONLY (boundary = 1.0 means low noise model used for all timesteps)
+        args.dual_dit_boundary = 1.0
+        logger.info("Forcing low noise model ONLY for video extension")
+    else:
+        # Default: use both models with default boundary (better for quality)
+        args.dual_dit_boundary = cfg.boundary  # Use default i2v-A14B boundary (0.9)
+        logger.info(f"Using default dual-dit boundary for extension: {cfg.boundary} (both models will be used)")
+    
+    model_result = load_dit_model(args, cfg, device, torch.float16, torch.float16, True)
+    
+    # Handle dual-dit dynamic loading - DO NOT force single model selection for extension
+    is_dual_dit = isinstance(model_result, tuple)
+    if is_dual_dit:
+        model_low_path, model_high_path, *lora_weights = model_result
+        model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+        model_manager.set_model_paths(model_low_path, model_high_path)
+        if len(lora_weights) >= 4:
+            model_manager.set_lora_weights(*lora_weights)
+        # For extension, start with high noise model but allow dynamic switching
+        model = model_manager.get_model('high')  # Initial model, will switch dynamically
+    else:
+        model = model_result
+    
+    optimize_model(model, args, device, torch.float16, torch.float16)
+    
+    # Setup scheduler
+    scheduler, _ = setup_scheduler(args, cfg, device)
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(args.seed if args.seed else 42)
+    
+    # Initialize with initial video
+    all_frames = video_tensor.squeeze(0).permute(1, 0, 2, 3)  # [F, C, H, W]
+    all_frames = (all_frames * 2.0 - 1.0)  # Scale to [-1, 1], keep on CPU to save GPU memory
+    
+    # Compute color statistics of initial video for normalization
+    initial_mean = all_frames.mean(dim=(0, 2, 3), keepdim=True)  # [1, C, 1, 1]
+    initial_std = all_frames.std(dim=(0, 2, 3), keepdim=True)  # [1, C, 1, 1]
+    logger.info(f"Initial video statistics - Mean: {initial_mean.squeeze().tolist()}, Std: {initial_std.squeeze().tolist()}")
+    
+    # Generate chunks iteratively
+    frames_per_chunk = args.video_length if args.video_length else 81
+    current_frame = initial_frames
+    
+    # Start with initial video, convert to [C, F, H, W] format to match other chunks
+    initial_chunk = all_frames[:initial_frames].permute(1, 0, 2, 3)  # [C, F, H, W]
+    generated_chunks = [initial_chunk]  # Start with initial video
+    
+    while current_frame < total_frames:
+        logger.info(f"Generating chunk: frames {current_frame} to {min(current_frame + frames_per_chunk, total_frames)}")
+        
+        # Get conditioning frames (last motion_frames from previous generation)
+        cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
+        cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W], move to device
+        
+        # Encode conditioning frames to latent
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            cond_latent = vae.encode([cond_frames])[0]
+        
+        # Prepare inputs for this chunk
+        chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)
+        noise, context, context_null, y, inputs = prepare_video_extension_inputs(
+            args, cfg, None, device, vae,
+            cond_frames, clip_context, chunk_frames
+        )
+        
+        # Get motion frames latent for injection
+        motion_latent = cond_latent[:, :(motion_frames-1)//cfg.vae_stride[0]+1]
+        
+        # Run sampling with motion frame injection
+        scheduler.set_timesteps(args.infer_steps, device=device)
+        timesteps = scheduler.timesteps
+        
+        # Apply timestep transformation for better temporal dynamics
+        # Use flow_shift parameter (default 5.0, or 3.0 for 480p as per multitalk)
+        shift = args.flow_shift if args.flow_shift else (3.0 if "480" in str(args.video_size) else 5.0)
+        transformed_timesteps = []
+        for t in timesteps:
+            transformed_t = timestep_transform(t, shift=shift, num_timesteps=1000)
+            transformed_timesteps.append(transformed_t)
+        timesteps = torch.stack(transformed_timesteps) if transformed_timesteps else timesteps
+        
+        final_latent = run_extension_sampling(
+            model, noise, scheduler, timesteps, args, inputs,
+            device, seed_g, accelerator,
+            motion_latent, motion_frames,
+            model_manager=model_manager
+        )
+        
+        # Decode the generated latent
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
+        
+        if args.color_match != "disabled":
+            try:
+                from color_matcher import ColorMatcher
+                cm = ColorMatcher()
+                
+                # Convert decoded chunk to numpy format [F, H, W, C] for ColorMatcher
+                # decoded_chunk is [C, F, H, W] in range [-1, 1]
+                decoded_np = decoded_chunk.permute(1, 2, 3, 0).cpu().float().numpy()  # [F, H, W, C]
+                
+                # Get reference frame from initial video (first frame)
+                # Use the very first frame of the initial video as reference for ALL chunks
+                # This prevents drift accumulation
+                ref_frame = initial_chunk[:, 0].permute(1, 2, 0).cpu().float().numpy()  # [H, W, C]
+                
+                # Apply color matching frame by frame
+                matched_frames = []
+                for frame_idx in range(decoded_np.shape[0]):
+                    frame = decoded_np[frame_idx]  # [H, W, C]
+                    # ColorMatcher expects values in range [0, 1] or [0, 255]
+                    # Convert from [-1, 1] to [0, 1]
+                    frame_01 = (frame + 1.0) / 2.0
+                    ref_01 = (ref_frame + 1.0) / 2.0
+                    
+                    # Apply color matching
+                    matched_01 = cm.transfer(src=frame_01, ref=ref_01, method=args.color_match)
+                    
+                    # Convert back to [-1, 1]
+                    matched = matched_01 * 2.0 - 1.0
+                    matched_frames.append(torch.from_numpy(matched))
+                
+                # Stack and convert back to [C, F, H, W]
+                decoded_chunk_normalized = torch.stack(matched_frames).permute(3, 0, 1, 2).to(device)
+                
+                logger.info(f"Applied {args.color_match} color matching to chunk {len(generated_chunks)+1}")
+            
+            except ImportError:
+                logger.warning("color_matcher library not installed. Install with: pip install color-matcher")
+                logger.warning("Falling back to internal statistics matching")
+                
+                # Fallback to internal normalization
+                decoded_mean = decoded_chunk.mean(dim=(1, 2, 3), keepdim=True)
+                decoded_std = decoded_chunk.std(dim=(1, 2, 3), keepdim=True)
+                decoded_chunk_normalized = (decoded_chunk - decoded_mean) / (decoded_std + 1e-6)
+                initial_std_reshaped = initial_std.view(-1, 1, 1, 1).to(device)
+                initial_mean_reshaped = initial_mean.view(-1, 1, 1, 1).to(device)
+                decoded_chunk_normalized = decoded_chunk_normalized * initial_std_reshaped + initial_mean_reshaped
+                decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
+        else:
+            # No color matching - keep decoded chunk as is
+            decoded_chunk_normalized = decoded_chunk
+        
+        # Ensure values stay in valid range
+        decoded_chunk_normalized = torch.clamp(decoded_chunk_normalized, -1.0, 1.0)
+        
+        # Apply chunk blending for smooth transition
+        if len(generated_chunks) > 0 and motion_frames > 0:
+            # Blend overlapping motion frames region
+            blend_frames = min(8, motion_frames // 2)  # Blend up to 8 frames
+            if blend_frames > 0:
+                # Get last frames from all_frames (previous chunk)
+                prev_motion_end = all_frames[-blend_frames:].permute(1, 0, 2, 3).to(device)  # [C, blend_frames, H, W]
+                # Get corresponding frames from new chunk
+                new_motion_start = decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames]  # [C, blend_frames, H, W]
+                
+                # Create blending weights using cosine interpolation for smoother transition
+                # Cosine blending provides smoother transition than linear
+                t = torch.linspace(0, np.pi, blend_frames).to(device)
+                blend_weights = (1.0 - torch.cos(t)) / 2.0  # Smoothstep from 0 to 1
+                blend_weights = (1.0 - blend_weights)  # Reverse to go from 1 to 0 for prev frames
+                blend_weights = blend_weights.view(1, blend_frames, 1, 1)  # [1, blend_frames, 1, 1]
+                
+                # Blend the overlapping region
+                blended_region = prev_motion_end * blend_weights + new_motion_start * (1.0 - blend_weights)
+                
+                # Replace the beginning of new frames with blended version
+                decoded_chunk_normalized[:, motion_frames:motion_frames+blend_frames] = blended_region
+        
+        # Log statistics for debugging
+        logger.info(f"Chunk {len(generated_chunks)+1} - After processing mean: {decoded_chunk_normalized.mean(dim=(1,2,3)).cpu().tolist()}")
+        
+        # Append new frames (skip the motion frames that were conditioning)
+        new_frames = decoded_chunk_normalized[:, motion_frames:]  # [C, remaining_frames, H, W]
+        generated_chunks.append(new_frames.cpu())  # Move to CPU to save GPU memory
+        
+        # Convert new_frames to [F, C, H, W] format to match all_frames and move to CPU
+        new_frames_transposed = new_frames.permute(1, 0, 2, 3).cpu()  # [remaining_frames, C, H, W], move to CPU
+        
+        # Update all_frames for next iteration
+        all_frames = torch.cat([all_frames, new_frames_transposed], dim=0)
+        current_frame += (frames_per_chunk - motion_frames)
+        
+        # Clean up GPU memory after each chunk
+        del cond_frames, cond_latent, noise, context, context_null, y, inputs, motion_latent, final_latent, decoded_chunk, new_frames, new_frames_transposed
+        clean_memory_on_device(device)
+        torch.cuda.empty_cache()
+        logger.info(f"Cleaned up GPU memory after chunk {current_frame // frames_per_chunk}")
+    
+    # Combine all chunks
+    final_video = torch.cat(generated_chunks, dim=1)  # [C, F, H, W]
+    final_video = final_video.unsqueeze(0)  # [1, C, F, H, W]
+    
+    # Cleanup
+    if is_dual_dit:
+        model_manager.cleanup()
+    else:
+        del model
+    del vae
+    
+    clean_memory_on_device(device)
+    
+    # Scale to [0, 1] for saving
+    final_video = (final_video + 1.0) / 2.0
+    final_video = torch.clamp(final_video, 0.0, 1.0)
+    
+    logger.info(f"Generated extended video: {final_video.shape}")
+    return final_video
+
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     """main function for generation pipeline (T2V, I2V, V2V)
 
@@ -2911,6 +3985,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     is_v2v = args.video_path is not None
     is_fun_control = args.control_path is not None and cfg.is_fun_control
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
+    is_extension = args.extend_video is not None
     is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
 
     if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
@@ -2918,6 +3993,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
+    elif is_extension: logger.info(f"Running Video Extension (multitalk-style) to {args.extend_frames} frames")
     else: 
         if args.task == "ti2v-5B" and args.image_path is None:
             logger.info(f"Running Text-to-Video (T2V) inference for ti2v-5B (no image provided)")
@@ -2985,6 +4061,29 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
     needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
     if needs_vae_early:
+        vae = load_vae(args, cfg, device, vae_dtype)
+        # Keep VAE on specified device for now, will be moved as needed
+
+    # Handle video extension mode
+    if is_extension:
+        logger.info(f"Extending video from {args.extend_video} to {args.extend_frames} frames")
+        
+        # Use clean i2v-based extension approach (much better than multitalk-style)
+        # This approach extracts the best frame and generates smooth extensions
+        try:
+            extended_video = generate_extended_video_i2v_based(
+                args, args.extend_video, args.extend_frames
+            )
+            return extended_video  # Return the extended video directly
+        except Exception as e:
+            logger.error(f"i2v-based extension failed: {e}")
+            logger.info("Falling back to multitalk-style extension")
+            # Fallback to original method
+            extended_video = generate_extended_video(
+                args, args.extend_video, args.extend_frames, args.motion_frames
+            )
+            return extended_video
+
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
 
@@ -3640,6 +4739,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
              logger.error(f"Failed to initialize Latent Previewer: {e}", exc_info=True)
              previewer = None # Ensure it's None if init fails
 
+    # --- Apply Context Windows if Enabled ---
+    model_options = apply_context_windows(args)
+    
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
     
@@ -3667,7 +4769,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         model_manager=model_manager,  # New parameter
         previewer=previewer, # MODIFIED: Pass the previewer instance
         use_cpu_offload=(args.blocks_to_swap > 0), # Example: offload if swapping
-        preview_suffix=args.preview_suffix # Pass the preview suffix to run_sampling
+        preview_suffix=args.preview_suffix, # Pass the preview suffix to run_sampling
+        model_options=model_options  # Pass context window options
     )
 
     # --- Cleanup ---
@@ -4116,14 +5219,24 @@ def main():
             torch.cuda.empty_cache()
         
         # Decode latent to video tensor [B, C, F, H, W], range [0, 1]
-        decoded_video = decode_latent(generated_latent, args, cfg)
+        # Skip VAE decode for extension mode since it already returns decoded pixels
+        if hasattr(args, 'extend_video') and args.extend_video is not None:
+            logger.info("Extension mode detected - using already decoded video")
+            decoded_video = generated_latent  # Already decoded pixels
+        else:
+            decoded_video = decode_latent(generated_latent, args, cfg)
 
         # Save the output (latent and/or video/images)
+        # Don't save "latents" for extension mode since generated_latent contains pixels
+        latent_to_save = None
+        if not (hasattr(args, 'extend_video') and args.extend_video is not None):
+            latent_to_save = generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
+        
         save_output(
             decoded_video,
             args,
             original_base_names=original_base_names,
-            latent_to_save=generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
+            latent_to_save=latent_to_save
         )
     else:
         logger.error("No latent available for decoding and saving.")
