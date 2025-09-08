@@ -470,7 +470,11 @@ def wan22_batch_handler(
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str,
     # Pusa Extension parameters
-    pusa_noise_multipliers: float, pusa_noisy_steps: int
+    pusa_noise_multipliers: float, pusa_noisy_steps: int,
+    # New Pusa Multi-Frame parameters
+    pusa_mode: str, pusa_end_image: str, pusa_cond_images: List[str], 
+    pusa_cond_positions: str, pusa_cond_noise_multipliers: str,
+    pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -523,8 +527,46 @@ def wan22_batch_handler(
         
         # --- Pusa Extension Parameters (only when using pusa solver) ---
         if sample_solver == "pusa":
+            # Legacy parameters (for backward compatibility)
             command.extend(["--pusa_noise_multipliers", str(pusa_noise_multipliers)])
             command.extend(["--pusa_noisy_steps", str(pusa_noisy_steps)])
+            
+            # Multi-Frame Conditioning Parameters
+            if pusa_mode != "basic":
+                if pusa_mode == "start_end" and pusa_end_image:
+                    # Start-End frame interpolation mode
+                    command.extend(["--end_image", pusa_end_image])
+                    
+                elif pusa_mode == "multi_images" and pusa_cond_images:
+                    # Multi-frame image conditioning
+                    if isinstance(pusa_cond_images, list) and len(pusa_cond_images) > 0:
+                        # Handle multiple image files
+                        image_paths = []
+                        for img_file in pusa_cond_images:
+                            if img_file and hasattr(img_file, 'name'):
+                                image_paths.append(img_file.name)
+                            elif isinstance(img_file, str) and img_file:
+                                image_paths.append(img_file)
+                        
+                        if image_paths:
+                            command.extend(["--cond_images"] + image_paths)
+                            
+                        if pusa_cond_positions:
+                            command.extend(["--cond_positions", pusa_cond_positions])
+                        if pusa_cond_noise_multipliers:
+                            command.extend(["--cond_noise_multipliers", pusa_cond_noise_multipliers])
+                
+                elif pusa_mode == "v2v" and pusa_cond_video:
+                    # Video-to-video conditioning
+                    if hasattr(pusa_cond_video, 'name'):
+                        command.extend(["--cond_video", pusa_cond_video.name])
+                    elif isinstance(pusa_cond_video, str) and pusa_cond_video:
+                        command.extend(["--cond_video", pusa_cond_video])
+                        
+                    if pusa_v2v_positions:
+                        command.extend(["--cond_positions", pusa_v2v_positions])
+                    if pusa_v2v_noise_multipliers:
+                        command.extend(["--cond_noise_multipliers", pusa_v2v_noise_multipliers])
         
         # --- Model Path Logic based on Task ---
         if "A14B" in task:
@@ -7875,26 +7917,117 @@ with gr.Blocks(
                     with gr.Accordion("Pusa Extension (Advanced Flow Matching)", open=False):
                         gr.Markdown("**Note:** These options only apply when Sample Solver is set to 'pusa'")
                         with gr.Group(visible=False) as wan22_pusa_controls:
-                            with gr.Row():
-                                wan22_pusa_noise_multipliers = gr.Slider(
-                                    label="Noise Multipliers", 
-                                    minimum=0.0, 
-                                    maximum=100.0, 
-                                    step=0.1, 
-                                    value=0.0,
-                                    info="Noise multipliers for Pusa extension (0.0-100.0). Higher values add more noise."
+                            # Legacy Pusa Controls (for backward compatibility)
+                            with gr.Accordion("Legacy Pusa Settings", open=False):
+                                with gr.Row():
+                                    wan22_pusa_noise_multipliers = gr.Slider(
+                                        label="Noise Multipliers", 
+                                        minimum=0.0, 
+                                        maximum=100.0, 
+                                        step=0.1, 
+                                        value=0.0,
+                                        info="Legacy noise multipliers for basic Pusa extension (0.0-100.0). Use Multi-Frame controls below for advanced features."
+                                    )
+                                    wan22_pusa_noisy_steps = gr.Number(
+                                        label="Noisy Steps", 
+                                        value=-1, 
+                                        minimum=-1, 
+                                        maximum=1000,
+                                        step=1,
+                                        info="Number of steps to apply Pusa noise (-1 for all steps)"
+                                    )
+                            
+                            # Multi-Frame Conditioning Controls
+                            with gr.Accordion("Multi-Frame Conditioning", open=True):
+                                gr.Markdown("### 🎯 Conditioning Modes")
+                                wan22_pusa_mode = gr.Radio(
+                                    label="Pusa Mode",
+                                    choices=[
+                                        ("Basic", "basic"),
+                                        ("Start-End Frames", "start_end"), 
+                                        ("Multi-Frame Images", "multi_images"),
+                                        ("Video-to-Video", "v2v")
+                                    ],
+                                    value="basic",
+                                    info="Select the type of conditioning to apply"
                                 )
-                                wan22_pusa_noisy_steps = gr.Number(
-                                    label="Noisy Steps", 
-                                    value=-1, 
-                                    minimum=-1, 
-                                    maximum=1000,
-                                    step=1,
-                                    info="Number of steps to apply Pusa noise (-1 for all steps)"
-                                )
+                                
+                                # Start-End Frame Controls
+                                with gr.Group(visible=False) as wan22_pusa_start_end_controls:
+                                    gr.Markdown("**Start-End Frame Interpolation** - Generate smooth transitions between two images")
+                                    wan22_pusa_end_image = gr.Image(
+                                        label="End Frame Image",
+                                        type="filepath",
+                                        info="Upload the end frame for interpolation (start frame uses main input image)"
+                                    )
+                                
+                                # Multi-Frame Image Controls  
+                                with gr.Group(visible=False) as wan22_pusa_multi_controls:
+                                    gr.Markdown("**Multi-Frame Image Conditioning** - Control specific frames with different images")
+                                    with gr.Row():
+                                        wan22_pusa_cond_images = gr.File(
+                                            label="Conditioning Images", 
+                                            file_count="multiple",
+                                            file_types=["image"],
+                                            info="Upload multiple images for frame conditioning"
+                                        )
+                                        with gr.Column():
+                                            wan22_pusa_cond_positions = gr.Textbox(
+                                                label="Frame Positions",
+                                                placeholder="0,20,40",
+                                                info="Comma-separated frame indices (e.g., 0,20,40)"
+                                            )
+                                            wan22_pusa_cond_noise_multipliers = gr.Textbox(
+                                                label="Noise Multipliers", 
+                                                placeholder="0.0,0.4,0.6",
+                                                info="Comma-separated noise values (0.0=clean, higher=more noise)"
+                                            )
+                                
+                                # Video-to-Video Controls
+                                with gr.Group(visible=False) as wan22_pusa_v2v_controls:
+                                    gr.Markdown("**Video-to-Video Conditioning** - Use frames from an existing video as conditioning")
+                                    wan22_pusa_cond_video = gr.Video(
+                                        label="Conditioning Video",
+                                        info="Upload a video to use frames from as conditioning"
+                                    )
+                                    with gr.Row():
+                                        wan22_pusa_v2v_positions = gr.Textbox(
+                                            label="Video Frame Positions",
+                                            placeholder="0,1,2,3",
+                                            info="Comma-separated frame indices from the conditioning video"
+                                        )
+                                        wan22_pusa_v2v_noise_multipliers = gr.Textbox(
+                                            label="Frame Noise Multipliers",
+                                            placeholder="0.2,0.4,0.4,0.4", 
+                                            info="Noise levels for each conditioning frame"
+                                        )
+                                
+                                # Example Configurations
+                                with gr.Accordion("Example Configurations", open=False):
+                                    gr.Markdown("""
+                                    ### 📋 Quick Start Examples
+                                    
+                                    **Start-End Interpolation:**
+                                    - Mode: Start-End Frames
+                                    - Upload end frame image
+                                    - Automatic clean start (0.0) and slight noise end (0.2)
+                                    
+                                    **Multi-Frame Keyframes:**
+                                    - Mode: Multi-Frame Images  
+                                    - Images: 3 files
+                                    - Positions: `0,40,80`
+                                    - Noise: `0.0,0.3,0.0` (clean start/end, noisy middle)
+                                    
+                                    **Video Extension:**
+                                    - Mode: Video-to-Video
+                                    - Upload conditioning video
+                                    - Positions: `0,1,2,3` (first 4 frames)
+                                    - Noise: `0.2,0.4,0.4,0.4` (progressive noise)
+                                    """)
+                                
                             with gr.Row():
                                 gr.Markdown(
-                                    "💡 **Tip:** Default LoRA locations for Pusa are `lora/high_noise_pusa.safetensors` and `lora/low_noise_pusa.safetensors`. "
+                                    "💡 **Tip:** Default LoRA locations for Pusa are `wan/high_noise_pusa.safetensors` and `wan/low_noise_pusa.safetensors`. "
                                     "Load them using the normal LoRA system above."
                                 )
                     
@@ -9225,14 +9358,28 @@ with gr.Blocks(
         outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_conditioning_strength]
     )
 
-    # Wan2.2 Pusa controls visibility handler
+    # Wan2.2 Pusa controls visibility handlers
     def update_wan22_pusa_visibility(solver):
         return gr.update(visible=solver == "pusa")
+    
+    def update_wan22_pusa_mode_visibility(mode):
+        """Update visibility of Pusa mode-specific controls"""
+        return [
+            gr.update(visible=mode == "start_end"),    # start_end_controls
+            gr.update(visible=mode == "multi_images"), # multi_controls  
+            gr.update(visible=mode == "v2v")           # v2v_controls
+        ]
     
     wan22_sample_solver.change(
         fn=update_wan22_pusa_visibility,
         inputs=[wan22_sample_solver],
         outputs=[wan22_pusa_controls]
+    )
+    
+    wan22_pusa_mode.change(
+        fn=update_wan22_pusa_mode_visibility,
+        inputs=[wan22_pusa_mode],
+        outputs=[wan22_pusa_start_end_controls, wan22_pusa_multi_controls, wan22_pusa_v2v_controls]
     )
 
 #multitalk event handlers
@@ -11595,6 +11742,15 @@ with gr.Blocks(
             # Pusa Extension arguments
             wan22_pusa_noise_multipliers,
             wan22_pusa_noisy_steps,
+            # New Pusa Multi-Frame arguments
+            wan22_pusa_mode,
+            wan22_pusa_end_image,
+            wan22_pusa_cond_images,
+            wan22_pusa_cond_positions,
+            wan22_pusa_cond_noise_multipliers,
+            wan22_pusa_cond_video,
+            wan22_pusa_v2v_positions,
+            wan22_pusa_v2v_noise_multipliers,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

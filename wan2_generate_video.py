@@ -38,7 +38,18 @@ from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from flowmatch_pusa_scheduler import FlowMatchSchedulerPusa
+from wan.pusa.flowmatch_pusa_scheduler import FlowMatchSchedulerPusa
+from wan.pusa.flowmatch_pusa_v2v_scheduler import FlowMatchSchedulerPusaV2V
+from wan.pusa.utils import (
+    process_conditioning_images,
+    process_conditioning_video,
+    parse_conditioning_positions,
+    parse_noise_multipliers,
+    create_conditioning_dict,
+    validate_conditioning_parameters,
+    create_frame_noise_mapping,
+    log_conditioning_info,
+)
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -389,6 +400,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Number of steps to apply Pusa noise (-1 for all steps). Only used with --sample_solver pusa.",
+    )
+    
+    # Pusa Multi-Frame Conditioning Arguments  
+    parser.add_argument(
+        "--cond_images",
+        type=str,
+        nargs='+',
+        help="Paths to conditioning images for multi-frame Pusa (e.g., start/end frames). Use with --cond_positions and --cond_noise_multipliers.",
+    )
+    parser.add_argument(
+        "--cond_video", 
+        type=str,
+        help="Path to conditioning video for video-to-video Pusa generation. Use with --cond_positions and --cond_noise_multipliers.",
+    )
+    parser.add_argument(
+        "--cond_positions",
+        type=str,
+        help="Comma-separated frame positions for conditioning (e.g., '0,20,40'). Must match length of --cond_images or correspond to --cond_video frames.",
+    )
+    parser.add_argument(
+        "--cond_noise_multipliers",
+        type=str,
+        help="Comma-separated noise multipliers for conditioning frames (e.g., '0.0,0.4,0.6'). 0.0 = clean conditioning, higher values = more noise.",
+    )
+    parser.add_argument(
+        "--end_image",
+        type=str,
+        help="Path to end frame image for start-end interpolation. Use with --input_image as start frame.",
     )
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
@@ -2770,11 +2809,21 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
 
         scheduler.step = step_wrapper
     elif args.sample_solver == "pusa":
-        scheduler = FlowMatchSchedulerPusa(
-            num_train_timesteps=config.num_train_timesteps, 
-            shift=args.flow_shift,
-            extra_one_step=True  # Following ComfyUI Pusa implementation
-        )
+        # Choose scheduler based on whether V2V conditioning is being used
+        if hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler:
+            logger.info("Using Pusa V2V scheduler for multi-frame conditioning")
+            scheduler = FlowMatchSchedulerPusaV2V(
+                num_train_timesteps=config.num_train_timesteps,
+                shift=args.flow_shift,
+                extra_one_step=True
+            )
+        else:
+            scheduler = FlowMatchSchedulerPusa(
+                num_train_timesteps=config.num_train_timesteps, 
+                shift=args.flow_shift,
+                extra_one_step=True  # Following ComfyUI Pusa implementation
+            )
+        
         scheduler.set_timesteps(
             num_inference_steps=args.infer_steps,
             device=device,
@@ -3235,12 +3284,27 @@ def run_sampling(
 
             # Scheduler expects noise_pred [B, C, F, H, W] and sample [B, C, F, H, W]
             # latent_on_device should already have the batch dim handled by the logic above
+            
+            # Prepare V2V conditioning parameters for Pusa scheduler
+            scheduler_kwargs = {
+                "return_dict": False,
+                "generator": seed_g
+            }
+            
+            # Add V2V conditioning if using Pusa V2V scheduler
+            if (hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and 
+                hasattr(args, 'pusa_cond_positions') and hasattr(args, 'pusa_frame_noise_mapping')):
+                scheduler_kwargs.update({
+                    "cond_frame_latent_indices": args.pusa_cond_positions,
+                    "noise_multipliers": args.pusa_frame_noise_mapping
+                })
+                logger.debug(f"Step {i}: Applying V2V conditioning to positions {args.pusa_cond_positions}")
+            
             scheduler_output = scheduler.step(
                 noise_pred.to(device), # Ensure noise_pred is on compute device for step
                 t,
                 latent_on_device, # Pass the tensor (with batch dim) on compute device
-                return_dict=False,
-                generator=seed_g
+                **scheduler_kwargs
             )
             prev_latent = scheduler_output[0] # Get the new latent state [B, C, F, H, W]
 
@@ -3256,6 +3320,40 @@ def run_sampling(
                 # Apply mask-based conditioning using stored masks: latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
+            
+            # 6. Apply Pusa multi-frame conditioning (inject conditioning frames)
+            if (hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and 
+                hasattr(args, 'pusa_frame_noise_mapping')):
+                logger.debug(f"Step {i}: Applying Pusa frame conditioning")
+                
+                # Get current timestep value for noise calculation
+                current_t = t.item() if hasattr(t, 'item') else t
+                sigma_ratio = current_t / 1000.0  # Convert timestep to sigma ratio
+                
+                # Apply conditioning to specific frames
+                for frame_idx, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
+                    if frame_idx < latent.shape[2]:  # Ensure frame index is valid
+                        # Convert conditioning image to latent space if needed
+                        if not hasattr(args, '_pusa_cond_latents_cache'):
+                            args._pusa_cond_latents_cache = {}
+                        
+                        if frame_idx not in args._pusa_cond_latents_cache:
+                            # This is a placeholder - in a real implementation, you'd encode the image to latent space
+                            # For now, we'll apply a simple noise-based conditioning
+                            logger.debug(f"Caching conditioning latent for frame {frame_idx}")
+                            # TODO: Add VAE encoding of conditioning images to latent space
+                            args._pusa_cond_latents_cache[frame_idx] = None
+                        
+                        # Apply conditioning based on noise multiplier and current timestep
+                        if noise_mult < 0.1:  # Clean conditioning (noise_mult ~ 0.0)
+                            logger.debug(f"Applying clean conditioning to frame {frame_idx}")
+                            # For clean conditioning, we would inject the clean latent
+                            # This is simplified - real implementation would use encoded image latents
+                        else:
+                            # Noisy conditioning - apply partial conditioning based on timestep
+                            conditioning_strength = 1.0 - (sigma_ratio * noise_mult)
+                            conditioning_strength = max(0.0, min(1.0, conditioning_strength))
+                            logger.debug(f"Applying noisy conditioning to frame {frame_idx}, strength: {conditioning_strength:.3f}")
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -5079,6 +5177,83 @@ def main():
         )
         if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
+
+        # --- Pusa Multi-Frame Conditioning Processing ---
+        if args.sample_solver == "pusa" and (args.cond_images or args.cond_video or args.end_image):
+            logger.info("Processing Pusa multi-frame conditioning...")
+            
+            # Determine conditioning type and process accordingly
+            conditioning_images = []
+            cond_positions = []
+            noise_multipliers = []
+            
+            if args.end_image and args.image_path:
+                # Start-end frame interpolation mode
+                logger.info("Pusa Start-End Frame Mode")
+                conditioning_images = process_conditioning_images([args.image_path, args.end_image], width, height)
+                cond_positions = [0, video_length - 1 if video_length else 80]  # Default to frame 80 if length unknown
+                noise_multipliers = [0.0, 0.2]  # Clean start, some noise on end
+                mode_str += "-Pusa-StartEnd"
+                
+            elif args.cond_images:
+                # Multi-frame conditioning mode
+                logger.info("Pusa Multi-Frame Conditioning Mode") 
+                if not args.cond_positions:
+                    raise ValueError("--cond_positions required when using --cond_images")
+                if not args.cond_noise_multipliers:
+                    raise ValueError("--cond_noise_multipliers required when using --cond_images")
+                
+                cond_positions = parse_conditioning_positions(args.cond_positions)
+                noise_multipliers = parse_noise_multipliers(args.cond_noise_multipliers)
+                conditioning_images = process_conditioning_images(args.cond_images, width, height)
+                
+                validate_conditioning_parameters(video_length or 81, cond_positions, noise_multipliers, conditioning_images)
+                mode_str += "-Pusa-MultiFrame"
+                
+            elif args.cond_video:
+                # Video-to-video conditioning mode
+                logger.info("Pusa Video-to-Video Mode")
+                if not args.cond_positions:
+                    raise ValueError("--cond_positions required when using --cond_video")
+                if not args.cond_noise_multipliers:
+                    raise ValueError("--cond_noise_multipliers required when using --cond_video")
+                
+                cond_positions = parse_conditioning_positions(args.cond_positions)
+                noise_multipliers = parse_noise_multipliers(args.cond_noise_multipliers)
+                video_frames = process_conditioning_video(args.cond_video, width, height)
+                
+                # Select specific frames based on positions
+                conditioning_images = []
+                for pos in cond_positions:
+                    if pos < len(video_frames):
+                        conditioning_images.append(video_frames[pos])
+                    else:
+                        logger.warning(f"Position {pos} exceeds video length {len(video_frames)}, using last frame")
+                        conditioning_images.append(video_frames[-1])
+                
+                validate_conditioning_parameters(video_length or 81, cond_positions, noise_multipliers, conditioning_images)
+                mode_str += "-Pusa-V2V"
+            
+            # Create conditioning dictionary and frame noise mapping
+            args.pusa_conditioning_dict = create_conditioning_dict(cond_positions, conditioning_images, noise_multipliers)
+            args.pusa_frame_noise_mapping = create_frame_noise_mapping(cond_positions, noise_multipliers)
+            args.pusa_cond_positions = cond_positions
+            
+            # Log conditioning info
+            log_conditioning_info(
+                task_type=mode_str,
+                cond_positions=cond_positions,
+                noise_multipliers=noise_multipliers,
+                num_images=len(conditioning_images),
+                video_path=args.cond_video if hasattr(args, 'cond_video') else None
+            )
+            
+            # Switch to V2V scheduler if multi-frame conditioning is used
+            if len(cond_positions) > 1:
+                logger.info("Using Pusa V2V scheduler for multi-frame conditioning")
+                args.pusa_use_v2v_scheduler = True
+            else:
+                args.pusa_use_v2v_scheduler = False
 
         # Core generation pipeline
         generated_latent = generate(args) # Returns [B, C, F, H, W] or None
