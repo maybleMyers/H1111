@@ -182,6 +182,22 @@ class IndexListContextHandler(ContextHandlerABC):
                         else:
                             resized_actual_cond[key] = cond_item
                             logger.warning(f"seq_len is None in conditioning")
+                    elif isinstance(cond_item, list):
+                        # Handle lists of tensors (e.g., 'y' for I2V models)
+                        resized_list = []
+                        for item in cond_item:
+                            if isinstance(item, torch.Tensor):
+                                # Check if this tensor has frames that need slicing
+                                if self.dim < item.ndim and item.size(self.dim) == x_in.size(self.dim):
+                                    # Slice the tensor to match the window
+                                    sliced_item = window.get_tensor(item, device)
+                                    resized_list.append(sliced_item)
+                                    logger.debug(f"Sliced list item in '{key}' from shape {item.shape} to {sliced_item.shape}")
+                                else:
+                                    resized_list.append(item.to(device) if device else item)
+                            else:
+                                resized_list.append(item)
+                        resized_actual_cond[key] = resized_list
                     elif isinstance(cond_item, torch.Tensor):
                         # Check if tensor matches expected dimensions
                         if self.dim < cond_item.ndim and cond_item.size(self.dim) == x_in.size(self.dim):
