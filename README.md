@@ -17,3 +17,9 @@ pip install imageio librosa pyloudnorm soundfile xfuser
 
 v2v seems to be working well now with the t2v model.
 Most warnings are safe to ignore and will probably be removed later.
+
+A cool thing to try are the mixed weight models, I preserved all the weights that would not safely convert to fp16 in fp32 without increasing model size very much. Select preserve mixed weight dtype at the bottom of the page, download the models named like this: wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors.
+
+## Changlog
+9/8/2025  
+    Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2, video extension for wan 2.2.  
