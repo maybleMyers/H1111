@@ -534,18 +534,45 @@ def wan22_batch_handler(
             
             # Multi-Frame Conditioning Parameters
             if pusa_mode != "basic":
+                # Debug output to understand what data types we're receiving
+                print(f"DEBUG Pusa: mode={pusa_mode}, end_image type={type(pusa_end_image)}, cond_images type={type(pusa_cond_images)}")
+                if pusa_cond_images:
+                    print(f"DEBUG Pusa cond_images content: {pusa_cond_images[:2] if len(pusa_cond_images) > 2 else pusa_cond_images}")
+                
                 if pusa_mode == "start_end" and pusa_end_image:
                     # Start-End frame interpolation mode
-                    command.extend(["--end_image", pusa_end_image])
+                    # Handle both string paths and file objects
+                    if hasattr(pusa_end_image, 'name'):
+                        end_image_path = pusa_end_image.name
+                    elif isinstance(pusa_end_image, str):
+                        end_image_path = pusa_end_image
+                    else:
+                        end_image_path = str(pusa_end_image)
+                    command.extend(["--end_image", end_image_path])
                     
                 elif pusa_mode == "multi_images" and pusa_cond_images:
                     # Multi-frame image conditioning
-                    # Gallery component passes image paths as a list of strings
+                    # Gallery component can pass different formats
+                    image_paths = []
                     if isinstance(pusa_cond_images, list) and len(pusa_cond_images) > 0:
-                        # Gallery format - image paths are already strings
-                        image_paths = [img for img in pusa_cond_images if img]
+                        for img in pusa_cond_images:
+                            if img is None:
+                                continue
+                            # Handle tuple format from Gallery (filepath, label)
+                            if isinstance(img, tuple) and len(img) >= 1:
+                                image_paths.append(img[0])  # Get filepath from tuple
+                            # Handle direct string paths
+                            elif isinstance(img, str):
+                                image_paths.append(img)
+                            # Handle dict format from Gallery
+                            elif isinstance(img, dict) and 'name' in img:
+                                image_paths.append(img['name'])
+                            # Handle file objects
+                            elif hasattr(img, 'name'):
+                                image_paths.append(img.name)
                         
                         if image_paths:
+                            print(f"DEBUG: Adding {len(image_paths)} images to command: {image_paths}")
                             command.extend(["--cond_images"] + image_paths)
                             
                         if pusa_cond_positions:
@@ -668,6 +695,24 @@ def wan22_batch_handler(
             command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
         
         # --- Execute Subprocess ---
+        # Validate and fix command items
+        for i, item in enumerate(command):
+            if not isinstance(item, str):
+                print(f"WARNING: Command item {i} is not a string: {type(item)} = {item}")
+                # Handle specific types
+                if isinstance(item, tuple) and len(item) > 0:
+                    # Use first element of tuple (likely filepath from Gallery)
+                    command[i] = str(item[0])
+                    print(f"  Fixed: Using first element of tuple: {command[i]}")
+                elif hasattr(item, 'name'):
+                    # File-like object
+                    command[i] = item.name
+                    print(f"  Fixed: Using .name attribute: {command[i]}")
+                else:
+                    # Fallback to string conversion
+                    command[i] = str(item)
+                    print(f"  Fixed: Converted to string: {command[i]}")
+        
         print(f"Running Wan2.2 Command: {' '.join(command)}")
         
         process = subprocess.Popen(
