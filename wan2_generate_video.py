@@ -940,12 +940,9 @@ class PipelineDynamicModelManager(DynamicModelManager):
             if t.dim() == 1:
                 t = t.expand(t.size(0), seq_len)
             with torch.amp.autocast('cuda', dtype=torch.float32):
-                bt = t.size(0)
-                t = t.flatten()
                 from wan.modules.model import sinusoidal_embedding_1d
-                e = model.time_embedding(
-                    sinusoidal_embedding_1d(model.freq_dim, t).unflatten(0, (bt, seq_len)).float())
-                e0 = model.time_projection(e).unflatten(2, (6, model.dim))
+                e = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t).float())
+                e0 = model.time_projection(e).unflatten(1, (6, model.dim))
             
             # Text embeddings
             context = model.text_embedding(
