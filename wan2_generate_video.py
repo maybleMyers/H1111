@@ -895,18 +895,28 @@ class PipelineDynamicModelManager(DynamicModelManager):
         This replaces the standard model.forward() call when using dual GPUs.
         """
         model = self.current_model
-        device = x.device  # Original device for compatibility
+        
+        # Handle list input format (x is a list of tensors for WAN model)
+        if isinstance(x, list):
+            x = [tensor.to(self.gpu0) for tensor in x]
+        else:
+            x = x.to(self.gpu0)
         
         # === Stage 1: Embeddings and preprocessing on GPU0 ===
         with torch.cuda.stream(self.stream_gpu0):
-            # Move inputs to GPU0
-            x = x.to(self.gpu0)
+            # Move other inputs to GPU0
             t = t.to(self.gpu0)
-            context = context.to(self.gpu0)
+            if isinstance(context, list):
+                context = [c.to(self.gpu0) for c in context]
+            else:
+                context = context.to(self.gpu0)
             if clip_fea is not None:
                 clip_fea = clip_fea.to(self.gpu0)
             if y is not None:
-                y = y.to(self.gpu0)
+                if isinstance(y, list):
+                    y = [tensor.to(self.gpu0) for tensor in y]
+                else:
+                    y = y.to(self.gpu0)
             if fun_ref is not None:
                 fun_ref = fun_ref.to(self.gpu0)
                 
