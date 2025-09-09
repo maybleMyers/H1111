@@ -853,15 +853,24 @@ class PipelineDynamicModelManager(DynamicModelManager):
         if hasattr(self.current_model, 'text_embedding'):
             self.current_model.text_embedding = self.current_model.text_embedding.to(self.gpu0)
         
+        # Move CLIP projection if present (for I2V models)
+        if hasattr(self.current_model, 'clip_projection'):
+            self.current_model.clip_projection = self.current_model.clip_projection.to(self.gpu0)
+        if hasattr(self.current_model, 'clip_norm'):
+            self.current_model.clip_norm = self.current_model.clip_norm.to(self.gpu0)
+            
         # Split blocks between GPUs
         for i in range(self.split_point):
             self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu0)
         for i in range(self.split_point, num_blocks):
             self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu1)
             
-        # Move output head and unpatchify to GPU1
+        # Move output head to GPU1 (unpatchify is a method, not a module)
         self.current_model.head = self.current_model.head.to(self.gpu1)
-        self.current_model.unpatchify = self.current_model.unpatchify.to(self.gpu1)
+        
+        # Move ref_conv if present (for Fun-Control models)
+        if hasattr(self.current_model, 'ref_conv') and self.current_model.ref_conv is not None:
+            self.current_model.ref_conv = self.current_model.ref_conv.to(self.gpu1)
         
         # Store references for easier access
         self.blocks_gpu0 = self.current_model.blocks[:self.split_point]
