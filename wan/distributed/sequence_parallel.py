@@ -121,12 +121,12 @@ def sp_dit_forward(
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
     
-    # Reshape e0 for blocks
+    # Fix e0 for our model's blocks
     # e0 shape after chunk: [B, seq_len/world_size, 6, dim]
-    # Blocks expect e to have shape compatible with modulation: [*, 6, dim]
-    # We need to merge batch and sequence dimensions
-    B, seq_chunk, six, D = e0.shape
-    e0 = e0.view(B * seq_chunk, six, D)
+    # Our blocks expect e to be [B, 6, dim] (no sequence dimension)
+    # Since time embeddings are the same for all positions in a batch,
+    # we can just take the first position's embedding
+    e0 = e0[:, 0, :, :]  # Shape: [B, 6, dim]
 
     # arguments
     kwargs = dict(
