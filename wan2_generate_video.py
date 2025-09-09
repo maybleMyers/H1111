@@ -3506,17 +3506,27 @@ def run_sampling(
                 else:
                     # Standard calls without context windows (original code)
                     if apply_slg_step and args.slg_mode == "original":
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                        skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        if isinstance(model_manager, PipelineDynamicModelManager):
+                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                            skip_layer_out = model_manager.pipeline_forward(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        else:
+                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                            skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                         noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                     elif apply_slg_step and args.slg_mode == "uncond":
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        if isinstance(model_manager, PipelineDynamicModelManager):
+                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        else:
+                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                     else: # Regular CFG
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        if isinstance(model_manager, PipelineDynamicModelManager):
+                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        else:
+                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
