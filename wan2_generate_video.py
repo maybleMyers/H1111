@@ -250,6 +250,13 @@ def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Wan 2.2 inference script with new model architecture support")
 
+    # Distributed launch arguments (added by torch.distributed.launch/torchrun)
+    # Note: --local-rank gets converted to args.local_rank by argparse (replaces hyphen with underscore)
+    parser.add_argument("--local-rank", type=int, default=0, dest='local_rank', 
+                       help="Local rank for distributed training (auto-set by torchrun)")
+    parser.add_argument("--local_rank", type=int, default=0, 
+                       help="Local rank for distributed training (alternative format)")
+    
     # WAN arguments
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-A14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
@@ -5729,12 +5736,29 @@ def save_output(
 def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
+    
+    # Handle distributed setup if using sequence parallelism
+    if args.use_sequence_parallel:
+        # Get local rank - args.local_rank is set by the parser (converts --local-rank to local_rank)
+        local_rank = args.local_rank
+        
+        # Set CUDA device based on local rank
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            
+        # Initialize distributed environment (handled by SequenceParallelModelManager)
+        logger.info(f"Sequence parallel mode detected, local_rank={local_rank}")
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
 
     # Set device
-    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.use_sequence_parallel:
+        # For sequence parallel, use the rank-specific device
+        local_rank = args.local_rank
+        device_str = f"cuda:{local_rank}"
+    else:
+        device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     args.device = torch.device(device_str) # Store device back in args
     logger.info(f"Using device: {args.device}")
 
