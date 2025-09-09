@@ -121,10 +121,12 @@ def sp_dit_forward(
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
     
-    # Rearrange e0 for proper indexing in blocks
+    # Reshape e0 for blocks
     # e0 shape after chunk: [B, seq_len/world_size, 6, dim]
-    # Need to transpose so indexing works: [6, B, seq_len/world_size, dim]
-    e0 = e0.permute(2, 0, 1, 3)
+    # Blocks expect e to have shape compatible with modulation: [*, 6, dim]
+    # We need to merge batch and sequence dimensions
+    B, seq_chunk, six, D = e0.shape
+    e0 = e0.view(B * seq_chunk, six, D)
 
     # arguments
     kwargs = dict(
