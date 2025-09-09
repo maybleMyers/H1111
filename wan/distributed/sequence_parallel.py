@@ -120,6 +120,11 @@ def sp_dit_forward(
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
+    
+    # Rearrange e0 for proper indexing in blocks
+    # e0 shape after chunk: [B, seq_len/world_size, 6, dim]
+    # Need to transpose so indexing works: [6, B, seq_len/world_size, dim]
+    e0 = e0.permute(2, 0, 1, 3)
 
     # arguments
     kwargs = dict(
