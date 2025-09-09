@@ -4825,8 +4825,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         
         # Process each conditioning image
         for frame_idx, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
-            if frame_idx < latent.shape[-3]:  # Check frame index is valid (shape is [B,C,F,H,W] or [C,F,H,W])
-                logger.debug(f"Encoding conditioning image for frame {frame_idx}")
+            # Determine the frame dimension based on tensor shape
+            if latent.dim() == 5:  # [B, C, F, H, W]
+                num_frames = latent.shape[2]
+            elif latent.dim() == 4:  # [C, F, H, W]
+                num_frames = latent.shape[1]
+            else:
+                logger.warning(f"Unexpected latent dimensions: {latent.shape}")
+                continue
+                
+            if frame_idx < num_frames:  # Check frame index is valid
+                logger.debug(f"Encoding conditioning image for frame {frame_idx} (total frames: {num_frames})")
                 
                 # Convert PIL image to tensor and prepare for VAE encoding
                 # The cond_image is a PIL Image from the pusa utils
@@ -4859,6 +4868,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                         latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
                     
                     logger.info(f"Injected conditioning latent at frame {frame_idx} (noise_mult={noise_mult})")
+            else:
+                logger.warning(f"Skipping conditioning frame {frame_idx} - out of bounds (latent has {num_frames} frames)")
         
         # Move VAE back to CPU to save memory
         vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
@@ -5263,9 +5274,18 @@ def main():
                 # Start-end frame interpolation mode
                 logger.info("Pusa Start-End Frame Mode")
                 conditioning_images = process_conditioning_images([args.image_path, args.end_image], width, height)
-                cond_positions = [0, video_length - 1 if video_length else 80]  # Default to frame 80 if length unknown
+                
+                # Convert pixel frame positions to latent frame positions (VAE has temporal stride)
+                # The VAE downsamples temporally, typically by a factor of 4
+                vae_temporal_stride = 4  # Standard for most video VAEs
+                latent_frames = (video_length - 1) // vae_temporal_stride + 1 if video_length else 21
+                
+                # Position conditioning at start and end of LATENT space, not pixel space
+                cond_positions = [0, latent_frames - 1]  # First and last latent frame
                 noise_multipliers = [0.0, 0.2]  # Clean start, some noise on end
                 mode_str += "-Pusa-StartEnd"
+                
+                logger.info(f"Pixel frames: {video_length}, Latent frames: {latent_frames}, Conditioning at latent positions: {cond_positions}")
                 
             elif args.cond_images:
                 # Multi-frame conditioning mode
