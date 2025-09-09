@@ -6,6 +6,7 @@ import os
 import re
 import time
 import math
+import types
 from typing import Tuple, Optional, List, Union, Any
 from pathlib import Path # Added for glob_images in V2V
 
@@ -13,6 +14,7 @@ from pathlib import Path # Added for glob_images in V2V
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
+import torch.distributed as dist
 import accelerate
 from accelerate import Accelerator
 from functools import partial
@@ -31,6 +33,8 @@ from utils.lora_utils import filter_lora_state_dict
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
+from wan.distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
+from wan.distributed.util import init_distributed_group, get_world_size, get_rank
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
@@ -467,15 +471,13 @@ def parse_args() -> argparse.Namespace:
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
 
-    # Dual GPU Pipeline Parallelism arguments
+    # Sequence Parallelism arguments
+    parser.add_argument("--use_sequence_parallel", action="store_true", 
+        help="Enable sequence parallelism across multiple GPUs for faster inference")
     parser.add_argument("--use_dual_gpu", action="store_true", 
-        help="Enable dual GPU pipeline parallelism for faster inference")
-    parser.add_argument("--gpu_split_ratio", type=float, default=0.5,
-        help="Ratio for splitting transformer blocks between GPUs (0.0-1.0, default 0.5)")
-    parser.add_argument("--pipeline_gpu0", type=int, default=0,
-        help="First GPU device ID for pipeline parallelism (default 0)")
-    parser.add_argument("--pipeline_gpu1", type=int, default=1,
-        help="Second GPU device ID for pipeline parallelism (default 1)")
+        help="[DEPRECATED] Use --use_sequence_parallel instead")
+    parser.add_argument("--debug_sequence_parallel", action="store_true",
+        help="Enable debugging output for sequence parallelism")
 
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
@@ -1134,6 +1136,149 @@ class PipelineDynamicModelManager(DynamicModelManager):
                 torch.cuda.empty_cache()
             with torch.cuda.device(self.gpu1):
                 torch.cuda.empty_cache()
+
+class SequenceParallelModelManager(DynamicModelManager):
+    """Extended model manager that supports sequence parallelism across multiple GPUs using distributed PyTorch."""
+    
+    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
+        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
+        
+        # Initialize distributed group if not already done
+        if not dist.is_initialized():
+            init_distributed_group()
+            
+        self.world_size = get_world_size()
+        self.rank = get_rank()
+        
+        # Set device based on rank
+        self.device = torch.device(f"cuda:{self.rank}")
+        
+        # Enable debugging if requested
+        self.debug = getattr(args, 'debug_sequence_parallel', False)
+        
+        logger.info(f"Sequence parallelism enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
+        
+    def _apply_sequence_parallel(self, model):
+        """Apply sequence parallel modifications to the model."""
+        # Replace attention forward methods with sequence parallel version
+        for block in model.blocks:
+            block.self_attn.forward = types.MethodType(sp_attn_forward, block.self_attn)
+        
+        # Replace model forward with sequence parallel version
+        model.forward = types.MethodType(sp_dit_forward, model)
+        
+        logger.info(f"Applied sequence parallelism to model on rank {self.rank}")
+        
+        if self.debug:
+            # Add hooks to monitor tensor values
+            self._add_debug_hooks(model)
+        
+    def get_model(self, model_type: str) -> WanModel:
+        """Load the requested model and apply sequence parallelism."""
+        # Check if we need to switch models
+        if self.current_model_type == model_type:
+            return self.current_model
+            
+        # Unload current model if exists
+        if self.current_model is not None:
+            logger.info(f"Rank {self.rank}: Unloading {self.current_model_type} noise model...")
+            
+            # Get memory usage before unloading
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"Rank {self.rank}: Memory before unload: {memory_before:.2f} GB")
+            
+            # Use parent's cleanup
+            self.cleanup()
+            
+            # Log memory after cleanup
+            if torch.cuda.is_available():
+                memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"Rank {self.rank}: Memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
+            
+        # Now load the new model using parent's loading logic
+        logger.info(f"Rank {self.rank}: Loading {model_type} noise model...")
+        loading_device = "cpu"
+        if self.args.blocks_to_swap == 0 and self.lora_weights_list_low is None and not self.args.fp8_scaled:
+            loading_device = self.device
+            
+        loading_weight_dtype = self.dit_weight_dtype
+        if self.args.mixed_dtype:
+            loading_weight_dtype = None
+        elif self.args.fp8_scaled or self.args.lora_weight is not None:
+            loading_weight_dtype = self.dit_dtype
+            
+        # Select appropriate LoRA weights
+        lora_weights_list = None
+        lora_multipliers = None
+        if model_type == 'low':
+            lora_weights_list = self.lora_weights_list_low
+            lora_multipliers = self.lora_multipliers_low
+        else:  # 'high'
+            lora_weights_list = self.lora_weights_list_high
+            lora_multipliers = self.lora_multipliers_high
+            
+        # Load model with LoRA weights if available
+        model = load_wan_model(
+            self.config, self.device, self.model_paths[model_type], 
+            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+        )
+        
+        # Optimize model
+        optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
+        
+        # Apply sequence parallelism
+        self._apply_sequence_parallel(model)
+        
+        # Move model to correct device
+        model = model.to(self.device)
+        
+        self.current_model = model
+        self.current_model_type = model_type
+        
+        # Synchronize across all ranks
+        if dist.is_initialized():
+            dist.barrier()
+        
+        return model
+    
+    def cleanup(self):
+        """Clean up resources with distributed synchronization."""
+        if dist.is_initialized():
+            dist.barrier()  # Ensure all ranks cleanup together
+        super().cleanup()
+    
+    def _add_debug_hooks(self, model):
+        """Add debug hooks to monitor tensor values during forward pass."""
+        def check_tensor(name, tensor):
+            if tensor is None:
+                return
+            if torch.isnan(tensor).any():
+                logger.error(f"Rank {self.rank}: {name} contains NaN values!")
+            if torch.isinf(tensor).any():
+                logger.error(f"Rank {self.rank}: {name} contains Inf values!")
+            logger.debug(f"Rank {self.rank}: {name} - shape={tensor.shape}, min={tensor.min():.4f}, max={tensor.max():.4f}, mean={tensor.mean():.4f}")
+        
+        def forward_hook(module, input, output, name):
+            if isinstance(output, tuple):
+                for i, out in enumerate(output):
+                    if isinstance(out, torch.Tensor):
+                        check_tensor(f"{name}_output_{i}", out)
+            elif isinstance(output, torch.Tensor):
+                check_tensor(f"{name}_output", output)
+        
+        # Add hooks to key modules
+        model.patch_embedding.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "patch_embedding"))
+        model.time_embedding.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "time_embedding"))
+        model.head.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "head"))
+        
+        # Add hooks to first and last transformer blocks
+        if len(model.blocks) > 0:
+            model.blocks[0].register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "block_0"))
+            model.blocks[-1].register_forward_hook(lambda m, i, o: forward_hook(m, i, o, f"block_{len(model.blocks)-1}"))
+        
+        logger.info(f"Rank {self.rank}: Debug hooks added to model")
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
@@ -3408,11 +3553,8 @@ def run_sampling(
                 logger.debug(f"Calling model with x_input_list length: {len(x_input_list) if isinstance(x_input_list, list) else 'not list'}")
                 if isinstance(x_input_list, list) and len(x_input_list) > 0:
                     logger.debug(f"  First tensor shape: {x_input_list[0].shape}")
-                # Use pipeline forward if available
-                if isinstance(model_manager, PipelineDynamicModelManager):
-                    result = model_manager.pipeline_forward(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
-                else:
-                    result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
+                # Direct forward call (sequence parallel modifies the model's forward method)
+                result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
                 # Return just the tensor for WAN models (not wrapped in list)
                 # The context handler expects a single tensor for single condition
                 logger.debug(f"Model returned shape: {result[0].shape if isinstance(result, tuple) else result.shape if isinstance(result, torch.Tensor) else 'unknown'}")
@@ -3457,11 +3599,8 @@ def run_sampling(
                     logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
             else:
                 # Standard model call without context windows
-                # Use pipeline forward if available
-                if isinstance(model_manager, PipelineDynamicModelManager):
-                    noise_pred_cond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_c)[0]
-                else:
-                    noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                # Direct forward call (sequence parallel modifies the model's forward method)
+                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
@@ -3602,27 +3741,17 @@ def run_sampling(
                 else:
                     # Standard calls without context windows (original code)
                     if apply_slg_step and args.slg_mode == "original":
-                        if isinstance(model_manager, PipelineDynamicModelManager):
-                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                            skip_layer_out = model_manager.pipeline_forward(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                        else:
-                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                            skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                         noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                     elif apply_slg_step and args.slg_mode == "uncond":
-                        if isinstance(model_manager, PipelineDynamicModelManager):
-                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
-                        else:
-                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                     else: # Regular CFG
-                        if isinstance(model_manager, PipelineDynamicModelManager):
-                            noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                        else:
-                            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
@@ -3995,20 +4124,13 @@ def run_extension_sampling(
             
             # Three-way CFG (multitalk-style)
             # Use pipeline forward if available
-            if isinstance(model_manager, PipelineDynamicModelManager):
-                # 1. Full conditional (text + CLIP)
-                noise_pred_cond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_c)[0]
-                # 2. Text-dropped (CLIP only)
-                noise_pred_text_dropped = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
-                # 3. Unconditional (negative prompt)
-                noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0]
-            else:
-                # 1. Full conditional (text + CLIP)
-                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
-                # 2. Text-dropped (CLIP only)
-                noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
-                # 3. Unconditional (negative prompt)
-                noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            # Direct forward calls (sequence parallel modifies the model's forward method)
+            # 1. Full conditional (text + CLIP)
+            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            # 2. Text-dropped (CLIP only)
+            noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+            # 3. Unconditional (negative prompt)
+            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
             
             # Apply three-way CFG formula (simplified from multitalk, no audio)
             # Formula: uncond + text_scale * (cond - text_dropped)
@@ -4280,14 +4402,16 @@ def generate_extended_video(
     is_dual_dit = isinstance(model_result, tuple)
     if is_dual_dit:
         model_low_path, model_high_path, *lora_weights = model_result
-        # Use PipelineDynamicModelManager if dual GPU is enabled
-        if args.use_dual_gpu:
-            if torch.cuda.device_count() < 2:
-                logger.warning(f"Dual GPU requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+        # Use SequenceParallelModelManager if sequence parallel is enabled
+        if args.use_sequence_parallel or args.use_dual_gpu:
+            if args.use_dual_gpu:
+                logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
+            if not dist.is_initialized() and torch.cuda.device_count() < 2:
+                logger.warning(f"Sequence parallelism requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
                 model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
             else:
-                logger.info(f"Using Pipeline Dynamic Model Manager for extension with {torch.cuda.device_count()} GPUs")
-                model_manager = PipelineDynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+                logger.info(f"Using Sequence Parallel Model Manager for extension")
+                model_manager = SequenceParallelModelManager(cfg, device, torch.float16, torch.float16, args)
         else:
             model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
@@ -5124,15 +5248,16 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             lora_weights_list_low = lora_multipliers_low = None
             lora_weights_list_high = lora_multipliers_high = None
             
-        # Use PipelineDynamicModelManager if dual GPU is enabled
-        if args.use_dual_gpu:
-            # Check if we have at least 2 GPUs
-            if torch.cuda.device_count() < 2:
-                logger.warning(f"Dual GPU requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+        # Use SequenceParallelModelManager if sequence parallel is enabled
+        if args.use_sequence_parallel or args.use_dual_gpu:
+            if args.use_dual_gpu:
+                logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
+            if not dist.is_initialized() and torch.cuda.device_count() < 2:
+                logger.warning(f"Sequence parallelism requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
                 model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
             else:
-                logger.info(f"Using Pipeline Dynamic Model Manager with {torch.cuda.device_count()} GPUs")
-                model_manager = PipelineDynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+                logger.info(f"Using Sequence Parallel Model Manager")
+                model_manager = SequenceParallelModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         else:
             model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_low_path, model_high_path)

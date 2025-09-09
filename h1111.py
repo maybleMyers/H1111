@@ -477,7 +477,7 @@ def wan22_batch_handler(
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
     pusa_auto_join: bool,
     # Dual GPU parameters
-    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float
+    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -697,7 +697,9 @@ def wan22_batch_handler(
             command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
         
         # --- Dual GPU Parameters ---
-        if dual_gpu_enable == "On":
+        # Handle dual GPU modes
+        if dual_gpu_enable == "Pipeline (Legacy)":
+            # Legacy pipeline parallelism mode
             command.append("--use_dual_gpu")
             if gpu_devices and gpu_devices.strip():
                 # Parse GPU devices (e.g., "0,1" -> gpu0=0, gpu1=1)
@@ -708,6 +710,11 @@ def wan22_batch_handler(
                     command.extend(["--pipeline_gpu1", str(devices[1].strip())])
             if gpu_split_ratio and gpu_split_ratio > 0:
                 command.extend(["--gpu_split_ratio", str(gpu_split_ratio)])
+        elif dual_gpu_enable == "Sequence Parallel":
+            # New sequence parallel mode - requires torchrun launcher
+            command.append("--use_sequence_parallel")
+            if debug_sequence_parallel:
+                command.append("--debug_sequence_parallel")
         
         # --- Execute Subprocess ---
         # Validate and fix command items
@@ -728,12 +735,26 @@ def wan22_batch_handler(
                     command[i] = str(item)
                     print(f"  Fixed: Converted to string: {command[i]}")
         
-        print(f"Running Wan2.2 Command: {' '.join(command)}")
-        
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', errors='replace', bufsize=1
-        )
+        # Check if we need to use torchrun for sequence parallel
+        if dual_gpu_enable == "Sequence Parallel":
+            # Modify command to use torchrun
+            torchrun_command = [
+                sys.executable, "-m", "torch.distributed.launch",
+                "--nproc_per_node=2",
+                "--master_addr=localhost",
+                "--master_port=29500"
+            ] + command[1:]  # Skip the python executable from original command
+            print(f"Running Wan2.2 with Sequence Parallel (torchrun): {' '.join(torchrun_command)}")
+            process = subprocess.Popen(
+                torchrun_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace', bufsize=1
+            )
+        else:
+            print(f"Running Wan2.2 Command: {' '.join(command)}")
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace', bufsize=1
+            )
 
         current_preview_yield_list = []
         last_preview_mtime = 0
@@ -8260,23 +8281,31 @@ with gr.Blocks(
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
                     wan22_dual_gpu_enable = gr.Radio(
-                        choices=["Off", "On"],
+                        choices=["Off", "Pipeline (Legacy)", "Sequence Parallel"],
                         value="Off",
                         label="Dual GPU Mode",
-                        interactive=True
+                        interactive=True,
+                        info="Sequence Parallel: Recommended for dual GPU (requires torchrun). Pipeline: Legacy mode."
                     )
                     wan22_gpu_devices = gr.Textbox(
                         label="GPU Devices (e.g., 0,1)",
                         value="0,1",
-                        interactive=True
+                        interactive=True,
+                        info="For Sequence Parallel, this is ignored (auto-detects from torchrun)"
                     )
                     wan22_gpu_split_ratio = gr.Number(
-                        label="GPU Split Ratio",
+                        label="GPU Split Ratio (Pipeline only)",
                         value=0.5,
                         minimum=0.1,
                         maximum=0.9,
                         step=0.1,
                         interactive=True
+                    )
+                    wan22_debug_sequence_parallel = gr.Checkbox(
+                        label="Debug Sequence Parallel",
+                        value=False,
+                        info="Enable detailed logging for sequence parallelism debugging",
+                        visible=False  # Only show when Sequence Parallel is selected
                     )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
@@ -11840,6 +11869,17 @@ with gr.Blocks(
         inputs=[wan22_task],
         outputs=wan22_lora_apply_high
     )
+    
+    # Add visibility control for debug checkbox based on dual GPU mode
+    def update_debug_visibility(dual_gpu_mode):
+        """Show debug checkbox only for Sequence Parallel mode"""
+        return gr.update(visible=(dual_gpu_mode == "Sequence Parallel"))
+    
+    wan22_dual_gpu_enable.change(
+        fn=update_debug_visibility,
+        inputs=[wan22_dual_gpu_enable],
+        outputs=[wan22_debug_sequence_parallel]
+    )
 
     wan22_generate_btn.click(
         fn=wan22_batch_handler,
@@ -11921,6 +11961,7 @@ with gr.Blocks(
             wan22_dual_gpu_enable,
             wan22_gpu_devices,
             wan22_gpu_split_ratio,
+            wan22_debug_sequence_parallel,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
