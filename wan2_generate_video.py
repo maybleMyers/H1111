@@ -936,9 +936,7 @@ class PipelineDynamicModelManager(DynamicModelManager):
                 for u in x
             ])
             
-            # Time embeddings
-            if t.dim() == 1:
-                t = t.expand(t.size(0), seq_len)
+            # Time embeddings - match the original model's processing
             with torch.amp.autocast('cuda', dtype=torch.float32):
                 from wan.modules.model import sinusoidal_embedding_1d
                 e = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t).float())
