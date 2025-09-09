@@ -881,8 +881,65 @@ class PipelineDynamicModelManager(DynamicModelManager):
         
     def get_model(self, model_type: str) -> WanModel:
         """Load the requested model and split it across GPUs."""
-        # Use parent class to handle model loading/unloading
-        model = super().get_model(model_type)
+        # Check if we need to switch models
+        if self.current_model_type == model_type:
+            return self.current_model
+            
+        # Unload current model if exists (with proper dual GPU cleanup)
+        if self.current_model is not None:
+            logger.info(f"Unloading {self.current_model_type} noise model from dual GPUs...")
+            
+            # Get memory usage before unloading
+            if torch.cuda.is_available():
+                memory_before_gpu0 = torch.cuda.memory_allocated(self.gpu0) / 1024**3
+                memory_before_gpu1 = torch.cuda.memory_allocated(self.gpu1) / 1024**3
+                logger.info(f"GPU0 memory before unload: {memory_before_gpu0:.2f} GB")
+                logger.info(f"GPU1 memory before unload: {memory_before_gpu1:.2f} GB")
+            
+            # Use our custom cleanup that handles both GPUs
+            self.cleanup()
+            
+            # Log memory after cleanup
+            if torch.cuda.is_available():
+                memory_after_gpu0 = torch.cuda.memory_allocated(self.gpu0) / 1024**3
+                memory_after_gpu1 = torch.cuda.memory_allocated(self.gpu1) / 1024**3
+                logger.info(f"GPU0 memory after unload: {memory_after_gpu0:.2f} GB (freed: {memory_before_gpu0 - memory_after_gpu0:.2f} GB)")
+                logger.info(f"GPU1 memory after unload: {memory_after_gpu1:.2f} GB (freed: {memory_before_gpu1 - memory_after_gpu1:.2f} GB)")
+            
+        # Now load the new model using parent's loading logic (but not its unloading)
+        logger.info(f"Loading {model_type} noise model...")
+        loading_device = "cpu"
+        if self.args.blocks_to_swap == 0 and self.lora_weights_list_low is None and not self.args.fp8_scaled:
+            loading_device = self.device
+            
+        loading_weight_dtype = self.dit_weight_dtype
+        if self.args.mixed_dtype:
+            loading_weight_dtype = None
+        elif self.args.fp8_scaled or self.args.lora_weight is not None:
+            loading_weight_dtype = self.dit_dtype
+            
+        # Select appropriate LoRA weights
+        lora_weights_list = None
+        lora_multipliers = None
+        if model_type == 'low':
+            lora_weights_list = self.lora_weights_list_low
+            lora_multipliers = self.lora_multipliers_low
+        else:  # 'high'
+            lora_weights_list = self.lora_weights_list_high
+            lora_multipliers = self.lora_multipliers_high
+            
+        # Load model with LoRA weights if available
+        model = load_wan_model(
+            self.config, self.device, self.model_paths[model_type], 
+            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+        )
+        
+        # Optimize model
+        optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
+        
+        self.current_model = model
+        self.current_model_type = model_type
         
         # Split the loaded model across GPUs
         self._split_model_blocks()
@@ -1020,24 +1077,63 @@ class PipelineDynamicModelManager(DynamicModelManager):
         if self.current_model is not None:
             logger.info(f"Cleaning up pipeline model from both GPUs...")
             
-            # Clear GPU0 blocks
+            # Move all model components to CPU before deletion
+            # Move embeddings from GPU0 to CPU
+            if hasattr(self.current_model, 'patch_embedding'):
+                self.current_model.patch_embedding = self.current_model.patch_embedding.cpu()
+            if hasattr(self.current_model, 'time_embedding'):
+                self.current_model.time_embedding = self.current_model.time_embedding.cpu()
+            if hasattr(self.current_model, 'time_projection'):
+                self.current_model.time_projection = self.current_model.time_projection.cpu()
+            if hasattr(self.current_model, 'text_embedding'):
+                self.current_model.text_embedding = self.current_model.text_embedding.cpu()
+            if hasattr(self.current_model, 'clip_projection'):
+                self.current_model.clip_projection = self.current_model.clip_projection.cpu()
+            if hasattr(self.current_model, 'clip_norm'):
+                self.current_model.clip_norm = self.current_model.clip_norm.cpu()
+                
+            # Move blocks from both GPUs to CPU
             if self.blocks_gpu0 is not None:
-                for block in self.blocks_gpu0:
-                    block.cpu()
+                for i, block in enumerate(self.blocks_gpu0):
+                    self.current_model.blocks[i] = self.current_model.blocks[i].cpu()
                     
-            # Clear GPU1 blocks  
             if self.blocks_gpu1 is not None:
-                for block in self.blocks_gpu1:
-                    block.cpu()
+                for i, block in enumerate(self.blocks_gpu1):
+                    idx = self.split_point + i
+                    self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
                     
+            # Move head from GPU1 to CPU
+            if hasattr(self.current_model, 'head'):
+                self.current_model.head = self.current_model.head.cpu()
+            if hasattr(self.current_model, 'ref_conv') and self.current_model.ref_conv is not None:
+                self.current_model.ref_conv = self.current_model.ref_conv.cpu()
+                
+            # Clear references
+            self.blocks_gpu0 = None
+            self.blocks_gpu1 = None
+            
             # Clear cache on both GPUs
+            with torch.cuda.device(self.gpu0):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(self.gpu0)
+            with torch.cuda.device(self.gpu1):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(self.gpu1)
+                
+            # Delete the model and reset state
+            del self.current_model
+            self.current_model = None
+            self.current_model_type = None
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Final cache clear
             with torch.cuda.device(self.gpu0):
                 torch.cuda.empty_cache()
             with torch.cuda.device(self.gpu1):
                 torch.cuda.empty_cache()
-                
-        # Call parent cleanup
-        super().cleanup()
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
