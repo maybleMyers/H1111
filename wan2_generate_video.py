@@ -467,6 +467,16 @@ def parse_args() -> argparse.Namespace:
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
 
+    # Dual GPU Pipeline Parallelism arguments
+    parser.add_argument("--use_dual_gpu", action="store_true", 
+        help="Enable dual GPU pipeline parallelism for faster inference")
+    parser.add_argument("--gpu_split_ratio", type=float, default=0.5,
+        help="Ratio for splitting transformer blocks between GPUs (0.0-1.0, default 0.5)")
+    parser.add_argument("--pipeline_gpu0", type=int, default=0,
+        help="First GPU device ID for pipeline parallelism (default 0)")
+    parser.add_argument("--pipeline_gpu1", type=int, default=1,
+        help="Second GPU device ID for pipeline parallelism (default 1)")
+
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
     parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
@@ -797,6 +807,223 @@ class DynamicModelManager:
     def unload_all(self):
         """Alias for cleanup method to ensure compatibility."""
         self.cleanup()
+
+class PipelineDynamicModelManager(DynamicModelManager):
+    """Extended model manager that supports pipeline parallelism across two GPUs."""
+    
+    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
+        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
+        
+        # Setup dual GPU devices
+        self.gpu0 = torch.device(f"cuda:{args.pipeline_gpu0}")
+        self.gpu1 = torch.device(f"cuda:{args.pipeline_gpu1}")
+        self.split_ratio = args.gpu_split_ratio
+        
+        # Pipeline components (will be set after model loading)
+        self.blocks_gpu0 = None
+        self.blocks_gpu1 = None
+        self.split_point = None
+        
+        # CUDA streams for async transfers
+        self.stream_gpu0 = torch.cuda.Stream(device=self.gpu0)
+        self.stream_gpu1 = torch.cuda.Stream(device=self.gpu1)
+        
+        logger.info(f"Pipeline parallelism enabled: GPU0={self.gpu0}, GPU1={self.gpu1}, split_ratio={self.split_ratio}")
+        
+    def _split_model_blocks(self):
+        """Split the current model's transformer blocks across two GPUs."""
+        if self.current_model is None:
+            return
+            
+        num_blocks = len(self.current_model.blocks)
+        self.split_point = int(num_blocks * self.split_ratio)
+        
+        # Ensure at least one block on each GPU
+        if self.split_point == 0:
+            self.split_point = 1
+        elif self.split_point >= num_blocks:
+            self.split_point = num_blocks - 1
+            
+        logger.info(f"Splitting {num_blocks} blocks: {self.split_point} on GPU0, {num_blocks - self.split_point} on GPU1")
+        
+        # Move embeddings and time projections to GPU0
+        self.current_model.patch_embedding = self.current_model.patch_embedding.to(self.gpu0)
+        self.current_model.time_embedding = self.current_model.time_embedding.to(self.gpu0)
+        self.current_model.time_projection = self.current_model.time_projection.to(self.gpu0)
+        if hasattr(self.current_model, 'text_embedding'):
+            self.current_model.text_embedding = self.current_model.text_embedding.to(self.gpu0)
+        
+        # Split blocks between GPUs
+        for i in range(self.split_point):
+            self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu0)
+        for i in range(self.split_point, num_blocks):
+            self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu1)
+            
+        # Move output head and unpatchify to GPU1
+        self.current_model.head = self.current_model.head.to(self.gpu1)
+        self.current_model.unpatchify = self.current_model.unpatchify.to(self.gpu1)
+        
+        # Store references for easier access
+        self.blocks_gpu0 = self.current_model.blocks[:self.split_point]
+        self.blocks_gpu1 = self.current_model.blocks[self.split_point:]
+        
+        # Clear cache on both GPUs
+        torch.cuda.empty_cache()
+        
+    def get_model(self, model_type: str) -> WanModel:
+        """Load the requested model and split it across GPUs."""
+        # Use parent class to handle model loading/unloading
+        model = super().get_model(model_type)
+        
+        # Split the loaded model across GPUs
+        self._split_model_blocks()
+        
+        return model
+        
+    def pipeline_forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, fun_ref=None):
+        """
+        Custom forward pass that handles pipeline parallelism.
+        This replaces the standard model.forward() call when using dual GPUs.
+        """
+        model = self.current_model
+        device = x.device  # Original device for compatibility
+        
+        # === Stage 1: Embeddings and preprocessing on GPU0 ===
+        with torch.cuda.stream(self.stream_gpu0):
+            # Move inputs to GPU0
+            x = x.to(self.gpu0)
+            t = t.to(self.gpu0)
+            context = context.to(self.gpu0)
+            if clip_fea is not None:
+                clip_fea = clip_fea.to(self.gpu0)
+            if y is not None:
+                y = y.to(self.gpu0)
+            if fun_ref is not None:
+                fun_ref = fun_ref.to(self.gpu0)
+                
+            # Patch embedding
+            if model.model_type == 'i2v':
+                assert y is not None
+                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            
+            x = [model.patch_embedding(u.unsqueeze(0)) for u in x]
+            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            
+            # Padding to seq_len
+            x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+                for u in x
+            ])
+            
+            # Time embeddings
+            if t.dim() == 1:
+                t = t.expand(t.size(0), seq_len)
+            with torch.amp.autocast('cuda', dtype=torch.float32):
+                bt = t.size(0)
+                t = t.flatten()
+                from wan.modules.model import sinusoidal_embedding_1d
+                e = model.time_embedding(
+                    sinusoidal_embedding_1d(model.freq_dim, t).unflatten(0, (bt, seq_len)).float())
+                e0 = model.time_projection(e).unflatten(2, (6, model.dim))
+            
+            # Text embeddings
+            context = model.text_embedding(
+                torch.stack([
+                    torch.cat([u, u.new_zeros(model.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]))
+            
+            # Process CLIP features if present
+            if clip_fea is not None:
+                clip_fea = model.clip_projection(clip_fea).view(-1, seq_len, model.dim)
+                clip_fea = model.clip_norm(clip_fea)
+                x = x + clip_fea
+                
+            # Setup kwargs for blocks
+            kwargs = dict(
+                e=e0, 
+                seq_lens=seq_lens.to(self.gpu0), 
+                grid_sizes=grid_sizes.to(self.gpu0), 
+                freqs=model.freqs.to(self.gpu0), 
+                context=context, 
+                context_lens=None
+            )
+            
+            # Process through first half of blocks on GPU0
+            for block_idx, block in enumerate(self.blocks_gpu0):
+                is_block_skipped = skip_block_indices is not None and block_idx in skip_block_indices
+                if not is_block_skipped:
+                    x = block(x, **kwargs)
+        
+        # === Transfer to GPU1 ===
+        torch.cuda.synchronize(self.gpu0)  # Ensure GPU0 work is complete
+        
+        with torch.cuda.stream(self.stream_gpu1):
+            # Move intermediate tensors to GPU1
+            x = x.to(self.gpu1)
+            e = e.to(self.gpu1)
+            e0 = e0.to(self.gpu1)
+            context = context.to(self.gpu1)
+            seq_lens = seq_lens.to(self.gpu1)
+            grid_sizes = grid_sizes.to(self.gpu1)
+            
+            # Update kwargs for GPU1
+            kwargs['e'] = e0
+            kwargs['seq_lens'] = seq_lens
+            kwargs['grid_sizes'] = grid_sizes
+            kwargs['freqs'] = model.freqs.to(self.gpu1)
+            kwargs['context'] = context
+            
+            # Process through second half of blocks on GPU1
+            for block_idx, block in enumerate(self.blocks_gpu1):
+                actual_idx = self.split_point + block_idx
+                is_block_skipped = skip_block_indices is not None and actual_idx in skip_block_indices
+                if not is_block_skipped:
+                    x = block(x, **kwargs)
+            
+            # Apply ref_conv if present (Fun-Control)
+            if model.ref_conv is not None and fun_ref is not None:
+                fun_ref = fun_ref.to(self.gpu1)
+                ref_emb = model.ref_conv(fun_ref.to(model.ref_conv.weight.dtype))
+                ref_emb = ref_emb.reshape(x.shape[0], x.shape[1], -1)
+                x = x + ref_emb
+            
+            # Final head processing
+            x = model.head(x, e)
+            
+            # Unpatchify
+            x = model.unpatchify(x, grid_sizes)
+        
+        # Synchronize before returning
+        torch.cuda.synchronize(self.gpu1)
+        
+        return [u.float() for u in x]
+        
+    def cleanup(self):
+        """Clean up models on both GPUs."""
+        if self.current_model is not None:
+            logger.info(f"Cleaning up pipeline model from both GPUs...")
+            
+            # Clear GPU0 blocks
+            if self.blocks_gpu0 is not None:
+                for block in self.blocks_gpu0:
+                    block.cpu()
+                    
+            # Clear GPU1 blocks  
+            if self.blocks_gpu1 is not None:
+                for block in self.blocks_gpu1:
+                    block.cpu()
+                    
+            # Clear cache on both GPUs
+            with torch.cuda.device(self.gpu0):
+                torch.cuda.empty_cache()
+            with torch.cuda.device(self.gpu1):
+                torch.cuda.empty_cache()
+                
+        # Call parent cleanup
+        super().cleanup()
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
@@ -3071,7 +3298,11 @@ def run_sampling(
                 logger.debug(f"Calling model with x_input_list length: {len(x_input_list) if isinstance(x_input_list, list) else 'not list'}")
                 if isinstance(x_input_list, list) and len(x_input_list) > 0:
                     logger.debug(f"  First tensor shape: {x_input_list[0].shape}")
-                result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
+                # Use pipeline forward if available
+                if isinstance(model_manager, PipelineDynamicModelManager):
+                    result = model_manager.pipeline_forward(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
+                else:
+                    result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
                 # Return just the tensor for WAN models (not wrapped in list)
                 # The context handler expects a single tensor for single condition
                 logger.debug(f"Model returned shape: {result[0].shape if isinstance(result, tuple) else result.shape if isinstance(result, torch.Tensor) else 'unknown'}")
@@ -3116,7 +3347,11 @@ def run_sampling(
                     logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
             else:
                 # Standard model call without context windows
-                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                # Use pipeline forward if available
+                if isinstance(model_manager, PipelineDynamicModelManager):
+                    noise_pred_cond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                else:
+                    noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
@@ -3639,12 +3874,21 @@ def run_extension_sampling(
             model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
             
             # Three-way CFG (multitalk-style)
-            # 1. Full conditional (text + CLIP)
-            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
-            # 2. Text-dropped (CLIP only)
-            noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
-            # 3. Unconditional (negative prompt)
-            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            # Use pipeline forward if available
+            if isinstance(model_manager, PipelineDynamicModelManager):
+                # 1. Full conditional (text + CLIP)
+                noise_pred_cond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                # 2. Text-dropped (CLIP only)
+                noise_pred_text_dropped = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+                # 3. Unconditional (negative prompt)
+                noise_pred_uncond = model_manager.pipeline_forward(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            else:
+                # 1. Full conditional (text + CLIP)
+                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                # 2. Text-dropped (CLIP only)
+                noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+                # 3. Unconditional (negative prompt)
+                noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
             
             # Apply three-way CFG formula (simplified from multitalk, no audio)
             # Formula: uncond + text_scale * (cond - text_dropped)
@@ -3916,7 +4160,16 @@ def generate_extended_video(
     is_dual_dit = isinstance(model_result, tuple)
     if is_dual_dit:
         model_low_path, model_high_path, *lora_weights = model_result
-        model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+        # Use PipelineDynamicModelManager if dual GPU is enabled
+        if args.use_dual_gpu:
+            if torch.cuda.device_count() < 2:
+                logger.warning(f"Dual GPU requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+                model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+            else:
+                logger.info(f"Using Pipeline Dynamic Model Manager for extension with {torch.cuda.device_count()} GPUs")
+                model_manager = PipelineDynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+        else:
+            model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         if len(lora_weights) >= 4:
             model_manager.set_lora_weights(*lora_weights)
@@ -4751,7 +5004,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             lora_weights_list_low = lora_multipliers_low = None
             lora_weights_list_high = lora_multipliers_high = None
             
-        model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+        # Use PipelineDynamicModelManager if dual GPU is enabled
+        if args.use_dual_gpu:
+            # Check if we have at least 2 GPUs
+            if torch.cuda.device_count() < 2:
+                logger.warning(f"Dual GPU requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+                model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+            else:
+                logger.info(f"Using Pipeline Dynamic Model Manager with {torch.cuda.device_count()} GPUs")
+                model_manager = PipelineDynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+        else:
+            model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         
         # Set LoRA weights if available

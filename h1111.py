@@ -8244,6 +8244,25 @@ with gr.Blocks(
                 with gr.Row():
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                    wan22_dual_gpu_enable = gr.Radio(
+                        choices=["Off", "On"],
+                        value="Off",
+                        label="Dual GPU Mode",
+                        interactive=True
+                    )
+                    wan22_gpu_devices = gr.Textbox(
+                        label="GPU Devices (e.g., 0,1)",
+                        value="0,1",
+                        interactive=True
+                    )
+                    wan22_gpu_split_ratio = gr.Number(
+                        label="GPU Split Ratio",
+                        value=0.5,
+                        minimum=0.1,
+                        maximum=0.9,
+                        step=0.1,
+                        interactive=True
+                    )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
                         wan22_dit_low_noise_path = gr.Dropdown(
