@@ -475,7 +475,9 @@ def wan22_batch_handler(
     pusa_mode: str, pusa_end_image: str, pusa_cond_images: List[str], 
     pusa_cond_positions: str, pusa_cond_noise_multipliers: str,
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
-    pusa_auto_join: bool
+    pusa_auto_join: bool,
+    # Dual GPU parameters
+    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -693,6 +695,19 @@ def wan22_batch_handler(
         if lora_weights_paths_high and "A14B" in task:
             command.extend(["--lora_weight_high"] + lora_weights_paths_high)
             command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+        
+        # --- Dual GPU Parameters ---
+        if dual_gpu_enable == "On":
+            command.append("--use_dual_gpu")
+            if gpu_devices and gpu_devices.strip():
+                # Parse GPU devices (e.g., "0,1" -> gpu0=0, gpu1=1)
+                devices = gpu_devices.strip().split(',')
+                if len(devices) >= 1:
+                    command.extend(["--pipeline_gpu0", str(devices[0].strip())])
+                if len(devices) >= 2:
+                    command.extend(["--pipeline_gpu1", str(devices[1].strip())])
+            if gpu_split_ratio and gpu_split_ratio > 0:
+                command.extend(["--gpu_split_ratio", str(gpu_split_ratio)])
         
         # --- Execute Subprocess ---
         # Validate and fix command items
@@ -11902,6 +11917,10 @@ with gr.Blocks(
             wan22_pusa_v2v_positions,
             wan22_pusa_v2v_noise_multipliers,
             wan22_pusa_auto_join,
+            # Dual GPU parameters
+            wan22_dual_gpu_enable,
+            wan22_gpu_devices,
+            wan22_gpu_split_ratio,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
