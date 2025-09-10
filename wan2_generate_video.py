@@ -1408,7 +1408,19 @@ class FSDPModelManager(DynamicModelManager):
             
             # Free FSDP model if it was sharded
             if self.dit_fsdp and hasattr(self, 'current_model'):
-                free_model(self.current_model)
+                # With CPU offloading, we can't use free_model due to pinned memory
+                # Instead, delete the model and clear cache
+                if self.fsdp_cpu_offload:
+                    del self.current_model
+                    self.current_model = None
+                    self.current_model_type = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                else:
+                    # Without CPU offload, we can use the free_model function
+                    free_model(self.current_model)
             else:
                 # Use parent's cleanup
                 self.cleanup()
@@ -1529,8 +1541,18 @@ class FSDPModelManager(DynamicModelManager):
     def cleanup(self):
         """Clean up resources with FSDP-aware cleanup."""
         if self.current_model is not None and self.dit_fsdp:
-            # Use FSDP-specific cleanup
-            free_model(self.current_model)
+            # With CPU offloading, we can't use free_model due to pinned memory
+            if self.fsdp_cpu_offload:
+                del self.current_model
+                self.current_model = None
+                self.current_model_type = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            else:
+                # Without CPU offload, we can use the free_model function
+                free_model(self.current_model)
         else:
             # Use parent's cleanup
             super().cleanup()
