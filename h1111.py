@@ -8415,8 +8415,8 @@ with gr.Blocks(
                         )
                         wan22_fsdp_cpu_offload = gr.Checkbox(
                             label="FSDP CPU Offload",
-                            value=True,
-                            info="Enable CPU offloading for FSDP to significantly reduce GPU memory usage"
+                            value=False,
+                            info="Enable CPU offloading for FSDP (uses ~28GB RAM per GPU). Not recommended with block swapping."
                         )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:

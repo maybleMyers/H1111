@@ -500,7 +500,7 @@ def parse_args() -> argparse.Namespace:
         choices=["bf16", "fp16", "fp32"],
         help="Mixed precision type for FSDP (default: bf16)")
     parser.add_argument("--fsdp_cpu_offload", action="store_true",
-        help="Enable CPU offloading for FSDP to reduce GPU memory usage")
+        help="Enable CPU offloading for FSDP (uses ~28GB RAM per GPU for BF16/FP16, ~56GB for FP32). Not recommended with blocks_to_swap.")
 
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
@@ -1351,6 +1351,23 @@ class FSDPModelManager(DynamicModelManager):
         # Call parent constructor with updated device
         super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
         
+        # Warn about memory usage with CPU offload
+        if self.fsdp_cpu_offload:
+            # Calculate expected RAM usage based on dtype
+            param_bytes = 2  # Default to FP16/BF16
+            if dit_weight_dtype == torch.float32:
+                param_bytes = 4
+            elif dit_weight_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                param_bytes = 1
+            model_size_gb = 14 * param_bytes  # 14B parameters
+            total_ram_gb = model_size_gb * self.world_size
+            logger.warning(f"FSDP CPU offload enabled: will use ~{total_ram_gb}GB system RAM ({model_size_gb}GB per GPU)")
+            
+        # Warn if both optimizations are enabled
+        if self.blocks_to_swap > 0 and self.fsdp_cpu_offload:
+            logger.warning("Both blocks_to_swap and fsdp_cpu_offload are enabled. This will use excessive RAM.")
+            logger.warning("Recommend using only one: either blocks_to_swap OR fsdp_cpu_offload")
+        
         logger.info(f"FSDP enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
         logger.info(f"FSDP config: dit_fsdp={self.dit_fsdp}, t5_fsdp={self.t5_fsdp}, strategy={args.fsdp_sharding_strategy}")
         logger.info(f"Memory optimizations: blocks_to_swap={self.blocks_to_swap}, fp8_scaled={self.fp8_scaled}, cpu_offload={self.fsdp_cpu_offload}")
@@ -1407,15 +1424,14 @@ class FSDPModelManager(DynamicModelManager):
         # Load on CPU first if using FSDP (for memory efficiency)
         loading_device = "cpu" if self.dit_fsdp else self.device
         
-        # Adjust weight dtype for FSDP
+        # Adjust weight dtype - respect user settings for FSDP
         loading_weight_dtype = self.dit_weight_dtype
         if self.args.mixed_dtype:
             loading_weight_dtype = None
-        elif self.dit_fsdp:
-            # FSDP works better with full precision initially
-            loading_weight_dtype = torch.float32
         elif self.args.fp8_scaled or self.args.lora_weight is not None:
             loading_weight_dtype = self.dit_dtype
+        # Note: We now respect the original dtype for FSDP instead of forcing FP32
+        # This significantly reduces RAM usage (e.g., BF16 uses 28GB instead of 56GB per GPU)
             
         # Select appropriate LoRA weights
         lora_weights_list = None
@@ -1453,11 +1469,19 @@ class FSDPModelManager(DynamicModelManager):
             from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
             from functools import partial
             
-            # Setup CPU offload if enabled or if using block swapping
+            # Setup CPU offload strategy based on settings
             cpu_offload = None
-            if self.fsdp_cpu_offload or self.blocks_to_swap > 0:
+            if self.fsdp_cpu_offload:
+                # Use CPU offloading only if explicitly enabled
+                # Calculate actual RAM usage based on dtype
+                param_bytes = 2 if param_dtype in [torch.float16, torch.bfloat16] else 4
+                ram_per_gpu = 14 * param_bytes  # 14B parameters
                 cpu_offload = CPUOffload(offload_params=True)
-                logger.info(f"Rank {self.rank}: CPU offloading enabled (cpu_offload={self.fsdp_cpu_offload}, blocks_to_swap={self.blocks_to_swap})")
+                logger.info(f"Rank {self.rank}: CPU offloading enabled - will use ~{ram_per_gpu}GB RAM per GPU")
+            elif self.blocks_to_swap > 0:
+                # For block swapping, use FSDP sharding without CPU offload
+                logger.info(f"Rank {self.rank}: Using FSDP sharding without CPU offload for block swapping")
+                # Don't enable CPU offload - let FSDP handle memory via sharding only
             
             # Get mixed precision dtype
             param_dtype = self._get_fsdp_mixed_precision_dtype()
