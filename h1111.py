@@ -487,7 +487,7 @@ def wan22_batch_handler(
     # Dual GPU parameters
     dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool, disable_libuv: bool,
     # FSDP parameters
-    fsdp_dit: bool, fsdp_t5: bool, fsdp_strategy: str, fsdp_mixed_precision: str
+    fsdp_dit: bool, fsdp_t5: bool, fsdp_strategy: str, fsdp_mixed_precision: str, fsdp_cpu_offload: bool
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -742,6 +742,8 @@ def wan22_batch_handler(
                 command.extend(["--fsdp_sharding_strategy", fsdp_strategy])
             if fsdp_mixed_precision:
                 command.extend(["--fsdp_mixed_precision", fsdp_mixed_precision])
+            if fsdp_cpu_offload:
+                command.append("--fsdp_cpu_offload")
             if debug_sequence_parallel:  # Use same debug flag for FSDP
                 command.append("--debug_sequence_parallel")
         
@@ -8411,6 +8413,11 @@ with gr.Blocks(
                             value="bf16",
                             info="Mixed precision type for FSDP computations"
                         )
+                        wan22_fsdp_cpu_offload = gr.Checkbox(
+                            label="FSDP CPU Offload",
+                            value=True,
+                            info="Enable CPU offloading for FSDP to significantly reduce GPU memory usage"
+                        )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
                         wan22_dit_low_noise_path = gr.Dropdown(
@@ -12078,6 +12085,7 @@ with gr.Blocks(
             wan22_fsdp_t5,
             wan22_fsdp_strategy,
             wan22_fsdp_mixed_precision,
+            wan22_fsdp_cpu_offload,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True

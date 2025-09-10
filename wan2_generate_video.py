@@ -499,6 +499,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsdp_mixed_precision", type=str, default="bf16",
         choices=["bf16", "fp16", "fp32"],
         help="Mixed precision type for FSDP (default: bf16)")
+    parser.add_argument("--fsdp_cpu_offload", action="store_true",
+        help="Enable CPU offloading for FSDP to reduce GPU memory usage")
 
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
@@ -1340,12 +1342,18 @@ class FSDPModelManager(DynamicModelManager):
         self.t5_fsdp = args.t5_fsdp
         self.fsdp_strategy = self._get_sharding_strategy(args.fsdp_sharding_strategy)
         self.fsdp_mixed_precision = args.fsdp_mixed_precision
+        self.fsdp_cpu_offload = getattr(args, 'fsdp_cpu_offload', False)
+        
+        # Store memory optimization settings
+        self.blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+        self.fp8_scaled = getattr(args, 'fp8_scaled', False)
         
         # Call parent constructor with updated device
         super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
         
         logger.info(f"FSDP enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
         logger.info(f"FSDP config: dit_fsdp={self.dit_fsdp}, t5_fsdp={self.t5_fsdp}, strategy={args.fsdp_sharding_strategy}")
+        logger.info(f"Memory optimizations: blocks_to_swap={self.blocks_to_swap}, fp8_scaled={self.fp8_scaled}, cpu_offload={self.fsdp_cpu_offload}")
         
     def _get_sharding_strategy(self, strategy_name):
         """Convert string strategy name to ShardingStrategy enum."""
@@ -1426,29 +1434,64 @@ class FSDPModelManager(DynamicModelManager):
             lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
         )
         
+        # Apply FP8 optimization if enabled (before FSDP)
+        if self.fp8_scaled:
+            logger.info(f"Rank {self.rank}: Applying FP8 optimization...")
+            state_dict = model.state_dict()
+            # Apply FP8 optimization on CPU to save memory
+            state_dict = model.fp8_optimization(state_dict, torch.device('cpu'), move_to_device=False, use_scaled_mm=self.args.fp8_fast)
+            info = model.load_state_dict(state_dict, strict=True, assign=True)
+            logger.info(f"Rank {self.rank}: Loaded FP8 optimized weights: {info}")
+        
         # Apply FSDP sharding if enabled
         if self.dit_fsdp:
             logger.info(f"Rank {self.rank}: Applying FSDP sharding to {model_type} model...")
             
+            # Import necessary FSDP components
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import MixedPrecision, CPUOffload
+            from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+            from functools import partial
+            
+            # Setup CPU offload if enabled or if using block swapping
+            cpu_offload = None
+            if self.fsdp_cpu_offload or self.blocks_to_swap > 0:
+                cpu_offload = CPUOffload(offload_params=True)
+                logger.info(f"Rank {self.rank}: CPU offloading enabled (cpu_offload={self.fsdp_cpu_offload}, blocks_to_swap={self.blocks_to_swap})")
+            
             # Get mixed precision dtype
             param_dtype = self._get_fsdp_mixed_precision_dtype()
             
-            # Apply sharding
-            model = shard_model(
-                model,
-                device_id=self.rank,
-                param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
-                buffer_dtype=torch.float32,
-                process_group=None,  # Use default process group
+            # Apply FSDP with proper configuration
+            model = FSDP(
+                module=model,
+                process_group=None,
                 sharding_strategy=self.fsdp_strategy,
-                sync_module_states=True
+                auto_wrap_policy=partial(
+                    lambda_auto_wrap_policy,
+                    lambda_fn=lambda m: m in model.blocks
+                ),
+                mixed_precision=MixedPrecision(
+                    param_dtype=param_dtype,
+                    reduce_dtype=torch.float32,
+                    buffer_dtype=torch.float32
+                ),
+                device_id=self.rank,
+                sync_module_states=True,
+                cpu_offload=cpu_offload,  # Enable CPU offloading
+                limit_all_gathers=True,  # Limit concurrent all-gathers to save memory
+                use_orig_params=False  # Use flattened parameters for better memory efficiency
             )
+            
             logger.info(f"Rank {self.rank}: FSDP sharding applied successfully")
         else:
             # Regular optimization without FSDP
-            optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
-            model = model.to(self.device)
+            if not self.fp8_scaled:  # Only optimize if not already done
+                optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
+            
+            # Move to device if not using block swapping
+            if self.blocks_to_swap == 0:
+                model = model.to(self.device)
         
         self.current_model = model
         self.current_model_type = model_type
