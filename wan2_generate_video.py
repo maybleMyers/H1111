@@ -1469,6 +1469,9 @@ class FSDPModelManager(DynamicModelManager):
             from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
             from functools import partial
             
+            # Get mixed precision dtype first
+            param_dtype = self._get_fsdp_mixed_precision_dtype()
+            
             # Setup CPU offload strategy based on settings
             cpu_offload = None
             if self.fsdp_cpu_offload:
@@ -1482,9 +1485,6 @@ class FSDPModelManager(DynamicModelManager):
                 # For block swapping, use FSDP sharding without CPU offload
                 logger.info(f"Rank {self.rank}: Using FSDP sharding without CPU offload for block swapping")
                 # Don't enable CPU offload - let FSDP handle memory via sharding only
-            
-            # Get mixed precision dtype
-            param_dtype = self._get_fsdp_mixed_precision_dtype()
             
             # Apply FSDP with proper configuration
             model = FSDP(
@@ -1562,9 +1562,6 @@ class FSDPModelManager(DynamicModelManager):
         # Apply FSDP sharding if enabled
         if self.t5_fsdp:
             logger.info(f"Rank {self.rank}: Applying FSDP sharding to T5 encoder...")
-            
-            # Get mixed precision dtype
-            param_dtype = self._get_fsdp_mixed_precision_dtype()
             
             # Apply sharding to T5 encoder
             from functools import partial
