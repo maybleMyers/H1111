@@ -485,7 +485,7 @@ def wan22_batch_handler(
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
     pusa_auto_join: bool,
     # Dual GPU parameters
-    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool,
+    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool, disable_libuv: bool,
     # FSDP parameters
     fsdp_dit: bool, fsdp_t5: bool, fsdp_strategy: str, fsdp_mixed_precision: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
@@ -772,6 +772,14 @@ def wan22_batch_handler(
                 devices = gpu_devices.strip().split(',')
                 num_gpus = len(devices)
             
+            # Set up environment for distributed execution
+            env = os.environ.copy()
+            
+            # Disable libuv backend if requested (for Windows compatibility)
+            if disable_libuv:
+                env['TORCH_UCC_AVOID_LIBUV'] = '1'
+                print("Disabling libuv backend for Windows compatibility (TORCH_UCC_AVOID_LIBUV=1)")
+            
             # Modify command to use torchrun
             torchrun_command = [
                 sys.executable, "-m", "torch.distributed.launch",
@@ -784,7 +792,8 @@ def wan22_batch_handler(
             print(f"Running Wan2.2 with {mode_name} (torchrun): {' '.join(torchrun_command)}")
             process = subprocess.Popen(
                 torchrun_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', bufsize=1
+                text=True, encoding='utf-8', errors='replace', bufsize=1,
+                env=env  # Pass the modified environment
             )
         else:
             print(f"Running Wan2.2 Command: {' '.join(command)}")
@@ -8351,6 +8360,12 @@ with gr.Blocks(
                         info="Enable detailed logging for distributed mode debugging",
                         visible=False  # Only show when Sequence Parallel or FSDP is selected
                     )
+                    wan22_disable_libuv = gr.Checkbox(
+                        label="Disable libuv Backend (Windows Fix)",
+                        value=True,  # Default to True on Windows
+                        info="Disable libuv backend for torch distributed. Enable this if you get 'torch not compiled with libuv' errors on Windows",
+                        visible=False  # Only show when distributed modes are selected
+                    )
                 
                 # FSDP-specific controls (grouped together)
                 with gr.Group(visible=False) as wan22_fsdp_controls:
@@ -11948,13 +11963,14 @@ with gr.Blocks(
         is_fsdp = dual_gpu_mode == "FSDP (Memory Efficient)"
         return [
             gr.update(visible=is_distributed),  # debug checkbox
+            gr.update(visible=is_distributed),  # disable libuv checkbox
             gr.update(visible=is_fsdp)  # FSDP controls group
         ]
     
     wan22_dual_gpu_enable.change(
         fn=update_distributed_controls_visibility,
         inputs=[wan22_dual_gpu_enable],
-        outputs=[wan22_debug_sequence_parallel, wan22_fsdp_controls]
+        outputs=[wan22_debug_sequence_parallel, wan22_disable_libuv, wan22_fsdp_controls]
     )
 
     wan22_generate_btn.click(
@@ -12038,6 +12054,7 @@ with gr.Blocks(
             wan22_gpu_devices,
             wan22_gpu_split_ratio,
             wan22_debug_sequence_parallel,
+            wan22_disable_libuv,
             # FSDP parameters
             wan22_fsdp_dit,
             wan22_fsdp_t5,
