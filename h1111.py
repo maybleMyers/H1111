@@ -778,15 +778,33 @@ def wan22_batch_handler(
             # Disable libuv backend if requested (for Windows compatibility)
             if disable_libuv:
                 env['USE_LIBUV'] = '0'
+                # Also try setting other related environment variables
+                env['TORCH_USE_LIBUV'] = '0'
+                env['TORCH_DISTRIBUTED_USE_LIBUV'] = '0'
                 print("Disabling libuv backend for Windows compatibility (USE_LIBUV=0)")
             
-            # Modify command to use torchrun
-            torchrun_command = [
-                sys.executable, "-m", "torch.distributed.launch",
-                f"--nproc_per_node={num_gpus}",
-                "--master_addr=localhost",
-                "--master_port=29500"
-            ] + command[1:]  # Skip the python executable from original command
+            # Check if torchrun is available, otherwise fall back to torch.distributed.launch
+            import shutil
+            use_torchrun = shutil.which("torchrun") is not None
+            
+            if use_torchrun:
+                # Use torchrun (newer, recommended method)
+                torchrun_command = [
+                    "torchrun",
+                    f"--nproc_per_node={num_gpus}",
+                    "--master_addr=localhost",
+                    "--master_port=29500"
+                ]
+            else:
+                # Fall back to torch.distributed.launch
+                torchrun_command = [
+                    sys.executable, "-m", "torch.distributed.run",  # Use run instead of launch
+                    f"--nproc_per_node={num_gpus}",
+                    "--master_addr=localhost",
+                    "--master_port=29500"
+                ]
+                
+            torchrun_command = torchrun_command + command[1:]  # Skip the python executable from original command
             
             mode_name = "Sequence Parallel" if dual_gpu_enable == "Sequence Parallel" else "FSDP"
             print(f"Running Wan2.2 with {mode_name} (torchrun): {' '.join(torchrun_command)}")

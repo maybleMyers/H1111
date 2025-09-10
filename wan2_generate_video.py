@@ -1166,7 +1166,17 @@ class SequenceParallelModelManager(DynamicModelManager):
         
         # Initialize distributed group if not already done
         if not dist.is_initialized():
-            init_distributed_group()
+            # Check if we should avoid libuv (Windows compatibility)
+            import os
+            if os.environ.get('USE_LIBUV') == '0':
+                # On Windows, use gloo backend instead of nccl
+                import platform
+                if platform.system() == 'Windows':
+                    dist.init_process_group(backend='gloo')
+                else:
+                    init_distributed_group()
+            else:
+                init_distributed_group()
             
         self.world_size = get_world_size()
         self.rank = get_rank()
@@ -1307,7 +1317,17 @@ class FSDPModelManager(DynamicModelManager):
     def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
         # Initialize distributed group if not already done
         if not dist.is_initialized():
-            init_distributed_group()
+            # Check if we should avoid libuv (Windows compatibility)
+            import os
+            if os.environ.get('USE_LIBUV') == '0':
+                # On Windows, use gloo backend instead of nccl
+                import platform
+                if platform.system() == 'Windows':
+                    dist.init_process_group(backend='gloo')
+                else:
+                    init_distributed_group()
+            else:
+                init_distributed_group()
             
         self.world_size = get_world_size() if dist.is_initialized() else 1
         self.rank = get_rank() if dist.is_initialized() else 0
