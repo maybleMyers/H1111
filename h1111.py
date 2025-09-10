@@ -777,8 +777,8 @@ def wan22_batch_handler(
             
             # Disable libuv backend if requested (for Windows compatibility)
             if disable_libuv:
-                env['TORCH_UCC_AVOID_LIBUV'] = '1'
-                print("Disabling libuv backend for Windows compatibility (TORCH_UCC_AVOID_LIBUV=1)")
+                env['USE_LIBUV'] = '0'
+                print("Disabling libuv backend for Windows compatibility (USE_LIBUV=0)")
             
             # Modify command to use torchrun
             torchrun_command = [
