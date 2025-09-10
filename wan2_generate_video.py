@@ -35,6 +35,8 @@ import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from wan.distributed.util import init_distributed_group, get_world_size, get_rank
+from Wan2_2.wan.distributed.fsdp import shard_model, free_model
+from torch.distributed.fsdp import ShardingStrategy
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
@@ -485,6 +487,18 @@ def parse_args() -> argparse.Namespace:
         help="[DEPRECATED] Use --use_sequence_parallel instead")
     parser.add_argument("--debug_sequence_parallel", action="store_true",
         help="Enable debugging output for sequence parallelism")
+    
+    # FSDP (Fully Sharded Data Parallel) arguments
+    parser.add_argument("--dit_fsdp", action="store_true",
+        help="Enable FSDP sharding for DiT models to reduce VRAM per GPU")
+    parser.add_argument("--t5_fsdp", action="store_true", 
+        help="Enable FSDP sharding for T5 text encoder to reduce VRAM")
+    parser.add_argument("--fsdp_sharding_strategy", type=str, default="FULL_SHARD",
+        choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"],
+        help="FSDP sharding strategy (default: FULL_SHARD for maximum memory savings)")
+    parser.add_argument("--fsdp_mixed_precision", type=str, default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+        help="Mixed precision type for FSDP (default: bf16)")
 
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
@@ -1286,6 +1300,211 @@ class SequenceParallelModelManager(DynamicModelManager):
             model.blocks[-1].register_forward_hook(lambda m, i, o: forward_hook(m, i, o, f"block_{len(model.blocks)-1}"))
         
         logger.info(f"Rank {self.rank}: Debug hooks added to model")
+
+class FSDPModelManager(DynamicModelManager):
+    """Extended model manager that supports FSDP (Fully Sharded Data Parallel) to reduce VRAM per GPU."""
+    
+    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
+        # Initialize distributed group if not already done
+        if not dist.is_initialized():
+            init_distributed_group()
+            
+        self.world_size = get_world_size() if dist.is_initialized() else 1
+        self.rank = get_rank() if dist.is_initialized() else 0
+        
+        # Set device based on rank
+        self.device = torch.device(f"cuda:{self.rank}")
+        
+        # Store FSDP configuration
+        self.dit_fsdp = args.dit_fsdp
+        self.t5_fsdp = args.t5_fsdp
+        self.fsdp_strategy = self._get_sharding_strategy(args.fsdp_sharding_strategy)
+        self.fsdp_mixed_precision = args.fsdp_mixed_precision
+        
+        # Call parent constructor with updated device
+        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
+        
+        logger.info(f"FSDP enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
+        logger.info(f"FSDP config: dit_fsdp={self.dit_fsdp}, t5_fsdp={self.t5_fsdp}, strategy={args.fsdp_sharding_strategy}")
+        
+    def _get_sharding_strategy(self, strategy_name):
+        """Convert string strategy name to ShardingStrategy enum."""
+        strategy_map = {
+            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+            "NO_SHARD": ShardingStrategy.NO_SHARD,
+            "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD if hasattr(ShardingStrategy, 'HYBRID_SHARD') else ShardingStrategy.FULL_SHARD,
+        }
+        return strategy_map.get(strategy_name, ShardingStrategy.FULL_SHARD)
+    
+    def _get_fsdp_mixed_precision_dtype(self):
+        """Get the dtype for FSDP mixed precision."""
+        if self.fsdp_mixed_precision == "bf16":
+            return torch.bfloat16
+        elif self.fsdp_mixed_precision == "fp16":
+            return torch.float16
+        else:
+            return torch.float32
+            
+    def get_model(self, model_type: str) -> WanModel:
+        """Load the requested model and apply FSDP sharding."""
+        # Check if we need to switch models
+        if self.current_model_type == model_type:
+            return self.current_model
+            
+        # Unload current model if exists
+        if self.current_model is not None:
+            logger.info(f"Rank {self.rank}: Unloading {self.current_model_type} noise model...")
+            
+            # Get memory usage before unloading
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"Rank {self.rank}: Memory before unload: {memory_before:.2f} GB")
+            
+            # Free FSDP model if it was sharded
+            if self.dit_fsdp and hasattr(self, 'current_model'):
+                free_model(self.current_model)
+            else:
+                # Use parent's cleanup
+                self.cleanup()
+            
+            # Log memory after cleanup
+            if torch.cuda.is_available():
+                memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"Rank {self.rank}: Memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
+            
+        # Now load the new model
+        logger.info(f"Rank {self.rank}: Loading {model_type} noise model...")
+        
+        # Load on CPU first if using FSDP (for memory efficiency)
+        loading_device = "cpu" if self.dit_fsdp else self.device
+        
+        # Adjust weight dtype for FSDP
+        loading_weight_dtype = self.dit_weight_dtype
+        if self.args.mixed_dtype:
+            loading_weight_dtype = None
+        elif self.dit_fsdp:
+            # FSDP works better with full precision initially
+            loading_weight_dtype = torch.float32
+        elif self.args.fp8_scaled or self.args.lora_weight is not None:
+            loading_weight_dtype = self.dit_dtype
+            
+        # Select appropriate LoRA weights
+        lora_weights_list = None
+        lora_multipliers = None
+        if model_type == 'low':
+            lora_weights_list = self.lora_weights_list_low
+            lora_multipliers = self.lora_multipliers_low
+        else:  # 'high'
+            lora_weights_list = self.lora_weights_list_high
+            lora_multipliers = self.lora_multipliers_high
+            
+        # Load model with LoRA weights if available
+        model = load_wan_model(
+            self.config, self.device, self.model_paths[model_type], 
+            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+        )
+        
+        # Apply FSDP sharding if enabled
+        if self.dit_fsdp:
+            logger.info(f"Rank {self.rank}: Applying FSDP sharding to {model_type} model...")
+            
+            # Get mixed precision dtype
+            param_dtype = self._get_fsdp_mixed_precision_dtype()
+            
+            # Apply sharding
+            model = shard_model(
+                model,
+                device_id=self.rank,
+                param_dtype=param_dtype,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float32,
+                process_group=None,  # Use default process group
+                sharding_strategy=self.fsdp_strategy,
+                sync_module_states=True
+            )
+            logger.info(f"Rank {self.rank}: FSDP sharding applied successfully")
+        else:
+            # Regular optimization without FSDP
+            optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
+            model = model.to(self.device)
+        
+        self.current_model = model
+        self.current_model_type = model_type
+        
+        # Synchronize across all ranks
+        if dist.is_initialized():
+            dist.barrier()
+        
+        return model
+    
+    def cleanup(self):
+        """Clean up resources with FSDP-aware cleanup."""
+        if self.current_model is not None and self.dit_fsdp:
+            # Use FSDP-specific cleanup
+            free_model(self.current_model)
+        else:
+            # Use parent's cleanup
+            super().cleanup()
+            
+        # Synchronize cleanup across all ranks
+        if dist.is_initialized():
+            dist.barrier()
+    
+    def load_text_encoder(self, config) -> T5EncoderModel:
+        """Load T5 text encoder with optional FSDP sharding."""
+        logger.info(f"Rank {self.rank}: Loading T5 text encoder (FSDP={self.t5_fsdp})...")
+        
+        checkpoint_path = None if self.args.ckpt_dir is None else os.path.join(self.args.ckpt_dir, config.t5_checkpoint)
+        tokenizer_path = None if self.args.ckpt_dir is None else os.path.join(self.args.ckpt_dir, config.t5_tokenizer)
+        
+        # Load on CPU first if using FSDP
+        loading_device = torch.device('cpu') if self.t5_fsdp else self.device
+        
+        # Create text encoder
+        text_encoder = T5EncoderModel(
+            text_len=config.text_len,
+            dtype=config.t5_dtype,
+            device=loading_device,
+            checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
+            shard_fn=None  # We'll apply FSDP manually below
+        )
+        
+        # Apply FSDP sharding if enabled
+        if self.t5_fsdp:
+            logger.info(f"Rank {self.rank}: Applying FSDP sharding to T5 encoder...")
+            
+            # Get mixed precision dtype
+            param_dtype = self._get_fsdp_mixed_precision_dtype()
+            
+            # Apply sharding to T5 encoder
+            from functools import partial
+            shard_fn = partial(
+                shard_model,
+                device_id=self.rank,
+                param_dtype=param_dtype,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float32,
+                process_group=None,
+                sharding_strategy=self.fsdp_strategy,
+                sync_module_states=True
+            )
+            
+            # Apply sharding to the encoder model
+            if hasattr(text_encoder, 'encoder') and text_encoder.encoder is not None:
+                text_encoder.encoder = shard_fn(text_encoder.encoder)
+                logger.info(f"Rank {self.rank}: T5 encoder FSDP sharding applied successfully")
+        else:
+            # Move to device without FSDP
+            text_encoder = text_encoder.to(self.device)
+        
+        # Synchronize across all ranks
+        if dist.is_initialized():
+            dist.barrier()
+        
+        return text_encoder
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
@@ -4409,8 +4628,16 @@ def generate_extended_video(
     is_dual_dit = isinstance(model_result, tuple)
     if is_dual_dit:
         model_low_path, model_high_path, *lora_weights = model_result
-        # Use SequenceParallelModelManager if sequence parallel is enabled
-        if args.use_sequence_parallel or args.use_dual_gpu:
+        # Select appropriate model manager based on configuration
+        if args.dit_fsdp or args.t5_fsdp:
+            # Use FSDP manager for memory-efficient distributed training
+            if not dist.is_initialized() and torch.cuda.device_count() < 2:
+                logger.warning(f"FSDP requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+                model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+            else:
+                logger.info(f"Using FSDP Model Manager for extension")
+                model_manager = FSDPModelManager(cfg, device, torch.float16, torch.float16, args)
+        elif args.use_sequence_parallel or args.use_dual_gpu:
             if args.use_dual_gpu:
                 logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
             if not dist.is_initialized() and torch.cuda.device_count() < 2:
@@ -5255,8 +5482,16 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             lora_weights_list_low = lora_multipliers_low = None
             lora_weights_list_high = lora_multipliers_high = None
             
-        # Use SequenceParallelModelManager if sequence parallel is enabled
-        if args.use_sequence_parallel or args.use_dual_gpu:
+        # Select appropriate model manager based on configuration
+        if args.dit_fsdp or args.t5_fsdp:
+            # Use FSDP manager for memory-efficient distributed training
+            if not dist.is_initialized() and torch.cuda.device_count() < 2:
+                logger.warning(f"FSDP requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
+                model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+            else:
+                logger.info(f"Using FSDP Model Manager")
+                model_manager = FSDPModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+        elif args.use_sequence_parallel or args.use_dual_gpu:
             if args.use_dual_gpu:
                 logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
             if not dist.is_initialized() and torch.cuda.device_count() < 2:
@@ -5737,8 +5972,8 @@ def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
     
-    # Handle distributed setup if using sequence parallelism
-    if args.use_sequence_parallel:
+    # Handle distributed setup if using sequence parallelism or FSDP
+    if args.use_sequence_parallel or args.dit_fsdp or args.t5_fsdp:
         # Get local rank - args.local_rank is set by the parser (converts --local-rank to local_rank)
         local_rank = args.local_rank
         
@@ -5746,15 +5981,18 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             
-        # Initialize distributed environment (handled by SequenceParallelModelManager)
-        logger.info(f"Sequence parallel mode detected, local_rank={local_rank}")
+        # Initialize distributed environment (handled by model managers)
+        if args.use_sequence_parallel:
+            logger.info(f"Sequence parallel mode detected, local_rank={local_rank}")
+        if args.dit_fsdp or args.t5_fsdp:
+            logger.info(f"FSDP mode detected, local_rank={local_rank}, dit_fsdp={args.dit_fsdp}, t5_fsdp={args.t5_fsdp}")
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
 
     # Set device
-    if args.use_sequence_parallel:
-        # For sequence parallel, use the rank-specific device
+    if args.use_sequence_parallel or args.dit_fsdp or args.t5_fsdp:
+        # For distributed modes, use the rank-specific device
         local_rank = args.local_rank
         device_str = f"cuda:{local_rank}"
     else:

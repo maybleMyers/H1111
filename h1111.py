@@ -26,10 +26,18 @@ from tqdm import tqdm
 from diffusers_helper.bucket_tools import find_nearest_bucket
 import time
 from gradio_image_annotation import image_annotator
+import torch  # Add torch import for GPU detection
 
 
 # Add global stop event
 stop_event = threading.Event()
+
+# GPU detection helper
+def get_gpu_count():
+    """Get the number of available CUDA GPUs"""
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+    return 0
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
@@ -477,12 +485,21 @@ def wan22_batch_handler(
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
     pusa_auto_join: bool,
     # Dual GPU parameters
-    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool
+    dual_gpu_enable: str, gpu_devices: str, gpu_split_ratio: float, debug_sequence_parallel: bool,
+    # FSDP parameters
+    fsdp_dit: bool, fsdp_t5: bool, fsdp_strategy: str, fsdp_mixed_precision: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
 
     # --- Initial Checks ---
+    # Check GPU requirements for distributed modes
+    if dual_gpu_enable in ["Pipeline (Legacy)", "Sequence Parallel", "FSDP (Memory Efficient)"]:
+        gpu_count = get_gpu_count()
+        if gpu_count < 2:
+            yield [], None, f"Error: {dual_gpu_enable} requires at least 2 GPUs, but only {gpu_count} GPU(s) detected.", ""
+            return
+    
     os.makedirs(save_path, exist_ok=True)
 
     all_generated_videos = []
@@ -715,6 +732,18 @@ def wan22_batch_handler(
             command.append("--use_sequence_parallel")
             if debug_sequence_parallel:
                 command.append("--debug_sequence_parallel")
+        elif dual_gpu_enable == "FSDP (Memory Efficient)":
+            # FSDP mode for memory-efficient multi-GPU
+            if fsdp_dit:
+                command.append("--dit_fsdp")
+            if fsdp_t5:
+                command.append("--t5_fsdp")
+            if fsdp_strategy:
+                command.extend(["--fsdp_sharding_strategy", fsdp_strategy])
+            if fsdp_mixed_precision:
+                command.extend(["--fsdp_mixed_precision", fsdp_mixed_precision])
+            if debug_sequence_parallel:  # Use same debug flag for FSDP
+                command.append("--debug_sequence_parallel")
         
         # --- Execute Subprocess ---
         # Validate and fix command items
@@ -735,16 +764,24 @@ def wan22_batch_handler(
                     command[i] = str(item)
                     print(f"  Fixed: Converted to string: {command[i]}")
         
-        # Check if we need to use torchrun for sequence parallel
-        if dual_gpu_enable == "Sequence Parallel":
+        # Check if we need to use torchrun for distributed modes
+        if dual_gpu_enable in ["Sequence Parallel", "FSDP (Memory Efficient)"]:
+            # Determine number of GPUs
+            num_gpus = 2  # Default
+            if gpu_devices and gpu_devices.strip():
+                devices = gpu_devices.strip().split(',')
+                num_gpus = len(devices)
+            
             # Modify command to use torchrun
             torchrun_command = [
                 sys.executable, "-m", "torch.distributed.launch",
-                "--nproc_per_node=2",
+                f"--nproc_per_node={num_gpus}",
                 "--master_addr=localhost",
                 "--master_port=29500"
             ] + command[1:]  # Skip the python executable from original command
-            print(f"Running Wan2.2 with Sequence Parallel (torchrun): {' '.join(torchrun_command)}")
+            
+            mode_name = "Sequence Parallel" if dual_gpu_enable == "Sequence Parallel" else "FSDP"
+            print(f"Running Wan2.2 with {mode_name} (torchrun): {' '.join(torchrun_command)}")
             process = subprocess.Popen(
                 torchrun_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', bufsize=1
@@ -8280,18 +8317,25 @@ with gr.Blocks(
                 with gr.Row():
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                    
+                    # GPU info display
+                    gpu_count = get_gpu_count()
+                    gpu_info_text = f"GPUs detected: {gpu_count}"
+                    if gpu_count < 2:
+                        gpu_info_text += " ⚠️ Multi-GPU modes require at least 2 GPUs"
+                    
                     wan22_dual_gpu_enable = gr.Radio(
-                        choices=["Off", "Pipeline (Legacy)", "Sequence Parallel"],
+                        choices=["Off", "Pipeline (Legacy)", "Sequence Parallel", "FSDP (Memory Efficient)"],
                         value="Off",
-                        label="Dual GPU Mode",
+                        label=f"Multi-GPU Mode ({gpu_info_text})",
                         interactive=True,
-                        info="Sequence Parallel: Recommended for dual GPU (requires torchrun). Pipeline: Legacy mode."
+                        info="FSDP: Best memory savings (50-70% reduction). Sequence Parallel: Fast for long videos. Pipeline: Legacy mode."
                     )
                     wan22_gpu_devices = gr.Textbox(
                         label="GPU Devices (e.g., 0,1)",
                         value="0,1",
                         interactive=True,
-                        info="For Sequence Parallel, this is ignored (auto-detects from torchrun)"
+                        info="For Sequence Parallel/FSDP, this is ignored (auto-detects from torchrun)"
                     )
                     wan22_gpu_split_ratio = gr.Number(
                         label="GPU Split Ratio (Pipeline only)",
@@ -8302,11 +8346,38 @@ with gr.Blocks(
                         interactive=True
                     )
                     wan22_debug_sequence_parallel = gr.Checkbox(
-                        label="Debug Sequence Parallel",
+                        label="Debug Distributed Mode",
                         value=False,
-                        info="Enable detailed logging for sequence parallelism debugging",
-                        visible=False  # Only show when Sequence Parallel is selected
+                        info="Enable detailed logging for distributed mode debugging",
+                        visible=False  # Only show when Sequence Parallel or FSDP is selected
                     )
+                
+                # FSDP-specific controls (grouped together)
+                with gr.Group(visible=False) as wan22_fsdp_controls:
+                    with gr.Row():
+                        wan22_fsdp_dit = gr.Checkbox(
+                            label="FSDP for DiT Models",
+                            value=True,
+                            info="Enable FSDP sharding for DiT models (main video generation models)"
+                        )
+                        wan22_fsdp_t5 = gr.Checkbox(
+                            label="FSDP for T5 Encoder",
+                            value=True,
+                            info="Enable FSDP sharding for T5 text encoder"
+                        )
+                    with gr.Row():
+                        wan22_fsdp_strategy = gr.Dropdown(
+                            label="FSDP Sharding Strategy",
+                            choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"],
+                            value="FULL_SHARD",
+                            info="FULL_SHARD: Maximum memory savings. SHARD_GRAD_OP: Moderate savings, faster."
+                        )
+                        wan22_fsdp_mixed_precision = gr.Dropdown(
+                            label="FSDP Mixed Precision",
+                            choices=["bf16", "fp16", "fp32"],
+                            value="bf16",
+                            info="Mixed precision type for FSDP computations"
+                        )
                 with gr.Row():
                     with gr.Group(visible=True) as wan22_a14b_paths:
                         wan22_dit_low_noise_path = gr.Dropdown(
@@ -11870,15 +11941,20 @@ with gr.Blocks(
         outputs=wan22_lora_apply_high
     )
     
-    # Add visibility control for debug checkbox based on dual GPU mode
-    def update_debug_visibility(dual_gpu_mode):
-        """Show debug checkbox only for Sequence Parallel mode"""
-        return gr.update(visible=(dual_gpu_mode == "Sequence Parallel"))
+    # Add visibility control for debug checkbox and FSDP controls based on dual GPU mode
+    def update_distributed_controls_visibility(dual_gpu_mode):
+        """Show debug checkbox for distributed modes and FSDP controls for FSDP mode"""
+        is_distributed = dual_gpu_mode in ["Sequence Parallel", "FSDP (Memory Efficient)"]
+        is_fsdp = dual_gpu_mode == "FSDP (Memory Efficient)"
+        return [
+            gr.update(visible=is_distributed),  # debug checkbox
+            gr.update(visible=is_fsdp)  # FSDP controls group
+        ]
     
     wan22_dual_gpu_enable.change(
-        fn=update_debug_visibility,
+        fn=update_distributed_controls_visibility,
         inputs=[wan22_dual_gpu_enable],
-        outputs=[wan22_debug_sequence_parallel]
+        outputs=[wan22_debug_sequence_parallel, wan22_fsdp_controls]
     )
 
     wan22_generate_btn.click(
@@ -11962,6 +12038,11 @@ with gr.Blocks(
             wan22_gpu_devices,
             wan22_gpu_split_ratio,
             wan22_debug_sequence_parallel,
+            # FSDP parameters
+            wan22_fsdp_dit,
+            wan22_fsdp_t5,
+            wan22_fsdp_strategy,
+            wan22_fsdp_mixed_precision,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
