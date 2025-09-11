@@ -2814,90 +2814,55 @@ def prepare_i2v_inputs(
 
         fun_ref_latent = None
         
-        # FSDP optimization: Only rank 0 performs VAE encoding
-        if is_fsdp:
-            rank = torch.distributed.get_rank()
-            
-            if rank == 0:
-                logger.info("FSDP: Rank 0 performing FunControl VAE encoding...")
-                should_encode = True
-            else:
-                logger.info(f"FSDP: Rank {rank} skipping FunControl VAE encoding, will receive from rank 0...")
-                should_encode = False
-                # Create empty tensors to receive broadcast
-                # Use cuda:0 for broadcast to ensure all ranks use the same device
-                y = torch.empty(32, lat_f, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
-                if args.task == "i2v-14B-FC-1.1" and args.image_path is not None:
-                    # Allocate space for fun_ref_latent broadcast
-                    fun_ref_latent = torch.empty(16, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
-        else:
-            should_encode = True
-            
-        if should_encode:
-            # Check if the task requires ref_conv and if a reference image is provided via --image_path
-            if args.task == "i2v-14B-FC-1.1" and args.image_path is not None:
-                logger.info(f"Task {args.task} requires ref_conv. Encoding reference image from --image_path: {args.image_path}")
-                try:
-                    ref_img = Image.open(args.image_path).convert("RGB")
-                    ref_img_np = np.array(ref_img)
-                    # Resize ref image to target pixel dimensions
-                    interpolation = cv2.INTER_AREA if pixel_height < ref_img_np.shape[0] else cv2.INTER_CUBIC
-                    ref_img_resized_np = cv2.resize(ref_img_np, (pixel_width, pixel_height), interpolation=interpolation)
-                    # Convert to tensor CFHW, range [-1, 1]
-                    ref_img_tensor = TF.to_tensor(ref_img_resized_np).sub_(0.5).div_(0.5).to(device)
-                    ref_img_tensor = ref_img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
-
-                    vae.to_device(device) # Ensure VAE is on device for encoding
-                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-                        # Encode the single reference frame
-                        # vae.encode returns list, take first element. Result shape [C', 1, H', W']
-                        fun_ref_latent = vae.encode([ref_img_tensor])[0]
-                        # Squeeze the frame dimension for Conv2d in the model: [C', H', W']
-                        fun_ref_latent = fun_ref_latent.squeeze(1)
-                    logger.info(f"Encoded fun_ref latent. Shape: {fun_ref_latent.shape}")
-                    # Keep VAE on device for main conditioning latent creation below
-
-                except Exception as e:
-                    logger.error(f"Error processing reference image for fun_ref: {e}")
-                    fun_ref_latent = None # Continue without ref if encoding fails
-
-                # **IMPORTANT**: Since --image_path is now used for fun_ref,
-                # temporarily set it to None *before* calling create_funcontrol_conditioning_latent
-                # so it doesn't get processed *again* as a start image inside that function.
-                original_image_path = args.image_path
-                args.image_path = None
-            else:
-                original_image_path = None
-
-            # Use the FunControl helper function to create the 32-channel 'y'
-            vae.to_device(device) # Ensure VAE is on compute device
-            y = create_funcontrol_conditioning_latent(
-                args, config, vae, device, lat_f, lat_h, lat_w, pixel_height, pixel_width
-            )
-            if args.task == "i2v-14B-FC-1.1" and original_image_path:
-                 args.image_path = original_image_path        
-            if y is None:
-                raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
-            vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu") # Move VAE back
-            clean_memory_on_device(device)
+        # In FSDP mode, each rank performs its own VAE encoding to avoid broadcast issues
+        # The results will be identical since they use the same input
         
-        # Broadcast the FunControl tensors in FSDP mode
-        if is_fsdp:
-            logger.info("FSDP: Broadcasting FunControl VAE encodings...")
-            # Ensure tensors are on cuda:0 for broadcast (common device for all ranks)
-            if y.device != torch.device('cuda:0'):
-                y = y.to('cuda:0')
-            torch.distributed.broadcast(y, src=0)
-            if fun_ref_latent is not None:
-                if fun_ref_latent.device != torch.device('cuda:0'):
-                    fun_ref_latent = fun_ref_latent.to('cuda:0')
-                torch.distributed.broadcast(fun_ref_latent, src=0)
-            logger.info("FSDP: Broadcast complete")
-            # Move tensors back to rank-specific device if needed
-            if device != torch.device('cuda:0'):
-                y = y.to(device)
-                if fun_ref_latent is not None:
-                    fun_ref_latent = fun_ref_latent.to(device)
+        # Check if the task requires ref_conv and if a reference image is provided via --image_path
+        if args.task == "i2v-14B-FC-1.1" and args.image_path is not None:
+            logger.info(f"Task {args.task} requires ref_conv. Encoding reference image from --image_path: {args.image_path}")
+            try:
+                ref_img = Image.open(args.image_path).convert("RGB")
+                ref_img_np = np.array(ref_img)
+                # Resize ref image to target pixel dimensions
+                interpolation = cv2.INTER_AREA if pixel_height < ref_img_np.shape[0] else cv2.INTER_CUBIC
+                ref_img_resized_np = cv2.resize(ref_img_np, (pixel_width, pixel_height), interpolation=interpolation)
+                # Convert to tensor CFHW, range [-1, 1]
+                ref_img_tensor = TF.to_tensor(ref_img_resized_np).sub_(0.5).div_(0.5).to(device)
+                ref_img_tensor = ref_img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
+
+                vae.to_device(device) # Ensure VAE is on device for encoding
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+                    # Encode the single reference frame
+                    # vae.encode returns list, take first element. Result shape [C', 1, H', W']
+                    fun_ref_latent = vae.encode([ref_img_tensor])[0]
+                    # Squeeze the frame dimension for Conv2d in the model: [C', H', W']
+                    fun_ref_latent = fun_ref_latent.squeeze(1)
+                logger.info(f"Encoded fun_ref latent. Shape: {fun_ref_latent.shape}")
+                # Keep VAE on device for main conditioning latent creation below
+
+            except Exception as e:
+                logger.error(f"Error processing reference image for fun_ref: {e}")
+                fun_ref_latent = None # Continue without ref if encoding fails
+
+            # **IMPORTANT**: Since --image_path is now used for fun_ref,
+            # temporarily set it to None *before* calling create_funcontrol_conditioning_latent
+            # so it doesn't get processed *again* as a start image inside that function.
+            original_image_path = args.image_path
+            args.image_path = None
+        else:
+            original_image_path = None
+
+        # Use the FunControl helper function to create the 32-channel 'y'
+        vae.to_device(device) # Ensure VAE is on compute device
+        y = create_funcontrol_conditioning_latent(
+            args, config, vae, device, lat_f, lat_h, lat_w, pixel_height, pixel_width
+        )
+        if args.task == "i2v-14B-FC-1.1" and original_image_path:
+             args.image_path = original_image_path        
+        if y is None:
+            raise RuntimeError("Failed to create FunControl conditioning latent 'y'.")
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu") # Move VAE back
+        clean_memory_on_device(device)
 
         # Prepare Model Input Arguments for FunControl
         y_for_model = y[0] # Shape becomes [32, F, H, W]
@@ -3038,23 +3003,11 @@ def prepare_i2v_inputs(
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #4: VAE Encoding and 'y' construction ---
         logger.info(f"Encoding image(s) to latent space (Standard I2V method)")
         
-        # FSDP optimization: Only rank 0 performs VAE encoding to save memory
-        if is_fsdp:
-            rank = torch.distributed.get_rank()
-            
-            if rank == 0:
-                logger.info("FSDP: Rank 0 performing VAE encoding...")
-                vae.to_device(device)
-            else:
-                logger.info(f"FSDP: Rank {rank} skipping VAE encoding, will receive from rank 0...")
-                # Create empty tensor with the right shape to receive broadcast
-                # Use cuda:0 for broadcast to ensure all ranks use the same device
-                y = torch.empty(20, lat_f_effective, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
-        else:
-            vae.to_device(device)
+        # In FSDP mode, each rank performs its own VAE encoding to avoid broadcast issues
+        # The results will be identical since they use the same input
+        vae.to_device(device)
         
-        # Perform VAE encoding (only on rank 0 in FSDP mode, or always in non-FSDP mode)
-        if not is_fsdp or (is_fsdp and rank == 0):
+        # Perform VAE encoding on all ranks
 
             # Resize image(s) for VAE
             interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
@@ -3109,27 +3062,14 @@ def prepare_i2v_inputs(
             # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
             y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
         
-        # Broadcast the encoded result to all ranks in FSDP mode
-        if is_fsdp:
-            logger.info(f"FSDP: Broadcasting VAE encoding result from rank 0 to all ranks...")
-            # Ensure tensor is on cuda:0 for broadcast (common device for all ranks)
-            if y.device != torch.device('cuda:0'):
-                y = y.to('cuda:0')
-            torch.distributed.broadcast(y, src=0)
-            logger.info(f"FSDP: Broadcast complete")
-            # Move tensor back to rank-specific device if needed
-            if device != torch.device('cuda:0'):
-                y = y.to(device)
-        
         # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
 
         logger.info(f"Standard I2V conditioning 'y' constructed. Shape: {y.shape}")
         logger.info(f"Image encoding complete")
 
         # Move VAE back
-        if not is_fsdp or (is_fsdp and rank == 0):
-            vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
-            clean_memory_on_device(device)
+        vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+        clean_memory_on_device(device)
 
         # Prepare model input arguments for Standard I2V
         # A14B models don't have img_emb layer, so don't pass clip_fea
