@@ -1348,8 +1348,8 @@ class FSDPModelManager(DynamicModelManager):
         self.blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
         self.fp8_scaled = getattr(args, 'fp8_scaled', False)
         
-        # Call parent constructor with updated device
-        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
+        # Call parent constructor with the rank-specific device
+        super().__init__(config, self.device, dit_dtype, dit_weight_dtype, args)
         
         # Warn about memory usage with CPU offload
         if self.fsdp_cpu_offload:
