@@ -1334,8 +1334,12 @@ class FSDPModelManager(DynamicModelManager):
         self.world_size = get_world_size() if dist.is_initialized() else 1
         self.rank = get_rank() if dist.is_initialized() else 0
         
-        # Set device based on rank
-        self.device = torch.device(f"cuda:{self.rank}")
+        # Set device based on LOCAL rank, not global rank
+        # Use environment variable or args to get local rank
+        import os
+        local_rank = int(os.environ.get("LOCAL_RANK", self.rank))
+        self.device = torch.device(f"cuda:{local_rank}")
+        self.local_rank = local_rank
         
         # Store FSDP configuration
         self.dit_fsdp = args.dit_fsdp
@@ -1368,7 +1372,7 @@ class FSDPModelManager(DynamicModelManager):
             logger.warning("Both blocks_to_swap and fsdp_cpu_offload are enabled. This will use excessive RAM.")
             logger.warning("Recommend using only one: either blocks_to_swap OR fsdp_cpu_offload")
         
-        logger.info(f"FSDP enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
+        logger.info(f"FSDP enabled: global_rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}, device={self.device}")
         logger.info(f"FSDP config: dit_fsdp={self.dit_fsdp}, t5_fsdp={self.t5_fsdp}, strategy={args.fsdp_sharding_strategy}")
         logger.info(f"Memory optimizations: blocks_to_swap={self.blocks_to_swap}, fp8_scaled={self.fp8_scaled}, cpu_offload={self.fsdp_cpu_offload}")
         
