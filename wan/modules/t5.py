@@ -453,7 +453,7 @@ class T5EncoderModel:
     def __init__(
         self,
         text_len,
-        dtype=torch.bfloat16,
+        dtype=None,
         device=torch.cuda.current_device(),
         checkpoint_path=None,
         tokenizer_path=None,
@@ -462,7 +462,6 @@ class T5EncoderModel:
         fp8=False,
     ):
         self.text_len = text_len
-        self.dtype = dtype if not fp8 else torch.float8_e4m3fn
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
@@ -472,6 +471,8 @@ class T5EncoderModel:
             model = umt5_xxl(encoder_only=True, return_tokenizer=False)
 
         model = model.eval().requires_grad_(False)
+        
+        # Load model weights first to detect original dtype
         if checkpoint_path is not None:
             logger.info(f"loading {checkpoint_path}")
             model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
@@ -485,8 +486,28 @@ class T5EncoderModel:
             sd = {k.replace("encoder.", ""): v for k, v in sd.items()}
             model.load_state_dict(sd, strict=True, assign=True)
 
-        logger.info(f"moving model to {device} and casting to {self.dtype}")
-        model = model.to(device, dtype=self.dtype)
+        # Detect original model dtype from weights
+        original_dtype = None
+        for param in model.parameters():
+            original_dtype = param.dtype
+            break
+        
+        # Determine target dtype: preserve original unless fp8 mode or explicit override
+        if fp8:
+            target_dtype = torch.float8_e4m3fn
+            self.dtype = target_dtype
+            logger.info(f"Using FP8 mode - target dtype: {target_dtype}")
+        elif dtype is not None:
+            target_dtype = dtype
+            self.dtype = target_dtype
+            logger.info(f"Using explicit dtype override - target dtype: {target_dtype}")
+        else:
+            target_dtype = original_dtype if original_dtype is not None else torch.bfloat16
+            self.dtype = target_dtype
+            logger.info(f"Preserving original model dtype: {target_dtype}")
+
+        logger.info(f"moving model to {device} and casting to {target_dtype}")
+        model = model.to(device, dtype=target_dtype)
 
         if fp8:
             logger.info("preparing model for fp8")
