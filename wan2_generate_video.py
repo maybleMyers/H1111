@@ -6151,6 +6151,7 @@ def save_output(
 
 def main():
     # --- Argument Parsing & Setup ---
+    import os
     args = parse_args()
     
     # Handle distributed setup if using sequence parallelism or FSDP
