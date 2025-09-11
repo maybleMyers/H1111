@@ -102,7 +102,7 @@ def load_text_encoder_fsdp(args: argparse.Namespace, config, device: torch.devic
 
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
-        dtype=config.t5_dtype,
+        dtype=config.t5_dtype if args.fp8_t5 else None,
         device=loading_device,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -1634,7 +1634,7 @@ class FSDPModelManager(DynamicModelManager):
         # Create text encoder
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
-            dtype=config.t5_dtype,
+            dtype=config.t5_dtype if self.args.fp8_t5 else None,
             device=loading_device,
             checkpoint_path=checkpoint_path,
             tokenizer_path=tokenizer_path,
@@ -2228,7 +2228,7 @@ def load_text_encoder(args: argparse.Namespace, config, device: torch.device) ->
 
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
-        dtype=config.t5_dtype,
+        dtype=config.t5_dtype if args.fp8_t5 else None,
         device=device,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -5276,7 +5276,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     shard_fn = partial(shard_model, device_id=kwargs.get('device_id', 0))
                     self.text_encoder = T5EncoderModel(
                         text_len=config.text_len,
-                        dtype=config.t5_dtype,
+                        dtype=config.t5_dtype if kwargs.get('fp8_t5', False) else None,
                         device=torch.device('cpu'),
                         checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
                         tokenizer_path="google/umt5-xxl",  # Use HF repo ID directly
