@@ -6154,27 +6154,24 @@ def main():
     args = parse_args()
     
     # Handle distributed setup if using sequence parallelism or FSDP
-    if args.use_sequence_parallel or args.dit_fsdp or args.t5_fsdp:
-        # Get local rank - args.local_rank is set by the parser (converts --local-rank to local_rank)
-        local_rank = args.local_rank
+    is_distributed = args.use_sequence_parallel or args.dit_fsdp or args.t5_fsdp
+    local_rank = 0
+    if is_distributed:
+        # RELIABLE way to get local_rank set by torchrun
+        local_rank = int(os.environ["LOCAL_RANK"])
         
-        # Set CUDA device based on local rank
+        # Set CUDA device for this specific process
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
-            
-        # Initialize distributed environment (handled by model managers)
-        if args.use_sequence_parallel:
-            logger.info(f"Sequence parallel mode detected, local_rank={local_rank}")
-        if args.dit_fsdp or args.t5_fsdp:
-            logger.info(f"FSDP mode detected, local_rank={local_rank}, dit_fsdp={args.dit_fsdp}, t5_fsdp={args.t5_fsdp}")
+        
+        # The FSDP/SP Model Managers will handle dist.init_process_group()
+        logger.info(f"Distributed mode detected. Rank {local_rank} assigned to device cuda:{local_rank}")
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
 
     # Set device
-    if args.use_sequence_parallel or args.dit_fsdp or args.t5_fsdp:
-        # For distributed modes, use the rank-specific device
-        local_rank = args.local_rank
+    if is_distributed:
         device_str = f"cuda:{local_rank}"
     else:
         device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
