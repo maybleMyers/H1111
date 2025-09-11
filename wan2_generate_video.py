@@ -5071,48 +5071,50 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
             'torch.bfloat16': torch.bfloat16,
         }
         
+        # Allocate on CUDA device for NCCL broadcast
         noise = torch.empty(shapes_info['noise_shape'], 
                            dtype=dtype_map.get(shapes_info['noise_dtype'], torch.float32),
-                           device='cpu')
+                           device=device)
         context = torch.empty(shapes_info['context_shape'],
                              dtype=dtype_map.get(shapes_info['context_dtype'], torch.float32),
-                             device='cpu')
+                             device=device)
         context_null = torch.empty(shapes_info['context_null_shape'],
                                    dtype=dtype_map.get(shapes_info['context_null_dtype'], torch.float32),
-                                   device='cpu')
+                                   device=device)
         
         if shapes_info['has_y']:
             y = torch.empty(shapes_info['y_shape'],
                            dtype=dtype_map.get(shapes_info['y_dtype'], torch.float32),
-                           device='cpu')
+                           device=device)
         else:
             y = None
     
-    # Step 3: Move tensors to CPU for broadcast (avoid device conflicts)
+    # Step 3: Ensure tensors are on CUDA for NCCL broadcast
     if rank == 0:
-        noise_cpu = noise.cpu() if noise.device != torch.device('cpu') else noise
+        # Move to device if not already there
+        noise_cuda = noise.to(device) if noise.device != device else noise
         # Handle list contexts
         if isinstance(context, list):
-            context_cpu = context[0].cpu() if context[0].device != torch.device('cpu') else context[0]
+            context_cuda = context[0].to(device) if context[0].device != device else context[0]
         else:
-            context_cpu = context.cpu() if context.device != torch.device('cpu') else context
+            context_cuda = context.to(device) if context.device != device else context
         if isinstance(context_null, list):
-            context_null_cpu = context_null[0].cpu() if context_null[0].device != torch.device('cpu') else context_null[0]
+            context_null_cuda = context_null[0].to(device) if context_null[0].device != device else context_null[0]
         else:
-            context_null_cpu = context_null.cpu() if context_null.device != torch.device('cpu') else context_null
-        y_cpu = y.cpu() if y is not None and y.device != torch.device('cpu') else y
+            context_null_cuda = context_null.to(device) if context_null.device != device else context_null
+        y_cuda = y.to(device) if y is not None and y.device != device else y
     else:
-        noise_cpu = noise
-        context_cpu = context
-        context_null_cpu = context_null
-        y_cpu = y
+        noise_cuda = noise
+        context_cuda = context
+        context_null_cuda = context_null
+        y_cuda = y
     
-    # Step 4: Broadcast tensors
-    dist.broadcast(noise_cpu, src=0)
-    dist.broadcast(context_cpu, src=0)
-    dist.broadcast(context_null_cpu, src=0)
+    # Step 4: Broadcast tensors (using CUDA tensors for NCCL)
+    dist.broadcast(noise_cuda, src=0)
+    dist.broadcast(context_cuda, src=0)
+    dist.broadcast(context_null_cuda, src=0)
     if shapes_info['has_y']:
-        dist.broadcast(y_cpu, src=0)
+        dist.broadcast(y_cuda, src=0)
     
     # Step 5: Broadcast inputs dict
     if rank == 0:
@@ -5123,23 +5125,20 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
     dist.broadcast_object_list(inputs_list, src=0)
     inputs = inputs_list[0]
     
-    # Step 6: Move tensors to target device and restore list format if needed
-    noise = noise_cpu.to(device)
+    # Step 6: Restore list format if needed (tensors already on device)
+    noise = noise_cuda
     
     # Restore list format for context if needed
-    context_tensor = context_cpu.to(device)
-    context = [context_tensor] if shapes_info['context_is_list'] else context_tensor
+    context = [context_cuda] if shapes_info['context_is_list'] else context_cuda
+    context_null = [context_null_cuda] if shapes_info['context_null_is_list'] else context_null_cuda
     
-    context_null_tensor = context_null_cpu.to(device)
-    context_null = [context_null_tensor] if shapes_info['context_null_is_list'] else context_null_tensor
-    
-    if y_cpu is not None:
-        y = y_cpu.to(device)
+    if y_cuda is not None:
+        y = y_cuda
     
     # Synchronize to ensure broadcast is complete
     dist.barrier()
     
-    logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context shape: {context_tensor.shape}")
+    logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context shape: {context_cuda.shape}")
     logger.info(f"Rank {rank}: Final context type: {type(context)}, context_null type: {type(context_null)}")
     if isinstance(context, list):
         logger.info(f"Rank {rank}: Context is list with {len(context)} items")
