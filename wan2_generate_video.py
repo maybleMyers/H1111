@@ -3008,59 +3008,58 @@ def prepare_i2v_inputs(
         vae.to_device(device)
         
         # Perform VAE encoding on all ranks
+        # Resize image(s) for VAE
+        interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
+        img_resized_np = cv2.resize(img_cv2, (target_width, target_height), interpolation=interpolation)
+        img_resized = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)  # [-1, 1], CHW
+        img_resized = img_resized.unsqueeze(1)  # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-            # Resize image(s) for VAE
-            interpolation = cv2.INTER_AREA if target_height < img_cv2.shape[0] else cv2.INTER_CUBIC
-            img_resized_np = cv2.resize(img_cv2, (target_width, target_height), interpolation=interpolation)
-            img_resized = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)  # [-1, 1], CHW
-            img_resized = img_resized.unsqueeze(1)  # Add frame dimension -> CFHW, Shape [C, 1, H, W]
+        end_img_resized = None
+        if has_end_image and end_img_cv2 is not None:
+            interpolation_end = cv2.INTER_AREA if target_height < end_img_cv2.shape[0] else cv2.INTER_CUBIC
+            end_img_resized_np = cv2.resize(end_img_cv2, (target_width, target_height), interpolation=interpolation_end)
+            end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device) # [-1, 1], CHW
+            end_img_resized = end_img_resized.unsqueeze(1) # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-            end_img_resized = None
-            if has_end_image and end_img_cv2 is not None:
-                interpolation_end = cv2.INTER_AREA if target_height < end_img_cv2.shape[0] else cv2.INTER_CUBIC
-                end_img_resized_np = cv2.resize(end_img_cv2, (target_width, target_height), interpolation=interpolation_end)
-                end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device) # [-1, 1], CHW
-                end_img_resized = end_img_resized.unsqueeze(1) # Add frame dimension -> CFHW, Shape [C, 1, H, W]
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #5: Mask Shape ---
+        msk = torch.zeros(4, lat_f_effective, lat_h, lat_w, device=device, dtype=vae.dtype) # Use adjusted frame dim
+        msk[:, 0] = 1 # Mask first frame
+        if has_end_image:
+            msk[:, -1] = 1 # Mask last frame (the lat_f+1'th frame)
 
-            # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #5: Mask Shape ---
-            msk = torch.zeros(4, lat_f_effective, lat_h, lat_w, device=device, dtype=vae.dtype) # Use adjusted frame dim
-            msk[:, 0] = 1 # Mask first frame
-            if has_end_image:
-                msk[:, -1] = 1 # Mask last frame (the lat_f+1'th frame)
+        # Encode image(s) using VAE (Padded Method)
+        with accelerator.autocast(), torch.no_grad():
+            # Pad the *start* image tensor temporally before encoding
+            # Calculate padding needed to reach base frame count (before adding end frame)
+            padding_frames_needed = frames - 1 # Number of frames to generate *after* the first
+            if padding_frames_needed < 0: padding_frames_needed = 0
 
-            # Encode image(s) using VAE (Padded Method)
-            with accelerator.autocast(), torch.no_grad():
-                # Pad the *start* image tensor temporally before encoding
-                # Calculate padding needed to reach base frame count (before adding end frame)
-                padding_frames_needed = frames - 1 # Number of frames to generate *after* the first
-                if padding_frames_needed < 0: padding_frames_needed = 0
+            img_padded = img_resized # Start with [C, 1, H, W]
+            if padding_frames_needed > 0:
+                 # Create padding tensor [C, padding_frames_needed, H, W]
+                 padding_tensor = torch.zeros(
+                     img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                     device=device, dtype=img_resized.dtype
+                 )
+                 # Concatenate along frame dimension (dim=1)
+                 img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+                 # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
 
-                img_padded = img_resized # Start with [C, 1, H, W]
-                if padding_frames_needed > 0:
-                     # Create padding tensor [C, padding_frames_needed, H, W]
-                     padding_tensor = torch.zeros(
-                         img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
-                         device=device, dtype=img_resized.dtype
-                     )
-                     # Concatenate along frame dimension (dim=1)
-                     img_padded = torch.cat([img_resized, padding_tensor], dim=1)
-                     # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
+            # Encode the padded start image tensor. VAE output matches latent frame count.
+            # vae.encode expects [C, F, H, W]
+            y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
 
-                # Encode the padded start image tensor. VAE output matches latent frame count.
-                # vae.encode expects [C, F, H, W]
-                y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
+            if has_end_image and end_img_resized is not None:
+                 # Encode the single end frame
+                 y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
+                 # Concatenate along frame dimension (dim=1)
+                 y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
+            else:
+                 y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
 
-                if has_end_image and end_img_resized is not None:
-                     # Encode the single end frame
-                     y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
-                     # Concatenate along frame dimension (dim=1)
-                     y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
-                else:
-                     y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
-
-            # Concatenate mask and the combined latent
-            # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
-            y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
+        # Concatenate mask and the combined latent
+        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
+        y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
         
         # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
 
