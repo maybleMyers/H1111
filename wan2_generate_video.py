@@ -2821,10 +2821,11 @@ def prepare_i2v_inputs(
                 logger.info(f"FSDP: Rank {rank} skipping FunControl VAE encoding, will receive from rank 0...")
                 should_encode = False
                 # Create empty tensors to receive broadcast
-                y = torch.empty(32, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
+                # Use cuda:0 for broadcast to ensure all ranks use the same device
+                y = torch.empty(32, lat_f, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
                 if args.task == "i2v-14B-FC-1.1" and args.image_path is not None:
                     # Allocate space for fun_ref_latent broadcast
-                    fun_ref_latent = torch.empty(16, lat_h, lat_w, device=device, dtype=torch.float32)
+                    fun_ref_latent = torch.empty(16, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
         else:
             should_encode = True
             
@@ -2879,10 +2880,20 @@ def prepare_i2v_inputs(
         # Broadcast the FunControl tensors in FSDP mode
         if is_fsdp:
             logger.info("FSDP: Broadcasting FunControl VAE encodings...")
+            # Ensure tensors are on cuda:0 for broadcast (common device for all ranks)
+            if y.device != torch.device('cuda:0'):
+                y = y.to('cuda:0')
             torch.distributed.broadcast(y, src=0)
             if fun_ref_latent is not None:
+                if fun_ref_latent.device != torch.device('cuda:0'):
+                    fun_ref_latent = fun_ref_latent.to('cuda:0')
                 torch.distributed.broadcast(fun_ref_latent, src=0)
             logger.info("FSDP: Broadcast complete")
+            # Move tensors back to rank-specific device if needed
+            if device != torch.device('cuda:0'):
+                y = y.to(device)
+                if fun_ref_latent is not None:
+                    fun_ref_latent = fun_ref_latent.to(device)
 
         # Prepare Model Input Arguments for FunControl
         y_for_model = y[0] # Shape becomes [32, F, H, W]
@@ -3033,7 +3044,8 @@ def prepare_i2v_inputs(
             else:
                 logger.info(f"FSDP: Rank {rank} skipping VAE encoding, will receive from rank 0...")
                 # Create empty tensor with the right shape to receive broadcast
-                y = torch.empty(20, lat_f_effective, lat_h, lat_w, device=device, dtype=torch.float32)
+                # Use cuda:0 for broadcast to ensure all ranks use the same device
+                y = torch.empty(20, lat_f_effective, lat_h, lat_w, device='cuda:0', dtype=torch.float32)
         else:
             vae.to_device(device)
         
@@ -3096,8 +3108,14 @@ def prepare_i2v_inputs(
         # Broadcast the encoded result to all ranks in FSDP mode
         if is_fsdp:
             logger.info(f"FSDP: Broadcasting VAE encoding result from rank 0 to all ranks...")
+            # Ensure tensor is on cuda:0 for broadcast (common device for all ranks)
+            if y.device != torch.device('cuda:0'):
+                y = y.to('cuda:0')
             torch.distributed.broadcast(y, src=0)
             logger.info(f"FSDP: Broadcast complete")
+            # Move tensor back to rank-specific device if needed
+            if device != torch.device('cuda:0'):
+                y = y.to(device)
         
         # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
 
