@@ -2781,6 +2781,14 @@ def prepare_i2v_inputs(
             else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
+        
+        # Debug: Check what T5 encoder returned
+        logger.info(f"T5 Encoder output - context type: {type(context)}, context_null type: {type(context_null)}")
+        if isinstance(context, list):
+            logger.info(f"Context is list with {len(context)} items, first item shape: {context[0].shape}")
+        else:
+            logger.info(f"Context tensor shape: {context.shape}")
+        
         del text_encoder
         clean_memory_on_device(device)
         # Always unload to save memory
@@ -2966,6 +2974,14 @@ def prepare_i2v_inputs(
             else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
+        
+        # Debug: Check what T5 encoder returned
+        logger.info(f"T5 Encoder output - context type: {type(context)}, context_null type: {type(context_null)}")
+        if isinstance(context, list):
+            logger.info(f"Context is list with {len(context)} items, first item shape: {context[0].shape}")
+        else:
+            logger.info(f"Context tensor shape: {context.shape}")
+        
         del text_encoder
         clean_memory_on_device(device)
         # Always unload to save memory
@@ -5016,13 +5032,24 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
     
     # Step 1: Broadcast shapes from rank 0
     if rank == 0:
+        # Handle context as list or tensor
+        context_is_list = isinstance(context, list)
+        context_tensor = context[0] if context_is_list else context
+        context_null_is_list = isinstance(context_null, list)
+        context_null_tensor = context_null[0] if context_null_is_list else context_null
+        
+        logger.info(f"Rank {rank}: Context is_list={context_is_list}, shape={context_tensor.shape}, dtype={context_tensor.dtype}")
+        logger.info(f"Rank {rank}: Context_null is_list={context_null_is_list}, shape={context_null_tensor.shape}, dtype={context_null_tensor.dtype}")
+        
         shapes_info = {
             'noise_shape': list(noise.shape),
             'noise_dtype': str(noise.dtype),
-            'context_shape': list(context.shape),
-            'context_dtype': str(context.dtype),
-            'context_null_shape': list(context_null.shape),
-            'context_null_dtype': str(context_null.dtype),
+            'context_is_list': context_is_list,
+            'context_shape': list(context_tensor.shape),
+            'context_dtype': str(context_tensor.dtype),
+            'context_null_is_list': context_null_is_list,
+            'context_null_shape': list(context_null_tensor.shape),
+            'context_null_dtype': str(context_null_tensor.dtype),
             'has_y': y is not None,
             'y_shape': list(y.shape) if y is not None else None,
             'y_dtype': str(y.dtype) if y is not None else None,
@@ -5064,8 +5091,15 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
     # Step 3: Move tensors to CPU for broadcast (avoid device conflicts)
     if rank == 0:
         noise_cpu = noise.cpu() if noise.device != torch.device('cpu') else noise
-        context_cpu = context.cpu() if context.device != torch.device('cpu') else context
-        context_null_cpu = context_null.cpu() if context_null.device != torch.device('cpu') else context_null
+        # Handle list contexts
+        if isinstance(context, list):
+            context_cpu = context[0].cpu() if context[0].device != torch.device('cpu') else context[0]
+        else:
+            context_cpu = context.cpu() if context.device != torch.device('cpu') else context
+        if isinstance(context_null, list):
+            context_null_cpu = context_null[0].cpu() if context_null[0].device != torch.device('cpu') else context_null[0]
+        else:
+            context_null_cpu = context_null.cpu() if context_null.device != torch.device('cpu') else context_null
         y_cpu = y.cpu() if y is not None and y.device != torch.device('cpu') else y
     else:
         noise_cpu = noise
@@ -5106,6 +5140,9 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
     dist.barrier()
     
     logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context shape: {context_tensor.shape}")
+    logger.info(f"Rank {rank}: Final context type: {type(context)}, context_null type: {type(context_null)}")
+    if isinstance(context, list):
+        logger.info(f"Rank {rank}: Context is list with {len(context)} items")
     
     return noise, context, context_null, y, inputs
 
