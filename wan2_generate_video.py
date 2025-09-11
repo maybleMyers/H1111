@@ -5724,19 +5724,19 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         
         if use_fsdp and rank == 0:
             # Only rank 0 prepares inputs
-            noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+            noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
             # Broadcast to other ranks
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, noise, context, context_null, inputs, device
+            noise, context, context_null, y, inputs = broadcast_prepared_inputs(
+                noise, context, context_null, y, inputs, device
             )
         elif use_fsdp:
             # Other ranks receive broadcast
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, None, None, None, None, device
+            noise, context, context_null, y, inputs = broadcast_prepared_inputs(
+                None, None, None, None, None, device
             )
         else:
             # Single GPU or non-FSDP mode
-            noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+            noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_i2v_inputs moves VAE to CPU/cache after use
 
     elif is_fun_control: # Pure FunControl T2V (no image input unless using start/end image)
@@ -5746,14 +5746,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         if use_fsdp and rank == 0:
             # Only rank 0 prepares inputs
             noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
-            # Broadcast to other ranks
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, noise, context, context_null, inputs, device
+            # Broadcast to other ranks (y is None for FunControl T2V)
+            noise, context, context_null, _, inputs = broadcast_prepared_inputs(
+                noise, context, context_null, None, inputs, device
             )
         elif use_fsdp:
             # Other ranks receive broadcast
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, None, None, None, None, device
+            noise, context, context_null, _, inputs = broadcast_prepared_inputs(
+                None, None, None, None, None, device
             )
         else:
             # Single GPU or non-FSDP mode
@@ -5767,14 +5767,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         if use_fsdp and rank == 0:
             # Only rank 0 prepares inputs
             noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
-            # Broadcast to other ranks
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, noise, context, context_null, inputs, device
+            # Broadcast to other ranks (y is None for standard T2V)
+            noise, context, context_null, _, inputs = broadcast_prepared_inputs(
+                noise, context, context_null, None, inputs, device
             )
         elif use_fsdp:
             # Other ranks receive broadcast
-            noise, context, context_null, inputs = broadcast_prepared_inputs(
-                rank, None, None, None, None, device
+            noise, context, context_null, _, inputs = broadcast_prepared_inputs(
+                None, None, None, None, None, device
             )
         else:
             # Single GPU or non-FSDP mode
