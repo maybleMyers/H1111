@@ -2726,10 +2726,8 @@ def prepare_i2v_inputs(
     if vae is None:
         raise ValueError("VAE must be provided for I2V input preparation.")
     
-    # Check if we're in FSDP mode to optimize memory usage
-    is_fsdp = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-    if is_fsdp:
-        logger.info("FSDP mode detected: Will unload VAE before loading T5 to prevent OOM")
+    # Note: FSDP memory optimization is now handled at a higher level
+    # This function assumes VAE/T5/CLIP are loaded sequentially as in single GPU mode
 
     # --- Prepare Conditioning Latent 'y' ---
     # This check MUST come first to decide the entire logic path
@@ -2766,12 +2764,11 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-        # FSDP optimization: Unload VAE before loading T5 to prevent OOM
-        if is_fsdp:
-            logger.info("FSDP: Unloading VAE before loading T5...")
-            vae.to_device("cpu")
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Unload VAE before loading T5 to save memory (sequential loading pattern)
+        logger.info("Unloading VAE before loading T5...")
+        vae.to_device("cpu")
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # load text encoder & encode prompts
         text_encoder = load_text_encoder(args, config, device)
@@ -2791,10 +2788,9 @@ def prepare_i2v_inputs(
         gc.collect()
         logger.info("Unloaded T5 model from memory")
         
-        # FSDP optimization: Reload VAE after T5 is unloaded
-        if is_fsdp:
-            logger.info("FSDP: Reloading VAE after T5 unload...")
-            vae.to_device(device)
+        # Reload VAE after T5 is unloaded
+        logger.info("Reloading VAE after T5 unload...")
+        vae.to_device(device)
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -2953,12 +2949,11 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-        # FSDP optimization: Unload VAE before loading T5 to prevent OOM
-        if is_fsdp:
-            logger.info("FSDP: Unloading VAE before loading T5...")
-            vae.to_device("cpu")
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Unload VAE before loading T5 to save memory (sequential loading pattern)
+        logger.info("Unloading VAE before loading T5...")
+        vae.to_device("cpu")
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # load text encoder & encode prompts
         text_encoder = load_text_encoder(args, config, device)
@@ -2978,10 +2973,9 @@ def prepare_i2v_inputs(
         gc.collect()
         logger.info("Unloaded T5 model from memory")
         
-        # FSDP optimization: Reload VAE after T5 is unloaded
-        if is_fsdp:
-            logger.info("FSDP: Reloading VAE after T5 unload...")
-            vae.to_device(device)
+        # Reload VAE after T5 is unloaded
+        logger.info("Reloading VAE after T5 unload...")
+        vae.to_device(device)
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -3003,8 +2997,6 @@ def prepare_i2v_inputs(
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #4: VAE Encoding and 'y' construction ---
         logger.info(f"Encoding image(s) to latent space (Standard I2V method)")
         
-        # In FSDP mode, each rank performs its own VAE encoding to avoid broadcast issues
-        # The results will be identical since they use the same input
         vae.to_device(device)
         
         # Perform VAE encoding on all ranks
@@ -3115,10 +3107,8 @@ def prepare_ti2v_inputs(
         
     logger.info("Preparing inputs for Text+Image-to-Video (TI2V) inference.")
     
-    # Check if we're in FSDP mode to optimize memory usage
-    is_fsdp = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-    if is_fsdp:
-        logger.info("FSDP mode detected: Will unload VAE before loading T5 to prevent OOM")
+    # Note: FSDP memory optimization is now handled at a higher level
+    # This function assumes VAE/T5/CLIP are loaded sequentially as in single GPU mode
     
     # Load and process the input image
     image = Image.open(args.image_path).convert('RGB')
@@ -3170,9 +3160,7 @@ def prepare_ti2v_inputs(
     logger.info(f"Image latent shape: {image_latent.shape}")
     
     # Move VAE to cache/CPU for memory management
-    if args.vae_cache_cpu or is_fsdp:
-        if is_fsdp:
-            logger.info("FSDP: Unloading VAE before loading T5...")
+    if args.vae_cache_cpu:
         vae.to_device("cpu")
         clean_memory_on_device(device)
     
@@ -5003,6 +4991,118 @@ def generate_extended_video(
     logger.info(f"Generated extended video: {final_video.shape}")
     return final_video
 
+def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
+    """Broadcast prepared inputs from rank 0 to all other ranks.
+    
+    Args:
+        noise: Noise tensor
+        context: Text context tensor
+        context_null: Negative text context tensor
+        y: Conditioning latent (can be None)
+        inputs: Tuple of (arg_c, arg_null) dicts
+        device: Target device for tensors after broadcast
+    
+    Returns:
+        Tuple of broadcasted tensors on the target device
+    """
+    import torch.distributed as dist
+    
+    if not dist.is_initialized():
+        # No distribution, return as-is
+        return noise, context, context_null, y, inputs
+    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Step 1: Broadcast shapes from rank 0
+    if rank == 0:
+        shapes_info = {
+            'noise_shape': list(noise.shape),
+            'noise_dtype': str(noise.dtype),
+            'context_shape': list(context.shape),
+            'context_dtype': str(context.dtype),
+            'context_null_shape': list(context_null.shape),
+            'context_null_dtype': str(context_null.dtype),
+            'has_y': y is not None,
+            'y_shape': list(y.shape) if y is not None else None,
+            'y_dtype': str(y.dtype) if y is not None else None,
+        }
+    else:
+        shapes_info = None
+    
+    # Broadcast shapes info as a list (NCCL doesn't support dict broadcast directly)
+    shapes_list = [shapes_info]
+    dist.broadcast_object_list(shapes_list, src=0)
+    shapes_info = shapes_list[0]
+    
+    # Step 2: Allocate tensors on non-rank-0 processes
+    if rank != 0:
+        # Convert string dtype back to torch dtype
+        dtype_map = {
+            'torch.float32': torch.float32,
+            'torch.float16': torch.float16,
+            'torch.bfloat16': torch.bfloat16,
+        }
+        
+        noise = torch.empty(shapes_info['noise_shape'], 
+                           dtype=dtype_map.get(shapes_info['noise_dtype'], torch.float32),
+                           device='cpu')
+        context = torch.empty(shapes_info['context_shape'],
+                             dtype=dtype_map.get(shapes_info['context_dtype'], torch.float32),
+                             device='cpu')
+        context_null = torch.empty(shapes_info['context_null_shape'],
+                                   dtype=dtype_map.get(shapes_info['context_null_dtype'], torch.float32),
+                                   device='cpu')
+        
+        if shapes_info['has_y']:
+            y = torch.empty(shapes_info['y_shape'],
+                           dtype=dtype_map.get(shapes_info['y_dtype'], torch.float32),
+                           device='cpu')
+        else:
+            y = None
+    
+    # Step 3: Move tensors to CPU for broadcast (avoid device conflicts)
+    if rank == 0:
+        noise_cpu = noise.cpu() if noise.device != torch.device('cpu') else noise
+        context_cpu = context.cpu() if context.device != torch.device('cpu') else context
+        context_null_cpu = context_null.cpu() if context_null.device != torch.device('cpu') else context_null
+        y_cpu = y.cpu() if y is not None and y.device != torch.device('cpu') else y
+    else:
+        noise_cpu = noise
+        context_cpu = context
+        context_null_cpu = context_null
+        y_cpu = y
+    
+    # Step 4: Broadcast tensors
+    dist.broadcast(noise_cpu, src=0)
+    dist.broadcast(context_cpu, src=0)
+    dist.broadcast(context_null_cpu, src=0)
+    if shapes_info['has_y']:
+        dist.broadcast(y_cpu, src=0)
+    
+    # Step 5: Broadcast inputs dict
+    if rank == 0:
+        inputs_list = [inputs]
+    else:
+        inputs_list = [None]
+    
+    dist.broadcast_object_list(inputs_list, src=0)
+    inputs = inputs_list[0]
+    
+    # Step 6: Move tensors to target device
+    noise = noise_cpu.to(device)
+    context = context_cpu.to(device)
+    context_null = context_null_cpu.to(device)
+    if y_cpu is not None:
+        y = y_cpu.to(device)
+    
+    # Synchronize to ensure broadcast is complete
+    dist.barrier()
+    
+    logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context: {context.shape}")
+    
+    return noise, context, context_null, y, inputs
+
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     """main function for generation pipeline (T2V, I2V, V2V)
 
@@ -5097,9 +5197,21 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     vae = None
     # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
     needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
+    
+    # Check if we're using FSDP
+    use_fsdp = args.dit_fsdp or args.t5_fsdp
+    rank = 0
+    if use_fsdp and dist.is_initialized():
+        rank = dist.get_rank()
+    
+    # Only load VAE on rank 0 when using FSDP
     if needs_vae_early:
-        vae = load_vae(args, cfg, device, vae_dtype)
-        # Keep VAE on specified device for now, will be moved as needed
+        if use_fsdp and rank != 0:
+            # Other ranks don't need VAE for input prep
+            vae = None
+        else:
+            vae = load_vae(args, cfg, device, vae_dtype)
+            # Keep VAE on specified device for now, will be moved as needed
 
     # Handle video extension mode
     if is_extension:
@@ -5130,6 +5242,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     context_null = None
     inputs = None
     video_latents = None # For V2V mixing
+    
+    # Check if we're using FSDP
+    use_fsdp = args.dit_fsdp or args.t5_fsdp
+    rank = 0
+    if use_fsdp and dist.is_initialized():
+        rank = dist.get_rank()
 
     if is_v2v_i2v:
         # V2V using i2v model - combines video encoding with CLIP conditioning
@@ -5603,21 +5721,69 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # I2V path (handles both standard and FunControl internally based on config)
         if args.video_length is None:
              raise ValueError("video_length must be specified for I2V mode.")
-        noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+        
+        if use_fsdp and rank == 0:
+            # Only rank 0 prepares inputs
+            noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+            # Broadcast to other ranks
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, noise, context, context_null, inputs, device
+            )
+        elif use_fsdp:
+            # Other ranks receive broadcast
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, None, None, None, None, device
+            )
+        else:
+            # Single GPU or non-FSDP mode
+            noise, context, context_null, _, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_i2v_inputs moves VAE to CPU/cache after use
-        # Note: prepare_ti2v_inputs moves VAE to CPU/cache after use
 
     elif is_fun_control: # Pure FunControl T2V (no image input unless using start/end image)
         if args.video_length is None:
              raise ValueError("video_length must be specified for Fun-Control T2V mode.")
-        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
+        
+        if use_fsdp and rank == 0:
+            # Only rank 0 prepares inputs
+            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
+            # Broadcast to other ranks
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, noise, context, context_null, inputs, device
+            )
+        elif use_fsdp:
+            # Other ranks receive broadcast
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, None, None, None, None, device
+            )
+        else:
+            # Single GPU or non-FSDP mode
+            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
         # Note: prepare_t2v_inputs moves VAE to CPU/cache if it used it
 
     elif is_t2v: # Standard T2V
         if args.video_length is None:
              raise ValueError("video_length must be specified for standard T2V mode.")
-        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
-
+        
+        if use_fsdp and rank == 0:
+            # Only rank 0 prepares inputs
+            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
+            # Broadcast to other ranks
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, noise, context, context_null, inputs, device
+            )
+        elif use_fsdp:
+            # Other ranks receive broadcast
+            noise, context, context_null, inputs = broadcast_prepared_inputs(
+                rank, None, None, None, None, device
+            )
+        else:
+            # Single GPU or non-FSDP mode
+            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
+    
+    # Add synchronization barrier for FSDP to ensure all ranks have inputs before proceeding
+    if use_fsdp and dist.is_initialized():
+        dist.barrier()
+        logger.info(f"Rank {rank}: Synchronized after input preparation")
 
     # At this point, VAE should be on CPU/cache unless still needed for decoding
     # If VAE wasn't loaded early (standard T2V), vae is still None
@@ -5652,6 +5818,11 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 model_manager = FSDPModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
                 # Use the rank-specific device from the model manager
                 device = model_manager.device
+                
+                # Synchronize before starting sampling
+                if dist.is_initialized():
+                    dist.barrier()
+                    logger.info(f"Rank {model_manager.rank}: Ready to start sampling with FSDP")
         elif args.use_sequence_parallel or args.use_dual_gpu:
             if args.use_dual_gpu:
                 logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
