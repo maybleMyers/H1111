@@ -4833,6 +4833,8 @@ def generate_extended_video(
             else:
                 logger.info(f"Using FSDP Model Manager for extension")
                 model_manager = FSDPModelManager(cfg, device, torch.float16, torch.float16, args)
+                # Use the rank-specific device from the model manager
+                device = model_manager.device
         elif args.use_sequence_parallel or args.use_dual_gpu:
             if args.use_dual_gpu:
                 logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
@@ -5687,6 +5689,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             else:
                 logger.info(f"Using FSDP Model Manager")
                 model_manager = FSDPModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+                # Use the rank-specific device from the model manager
+                device = model_manager.device
         elif args.use_sequence_parallel or args.use_dual_gpu:
             if args.use_dual_gpu:
                 logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
