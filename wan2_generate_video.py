@@ -5089,17 +5089,23 @@ def broadcast_prepared_inputs(noise, context, context_null, y, inputs, device):
     dist.broadcast_object_list(inputs_list, src=0)
     inputs = inputs_list[0]
     
-    # Step 6: Move tensors to target device
+    # Step 6: Move tensors to target device and restore list format if needed
     noise = noise_cpu.to(device)
-    context = context_cpu.to(device)
-    context_null = context_null_cpu.to(device)
+    
+    # Restore list format for context if needed
+    context_tensor = context_cpu.to(device)
+    context = [context_tensor] if shapes_info['context_is_list'] else context_tensor
+    
+    context_null_tensor = context_null_cpu.to(device)
+    context_null = [context_null_tensor] if shapes_info['context_null_is_list'] else context_null_tensor
+    
     if y_cpu is not None:
         y = y_cpu.to(device)
     
     # Synchronize to ensure broadcast is complete
     dist.barrier()
     
-    logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context: {context.shape}")
+    logger.info(f"Rank {rank}: Broadcast complete. Noise: {noise.shape}, Context shape: {context_tensor.shape}")
     
     return noise, context, context_null, y, inputs
 
