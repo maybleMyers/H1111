@@ -2721,6 +2721,11 @@ def prepare_i2v_inputs(
     """
     if vae is None:
         raise ValueError("VAE must be provided for I2V input preparation.")
+    
+    # Check if we're in FSDP mode to optimize memory usage
+    is_fsdp = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+    if is_fsdp:
+        logger.info("FSDP mode detected: Will unload VAE before loading T5 to prevent OOM")
 
     # --- Prepare Conditioning Latent 'y' ---
     # This check MUST come first to decide the entire logic path
@@ -2757,6 +2762,13 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
+        # FSDP optimization: Unload VAE before loading T5 to prevent OOM
+        if is_fsdp:
+            logger.info("FSDP: Unloading VAE before loading T5...")
+            vae.to_device("cpu")
+            torch.cuda.empty_cache()
+            gc.collect()
+
         # load text encoder & encode prompts
         text_encoder = load_text_encoder(args, config, device)
         text_encoder.model.to(device)
@@ -2774,6 +2786,11 @@ def prepare_i2v_inputs(
         torch.cuda.empty_cache()
         gc.collect()
         logger.info("Unloaded T5 model from memory")
+        
+        # FSDP optimization: Reload VAE after T5 is unloaded
+        if is_fsdp:
+            logger.info("FSDP: Reloading VAE after T5 unload...")
+            vae.to_device(device)
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -2926,6 +2943,13 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
+        # FSDP optimization: Unload VAE before loading T5 to prevent OOM
+        if is_fsdp:
+            logger.info("FSDP: Unloading VAE before loading T5...")
+            vae.to_device("cpu")
+            torch.cuda.empty_cache()
+            gc.collect()
+
         # load text encoder & encode prompts
         text_encoder = load_text_encoder(args, config, device)
         text_encoder.model.to(device)
@@ -2943,6 +2967,11 @@ def prepare_i2v_inputs(
         torch.cuda.empty_cache()
         gc.collect()
         logger.info("Unloaded T5 model from memory")
+        
+        # FSDP optimization: Reload VAE after T5 is unloaded
+        if is_fsdp:
+            logger.info("FSDP: Reloading VAE after T5 unload...")
+            vae.to_device(device)
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -3071,6 +3100,11 @@ def prepare_ti2v_inputs(
         
     logger.info("Preparing inputs for Text+Image-to-Video (TI2V) inference.")
     
+    # Check if we're in FSDP mode to optimize memory usage
+    is_fsdp = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+    if is_fsdp:
+        logger.info("FSDP mode detected: Will unload VAE before loading T5 to prevent OOM")
+    
     # Load and process the input image
     image = Image.open(args.image_path).convert('RGB')
     logger.info(f"Loaded input image: {args.image_path}")
@@ -3121,7 +3155,9 @@ def prepare_ti2v_inputs(
     logger.info(f"Image latent shape: {image_latent.shape}")
     
     # Move VAE to cache/CPU for memory management
-    if args.vae_cache_cpu:
+    if args.vae_cache_cpu or is_fsdp:
+        if is_fsdp:
+            logger.info("FSDP: Unloading VAE before loading T5...")
         vae.to_device("cpu")
         clean_memory_on_device(device)
     
