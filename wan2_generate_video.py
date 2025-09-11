@@ -89,6 +89,62 @@ from einops import rearrange
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
+def load_text_encoder_fsdp(args: argparse.Namespace, config, device: torch.device) -> T5EncoderModel:
+    """Load text encoder (T5) model with optional FSDP sharding."""
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    logger.info(f"Rank {rank}: Loading T5 text encoder (FSDP={args.t5_fsdp})...")
+
+    checkpoint_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_checkpoint)
+    tokenizer_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_tokenizer)
+
+    # Load on CPU first if using FSDP for memory efficiency
+    loading_device = torch.device('cpu') if args.t5_fsdp else device
+
+    text_encoder = T5EncoderModel(
+        text_len=config.text_len,
+        dtype=config.t5_dtype,
+        device=loading_device,
+        checkpoint_path=checkpoint_path,
+        tokenizer_path=tokenizer_path,
+        weight_path=args.t5,
+        fp8=args.fp8_t5,
+    )
+
+    # Apply FSDP sharding if enabled
+    if args.t5_fsdp:
+        if not dist.is_initialized():
+            raise RuntimeError("FSDP is requested for T5, but distributed environment is not initialized.")
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from functools import partial
+
+        # FSDP requires the model to be on the CPU before wrapping
+        text_encoder.model.to('cpu')
+
+        # Define a wrap policy for T5 blocks
+        t5_block_class = type(text_encoder.model.encoder.block[0])
+        auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={t5_block_class})
+
+        # Get mixed precision dtype
+        fsdp_dtype = torch.bfloat16 if args.fsdp_mixed_precision == "bf16" else torch.float16
+
+        # Wrap the T5 encoder with FSDP
+        text_encoder.model.encoder = FSDP(
+            text_encoder.model.encoder,
+            auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=MixedPrecision(
+                param_dtype=fsdp_dtype,
+                reduce_dtype=torch.float32,
+            ),
+            sharding_strategy=ShardingStrategy.FULL_SHARD, # Use FULL_SHARD for max memory savings
+            device_id=torch.cuda.current_device(),
+        )
+        logger.info(f"Rank {rank}: T5 encoder FSDP sharding applied successfully")
+
+    return text_encoder
+
 def synchronize_device(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -2627,7 +2683,7 @@ def prepare_t2v_inputs(
         seed_g = torch.manual_seed(seed)
 
     # load text encoder
-    text_encoder = load_text_encoder(args, config, device)
+    text_encoder = load_text_encoder_fsdp(args, config, device)
     text_encoder.model.to(device)
 
     # encode prompt
@@ -5016,14 +5072,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if use_fsdp and dist.is_initialized():
         rank = dist.get_rank()
     
-    # Only load VAE on rank 0 when using FSDP
     if needs_vae_early:
-        if use_fsdp and rank != 0:
-            # Other ranks don't need VAE for input prep
-            vae = None
-        else:
-            vae = load_vae(args, cfg, device, vae_dtype)
-            # Keep VAE on specified device for now, will be moved as needed
+        vae = load_vae(args, cfg, device, vae_dtype)
 
     # Handle video extension mode
     if is_extension:
