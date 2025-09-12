@@ -6,7 +6,6 @@ import os
 import re
 import time
 import math
-import types
 from typing import Tuple, Optional, List, Union, Any
 from pathlib import Path # Added for glob_images in V2V
 
@@ -14,7 +13,6 @@ from pathlib import Path # Added for glob_images in V2V
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
-import torch.distributed as dist
 import accelerate
 from accelerate import Accelerator
 from functools import partial
@@ -33,8 +31,6 @@ from utils.lora_utils import filter_lora_state_dict
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
-from wan.distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
-from wan.distributed.util import init_distributed_group, get_world_size, get_rank
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
@@ -250,13 +246,6 @@ def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Wan 2.2 inference script with new model architecture support")
 
-    # Distributed launch arguments (added by torch.distributed.launch/torchrun)
-    # Note: --local-rank gets converted to args.local_rank by argparse (replaces hyphen with underscore)
-    parser.add_argument("--local-rank", type=int, default=0, dest='local_rank', 
-                       help="Local rank for distributed training (auto-set by torchrun)")
-    parser.add_argument("--local_rank", type=int, default=0, 
-                       help="Local rank for distributed training (alternative format)")
-    
     # WAN arguments
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-A14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
@@ -477,14 +466,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None,
         help="Unique suffix for preview files to avoid conflicts in concurrent runs.",
     )
-
-    # Sequence Parallelism arguments
-    parser.add_argument("--use_sequence_parallel", action="store_true", 
-        help="Enable sequence parallelism across multiple GPUs for faster inference")
-    parser.add_argument("--use_dual_gpu", action="store_true", 
-        help="[DEPRECATED] Use --use_sequence_parallel instead")
-    parser.add_argument("--debug_sequence_parallel", action="store_true",
-        help="Enable debugging output for sequence parallelism")
 
     # Video extension arguments (multitalk-style)
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
@@ -816,476 +797,6 @@ class DynamicModelManager:
     def unload_all(self):
         """Alias for cleanup method to ensure compatibility."""
         self.cleanup()
-
-class PipelineDynamicModelManager(DynamicModelManager):
-    """Extended model manager that supports pipeline parallelism across two GPUs."""
-    
-    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
-        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
-        
-        # Setup dual GPU devices
-        self.gpu0 = torch.device(f"cuda:{args.pipeline_gpu0}")
-        self.gpu1 = torch.device(f"cuda:{args.pipeline_gpu1}")
-        self.split_ratio = args.gpu_split_ratio
-        
-        # Pipeline components (will be set after model loading)
-        self.blocks_gpu0 = None
-        self.blocks_gpu1 = None
-        self.split_point = None
-        
-        # CUDA streams for async transfers
-        self.stream_gpu0 = torch.cuda.Stream(device=self.gpu0)
-        self.stream_gpu1 = torch.cuda.Stream(device=self.gpu1)
-        
-        logger.info(f"Pipeline parallelism enabled: GPU0={self.gpu0}, GPU1={self.gpu1}, split_ratio={self.split_ratio}")
-        
-    def _split_model_blocks(self):
-        """Split the current model's transformer blocks across two GPUs."""
-        if self.current_model is None:
-            return
-            
-        num_blocks = len(self.current_model.blocks)
-        self.split_point = int(num_blocks * self.split_ratio)
-        
-        # Ensure at least one block on each GPU
-        if self.split_point == 0:
-            self.split_point = 1
-        elif self.split_point >= num_blocks:
-            self.split_point = num_blocks - 1
-            
-        logger.info(f"Splitting {num_blocks} blocks: {self.split_point} on GPU0, {num_blocks - self.split_point} on GPU1")
-        
-        # Move embeddings and time projections to GPU0
-        self.current_model.patch_embedding = self.current_model.patch_embedding.to(self.gpu0)
-        self.current_model.time_embedding = self.current_model.time_embedding.to(self.gpu0)
-        self.current_model.time_projection = self.current_model.time_projection.to(self.gpu0)
-        if hasattr(self.current_model, 'text_embedding'):
-            self.current_model.text_embedding = self.current_model.text_embedding.to(self.gpu0)
-        
-        # Move CLIP projection if present (for I2V models)
-        if hasattr(self.current_model, 'clip_projection'):
-            self.current_model.clip_projection = self.current_model.clip_projection.to(self.gpu0)
-        if hasattr(self.current_model, 'clip_norm'):
-            self.current_model.clip_norm = self.current_model.clip_norm.to(self.gpu0)
-            
-        # Split blocks between GPUs
-        for i in range(self.split_point):
-            self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu0)
-        for i in range(self.split_point, num_blocks):
-            self.current_model.blocks[i] = self.current_model.blocks[i].to(self.gpu1)
-            
-        # Move output head to GPU1 (unpatchify is a method, not a module)
-        self.current_model.head = self.current_model.head.to(self.gpu1)
-        
-        # Move ref_conv if present (for Fun-Control models)
-        if hasattr(self.current_model, 'ref_conv') and self.current_model.ref_conv is not None:
-            self.current_model.ref_conv = self.current_model.ref_conv.to(self.gpu1)
-        
-        # Store references for easier access
-        self.blocks_gpu0 = self.current_model.blocks[:self.split_point]
-        self.blocks_gpu1 = self.current_model.blocks[self.split_point:]
-        
-        # Clear cache on both GPUs
-        torch.cuda.empty_cache()
-        
-    def get_model(self, model_type: str) -> WanModel:
-        """Load the requested model and split it across GPUs."""
-        # Check if we need to switch models
-        if self.current_model_type == model_type:
-            return self.current_model
-            
-        # Unload current model if exists (with proper dual GPU cleanup)
-        if self.current_model is not None:
-            logger.info(f"Unloading {self.current_model_type} noise model from dual GPUs...")
-            
-            # Get memory usage before unloading
-            if torch.cuda.is_available():
-                memory_before_gpu0 = torch.cuda.memory_allocated(self.gpu0) / 1024**3
-                memory_before_gpu1 = torch.cuda.memory_allocated(self.gpu1) / 1024**3
-                logger.info(f"GPU0 memory before unload: {memory_before_gpu0:.2f} GB")
-                logger.info(f"GPU1 memory before unload: {memory_before_gpu1:.2f} GB")
-            
-            # Use our custom cleanup that handles both GPUs
-            self.cleanup()
-            
-            # Log memory after cleanup
-            if torch.cuda.is_available():
-                memory_after_gpu0 = torch.cuda.memory_allocated(self.gpu0) / 1024**3
-                memory_after_gpu1 = torch.cuda.memory_allocated(self.gpu1) / 1024**3
-                logger.info(f"GPU0 memory after unload: {memory_after_gpu0:.2f} GB (freed: {memory_before_gpu0 - memory_after_gpu0:.2f} GB)")
-                logger.info(f"GPU1 memory after unload: {memory_after_gpu1:.2f} GB (freed: {memory_before_gpu1 - memory_after_gpu1:.2f} GB)")
-            
-        # Now load the new model using parent's loading logic (but not its unloading)
-        logger.info(f"Loading {model_type} noise model...")
-        loading_device = "cpu"
-        if self.args.blocks_to_swap == 0 and self.lora_weights_list_low is None and not self.args.fp8_scaled:
-            loading_device = self.device
-            
-        loading_weight_dtype = self.dit_weight_dtype
-        if self.args.mixed_dtype:
-            loading_weight_dtype = None
-        elif self.args.fp8_scaled or self.args.lora_weight is not None:
-            loading_weight_dtype = self.dit_dtype
-            
-        # Select appropriate LoRA weights
-        lora_weights_list = None
-        lora_multipliers = None
-        if model_type == 'low':
-            lora_weights_list = self.lora_weights_list_low
-            lora_multipliers = self.lora_multipliers_low
-        else:  # 'high'
-            lora_weights_list = self.lora_weights_list_high
-            lora_multipliers = self.lora_multipliers_high
-            
-        # Load model with LoRA weights if available
-        model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type], 
-            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
-        )
-        
-        # Optimize model
-        optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
-        
-        self.current_model = model
-        self.current_model_type = model_type
-        
-        # Split the loaded model across GPUs
-        self._split_model_blocks()
-        
-        return model
-        
-    def pipeline_forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, fun_ref=None):
-        """
-        Custom forward pass that handles pipeline parallelism.
-        This replaces the standard model.forward() call when using dual GPUs.
-        """
-        model = self.current_model
-        
-        # Handle list input format (x is a list of tensors for WAN model)
-        if isinstance(x, list):
-            x = [tensor.to(self.gpu0) for tensor in x]
-        else:
-            x = x.to(self.gpu0)
-        
-        # === Stage 1: Embeddings and preprocessing on GPU0 ===
-        with torch.cuda.stream(self.stream_gpu0):
-            # Move other inputs to GPU0
-            t = t.to(self.gpu0)
-            if isinstance(context, list):
-                context = [c.to(self.gpu0) for c in context]
-            else:
-                context = context.to(self.gpu0)
-            if clip_fea is not None:
-                clip_fea = clip_fea.to(self.gpu0)
-            if y is not None:
-                if isinstance(y, list):
-                    y = [tensor.to(self.gpu0) for tensor in y]
-                else:
-                    y = y.to(self.gpu0)
-            if fun_ref is not None:
-                fun_ref = fun_ref.to(self.gpu0)
-                
-            # Patch embedding
-            if model.model_type == 'i2v':
-                assert y is not None
-                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-            
-            x = [model.patch_embedding(u.unsqueeze(0)) for u in x]
-            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-            x = [u.flatten(2).transpose(1, 2) for u in x]
-            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-            
-            # Padding to seq_len
-            x = torch.cat([
-                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
-                for u in x
-            ])
-            
-            # Time embeddings - match the original model's processing
-            with torch.amp.autocast('cuda', dtype=torch.float32):
-                from wan.modules.model import sinusoidal_embedding_1d
-                e = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t).float())
-                e0 = model.time_projection(e).unflatten(1, (6, model.dim))
-            
-            # Text embeddings
-            context = model.text_embedding(
-                torch.stack([
-                    torch.cat([u, u.new_zeros(model.text_len - u.size(0), u.size(1))])
-                    for u in context
-                ]))
-            
-            # Process CLIP features if present
-            if clip_fea is not None:
-                clip_fea = model.clip_projection(clip_fea).view(-1, seq_len, model.dim)
-                clip_fea = model.clip_norm(clip_fea)
-                x = x + clip_fea
-                
-            # Setup kwargs for blocks
-            kwargs = dict(
-                e=e0, 
-                seq_lens=seq_lens.to(self.gpu0), 
-                grid_sizes=grid_sizes.to(self.gpu0), 
-                freqs=model.freqs.to(self.gpu0), 
-                context=context, 
-                context_lens=None
-            )
-            
-            # Process through first half of blocks on GPU0
-            for block_idx, block in enumerate(self.blocks_gpu0):
-                is_block_skipped = skip_block_indices is not None and block_idx in skip_block_indices
-                if not is_block_skipped:
-                    x = block(x, **kwargs)
-        
-        # === Transfer to GPU1 ===
-        torch.cuda.synchronize(self.gpu0)  # Ensure GPU0 work is complete
-        
-        with torch.cuda.stream(self.stream_gpu1):
-            # Move intermediate tensors to GPU1
-            x = x.to(self.gpu1)
-            e = e.to(self.gpu1)
-            e0 = e0.to(self.gpu1)
-            context = context.to(self.gpu1)
-            seq_lens = seq_lens.to(self.gpu1)
-            grid_sizes = grid_sizes.to(self.gpu1)
-            
-            # Update kwargs for GPU1
-            kwargs['e'] = e0
-            kwargs['seq_lens'] = seq_lens
-            kwargs['grid_sizes'] = grid_sizes
-            kwargs['freqs'] = model.freqs.to(self.gpu1)
-            kwargs['context'] = context
-            
-            # Process through second half of blocks on GPU1
-            for block_idx, block in enumerate(self.blocks_gpu1):
-                actual_idx = self.split_point + block_idx
-                is_block_skipped = skip_block_indices is not None and actual_idx in skip_block_indices
-                if not is_block_skipped:
-                    x = block(x, **kwargs)
-            
-            # Apply ref_conv if present (Fun-Control)
-            if model.ref_conv is not None and fun_ref is not None:
-                fun_ref = fun_ref.to(self.gpu1)
-                ref_emb = model.ref_conv(fun_ref.to(model.ref_conv.weight.dtype))
-                ref_emb = ref_emb.reshape(x.shape[0], x.shape[1], -1)
-                x = x + ref_emb
-            
-            # Final head processing
-            x = model.head(x, e)
-            
-            # Unpatchify
-            x = model.unpatchify(x, grid_sizes)
-        
-        # Synchronize before returning
-        torch.cuda.synchronize(self.gpu1)
-        
-        return [u.float() for u in x]
-        
-    def cleanup(self):
-        """Clean up models on both GPUs."""
-        if self.current_model is not None:
-            logger.info(f"Cleaning up pipeline model from both GPUs...")
-            
-            # Move all model components to CPU before deletion
-            # Move embeddings from GPU0 to CPU
-            if hasattr(self.current_model, 'patch_embedding'):
-                self.current_model.patch_embedding = self.current_model.patch_embedding.cpu()
-            if hasattr(self.current_model, 'time_embedding'):
-                self.current_model.time_embedding = self.current_model.time_embedding.cpu()
-            if hasattr(self.current_model, 'time_projection'):
-                self.current_model.time_projection = self.current_model.time_projection.cpu()
-            if hasattr(self.current_model, 'text_embedding'):
-                self.current_model.text_embedding = self.current_model.text_embedding.cpu()
-            if hasattr(self.current_model, 'clip_projection'):
-                self.current_model.clip_projection = self.current_model.clip_projection.cpu()
-            if hasattr(self.current_model, 'clip_norm'):
-                self.current_model.clip_norm = self.current_model.clip_norm.cpu()
-                
-            # Move blocks from both GPUs to CPU
-            if self.blocks_gpu0 is not None:
-                for i, block in enumerate(self.blocks_gpu0):
-                    self.current_model.blocks[i] = self.current_model.blocks[i].cpu()
-                    
-            if self.blocks_gpu1 is not None:
-                for i, block in enumerate(self.blocks_gpu1):
-                    idx = self.split_point + i
-                    self.current_model.blocks[idx] = self.current_model.blocks[idx].cpu()
-                    
-            # Move head from GPU1 to CPU
-            if hasattr(self.current_model, 'head'):
-                self.current_model.head = self.current_model.head.cpu()
-            if hasattr(self.current_model, 'ref_conv') and self.current_model.ref_conv is not None:
-                self.current_model.ref_conv = self.current_model.ref_conv.cpu()
-                
-            # Clear references
-            self.blocks_gpu0 = None
-            self.blocks_gpu1 = None
-            
-            # Clear cache on both GPUs
-            with torch.cuda.device(self.gpu0):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize(self.gpu0)
-            with torch.cuda.device(self.gpu1):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize(self.gpu1)
-                
-            # Delete the model and reset state
-            del self.current_model
-            self.current_model = None
-            self.current_model_type = None
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            # Final cache clear
-            with torch.cuda.device(self.gpu0):
-                torch.cuda.empty_cache()
-            with torch.cuda.device(self.gpu1):
-                torch.cuda.empty_cache()
-
-class SequenceParallelModelManager(DynamicModelManager):
-    """Extended model manager that supports sequence parallelism across multiple GPUs using distributed PyTorch."""
-    
-    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
-        super().__init__(config, device, dit_dtype, dit_weight_dtype, args)
-        
-        # Initialize distributed group if not already done
-        if not dist.is_initialized():
-            init_distributed_group()
-            
-        self.world_size = get_world_size()
-        self.rank = get_rank()
-        
-        # Set device based on rank
-        self.device = torch.device(f"cuda:{self.rank}")
-        
-        # Enable debugging if requested
-        self.debug = getattr(args, 'debug_sequence_parallel', False)
-        
-        logger.info(f"Sequence parallelism enabled: rank={self.rank}, world_size={self.world_size}, device={self.device}")
-        
-    def _apply_sequence_parallel(self, model):
-        """Apply sequence parallel modifications to the model."""
-        # Replace attention forward methods with sequence parallel version
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(sp_attn_forward, block.self_attn)
-        
-        # Replace model forward with sequence parallel version
-        model.forward = types.MethodType(sp_dit_forward, model)
-        
-        logger.info(f"Applied sequence parallelism to model on rank {self.rank}")
-        
-        if self.debug:
-            # Add hooks to monitor tensor values
-            self._add_debug_hooks(model)
-        
-    def get_model(self, model_type: str) -> WanModel:
-        """Load the requested model and apply sequence parallelism."""
-        # Check if we need to switch models
-        if self.current_model_type == model_type:
-            return self.current_model
-            
-        # Unload current model if exists
-        if self.current_model is not None:
-            logger.info(f"Rank {self.rank}: Unloading {self.current_model_type} noise model...")
-            
-            # Get memory usage before unloading
-            if torch.cuda.is_available():
-                memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
-                logger.info(f"Rank {self.rank}: Memory before unload: {memory_before:.2f} GB")
-            
-            # Use parent's cleanup
-            self.cleanup()
-            
-            # Log memory after cleanup
-            if torch.cuda.is_available():
-                memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
-                logger.info(f"Rank {self.rank}: Memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
-            
-        # Now load the new model using parent's loading logic
-        logger.info(f"Rank {self.rank}: Loading {model_type} noise model...")
-        loading_device = "cpu"
-        if self.args.blocks_to_swap == 0 and self.lora_weights_list_low is None and not self.args.fp8_scaled:
-            loading_device = self.device
-            
-        loading_weight_dtype = self.dit_weight_dtype
-        if self.args.mixed_dtype:
-            loading_weight_dtype = None
-        elif self.args.fp8_scaled or self.args.lora_weight is not None:
-            loading_weight_dtype = self.dit_dtype
-            
-        # Select appropriate LoRA weights
-        lora_weights_list = None
-        lora_multipliers = None
-        if model_type == 'low':
-            lora_weights_list = self.lora_weights_list_low
-            lora_multipliers = self.lora_multipliers_low
-        else:  # 'high'
-            lora_weights_list = self.lora_weights_list_high
-            lora_multipliers = self.lora_multipliers_high
-            
-        # Load model with LoRA weights if available
-        model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type], 
-            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
-        )
-        
-        # Optimize model
-        optimize_model(model, self.args, self.device, self.dit_dtype, self.dit_weight_dtype)
-        
-        # Apply sequence parallelism
-        self._apply_sequence_parallel(model)
-        
-        # Move model to correct device
-        model = model.to(self.device)
-        
-        self.current_model = model
-        self.current_model_type = model_type
-        
-        # Synchronize across all ranks
-        if dist.is_initialized():
-            dist.barrier()
-        
-        return model
-    
-    def cleanup(self):
-        """Clean up resources with distributed synchronization."""
-        if dist.is_initialized():
-            dist.barrier()  # Ensure all ranks cleanup together
-        super().cleanup()
-    
-    def _add_debug_hooks(self, model):
-        """Add debug hooks to monitor tensor values during forward pass."""
-        def check_tensor(name, tensor):
-            if tensor is None:
-                return
-            if torch.isnan(tensor).any():
-                logger.error(f"Rank {self.rank}: {name} contains NaN values!")
-            if torch.isinf(tensor).any():
-                logger.error(f"Rank {self.rank}: {name} contains Inf values!")
-            logger.debug(f"Rank {self.rank}: {name} - shape={tensor.shape}, min={tensor.min():.4f}, max={tensor.max():.4f}, mean={tensor.mean():.4f}")
-        
-        def forward_hook(module, input, output, name):
-            if isinstance(output, tuple):
-                for i, out in enumerate(output):
-                    if isinstance(out, torch.Tensor):
-                        check_tensor(f"{name}_output_{i}", out)
-            elif isinstance(output, torch.Tensor):
-                check_tensor(f"{name}_output", output)
-        
-        # Add hooks to key modules
-        model.patch_embedding.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "patch_embedding"))
-        model.time_embedding.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "time_embedding"))
-        model.head.register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "head"))
-        
-        # Add hooks to first and last transformer blocks
-        if len(model.blocks) > 0:
-            model.blocks[0].register_forward_hook(lambda m, i, o: forward_hook(m, i, o, "block_0"))
-            model.blocks[-1].register_forward_hook(lambda m, i, o: forward_hook(m, i, o, f"block_{len(model.blocks)-1}"))
-        
-        logger.info(f"Rank {self.rank}: Debug hooks added to model")
 
 def create_funcontrol_conditioning_latent(
     args: argparse.Namespace,
@@ -3560,7 +3071,6 @@ def run_sampling(
                 logger.debug(f"Calling model with x_input_list length: {len(x_input_list) if isinstance(x_input_list, list) else 'not list'}")
                 if isinstance(x_input_list, list) and len(x_input_list) > 0:
                     logger.debug(f"  First tensor shape: {x_input_list[0].shape}")
-                # Direct forward call (sequence parallel modifies the model's forward method)
                 result = model_to_use(x_input_list, t=ts, context=context, seq_len=seq_len, **model_cond_dict)
                 # Return just the tensor for WAN models (not wrapped in list)
                 # The context handler expects a single tensor for single condition
@@ -3606,7 +3116,6 @@ def run_sampling(
                     logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
             else:
                 # Standard model call without context windows
-                # Direct forward call (sequence parallel modifies the model's forward method)
                 noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
@@ -4130,8 +3639,6 @@ def run_extension_sampling(
             model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
             
             # Three-way CFG (multitalk-style)
-            # Use pipeline forward if available
-            # Direct forward calls (sequence parallel modifies the model's forward method)
             # 1. Full conditional (text + CLIP)
             noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             # 2. Text-dropped (CLIP only)
@@ -4409,18 +3916,7 @@ def generate_extended_video(
     is_dual_dit = isinstance(model_result, tuple)
     if is_dual_dit:
         model_low_path, model_high_path, *lora_weights = model_result
-        # Use SequenceParallelModelManager if sequence parallel is enabled
-        if args.use_sequence_parallel or args.use_dual_gpu:
-            if args.use_dual_gpu:
-                logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
-            if not dist.is_initialized() and torch.cuda.device_count() < 2:
-                logger.warning(f"Sequence parallelism requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
-                model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
-            else:
-                logger.info(f"Using Sequence Parallel Model Manager for extension")
-                model_manager = SequenceParallelModelManager(cfg, device, torch.float16, torch.float16, args)
-        else:
-            model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
+        model_manager = DynamicModelManager(cfg, device, torch.float16, torch.float16, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         if len(lora_weights) >= 4:
             model_manager.set_lora_weights(*lora_weights)
@@ -5255,18 +4751,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             lora_weights_list_low = lora_multipliers_low = None
             lora_weights_list_high = lora_multipliers_high = None
             
-        # Use SequenceParallelModelManager if sequence parallel is enabled
-        if args.use_sequence_parallel or args.use_dual_gpu:
-            if args.use_dual_gpu:
-                logger.warning("--use_dual_gpu is deprecated. Using --use_sequence_parallel instead.")
-            if not dist.is_initialized() and torch.cuda.device_count() < 2:
-                logger.warning(f"Sequence parallelism requested but only {torch.cuda.device_count()} GPU(s) available. Falling back to single GPU.")
-                model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
-            else:
-                logger.info(f"Using Sequence Parallel Model Manager")
-                model_manager = SequenceParallelModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
-        else:
-            model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+        model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_low_path, model_high_path)
         
         # Set LoRA weights if available
@@ -5736,29 +5221,12 @@ def save_output(
 def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
-    
-    # Handle distributed setup if using sequence parallelism
-    if args.use_sequence_parallel:
-        # Get local rank - args.local_rank is set by the parser (converts --local-rank to local_rank)
-        local_rank = args.local_rank
-        
-        # Set CUDA device based on local rank
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-            
-        # Initialize distributed environment (handled by SequenceParallelModelManager)
-        logger.info(f"Sequence parallel mode detected, local_rank={local_rank}")
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
 
     # Set device
-    if args.use_sequence_parallel:
-        # For sequence parallel, use the rank-specific device
-        local_rank = args.local_rank
-        device_str = f"cuda:{local_rank}"
-    else:
-        device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     args.device = torch.device(device_str) # Store device back in args
     logger.info(f"Using device: {args.device}")
 
@@ -5846,16 +5314,16 @@ def main():
                 noise_multipliers = parse_noise_multipliers(args.cond_noise_multipliers)
                 video_frames = process_conditioning_video(args.cond_video, width, height)
                 
-                # Automatically use first frame as input image if no input image provided
+                # Automatically use last frame as input image if no input image provided
                 if not args.image_path and len(video_frames) > 0:
                     import tempfile
                     import os
-                    # Save first frame as temporary input image
+                    # Save last frame as temporary input image
                     temp_dir = tempfile.mkdtemp()
                     temp_image_path = os.path.join(temp_dir, "pusa_input_frame.png")
-                    video_frames[0].save(temp_image_path)
+                    video_frames[-1].save(temp_image_path)
                     args.image_path = temp_image_path
-                    logger.info(f"Auto-extracted first frame as input image: {temp_image_path}")
+                    logger.info(f"Auto-extracted last frame as input image: {temp_image_path}")
                 
                 # Select specific frames based on positions
                 conditioning_images = []
