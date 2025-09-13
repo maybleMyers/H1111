@@ -3344,16 +3344,19 @@ def run_sampling(
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
             
             # 6. Apply Pusa multi-frame conditioning (inject conditioning frames)
-            if (hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and 
+            if (hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and
                 hasattr(args, 'pusa_frame_noise_mapping')):
                 logger.debug(f"Step {i}: Applying Pusa frame conditioning")
-                
+
                 # Get current timestep value for noise calculation
                 current_t = t.item() if hasattr(t, 'item') else t
                 sigma_ratio = current_t / 1000.0  # Convert timestep to sigma ratio
-                
+
+                # Use remapped positions for V2V extension mode
+                conditioning_dict = args._pusa_remapped_dict if hasattr(args, '_pusa_remapped_dict') else args.pusa_conditioning_dict
+
                 # Apply conditioning to specific frames
-                for frame_idx, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
+                for frame_idx, (cond_image, noise_mult) in conditioning_dict.items():
                     if frame_idx < latent.shape[2]:  # Ensure frame index is valid
                         # Convert conditioning image to latent space if needed
                         if not hasattr(args, '_pusa_cond_latents_cache'):
@@ -4819,12 +4822,31 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # This must happen BEFORE the sampling loop to inject conditioning frames into the initial latent
     if hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and vae is not None:
         logger.info("Encoding Pusa conditioning images to latent space...")
-        
+
         # Ensure VAE is on the correct device
         vae.to_device(device)
-        
-        # Process each conditioning image
-        for frame_idx, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
+
+        # For Pusa V2V extension: remap conditioning positions for proper transition
+        # Input frames 19-20 should condition output frames 0-1, not 19-20
+        remapped_dict = {}
+        if hasattr(args, 'cond_video') and args.cond_video:
+            # This is V2V extension mode - remap positions for transition
+            logger.info("Pusa V2V Extension Mode: Remapping conditioning positions for transition")
+            position_list = sorted(args.pusa_conditioning_dict.keys())
+            for idx, (orig_pos, (cond_image, noise_mult)) in enumerate(args.pusa_conditioning_dict.items()):
+                # Map last frames of input to first frames of output for smooth transition
+                new_pos = idx  # 0, 1, 2... for transition frames
+                remapped_dict[new_pos] = (cond_image, noise_mult)
+                logger.info(f"Remapped conditioning: input frame {orig_pos} -> output frame {new_pos}")
+        else:
+            # Standard Pusa mode - keep original positions
+            remapped_dict = args.pusa_conditioning_dict
+
+        # Save remapped dict for use in sampling loop
+        args._pusa_remapped_dict = remapped_dict
+
+        # Process each conditioning image with remapped positions
+        for frame_idx, (cond_image, noise_mult) in remapped_dict.items():
             # Determine the frame dimension based on tensor shape
             if latent.dim() == 5:  # [B, C, F, H, W]
                 num_frames = latent.shape[2]
@@ -4833,7 +4855,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             else:
                 logger.warning(f"Unexpected latent dimensions: {latent.shape}")
                 continue
-                
+
             if frame_idx < num_frames:  # Check frame index is valid
                 logger.debug(f"Encoding conditioning image for frame {frame_idx} (total frames: {num_frames})")
                 
