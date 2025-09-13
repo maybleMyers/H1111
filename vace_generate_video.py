@@ -1939,32 +1939,23 @@ def vace_encode_frames(frames: torch.Tensor, ref_images: Optional[torch.Tensor],
 
             # Encode both parts
             with torch.no_grad():
-                # VAE encode returns (latent_dist, ...) tuple, get first element
-                inactive_encoded = vae.encode(inactive)
-                if isinstance(inactive_encoded, tuple):
-                    inactive_encoded = inactive_encoded[0]
-                inactive_latent = inactive_encoded.mode() if hasattr(inactive_encoded, 'mode') else inactive_encoded
-
-                reactive_encoded = vae.encode(reactive)
-                if isinstance(reactive_encoded, tuple):
-                    reactive_encoded = reactive_encoded[0]
-                reactive_latent = reactive_encoded.mode() if hasattr(reactive_encoded, 'mode') else reactive_encoded
+                # WanVAE expects a list of tensors and returns a list
+                # Pass as single-item list and get first result
+                inactive_encoded = vae.encode([inactive.squeeze(0)])[0]
+                reactive_encoded = vae.encode([reactive.squeeze(0)])[0]
 
             # Combine latents based on mask
-            latent = inactive_latent + reactive_latent
+            latent = inactive_encoded + reactive_encoded
         else:
             # Encode without mask
             with torch.no_grad():
-                # VAE encode returns (latent_dist, ...) tuple, get first element
-                encoded = vae.encode(frame)
-                if isinstance(encoded, tuple):
-                    encoded = encoded[0]
-                latent = encoded.mode() if hasattr(encoded, 'mode') else encoded
+                # WanVAE expects a list of tensors and returns a list
+                # Pass as single-item list and get first result
+                encoded = vae.encode([frame.squeeze(0)])[0]
+                latent = encoded
 
-        # Ensure latent is a tensor before squeezing
-        if isinstance(latent, tuple):
-            latent = latent[0]
-        latents.append(latent.squeeze(0) if latent.dim() > 3 else latent)  # Remove batch dim if present
+        # The result should be a tensor [C, T, H, W]
+        latents.append(latent)
 
     return latents
 
