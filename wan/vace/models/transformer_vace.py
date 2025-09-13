@@ -69,7 +69,14 @@ class BaseWanAttentionBlock(WanAttentionBlock):
         self.block_id = block_id
 
     def forward(self, x, hints, context_scale=1.0, **kwargs):
-        x = super().forward(x, **kwargs)
+        # Filter out kwargs that the parent class doesn't accept
+        # WanAttentionBlock.forward expects: x, e, seq_lens, grid_sizes, freqs, context, context_lens, t
+        parent_kwargs = {}
+        for key in ['e', 'seq_lens', 'grid_sizes', 'freqs', 'context', 'context_lens', 't']:
+            if key in kwargs:
+                parent_kwargs[key] = kwargs[key]
+
+        x = super().forward(x, **parent_kwargs)
         if self.block_id is not None:
             x = x + hints[self.block_id] * context_scale
         return x
