@@ -1939,17 +1939,32 @@ def vace_encode_frames(frames: torch.Tensor, ref_images: Optional[torch.Tensor],
 
             # Encode both parts
             with torch.no_grad():
-                inactive_latent = vae.encode(inactive)[0].mode() if hasattr(vae.encode(inactive)[0], 'mode') else vae.encode(inactive)[0]
-                reactive_latent = vae.encode(reactive)[0].mode() if hasattr(vae.encode(reactive)[0], 'mode') else vae.encode(reactive)[0]
+                # VAE encode returns (latent_dist, ...) tuple, get first element
+                inactive_encoded = vae.encode(inactive)
+                if isinstance(inactive_encoded, tuple):
+                    inactive_encoded = inactive_encoded[0]
+                inactive_latent = inactive_encoded.mode() if hasattr(inactive_encoded, 'mode') else inactive_encoded
+
+                reactive_encoded = vae.encode(reactive)
+                if isinstance(reactive_encoded, tuple):
+                    reactive_encoded = reactive_encoded[0]
+                reactive_latent = reactive_encoded.mode() if hasattr(reactive_encoded, 'mode') else reactive_encoded
 
             # Combine latents based on mask
             latent = inactive_latent + reactive_latent
         else:
             # Encode without mask
             with torch.no_grad():
-                latent = vae.encode(frame)[0].mode() if hasattr(vae.encode(frame)[0], 'mode') else vae.encode(frame)[0]
+                # VAE encode returns (latent_dist, ...) tuple, get first element
+                encoded = vae.encode(frame)
+                if isinstance(encoded, tuple):
+                    encoded = encoded[0]
+                latent = encoded.mode() if hasattr(encoded, 'mode') else encoded
 
-        latents.append(latent.squeeze(0))  # Remove batch dim for list
+        # Ensure latent is a tensor before squeezing
+        if isinstance(latent, tuple):
+            latent = latent[0]
+        latents.append(latent.squeeze(0) if latent.dim() > 3 else latent)  # Remove batch dim if present
 
     return latents
 
