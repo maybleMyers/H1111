@@ -2986,38 +2986,6 @@ def run_sampling(
             # Standard timestep for T2V, I2V, V2V
             timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
 
-        # Apply Pusa timestep modification for conditioned frames
-        if (hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and
-            hasattr(args, '_pusa_remapped_dict')):
-            # Get conditioning positions and noise multipliers
-            conditioning_dict = args._pusa_remapped_dict if hasattr(args, '_pusa_remapped_dict') else args.pusa_conditioning_dict
-
-            # Determine number of frames
-            if len(latent.shape) == 5:  # [B, C, F, H, W]
-                num_frames = latent.shape[2]
-            elif len(latent.shape) == 4:  # [C, F, H, W]
-                num_frames = latent.shape[1]
-            else:
-                num_frames = 21  # Default for 81-frame video
-
-            # Create per-frame timestep tensor
-            frame_timesteps = timestep.repeat(1, num_frames) if timestep.dim() == 1 else timestep.clone()
-            if frame_timesteps.dim() == 1:
-                frame_timesteps = frame_timesteps.unsqueeze(0).repeat(1, num_frames)
-
-            # Modify timesteps for conditioned frames
-            for frame_idx, (_, noise_mult) in conditioning_dict.items():
-                if frame_idx < num_frames:
-                    # Set timestep to 0 for clean frames (noise_mult < 0.1)
-                    # Or multiply by noise_mult for noisy conditioning
-                    if noise_mult < 0.1:
-                        frame_timesteps[:, frame_idx] = 0
-                    else:
-                        frame_timesteps[:, frame_idx] = frame_timesteps[:, frame_idx] * noise_mult
-
-            # Use the per-frame timesteps
-            timestep = frame_timesteps.to(dtype=torch.float32, device=device)
-
         with accelerator.autocast(), torch.no_grad():
             # --- Select appropriate model for dual-dit architectures ---
             if model_manager is not None:  # Always true for dual-dit models now
@@ -3324,14 +3292,18 @@ def run_sampling(
             }
             
             # Add V2V conditioning if using Pusa V2V scheduler
-            if (hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and 
-                hasattr(args, 'pusa_cond_positions') and hasattr(args, 'pusa_frame_noise_mapping')):
+            if (hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and
+                hasattr(args, '_pusa_remapped_dict')):
+                # Use REMAPPED positions for V2V extension (0,1,2 instead of 17,18,19)
+                remapped_positions = list(args._pusa_remapped_dict.keys())
+                remapped_noise_mapping = {idx: noise_mult for idx, (_, noise_mult) in args._pusa_remapped_dict.items()}
+
                 scheduler_kwargs.update({
-                    "cond_frame_latent_indices": args.pusa_cond_positions,
-                    "noise_multipliers": args.pusa_frame_noise_mapping
+                    "cond_frame_latent_indices": remapped_positions,
+                    "noise_multipliers": remapped_noise_mapping
                 })
-                logger.debug(f"Step {i}: Applying V2V conditioning to positions {args.pusa_cond_positions}")
-                
+                logger.debug(f"Step {i}: Applying V2V conditioning to remapped positions {remapped_positions}")
+
                 # Create 2D timestep tensor for V2V scheduler (expects shape [B, F])
                 # Convert scalar timestep to frame-aware tensor
                 num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
@@ -3341,11 +3313,11 @@ def run_sampling(
                 else:
                     t_tensor = t.to(device)
                 timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
-                
-                # Apply frame-specific timestep modifications for conditioning frames
-                for frame_idx in args.pusa_cond_positions:
+
+                # Apply frame-specific timestep modifications for REMAPPED conditioning frames
+                for frame_idx in remapped_positions:
                     if frame_idx < num_frames:
-                        noise_mult = args.pusa_frame_noise_mapping.get(frame_idx, 1.0)
+                        noise_mult = remapped_noise_mapping.get(frame_idx, 1.0)
                         timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
                 
                 # Use 2D timestep for V2V scheduler
