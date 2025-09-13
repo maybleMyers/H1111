@@ -1799,28 +1799,44 @@ def process_vace_subject_references(args: argparse.Namespace, sample_size: Tuple
     """Process subject reference images for VACE S2V generation."""
     if not VACE_AVAILABLE or not args.subject_ref_images:
         return None
-    
+
     try:
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
         subject_ref_images = []
         for ref_path in args.subject_ref_images:
             if not os.path.exists(ref_path):
                 logger.warning(f"Subject reference image not found: {ref_path}")
                 continue
-                
+
             # Load and process reference image
-            ref_latent = get_image_latent(
-                ref_path, 
-                sample_size=sample_size, 
-                padding=args.padding_in_subject_ref_images
-            )
-            subject_ref_images.append(ref_latent)
-        
+            img = Image.open(ref_path).convert("RGB")
+
+            # Resize to sample size if needed
+            if args.padding_in_subject_ref_images:
+                # Add padding to maintain aspect ratio
+                img.thumbnail(sample_size, Image.Resampling.LANCZOS)
+                # Create new image with padding
+                padded = Image.new('RGB', sample_size, (0, 0, 0))
+                padded.paste(img, ((sample_size[0] - img.width) // 2,
+                                  (sample_size[1] - img.height) // 2))
+                img = padded
+            else:
+                img = img.resize(sample_size, Image.Resampling.LANCZOS)
+
+            # Convert to tensor and normalize
+            img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+            subject_ref_images.append(img_tensor)
+
         if subject_ref_images:
-            return torch.cat(subject_ref_images, dim=2)
+            # Stack along frame dimension
+            return torch.cat(subject_ref_images, dim=0)  # [N, C, H, W]
         else:
             logger.warning("No valid subject reference images found")
             return None
-            
+
     except Exception as e:
         logger.error(f"Error processing subject reference images: {e}")
         return None
@@ -1829,16 +1845,55 @@ def process_vace_control_video(args: argparse.Namespace, video_length: int, samp
     """Process control video for VACE V2V generation."""
     if not VACE_AVAILABLE or not args.control_video:
         return None
-        
+
     try:
-        control_video, _, _, _ = get_video_to_video_latent(
-            args.control_video, 
-            video_length=video_length, 
-            sample_size=sample_size, 
-            fps=16, 
-            ref_image=None
-        )
-        return control_video
+        import cv2
+        import torchvision.transforms.functional as TF
+        from PIL import Image
+
+        # Load video
+        cap = cv2.VideoCapture(args.control_video)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Calculate frames to extract
+        if frame_count > video_length:
+            # Sample frames evenly
+            indices = np.linspace(0, frame_count - 1, video_length, dtype=int)
+        else:
+            # Use all frames and repeat if needed
+            indices = list(range(frame_count))
+            while len(indices) < video_length:
+                indices.extend(list(range(frame_count)))
+            indices = indices[:video_length]
+
+        frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert BGR to RGB
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert to PIL Image
+                pil_frame = Image.fromarray(frame)
+                # Resize to target size
+                pil_frame = pil_frame.resize(sample_size, Image.Resampling.LANCZOS)
+                # Convert to tensor and normalize
+                frame_tensor = TF.to_tensor(pil_frame).sub_(0.5).div_(0.5)
+                frames.append(frame_tensor)
+
+        cap.release()
+
+        if frames:
+            # Stack frames [F, C, H, W]
+            control_video = torch.stack(frames, dim=0)
+            # Add batch dimension [1, C, F, H, W]
+            control_video = control_video.permute(1, 0, 2, 3).unsqueeze(0)
+            return control_video
+        else:
+            logger.warning("No frames extracted from control video")
+            return None
+
     except Exception as e:
         logger.error(f"Error processing control video: {e}")
         return None

@@ -106,6 +106,10 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         self.sp_world_size = 1
         self.sp_world_rank = 0
 
+        # Initialize teacache (for acceleration, can be enabled later)
+        self.teacache = None
+        self.gradient_checkpointing = False
+
         assert 0 in self.vace_layers
         self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
 
