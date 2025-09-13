@@ -1843,11 +1843,192 @@ def process_vace_control_video(args: argparse.Namespace, video_length: int, samp
         logger.error(f"Error processing control video: {e}")
         return None
 
+def vace_encode_frames(frames: torch.Tensor, ref_images: Optional[torch.Tensor],
+                       masks: Optional[torch.Tensor], vae, device, dtype) -> List[torch.Tensor]:
+    """Encode frames for VACE context creation.
+
+    Args:
+        frames: Control video frames tensor
+        ref_images: Subject reference images tensor (optional)
+        masks: Mask tensor (optional)
+        vae: VAE model for encoding
+        device: Device to use
+        dtype: Data type for tensors
+
+    Returns:
+        List of encoded latents
+    """
+    if frames is None:
+        return []
+
+    # Move to device and ensure correct dtype
+    frames = frames.to(device=device, dtype=dtype)
+
+    if ref_images is None:
+        ref_images = [None] * len(frames) if frames.dim() == 5 else [None]
+
+    # Handle batch dimension
+    if frames.dim() == 4:  # Single frame [C, F, H, W]
+        frames = frames.unsqueeze(0)  # Add batch dim
+
+    latents = []
+    for i in range(frames.shape[0]):
+        frame = frames[i:i+1]  # Keep batch dim
+
+        if masks is not None and i < masks.shape[0]:
+            mask = masks[i:i+1].to(device=device, dtype=dtype)
+            # Apply mask to frames
+            mask_binary = torch.where(mask > 0.5, 1.0, 0.0).to(dtype)
+            inactive = frame * (1 - mask_binary)
+            reactive = frame * mask_binary
+
+            # Encode both parts
+            with torch.no_grad():
+                inactive_latent = vae.encode(inactive)[0].mode() if hasattr(vae.encode(inactive)[0], 'mode') else vae.encode(inactive)[0]
+                reactive_latent = vae.encode(reactive)[0].mode() if hasattr(vae.encode(reactive)[0], 'mode') else vae.encode(reactive)[0]
+
+            # Combine latents based on mask
+            latent = inactive_latent + reactive_latent
+        else:
+            # Encode without mask
+            with torch.no_grad():
+                latent = vae.encode(frame)[0].mode() if hasattr(vae.encode(frame)[0], 'mode') else vae.encode(frame)[0]
+
+        latents.append(latent.squeeze(0))  # Remove batch dim for list
+
+    return latents
+
+def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.Tensor],
+                     vae_stride: List[int] = [4, 8, 8], device=None, dtype=None) -> List[torch.Tensor]:
+    """Encode masks for VACE context creation.
+
+    Args:
+        masks: Mask tensor
+        ref_images: Subject reference images (optional)
+        vae_stride: VAE stride for spatial/temporal compression
+        device: Device to use
+        dtype: Data type
+
+    Returns:
+        List of mask latents
+    """
+    if masks is None:
+        return []
+
+    if ref_images is None:
+        ref_images = [None] * (masks.shape[0] if masks.dim() == 5 else 1)
+
+    result_masks = []
+
+    # Handle batch dimension
+    if masks.dim() == 4:  # [C, F, H, W]
+        masks = masks.unsqueeze(0)
+
+    for i in range(masks.shape[0]):
+        mask = masks[i]  # [C, F, H, W]
+
+        if mask.dim() == 3:  # Add channel dim if needed
+            mask = mask.unsqueeze(0)
+
+        c, depth, height, width = mask.shape
+
+        # Calculate new dimensions based on VAE stride
+        new_depth = int((depth + vae_stride[0] - 1) // vae_stride[0])
+        height = 2 * (int(height) // (vae_stride[1] * 2))
+        width = 2 * (int(width) // (vae_stride[2] * 2))
+
+        # Reshape mask
+        mask = mask[0, :, :, :]  # Remove channel dim
+        mask = mask.view(
+            new_depth, vae_stride[0], height // 2, 2, width // 2, 2
+        ).permute(0, 2, 4, 1, 3, 5).contiguous()
+        mask = mask.view(new_depth, height // 2, width // 2, -1)
+        mask = mask.view(new_depth * 12, height // 2, width // 2)
+
+        # Move to device if specified
+        if device is not None:
+            mask = mask.to(device)
+        if dtype is not None:
+            mask = mask.to(dtype)
+
+        result_masks.append(mask)
+
+    return result_masks
+
+def vace_latent(z: List[torch.Tensor], m: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Combine encoded frames and masks into VACE context.
+
+    Args:
+        z: List of encoded frame latents
+        m: List of mask latents
+
+    Returns:
+        List of combined VACE context tensors
+    """
+    if not z:
+        return []
+
+    # If no masks, return just the latents
+    if not m:
+        return z
+
+    # Combine latents and masks
+    vace_context = []
+    for i in range(len(z)):
+        if i < len(m):
+            # Concatenate latent and mask along channel dimension
+            combined = torch.cat([z[i], m[i]], dim=0)
+        else:
+            # No mask for this latent, use just the latent
+            combined = z[i]
+        vace_context.append(combined)
+
+    return vace_context
+
+def create_vace_context(control_video: Optional[torch.Tensor],
+                       subject_ref_images: Optional[torch.Tensor],
+                       vae, device, dtype) -> Optional[List[torch.Tensor]]:
+    """Create VACE context from control video and subject reference images.
+
+    Args:
+        control_video: Control video tensor
+        subject_ref_images: Subject reference images tensor
+        vae: VAE model for encoding
+        device: Device to use
+        dtype: Data type
+
+    Returns:
+        VACE context as list of tensors, or None if no inputs
+    """
+    if control_video is None and subject_ref_images is None:
+        return None
+
+    # Determine input video (control video takes precedence)
+    input_video = control_video if control_video is not None else subject_ref_images
+
+    # Create dummy masks if needed (all ones = no masking)
+    if input_video is not None:
+        if input_video.dim() == 4:  # [C, F, H, W]
+            masks = torch.ones(1, input_video.shape[1], input_video.shape[2], input_video.shape[3])
+        else:  # [B, C, F, H, W]
+            masks = torch.ones(input_video.shape[0], input_video.shape[2], input_video.shape[3], input_video.shape[4])
+    else:
+        masks = None
+
+    # Encode frames and masks
+    vace_latents = vace_encode_frames(input_video, subject_ref_images, masks, vae, device, dtype)
+    mask_latents = vace_encode_masks(masks, subject_ref_images, device=device, dtype=dtype)
+
+    # Combine into VACE context
+    vace_context = vace_latent(vace_latents, mask_latents)
+
+    return vace_context if vace_context else None
+
 def detect_vace_generation_mode(args: argparse.Namespace) -> str:
     """Auto-detect VACE generation mode based on inputs."""
     if args.vace_generation_mode != "auto":
         return args.vace_generation_mode
-    
+
     # Auto-detection logic
     if args.subject_ref_images:
         return "s2v"  # Subject-to-Video
@@ -2684,6 +2865,31 @@ def prepare_t2v_inputs(
          # arg_c["y"] = [y]
          # arg_null["y"] = [y]
 
+    # Handle VACE context for VACE models
+    if "vace-" in args.task.lower() and VACE_AVAILABLE:
+        # Process control video and subject ref images if provided
+        control_video = process_vace_control_video(args, args.video_length, (height, width)) if args.control_video else None
+        subject_ref_images = process_vace_subject_references(args, (height, width)) if args.subject_ref_images else None
+
+        # Create VACE context
+        if vae is not None and (control_video is not None or subject_ref_images is not None):
+            vae.to_device(device)  # Ensure VAE is on device
+            vace_context = create_vace_context(control_video, subject_ref_images, vae, device, torch.float32)
+            vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
+
+            if vace_context is not None:
+                arg_c["vace_context"] = vace_context
+                arg_c["vace_context_scale"] = args.vace_context_scale
+                arg_null["vace_context"] = vace_context
+                arg_null["vace_context_scale"] = args.vace_context_scale
+                logger.info(f"Added VACE context to model inputs (scale: {args.vace_context_scale})")
+        else:
+            # For VACE models, we still need to provide empty vace_context
+            logger.warning("VACE model detected but no control video or subject references provided. Using empty context.")
+            arg_c["vace_context"] = []
+            arg_c["vace_context_scale"] = args.vace_context_scale
+            arg_null["vace_context"] = []
+            arg_null["vace_context_scale"] = args.vace_context_scale
 
     return noise, context, context_null, (arg_c, arg_null)
 
@@ -2848,7 +3054,27 @@ def prepare_i2v_inputs(
             # Model forward expects fun_ref directly, not in a list like 'y'
             arg_c["fun_ref"] = fun_ref_latent
             arg_null["fun_ref"] = fun_ref_latent # Pass to both cond and uncond
-            logger.info("Added fun_ref latent to model inputs.")    
+            logger.info("Added fun_ref latent to model inputs.")
+
+        # Handle VACE context for VACE models
+        if "vace-" in args.task.lower() and VACE_AVAILABLE:
+            control_video = process_vace_control_video(args, frames, (height, width)) if args.control_video else None
+            subject_ref_images = process_vace_subject_references(args, (height, width)) if args.subject_ref_images else None
+
+            if control_video is not None or subject_ref_images is not None:
+                vace_context = create_vace_context(control_video, subject_ref_images, vae, device, torch.float32)
+                if vace_context is not None:
+                    arg_c["vace_context"] = vace_context
+                    arg_c["vace_context_scale"] = args.vace_context_scale
+                    arg_null["vace_context"] = vace_context
+                    arg_null["vace_context_scale"] = args.vace_context_scale
+                    logger.info(f"Added VACE context to FunControl I2V inputs (scale: {args.vace_context_scale})")
+            else:
+                # Empty context for VACE models without control inputs
+                arg_c["vace_context"] = []
+                arg_c["vace_context_scale"] = args.vace_context_scale
+                arg_null["vace_context"] = []
+                arg_null["vace_context_scale"] = args.vace_context_scale
 
         # Return noise, context, context_null, y (for potential debugging), (arg_c, arg_null)
         return noise, context, context_null, y, (arg_c, arg_null)
@@ -3031,6 +3257,26 @@ def prepare_i2v_inputs(
             "seq_len": max_seq_len,
             "y": [y], # Use the 'original method' y
         }
+
+        # Handle VACE context for VACE models
+        if "vace-" in args.task.lower() and VACE_AVAILABLE:
+            control_video = process_vace_control_video(args, frames, (height, width)) if args.control_video else None
+            subject_ref_images = process_vace_subject_references(args, (height, width)) if args.subject_ref_images else None
+
+            if control_video is not None or subject_ref_images is not None:
+                vace_context = create_vace_context(control_video, subject_ref_images, vae, device, torch.float32)
+                if vace_context is not None:
+                    arg_c["vace_context"] = vace_context
+                    arg_c["vace_context_scale"] = args.vace_context_scale
+                    arg_null["vace_context"] = vace_context
+                    arg_null["vace_context_scale"] = args.vace_context_scale
+                    logger.info(f"Added VACE context to standard I2V inputs (scale: {args.vace_context_scale})")
+            else:
+                # Empty context for VACE models without control inputs
+                arg_c["vace_context"] = []
+                arg_c["vace_context_scale"] = args.vace_context_scale
+                arg_null["vace_context"] = []
+                arg_null["vace_context_scale"] = args.vace_context_scale
 
         # Return noise, context, context_null, y (for debugging), (arg_c, arg_null)
         return noise, context, context_null, y, (arg_c, arg_null)
@@ -3375,6 +3621,39 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
     # V2V does not use 'y' or 'clip_fea' in the standard Wan model case
     # If a specific V2V variant *did* need them, they would be added here.
+
+    # Handle VACE context for VACE models
+    if "vace-" in args.task.lower() and VACE_AVAILABLE:
+        # For V2V, we can use the video itself as control
+        # Process control video and subject ref images if provided
+        control_video = process_vace_control_video(args, args.video_length, (args.video_size[1], args.video_size[0])) if args.control_video else None
+        subject_ref_images = process_vace_subject_references(args, (args.video_size[1], args.video_size[0])) if args.subject_ref_images else None
+
+        # If no explicit control video or ref images, use the input video itself as context
+        if control_video is None and subject_ref_images is None and args.video_path:
+            logger.info("VACE V2V: Using input video as control context")
+            # The video_latents are already encoded, so we can use them directly
+            # But we need the VAE to properly create the VACE context
+            # This is a simplified approach - in practice, you might want to pass the original frames
+            arg_c["vace_context"] = []  # Empty for now, would need proper video frames
+            arg_c["vace_context_scale"] = args.vace_context_scale
+            arg_null["vace_context"] = []
+            arg_null["vace_context_scale"] = args.vace_context_scale
+            logger.warning("VACE V2V requires control video or subject references. Using empty context.")
+        elif control_video is not None or subject_ref_images is not None:
+            # We have control inputs, but need VAE to create context
+            # Since VAE is not passed to this function, we'll use empty context
+            arg_c["vace_context"] = []
+            arg_c["vace_context_scale"] = args.vace_context_scale
+            arg_null["vace_context"] = []
+            arg_null["vace_context_scale"] = args.vace_context_scale
+            logger.warning("VACE V2V context creation requires VAE. Using empty context.")
+        else:
+            # Empty context for VACE models
+            arg_c["vace_context"] = []
+            arg_c["vace_context_scale"] = args.vace_context_scale
+            arg_null["vace_context"] = []
+            arg_null["vace_context_scale"] = args.vace_context_scale
 
     return noise, context, context_null, (arg_c, arg_null)
 
@@ -3929,7 +4208,27 @@ def run_sampling(
                     logger.debug(f"Squeezed batch dimension from noise_pred_cond, new shape: {noise_pred_cond.shape}")
             else:
                 # Standard model call without context windows
-                noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+                # Check if this is a VACE model that needs special handling
+                if "vace_context" in model_arg_c and hasattr(current_model, '__class__') and 'Vace' in current_model.__class__.__name__:
+                    # VACE model expects vace_context as a positional argument
+                    vace_context = model_arg_c.pop("vace_context")
+                    vace_context_scale = model_arg_c.pop("vace_context_scale", 1.0)
+                    context = model_arg_c.pop("context")
+                    seq_len = model_arg_c.pop("seq_len")
+
+                    # Call VACE model with correct positional arguments
+                    noise_pred_cond = current_model(
+                        latent_model_input_list,
+                        t=timestep,
+                        vace_context=vace_context,
+                        context=context,
+                        seq_len=seq_len,
+                        vace_context_scale=vace_context_scale,
+                        **model_arg_c  # Any remaining kwargs
+                    )[0]
+                else:
+                    # Standard model call
+                    noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
             
             # Move result to storage device early if offloading to potentially save VRAM during uncond/slg pred
             noise_pred_cond = noise_pred_cond.to(latent_storage_device)
@@ -4069,18 +4368,46 @@ def run_sampling(
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
                     # Standard calls without context windows (original code)
+                    # Helper function to call model with VACE support
+                    def call_model_with_vace_support(model, latents, t, model_args, skip_indices=None):
+                        """Helper to call model with VACE context if needed"""
+                        model_args_copy = model_args.copy()
+                        if "vace_context" in model_args_copy and hasattr(model, '__class__') and 'Vace' in model.__class__.__name__:
+                            # VACE model expects vace_context as a positional argument
+                            vace_context = model_args_copy.pop("vace_context")
+                            vace_context_scale = model_args_copy.pop("vace_context_scale", 1.0)
+                            context = model_args_copy.pop("context")
+                            seq_len = model_args_copy.pop("seq_len")
+
+                            return model(
+                                latents,
+                                t=t,
+                                vace_context=vace_context,
+                                context=context,
+                                seq_len=seq_len,
+                                vace_context_scale=vace_context_scale,
+                                skip_block_indices=skip_indices,
+                                **model_args_copy
+                            )[0]
+                        else:
+                            # Standard model call
+                            if skip_indices is not None:
+                                return model(latents, t=t, skip_block_indices=skip_indices, **model_args_copy)[0]
+                            else:
+                                return model(latents, t=t, **model_args_copy)[0]
+
                     if apply_slg_step and args.slg_mode == "original":
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
-                        skip_layer_out = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = call_model_with_vace_support(current_model, latent_model_input_list, timestep, model_arg_null).to(latent_storage_device)
+                        skip_layer_out = call_model_with_vace_support(current_model, latent_model_input_list, timestep, model_arg_null, skip_indices=slg_indices_for_call).to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
                         noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
 
                     elif apply_slg_step and args.slg_mode == "uncond":
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, skip_block_indices=slg_indices_for_call, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = call_model_with_vace_support(current_model, latent_model_input_list, timestep, model_arg_null, skip_indices=slg_indices_for_call).to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                     else: # Regular CFG
-                        noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0].to(latent_storage_device)
+                        noise_pred_uncond = call_model_with_vace_support(current_model, latent_model_input_list, timestep, model_arg_null).to(latent_storage_device)
                         noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # CFG is skipped, use conditional prediction directly
@@ -4451,13 +4778,36 @@ def run_extension_sampling(
             model_arg_text_dropped = {k: v for k, v in arg_text_dropped.items() if not k.startswith('_')}
             model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
             
+            # Helper function for VACE-aware model calls
+            def call_model_with_vace(model, latents, t, model_args):
+                """Helper to call model with VACE context if needed"""
+                model_args_copy = model_args.copy()
+                if "vace_context" in model_args_copy and hasattr(model, '__class__') and 'Vace' in model.__class__.__name__:
+                    # VACE model expects vace_context as a positional argument
+                    vace_context = model_args_copy.pop("vace_context")
+                    vace_context_scale = model_args_copy.pop("vace_context_scale", 1.0)
+                    context = model_args_copy.pop("context")
+                    seq_len = model_args_copy.pop("seq_len")
+
+                    return model(
+                        latents,
+                        t=t,
+                        vace_context=vace_context,
+                        context=context,
+                        seq_len=seq_len,
+                        vace_context_scale=vace_context_scale,
+                        **model_args_copy
+                    )[0]
+                else:
+                    return model(latents, t=t, **model_args_copy)[0]
+
             # Three-way CFG (multitalk-style)
             # 1. Full conditional (text + CLIP)
-            noise_pred_cond = current_model(latent_model_input_list, t=timestep, **model_arg_c)[0]
+            noise_pred_cond = call_model_with_vace(current_model, latent_model_input_list, timestep, model_arg_c)
             # 2. Text-dropped (CLIP only)
-            noise_pred_text_dropped = current_model(latent_model_input_list, t=timestep, **model_arg_text_dropped)[0]
+            noise_pred_text_dropped = call_model_with_vace(current_model, latent_model_input_list, timestep, model_arg_text_dropped)
             # 3. Unconditional (negative prompt)
-            noise_pred_uncond = current_model(latent_model_input_list, t=timestep, **model_arg_null)[0]
+            noise_pred_uncond = call_model_with_vace(current_model, latent_model_input_list, timestep, model_arg_null)
             
             # Apply three-way CFG formula (simplified from multitalk, no audio)
             # Formula: uncond + text_scale * (cond - text_dropped)
