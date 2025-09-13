@@ -2965,13 +2965,13 @@ def run_sampling(
             # Official TI2V timestep processing with mask-based spatial-temporal modulation
             # This is critical for proper image conditioning
             timestep_base = torch.stack([t]).to(device)
-            
+
             # Get sequence length from args
             seq_len = inputs[0]["seq_len"]
-            
+
             # Use stored masks from official implementation
             ti2v_mask2 = inputs[0]["_ti2v_mask2"]
-            
+
             # Official timestep processing: temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
             # mask2[0] is the first tensor in the mask list, [0] is the first channel
             temp_ts = (ti2v_mask2[0][0][:, ::2, ::2] * timestep_base).flatten()
@@ -2985,6 +2985,38 @@ def run_sampling(
         else:
             # Standard timestep for T2V, I2V, V2V
             timestep = torch.stack([t]).to(device) # Ensure timestep is a tensor on device
+
+        # Apply Pusa timestep modification for conditioned frames
+        if (hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and
+            hasattr(args, '_pusa_remapped_dict')):
+            # Get conditioning positions and noise multipliers
+            conditioning_dict = args._pusa_remapped_dict if hasattr(args, '_pusa_remapped_dict') else args.pusa_conditioning_dict
+
+            # Determine number of frames
+            if len(latent.shape) == 5:  # [B, C, F, H, W]
+                num_frames = latent.shape[2]
+            elif len(latent.shape) == 4:  # [C, F, H, W]
+                num_frames = latent.shape[1]
+            else:
+                num_frames = 21  # Default for 81-frame video
+
+            # Create per-frame timestep tensor
+            frame_timesteps = timestep.repeat(1, num_frames) if timestep.dim() == 1 else timestep.clone()
+            if frame_timesteps.dim() == 1:
+                frame_timesteps = frame_timesteps.unsqueeze(0).repeat(1, num_frames)
+
+            # Modify timesteps for conditioned frames
+            for frame_idx, (_, noise_mult) in conditioning_dict.items():
+                if frame_idx < num_frames:
+                    # Set timestep to 0 for clean frames (noise_mult < 0.1)
+                    # Or multiply by noise_mult for noisy conditioning
+                    if noise_mult < 0.1:
+                        frame_timesteps[:, frame_idx] = 0
+                    else:
+                        frame_timesteps[:, frame_idx] = frame_timesteps[:, frame_idx] * noise_mult
+
+            # Use the per-frame timesteps
+            timestep = frame_timesteps.to(dtype=torch.float32, device=device)
 
         with accelerator.autocast(), torch.no_grad():
             # --- Select appropriate model for dual-dit architectures ---
