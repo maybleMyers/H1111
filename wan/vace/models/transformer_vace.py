@@ -136,9 +136,37 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         seq_len,
         kwargs
     ):
+        # Handle empty vace_context
+        if not vace_context or len(vace_context) == 0:
+            # Return empty hints - one for each vace layer
+            # Get device and dtype from x (which is already processed)
+            device = kwargs.get('dtype', torch.float32)
+            dtype = kwargs.get('dtype', torch.float32)
+            return [torch.zeros(1, seq_len, self.dim, device=self.patch_embedding.weight.device, dtype=dtype)
+                    for _ in range(len(self.vace_layers))]
+
         # embeddings
-        c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+        c = []
+        for u in vace_context:
+            # Ensure u has the right shape - should be [C, F, H, W]
+            if u.dim() == 3:  # Missing batch dimension
+                u = u.unsqueeze(0)
+            elif u.dim() == 5:  # Has batch dimension already
+                u = u.squeeze(0)  # Remove it to get [C, F, H, W]
+
+            # Apply patch embedding
+            embedded = self.vace_patch_embedding(u.unsqueeze(0))  # Add batch dim for conv3d
+            c.append(embedded)
+
         c = [u.flatten(2).transpose(1, 2) for u in c]
+
+        # Handle case where c is empty
+        if not c:
+            device = self.patch_embedding.weight.device
+            dtype = kwargs.get('dtype', torch.float32)
+            return [torch.zeros(1, seq_len, self.dim, device=device, dtype=dtype)
+                    for _ in range(len(self.vace_layers))]
+
         c = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in c
@@ -150,7 +178,7 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         # arguments
         new_kwargs = dict(x=x)
         new_kwargs.update(kwargs)
-        
+
         for block in self.vace_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 def create_custom_forward(module, **static_kwargs):

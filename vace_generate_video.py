@@ -5901,7 +5901,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     elif is_t2v: # Standard T2V
         if args.video_length is None:
              raise ValueError("video_length must be specified for standard T2V mode.")
-        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, None) # Pass None for VAE
+        # For VACE models, we need VAE to create context from control video/ref images
+        vae_for_t2v = vae if vace_mode is not None else None
+        noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae_for_t2v)
 
 
     # At this point, VAE should be on CPU/cache unless still needed for decoding
