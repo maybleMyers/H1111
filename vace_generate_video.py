@@ -2010,15 +2010,14 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
         # First extract single channel mask
         mask = mask[0, :, :, :]  # [depth, height_orig, width_orig]
 
-        # Resize mask to match the adjusted dimensions if needed
-        if mask.shape[1] != height or mask.shape[2] != width:
-            # Interpolate to adjusted dimensions
-            mask = F.interpolate(
-                mask.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
-                size=(depth, height, width),
-                mode='trilinear',
-                align_corners=False
-            ).squeeze(0).squeeze(0)  # Remove batch and channel dims
+        # Resize mask to match the adjusted dimensions
+        # Always interpolate to ensure correct dimensions for reshaping
+        mask = F.interpolate(
+            mask.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
+            size=(depth, height, width),
+            mode='trilinear',
+            align_corners=False
+        )[0, 0]  # Remove batch and channel dims [depth, height, width]
 
         # Now reshape following official VACE implementation
         # Reshape the spatial dimensions (height, width) into (new_height, 8, new_width, 8)
