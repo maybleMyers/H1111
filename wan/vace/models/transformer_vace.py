@@ -102,6 +102,10 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
         self.vace_in_dim = self.in_dim if vace_in_dim is None else vace_in_dim
 
+        # Initialize context parallel attributes (not used in single GPU mode)
+        self.sp_world_size = 1
+        self.sp_world_rank = 0
+
         assert 0 in self.vace_layers
         self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
 
