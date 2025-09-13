@@ -831,9 +831,7 @@ class DynamicModelManager:
                 # Use to_empty to materialize the model on the target device
                 # This is necessary when using init_empty_weights()
                 model = model.to_empty(device=loading_device).to(dtype=loading_weight_dtype or self.dit_dtype)
-            else:
-                # If not using empty weights, move normally
-                model = model.to(device=loading_device, dtype=loading_weight_dtype or self.dit_dtype)
+
             model.eval()
             
             # Apply LoRA weights if available
