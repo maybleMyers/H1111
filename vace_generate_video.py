@@ -1995,16 +1995,31 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
 
         # Calculate new dimensions based on VAE stride
         new_depth = int((depth + vae_stride[0] - 1) // vae_stride[0])
-        height = 2 * (int(height) // (vae_stride[1] * 2))
-        width = 2 * (int(width) // (vae_stride[2] * 2))
+        new_height = height // vae_stride[1]
+        new_width = width // vae_stride[2]
 
-        # Reshape mask
-        mask = mask[0, :, :, :]  # Remove channel dim
-        mask = mask.view(
-            new_depth, vae_stride[0], height // 2, 2, width // 2, 2
-        ).permute(0, 2, 4, 1, 3, 5).contiguous()
-        mask = mask.view(new_depth, height // 2, width // 2, -1)
-        mask = mask.view(new_depth * 12, height // 2, width // 2)
+        # For VACE, we just need to downsample the mask to match latent dimensions
+        # Simply create a downsampled mask tensor
+        import torch.nn.functional as F
+
+        # Downsample the mask to match VAE latent dimensions
+        # mask shape: [1, depth, height, width]
+        # Need to reshape to [1, 1, depth, height, width] for 3D interpolation
+        mask_5d = mask.unsqueeze(0)  # [1, 1, depth, height, width]
+
+        # Downsample using 3D interpolation
+        downsampled = F.interpolate(
+            mask_5d,
+            size=(new_depth, new_height, new_width),
+            mode='trilinear',
+            align_corners=False
+        )
+
+        # Remove batch and channel dimensions
+        mask = downsampled[0, 0]  # [new_depth, new_height, new_width]
+
+        # Flatten to create the mask latent
+        mask = mask.flatten()
 
         # Move to device if specified
         if device is not None:
