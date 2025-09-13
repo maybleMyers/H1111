@@ -72,21 +72,20 @@ try:
     from wan.vace.models import (
         AutoencoderKLWan,          # Standard VAE
         AutoencoderKLWan3_8,       # Alternative VAE
-        WanT5EncoderModel,         # T5 text encoder
         VaceWanTransformer3DModel, # VACE transformer
         get_teacache_coefficients,
         AutoTokenizer              # Tokenizer
     )
     # Standard Wan models for compatibility
-    from Wan2_2.wan.modules.model import Wan2_2Transformer3DModel
-    from wan.modules.model import CLIPModel
+    from Wan2_2.wan.modules.model import WanModel as Wan2_2Transformer3DModel
+    from wan.modules.clip import CLIPModel
     
     # Pipeline imports
     from wan.vace.pipeline import (
         Wan2_2VaceFunPipeline      # VACE pipeline
     )
     # For compatibility, use standard pipeline as fallback
-    from Wan2_2.wan.pipeline import Wan2_2FunInpaintPipeline
+    # from Wan2_2.wan.pipeline import Wan2_2FunInpaintPipeline  # Not needed for VACE
     
     # Utility imports from wan.vace
     from wan.vace.utils import (
@@ -641,11 +640,18 @@ class DynamicModelManager:
         self.lora_multipliers_low = None
         self.lora_weights_list_high = None
         self.lora_multipliers_high = None
-        self.is_vace_model = False
+        # Detect VACE from task name (priority over weight detection)
+        self.is_vace_model = "vace-" in args.task.lower()
+        if self.is_vace_model:
+            logger.info(f"VACE task detected: {args.task}")
         self.vace_config = None
         
     def detect_vace_model(self, model_path: str) -> bool:
-        """Detect if model is VACE variant based on state dict keys."""
+        """Detect if model is VACE variant based on task name or state dict keys."""
+        # First check task name - this takes priority
+        if "vace-" in self.args.task.lower():
+            return True
+            
         if not VACE_AVAILABLE:
             return False
             
@@ -762,7 +768,7 @@ class DynamicModelManager:
             # Proper model loading using from_pretrained
             if os.path.isdir(model_path):
                 # Directory path - use from_pretrained
-                model = Wan2_2Transformer3DModel.from_pretrained(
+                model = VaceWanTransformer3DModel.from_pretrained(
                     model_path,
                     transformer_additional_kwargs=transformer_kwargs,
                     low_cpu_mem_usage=True,
@@ -777,14 +783,25 @@ class DynamicModelManager:
                 # Detect model configuration from state dict
                 dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
                 
-                # Create model with proper configuration
-                model = Wan2_2Transformer3DModel(
-                    **transformer_kwargs,
+                # Create VACE model with proper configuration
+                model = VaceWanTransformer3DModel(
+                    vace_layers=transformer_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
+                    vace_in_dim=transformer_kwargs.get('vace_in_dim', 96),
+                    model_type='t2v',
+                    patch_size=(1, 2, 2),
+                    text_len=512,
                     in_dim=16,  # Standard input dimension
                     dim=dim,
-                    ffn_dim=8192 if dim == 3072 else 13696,  # Adjust based on model size
+                    ffn_dim=8192 if dim == 3072 else 13824,  # Adjust based on model size
+                    freq_dim=256,
+                    text_dim=4096,
+                    out_dim=16,
                     num_heads=24 if dim == 3072 else 40,
-                    num_layers=30 if dim == 3072 else 40
+                    num_layers=30 if dim == 3072 else 40,
+                    window_size=(-1, -1),
+                    qk_norm=True,
+                    cross_attn_norm=True,
+                    eps=1e-6
                 )
                 
                 # Load state dict
@@ -808,15 +825,8 @@ class DynamicModelManager:
             
         except Exception as e:
             logger.error(f"Error loading VACE model: {e}")
-            # Fallback to standard WanModel if VACE loading fails
-            logger.info("Falling back to standard WanModel loading")
-            return load_wan_model(
-                model_path,
-                device=loading_device,
-                dtype=loading_weight_dtype or self.dit_dtype,
-                fp8=self.args.fp8,
-                model_dtype=self.dit_dtype
-            )
+            # For VACE tasks, we must use VACE models - no fallback
+            raise RuntimeError(f"Failed to load VACE model from {model_path}: {e}")
 
     def has_model_loaded(self):
         """Check if any model is currently loaded."""
@@ -979,7 +989,8 @@ class DynamicModelManager:
             logger.info(f"DEBUG: Loading {model_type} noise DiT model with NO LoRA weights")
             
         # Load model with LoRA weights if available
-        if self.is_vace_model:
+        # Force VACE loading for VACE tasks
+        if "vace-" in self.args.task.lower() or self.is_vace_model:
             model = self._load_vace_model(model_type, loading_device, loading_weight_dtype, 
                                         lora_weights_list, lora_multipliers)
         else:
@@ -1662,8 +1673,10 @@ def load_text_encoder(args: argparse.Namespace, config, device: torch.device, va
         vace_config: VACE configuration (optional)
 
     Returns:
-        T5EncoderModel or WanT5EncoderModel: loaded text encoder model
+        T5EncoderModel: loaded text encoder model
     """
+    from wan.modules.t5 import T5EncoderModel
+    
     # Use VACE text encoder if available
     if VACE_AVAILABLE and vace_config is not None:
         try:
@@ -1672,11 +1685,12 @@ def load_text_encoder(args: argparse.Namespace, config, device: torch.device, va
             if args.dit and os.path.isdir(args.dit):
                 text_encoder_path = os.path.join(args.dit, text_encoder_subpath)
                 if os.path.exists(text_encoder_path):
-                    text_encoder = WanT5EncoderModel.from_pretrained(
-                        text_encoder_path,
-                        additional_kwargs=OmegaConf.to_container(vace_config.get('text_encoder_kwargs', {})),
-                        low_cpu_mem_usage=True,
-                        torch_dtype=config.t5_dtype
+                    # For VACE, use standard T5 encoder with proper parameters
+                    text_encoder = T5EncoderModel(
+                        text_len=config.text_len,
+                        dtype=config.t5_dtype,
+                        device=device,
+                        weight_path=text_encoder_path
                     )
                     text_encoder = text_encoder.eval()
                     return text_encoder
@@ -2008,7 +2022,7 @@ def generate_with_vace_pipeline(args: argparse.Namespace, vace_mode: str, device
                 vace_config = OmegaConf.create()
         
         # Load models with VACE support
-        from wan.vace.models import AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel
+        from wan.vace.models import AutoencoderKLWan, AutoencoderKLWan3_8
         
         # Load VAE
         vae_type = vace_config.get('vae_kwargs', {}).get('vae_type', 'AutoencoderKLWan')
@@ -2021,13 +2035,20 @@ def generate_with_vace_pipeline(args: argparse.Namespace, vace_mode: str, device
             logger.warning(f"VAE not found at {vae_path}, using default")
             vae = ChosenVAE().to(dit_weight_dtype or dit_dtype)
         
-        # Load text encoder
+        # Load text encoder - For VACE, use the standard T5 encoder
+        # VACE models work with the standard T5 encoder
+        from wan.modules.t5 import T5EncoderModel
         text_encoder_path = args.t5 if args.t5 else "models/text_encoder/models_t5_umt5-xxl-enc-bf16.pth"
         if os.path.exists(text_encoder_path):
-            text_encoder = WanT5EncoderModel.from_pretrained(text_encoder_path).to(dit_weight_dtype or dit_dtype)
+            text_encoder = T5EncoderModel(
+                text_len=512,  # Standard text length for VACE
+                dtype=dit_weight_dtype or dit_dtype,
+                device=device,
+                weight_path=text_encoder_path
+            )
         else:
-            logger.warning(f"Text encoder not found at {text_encoder_path}, using default")
-            text_encoder = WanT5EncoderModel().to(dit_weight_dtype or dit_dtype)
+            logger.error(f"Text encoder not found at {text_encoder_path}")
+            return None
         
         # Load tokenizer
         from wan.vace.models import AutoTokenizer
@@ -2045,15 +2066,14 @@ def generate_with_vace_pipeline(args: argparse.Namespace, vace_mode: str, device
         model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
         model_manager.set_model_paths(model_path_low, model_path_high or model_path_low)
         
-        # Get transformers
-        transformer = model_manager.get_model('low')
-        transformer_2 = model_manager.get_model('high') if model_path_high else None
+        # Instead of using a separate VACE pipeline, use the standard generation path
+        # which already has proper dynamic loading support for dual-dit models
+        # The VACE models will be loaded with VaceWanTransformer3DModel class automatically
+        logger.info("Using standard generation path with VACE models for dynamic loading")
         
-        # Create VACE pipeline
-        pipeline = create_vace_pipeline(args, transformer, transformer_2, vae, tokenizer, text_encoder)
-        if pipeline is None:
-            logger.error("Failed to create VACE pipeline")
-            return None
+        # Return None to fall back to the standard generation path
+        # The task detection will ensure VACE models are loaded properly
+        return None
         
         # Enable VACE optimizations
         enable_vace_optimizations(pipeline, args, model_manager)
@@ -5533,8 +5553,10 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- VACE Pipeline Integration ---
     if vace_mode is not None:
-        # Use VACE pipeline for generation
-        return generate_with_vace_pipeline(args, vace_mode, device, cfg, dit_dtype, dit_weight_dtype)
+        # For VACE models, we use the standard generation path with VACE-specific handling
+        # The DynamicModelManager will automatically detect and load VACE models with VaceWanTransformer3DModel
+        logger.info(f"VACE mode {vace_mode} detected, using standard generation with VACE model loading")
+        # Don't return here - continue with standard generation which will handle VACE models
 
     # --- Load DiT Model(s) ---
     model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)

@@ -7,8 +7,8 @@ import math
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
-from diffusers.configuration_utils import register_to_config
 from diffusers.utils import is_torch_version
+from safetensors.torch import load_file
 
 from wan.modules.model import WanAttentionBlock, WanModel as WanTransformer3DModel
 from wan.modules.model import sinusoidal_embedding_1d
@@ -76,7 +76,6 @@ class BaseWanAttentionBlock(WanAttentionBlock):
     
     
 class VaceWanTransformer3DModel(WanTransformer3DModel):
-    @register_to_config
     def __init__(self,
                  vace_layers=None,
                  vace_in_dim=None,
@@ -97,7 +96,8 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
                  eps=1e-6):
         model_type = "t2v"   # TODO: Hard code for both preview and official versions.
         super().__init__(model_type, patch_size, text_len, in_dim, dim, ffn_dim, freq_dim, text_dim, out_dim,
-                         num_heads, num_layers, window_size, qk_norm, cross_attn_norm, eps)
+                         num_heads, num_layers, window_size, qk_norm, cross_attn_norm, eps,
+                         attn_mode=None, split_attn=False, add_ref_conv=False, in_dim_ref_conv=16)
 
         self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
         self.vace_in_dim = self.in_dim if vace_in_dim is None else vace_in_dim
@@ -376,3 +376,63 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
             if self.teacache.cnt == self.teacache.num_steps:
                 self.teacache.reset()
         return x
+
+    @classmethod
+    def from_pretrained(cls, model_path, transformer_additional_kwargs=None,
+                       low_cpu_mem_usage=True, torch_dtype=torch.bfloat16):
+        """Load VACE model from pretrained weights."""
+        import os
+        from safetensors.torch import load_file
+
+        if transformer_additional_kwargs is None:
+            transformer_additional_kwargs = {}
+
+        # Load state dict
+        if os.path.isdir(model_path):
+            ckpt_path = os.path.join(model_path, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(ckpt_path):
+                ckpt_path = os.path.join(model_path, "diffusion_pytorch_model.bin")
+        else:
+            ckpt_path = model_path
+
+        if ckpt_path.endswith('.safetensors'):
+            state_dict = load_file(ckpt_path, device="cpu")
+        else:
+            state_dict = torch.load(ckpt_path, map_location="cpu")
+
+        # Detect model configuration from state dict
+        dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
+
+        # Create model instance with detected config
+        model = cls(
+            vace_layers=transformer_additional_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
+            vace_in_dim=transformer_additional_kwargs.get('vace_in_dim', 96),
+            model_type='t2v',
+            patch_size=(1, 2, 2),
+            text_len=512,
+            in_dim=16,
+            dim=dim,
+            ffn_dim=8192 if dim == 3072 else 13824,
+            freq_dim=256,
+            text_dim=4096,
+            out_dim=16,
+            num_heads=24 if dim == 3072 else 40,
+            num_layers=30 if dim == 3072 else 40,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=True,
+            eps=1e-6
+        )
+
+        # Load weights
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"Unexpected keys: {len(unexpected)}")
+
+        # Convert dtype if specified
+        if torch_dtype is not None:
+            model = model.to(torch_dtype)
+
+        return model

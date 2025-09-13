@@ -7,9 +7,10 @@
 import hashlib
 import math
 import os
+import re
 from collections import defaultdict
 from io import BytesIO
-from typing import List, Optional, Type, Union
+from typing import Dict, List, Optional, Type, Union
 
 import safetensors.torch
 import torch
@@ -574,3 +575,43 @@ def unmerge_lora(pipeline, lora_path, multiplier=1, device="cpu", dtype=torch.fl
     if sequential_cpu_offload_flag:
         pipeline.enable_sequential_cpu_offload(device=device)
     return pipeline
+
+
+def filter_lora_state_dict(
+    weights_sd: Dict[str, torch.Tensor],
+    include_pattern: Optional[str] = None,
+    exclude_pattern: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Filter LoRA state dict based on include/exclude patterns.
+    
+    Args:
+        weights_sd: Dictionary of LoRA weights
+        include_pattern: Regex pattern to include keys
+        exclude_pattern: Regex pattern to exclude keys
+        
+    Returns:
+        Filtered dictionary of LoRA weights
+    """
+    # Apply include/exclude patterns
+    original_key_count = len(weights_sd.keys())
+    
+    if include_pattern is not None:
+        regex_include = re.compile(include_pattern)
+        weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
+        print(f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}")
+
+    if exclude_pattern is not None:
+        original_key_count_ex = len(weights_sd.keys())
+        regex_exclude = re.compile(exclude_pattern)
+        weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
+        print(f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}")
+
+    if len(weights_sd) != original_key_count:
+        remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
+        remaining_keys.sort()
+        print(f"Remaining LoRA modules after filtering: {remaining_keys}")
+        if len(weights_sd) == 0:
+            print(f"Warning: No keys left after filtering.")
+
+    return weights_sd
