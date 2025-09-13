@@ -380,14 +380,14 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
     @classmethod
     def from_pretrained(cls, model_path, transformer_additional_kwargs=None,
                        low_cpu_mem_usage=True, torch_dtype=torch.bfloat16):
-        """Load VACE model from pretrained weights."""
+        """Load VACE model from pretrained weights with memory-efficient loading."""
         import os
-        from safetensors.torch import load_file
+        from safetensors import safe_open
 
         if transformer_additional_kwargs is None:
             transformer_additional_kwargs = {}
 
-        # Load state dict
+        # Determine checkpoint path
         if os.path.isdir(model_path):
             ckpt_path = os.path.join(model_path, "diffusion_pytorch_model.safetensors")
             if not os.path.exists(ckpt_path):
@@ -395,13 +395,16 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         else:
             ckpt_path = model_path
 
+        # Detect model configuration without loading full state dict
         if ckpt_path.endswith('.safetensors'):
-            state_dict = load_file(ckpt_path, device="cpu")
+            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+                # Just peek at one weight to determine model size
+                patch_weight_shape = f.get_tensor("patch_embedding.weight").shape
+                dim = patch_weight_shape[0]
         else:
+            # For .bin files, we need to load to check dimensions
             state_dict = torch.load(ckpt_path, map_location="cpu")
-
-        # Detect model configuration from state dict
-        dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
+            dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
 
         # Create model instance with detected config
         model = cls(
@@ -424,8 +427,19 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
             eps=1e-6
         )
 
-        # Load weights
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # Load weights efficiently
+        if ckpt_path.endswith('.safetensors'):
+            # Memory-efficient loading for safetensors
+            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+                state_dict = {}
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                del state_dict  # Free memory immediately
+        else:
+            # Already loaded for .bin files
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
         if missing:
             print(f"Missing keys: {len(missing)}")
         if unexpected:

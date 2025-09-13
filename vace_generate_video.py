@@ -776,13 +776,13 @@ class DynamicModelManager:
                 )
             else:
                 # Single file - load state dict and create model
-                # First, try to detect model size from state dict
+                # First, detect model size without loading full state dict
                 with safe_open(model_path, framework="pt", device="cpu") as f:
-                    state_dict = {key: f.get_tensor(key) for key in f.keys()}
-                
-                # Detect model configuration from state dict
-                dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
-                
+                    # Just peek at one weight to determine model size
+                    patch_weight = f.get_tensor("patch_embedding.weight")
+                    dim = patch_weight.shape[0]
+                    del patch_weight  # Free this small tensor immediately
+
                 # Create VACE model with proper configuration
                 model = VaceWanTransformer3DModel(
                     vace_layers=transformer_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
@@ -803,9 +803,28 @@ class DynamicModelManager:
                     cross_attn_norm=True,
                     eps=1e-6
                 )
-                
-                # Load state dict
-                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+                # Load state dict efficiently - load weights one by one
+                with safe_open(model_path, framework="pt", device="cpu") as f:
+                    # Get model's state dict for comparison
+                    model_state = model.state_dict()
+                    missing = []
+                    unexpected = []
+
+                    # Load each weight directly into the model
+                    for key in f.keys():
+                        if key in model_state:
+                            param = f.get_tensor(key)
+                            model_state[key].copy_(param)
+                            del param  # Free memory immediately
+                        else:
+                            unexpected.append(key)
+
+                    # Check for missing keys
+                    for key in model_state.keys():
+                        if key not in f.keys():
+                            missing.append(key)
+
                 if missing:
                     logger.warning(f"Missing keys in VACE model: {len(missing)} keys")
                 if unexpected:
