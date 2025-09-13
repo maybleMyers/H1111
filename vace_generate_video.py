@@ -820,15 +820,20 @@ class DynamicModelManager:
                         model.to(loading_weight_dtype or self.dit_dtype)
 
                 # Load state dict with assign=True for zero-copy assignment
+                # This directly places weights on the target device
                 info = model.load_state_dict(sd, strict=False, assign=True)
 
                 if info.missing_keys:
                     logger.warning(f"Missing keys in VACE model: {len(info.missing_keys)} keys")
                 if info.unexpected_keys:
                     logger.warning(f"Unexpected keys in VACE model: {len(info.unexpected_keys)} keys")
-            
-            # Move to target device and dtype
-            model = model.to(device=loading_device, dtype=loading_weight_dtype or self.dit_dtype)
+
+                # Use to_empty to materialize the model on the target device
+                # This is necessary when using init_empty_weights()
+                model = model.to_empty(device=loading_device).to(dtype=loading_weight_dtype or self.dit_dtype)
+            else:
+                # If not using empty weights, move normally
+                model = model.to(device=loading_device, dtype=loading_weight_dtype or self.dit_dtype)
             model.eval()
             
             # Apply LoRA weights if available
