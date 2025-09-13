@@ -759,9 +759,11 @@ class DynamicModelManager:
                 )
             else:
                 # Default VACE configuration
+                # VACE layers are typically every 2 layers starting from 0
+                num_layers = 40 if "14B" in model_path else 30
                 transformer_kwargs = {
-                    'vace_layers': [0, 5, 10, 15, 20, 25, 30, 35],
-                    'vace_in_dim': 96,
+                    'vace_layers': list(range(0, num_layers, 2)),  # Every 2nd layer: [0, 2, 4, 6, ...]
+                    'vace_in_dim': 16,  # Should match in_dim for standard VACE models
                     'model_type': 't2v'
                 }
             
@@ -788,8 +790,8 @@ class DynamicModelManager:
                 # Create VACE model with empty weights (no memory allocation)
                 with init_empty_weights():
                     model = VaceWanTransformer3DModel(
-                        vace_layers=transformer_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
-                        vace_in_dim=transformer_kwargs.get('vace_in_dim', 96),
+                        vace_layers=transformer_kwargs.get('vace_layers', list(range(0, 40, 2))),
+                        vace_in_dim=transformer_kwargs.get('vace_in_dim', 16),  # Should match in_dim by default
                         model_type='t2v',
                         patch_size=(1, 2, 2),
                         text_len=512,
@@ -1995,31 +1997,44 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
 
         # Calculate new dimensions based on VAE stride
         new_depth = int((depth + vae_stride[0] - 1) // vae_stride[0])
+        # Ensure height and width are even multiples for proper reshaping
+        height = 2 * (int(height) // (vae_stride[1] * 2))
+        width = 2 * (int(width) // (vae_stride[2] * 2))
         new_height = height // vae_stride[1]
         new_width = width // vae_stride[2]
 
-        # For VACE, we just need to downsample the mask to match latent dimensions
-        # Simply create a downsampled mask tensor
+        # Import F at the top of the function scope if not already
         import torch.nn.functional as F
 
-        # Downsample the mask to match VAE latent dimensions
-        # mask shape: [1, depth, height, width]
-        # Need to reshape to [1, 1, depth, height, width] for 3D interpolation
-        mask_5d = mask.unsqueeze(0)  # [1, 1, depth, height, width]
+        # Reshape mask following official VACE implementation
+        # Extract the first channel (assuming single channel mask)
+        mask = mask[0, :, :, :]  # [depth, height, width]
 
-        # Downsample using 3D interpolation
-        downsampled = F.interpolate(
-            mask_5d,
+        # Reshape to create 64 channels from spatial dimensions (8x8)
+        # This matches the official implementation's spatial downsampling approach
+        mask = mask.view(
+            depth, height // vae_stride[1], vae_stride[1], width // vae_stride[2], vae_stride[2]
+        )  # [depth, new_height, 8, new_width, 8]
+
+        mask = mask.permute(2, 4, 0, 1, 3)  # [8, 8, depth, new_height, new_width]
+        mask = mask.reshape(
+            vae_stride[1] * vae_stride[2], depth, new_height, new_width
+        )  # [64, depth, new_height, new_width]
+
+        # Interpolate temporally to match new_depth
+        mask = F.interpolate(
+            mask.unsqueeze(0),  # Add batch dim for interpolation
             size=(new_depth, new_height, new_width),
-            mode='trilinear',
-            align_corners=False
-        )
+            mode='nearest-exact'
+        ).squeeze(0)  # Remove batch dim, result is [64, new_depth, new_height, new_width]
 
-        # Remove batch and channel dimensions
-        mask = downsampled[0, 0]  # [new_depth, new_height, new_width]
-
-        # Flatten to create the mask latent
-        mask = mask.flatten()
+        # Handle reference images padding if needed
+        refs = ref_images[i] if i < len(ref_images) else None
+        if refs is not None:
+            # If we have reference images, pad the temporal dimension
+            ref_length = 1  # Assuming single reference frame
+            mask_pad = torch.zeros_like(mask[:, :ref_length, :, :])
+            mask = torch.cat((mask_pad, mask), dim=1)
 
         # Move to device if specified
         if device is not None:
