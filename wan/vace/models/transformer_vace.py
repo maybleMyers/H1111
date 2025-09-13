@@ -45,9 +45,13 @@ class VaceWanAttentionBlock(WanAttentionBlock):
             all_c = list(torch.unbind(c))
             c = all_c.pop(-1)
 
-        # Filter out dtype as it's not expected by parent WanAttentionBlock
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k != 'dtype'}
-        c = super().forward(c, **filtered_kwargs)
+        # The parent WanAttentionBlock.forward expects specific arguments
+        # Filter for only the arguments it expects to avoid TypeErrors
+        expected_parent_args = ['e', 'seq_lens', 'grid_sizes', 'freqs', 'context', 'context_lens']
+        parent_kwargs = {k: v for k, v in kwargs.items() if k in expected_parent_args}
+
+        # Pass c as the x argument to parent's forward method
+        c = super().forward(c, **parent_kwargs)
         c_skip = self.after_proj(c)
         all_c += [c_skip, c]
         c = torch.stack(all_c)

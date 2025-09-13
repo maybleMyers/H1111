@@ -36,7 +36,6 @@ from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders.single_file_model import FromOriginalModelMixin
-from diffusers.models import T5EncoderModel as DiffusersT5EncoderModel
 from diffusers.models.autoencoders.vae import (DecoderOutput,
                                               DiagonalGaussianDistribution)
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
@@ -58,16 +57,17 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, T5EncoderModel
 
 # Import external Wan library dependencies
-try:
-    from wan.modules.model import WanAttentionBlock, WanModel
-    from wan.modules.model import sinusoidal_embedding_1d
-    from wan.modules.t5 import WanT5EncoderModel
-    from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas
-    from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-except ImportError as e:
-    print(f"Error: Missing external dependency from the 'wan' library: {e}")
-    print("Please ensure the Wan2.2 library is correctly installed and accessible in your Python path.")
-    sys.exit(1)
+from wan.modules.model import WanAttentionBlock, WanModel
+from wan.modules.model import sinusoidal_embedding_1d
+from wan.modules.t5 import T5EncoderModel as WanT5EncoderModel
+from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas
+from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+# Import VACE-specific transformer directly
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'wan', 'vace', 'models'))
+from transformer_vace import VaceWanTransformer3DModel
 
 logger = logging.get_logger(__name__)
 
@@ -279,16 +279,18 @@ def get_image_latent(ref_image=None, sample_size=None, padding=False):
 # ==================================================================================
 
 def get_teacache_coefficients(model_name):
-    if "wan2.1-t2v-1.3b" in model_name.lower() or "wan2.1-fun-1.3b" in model_name.lower() \
-        or "wan2.1-fun-v1.1-1.3b" in model_name.lower() or "wan2.1-vace-1.3b" in model_name.lower():
+    model_name_lower = model_name.lower()
+    if "wan2.1-t2v-1.3b" in model_name_lower or "wan2.1-fun-1.3b" in model_name_lower \
+        or "wan2.1-fun-v1.1-1.3b" in model_name_lower or "wan2.1-vace-1.3b" in model_name_lower:
         return [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02]
-    elif "wan2.1-t2v-14b" in model_name.lower():
+    elif "wan2.1-t2v-14b" in model_name_lower:
         return [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01]
-    elif "wan2.1-i2v-14b-480p" in model_name.lower():
+    elif "wan2.1-i2v-14b-480p" in model_name_lower:
         return [2.57151496e+05, -3.54229917e+04,  1.40286849e+03, -1.35890334e+01, 1.32517977e-01]
-    elif "wan2.1-i2v-14b-720p" in model_name.lower() or "wan2.1-fun-14b" in model_name.lower() or "wan2.2-fun" in model_name.lower() \
-        or "wan2.2-i2v-a14b" in model_name.lower() or "wan2.2-t2v-a14b" in model_name.lower() or "wan2.2-ti2v-5b" in model_name.lower() \
-        or "wan2.2-s2v" in model_name.lower() or "wan2.1-vace-14b" in model_name.lower() or "wan2.2-vace-fun" in model_name.lower():
+    elif "wan2.1-i2v-14b-720p" in model_name_lower or "wan2.1-fun-14b" in model_name_lower or "wan2.2-fun" in model_name_lower \
+        or "wan2.2-i2v-a14b" in model_name_lower or "wan2.2-t2v-a14b" in model_name_lower or "wan2.2-ti2v-5b" in model_name_lower \
+        or "wan2.2-s2v" in model_name_lower or "wan2.1-vace-14b" in model_name_lower or "wan2.2-vace-fun" in model_name_lower \
+        or "wan2.2-vace-fun-a14b_low" in model_name_lower or "wan2.2-vace-fun-a14b_high" in model_name_lower:
         return [8.10705460e+03,  2.13393892e+03, -3.72934672e+02,  1.66203073e+01, -4.17769401e-02]
     else:
         print(f"The model {model_name} is not supported by TeaCache.")
@@ -723,10 +725,13 @@ class AutoencoderKLWan3_8(AutoencoderKLWan):
         self.scale = [self.mean, 1.0 / self.std]
 
 # ==================================================================================
-# Transformer Components
+# Transformer Components (Local implementations if needed)
 # ==================================================================================
 
-class VaceWanAttentionBlock(WanAttentionBlock):
+# Note: VaceWanAttentionBlock and VaceWanTransformer3DModel are now imported from wan.vace.models.transformer_vace
+# Keep these local implementations as fallback if needed
+
+class VaceWanAttentionBlockLocal(WanAttentionBlock):
     def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6, block_id=0):
         super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
         self.block_id = block_id
@@ -771,7 +776,7 @@ class BaseWanAttentionBlock(WanAttentionBlock):
             x = x + hints[self.block_id] * context_scale
         return x
 
-class VaceWanTransformer3DModel(WanModel):
+class VaceWanTransformer3DModelLocal(WanModel):
     def __init__(self, vace_layers=None, vace_in_dim=None, model_type='t2v', patch_size=(1, 2, 2), text_len=512, in_dim=16, dim=2048, ffn_dim=8192, freq_dim=256, text_dim=4096, out_dim=16, num_heads=16, num_layers=32, window_size=(-1, -1), qk_norm=True, cross_attn_norm=True, eps=1e-6):
         super().__init__(model_type="t2v", patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, attn_mode=None, split_attn=False, add_ref_conv=False, in_dim_ref_conv=16)
         self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
@@ -1017,9 +1022,17 @@ class Wan2_2VaceFunPipeline(DiffusionPipeline):
 def main():
     parser = argparse.ArgumentParser(description="VACE Video Generation Script using Official Pipeline")
 
-    # Core Paths
-    parser.add_argument("--model_dir", type=str, required=True, help="Path to the VACE model directory")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to the VACE model's .yaml configuration file")
+    # Model Paths - can use either model_dir or individual safetensors files
+    parser.add_argument("--model_dir", type=str, default=None, help="Path to the VACE model directory")
+    parser.add_argument("--config_path", type=str, default=None, help="Path to the VACE model's .yaml configuration file")
+
+    # Individual model files (for direct safetensors loading)
+    parser.add_argument("--dit_low_noise", type=str, default=None, help="Path to low-noise DiT safetensors file")
+    parser.add_argument("--dit_high_noise", type=str, default=None, help="Path to high-noise DiT safetensors file")
+    parser.add_argument("--vae", type=str, default=None, help="Path to VAE model file")
+    parser.add_argument("--t5", type=str, default=None, help="Path to T5 text encoder model file")
+    parser.add_argument("--task", type=str, default="vace-t2v-A14B", help="Task type for generation")
+
     parser.add_argument("--save_path", type=str, required=True, help="Directory to save the output videos")
 
     # Generation Parameters
@@ -1051,6 +1064,14 @@ def main():
                        choices=["model_full_load", "model_cpu_offload", "sequential_cpu_offload"],
                        help="GPU memory optimization mode")
 
+    # Scheduler parameters
+    parser.add_argument("--flow_shift", type=float, default=5.0, help="Flow shift value for scheduler")
+    parser.add_argument("--dual_dit_boundary", type=float, default=0.875, help="Boundary for dual DiT model switching")
+
+    # Attention mode
+    parser.add_argument("--attn_mode", type=str, default="sdpa", help="Attention mode (sdpa, flash_attn, etc.)")
+    parser.add_argument("--blocks_to_swap", type=int, default=30, help="Number of blocks to swap for memory optimization")
+
     args = parser.parse_args()
 
     # Setup
@@ -1062,45 +1083,104 @@ def main():
 
     logger.info(f"Using device: {device}, dtype: {weight_dtype}, seed: {args.seed}")
 
-    # Load Config
-    try:
+    # Check if using direct safetensors files or model directory
+    if args.dit_low_noise and args.vae and args.t5:
+        # Direct safetensors loading mode
+        logger.info("Using direct safetensors file loading mode")
+
+        # Default config for direct loading
+        if args.task == "vace-t2v-A14B":
+            vace_layers = [0, 5, 10, 15, 20, 25, 30, 35]
+            vae_type = 'AutoencoderKLWan'
+            num_layers = 40
+            dim = 3072
+            ffn_dim = 13824
+            num_heads = 40
+        else:
+            # Default for other models
+            vace_layers = [0, 5, 10, 15, 20, 25, 30]
+            vae_type = 'AutoencoderKLWan'
+            num_layers = 30
+            dim = 3072
+            ffn_dim = 8192
+            num_heads = 24
+
+        boundary = args.dual_dit_boundary
+
+        # Set direct paths
+        transformer_low_path = args.dit_low_noise
+        transformer_high_path = args.dit_high_noise if args.dit_high_noise else None
+        vae_path = args.vae
+        text_encoder_path = args.t5
+        tokenizer_path = "wan/xlm-roberta-large"  # Default tokenizer path
+
+    elif args.config_path and args.model_dir:
+        # Traditional config-based loading
         config = OmegaConf.load(args.config_path)
-    except FileNotFoundError:
-        logger.error(f"Configuration file not found at: {args.config_path}")
+        boundary = config['transformer_additional_kwargs'].get('boundary', 0.875)
+
+        transformer_low_path = os.path.join(args.model_dir, config['transformer_additional_kwargs'].get('transformer_low_noise_model_subpath', 'transformer'))
+        transformer_high_path = os.path.join(args.model_dir, config['transformer_additional_kwargs'].get('transformer_high_noise_model_subpath', 'transformer_high'))
+        vae_path = os.path.join(args.model_dir, config['vae_kwargs'].get('vae_subpath', 'vae'))
+        tokenizer_path = os.path.join(args.model_dir, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer'))
+        text_encoder_path = os.path.join(args.model_dir, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder'))
+        vae_type = config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan')
+        vace_layers = config['transformer_additional_kwargs'].get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35])
+    else:
+        logger.error("Please provide either --dit_low_noise/--vae/--t5 for direct loading or --config_path/--model_dir for config-based loading")
         sys.exit(1)
 
-    boundary = config['transformer_additional_kwargs'].get('boundary', 0.875)
-
-    # Load Models
-    transformer_low_path = os.path.join(args.model_dir, config['transformer_additional_kwargs'].get('transformer_low_noise_model_subpath', 'transformer'))
-    transformer_high_path = os.path.join(args.model_dir, config['transformer_additional_kwargs'].get('transformer_high_noise_model_subpath', 'transformer_high'))
-    vae_path = os.path.join(args.model_dir, config['vae_kwargs'].get('vae_subpath', 'vae'))
-    tokenizer_path = os.path.join(args.model_dir, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer'))
-    text_encoder_path = os.path.join(args.model_dir, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder'))
-
     logger.info("Loading VACE Transformer (Low Noise)...")
-    transformer = VaceWanTransformer3DModel.from_pretrained(
-        transformer_low_path,
-        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-        torch_dtype=weight_dtype,
-    )
-
-    if config['transformer_additional_kwargs'].get('transformer_combination_type', 'single') == "moe":
-        logger.info("Loading VACE Transformer (High Noise)...")
-        transformer_2 = VaceWanTransformer3DModel.from_pretrained(
-            transformer_high_path,
+    if args.dit_low_noise:
+        # Direct loading with default config
+        transformer_additional_kwargs = {
+            'vace_layers': vace_layers,
+            'vace_in_dim': 96 if args.task == "vace-t2v-A14B" else 16
+        }
+        transformer = VaceWanTransformer3DModel.from_pretrained(
+            transformer_low_path,
+            transformer_additional_kwargs=transformer_additional_kwargs,
+            torch_dtype=weight_dtype,
+        )
+    else:
+        transformer = VaceWanTransformer3DModel.from_pretrained(
+            transformer_low_path,
             transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
             torch_dtype=weight_dtype,
         )
+
+    # Load high noise transformer if provided
+    if transformer_high_path:
+        logger.info("Loading VACE Transformer (High Noise)...")
+        if args.dit_high_noise:
+            transformer_2 = VaceWanTransformer3DModel.from_pretrained(
+                transformer_high_path,
+                transformer_additional_kwargs=transformer_additional_kwargs,
+                torch_dtype=weight_dtype,
+            )
+        else:
+            transformer_2 = VaceWanTransformer3DModel.from_pretrained(
+                transformer_high_path,
+                transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+                torch_dtype=weight_dtype,
+            )
     else:
         transformer_2 = None
 
     logger.info("Loading VAE...")
-    Chosen_AutoencoderKL = {'AutoencoderKLWan': AutoencoderKLWan, 'AutoencoderKLWan3_8': AutoencoderKLWan3_8}[config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan')]
-    vae = Chosen_AutoencoderKL.from_pretrained(
-        vae_path,
-        additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
-    ).to(weight_dtype)
+    if args.vae:
+        # Direct loading
+        Chosen_AutoencoderKL = {'AutoencoderKLWan': AutoencoderKLWan, 'AutoencoderKLWan3_8': AutoencoderKLWan3_8}[vae_type]
+        vae = Chosen_AutoencoderKL.from_pretrained(
+            vae_path,
+            additional_kwargs={}
+        ).to(weight_dtype)
+    else:
+        Chosen_AutoencoderKL = {'AutoencoderKLWan': AutoencoderKLWan, 'AutoencoderKLWan3_8': AutoencoderKLWan3_8}[config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan')]
+        vae = Chosen_AutoencoderKL.from_pretrained(
+            vae_path,
+            additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
+        ).to(weight_dtype)
 
     logger.info("Loading Tokenizer and Text Encoder...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -1110,9 +1190,19 @@ def main():
         torch_dtype=weight_dtype,
     )
 
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
-    )
+    # Create scheduler
+    if args.dit_low_noise:
+        # Direct loading with default scheduler config
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            shift=args.flow_shift,
+            num_train_timesteps=1000,
+            base_image_seq_len=256,
+            max_image_seq_len=1024
+        )
+    else:
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+        )
 
     # Create Pipeline
     pipeline = Wan2_2VaceFunPipeline(
@@ -1134,7 +1224,12 @@ def main():
 
     # Enable TeaCache if requested
     if args.enable_teacache:
-        coefficients = get_teacache_coefficients(args.model_dir)
+        # Use the actual model filename for coefficient lookup
+        if args.dit_low_noise:
+            model_name = os.path.basename(args.dit_low_noise) if args.dit_low_noise else args.task
+        else:
+            model_name = args.model_dir
+        coefficients = get_teacache_coefficients(model_name)
         if coefficients:
             logger.info(f"Enabling TeaCache with threshold {args.teacache_threshold}")
             # Note: TeaCache integration would require additional implementation in the transformer models
