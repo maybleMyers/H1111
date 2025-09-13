@@ -2922,9 +2922,17 @@ def prepare_t2v_inputs(
 
     # Handle VACE context for VACE models
     if "vace-" in args.task.lower() and VACE_AVAILABLE:
+        # Debug: Log what we're trying to load
+        logger.info(f"VACE: control_video path = {args.control_video}")
+        logger.info(f"VACE: subject_ref_images = {args.subject_ref_images}")
+
         # Process control video and subject ref images if provided
         control_video = process_vace_control_video(args, args.video_length, (height, width)) if args.control_video else None
         subject_ref_images = process_vace_subject_references(args, (height, width)) if args.subject_ref_images else None
+
+        # Debug: Log what was loaded
+        logger.info(f"VACE: control_video loaded = {control_video is not None} (shape: {control_video.shape if control_video is not None else 'None'})")
+        logger.info(f"VACE: subject_ref_images loaded = {subject_ref_images is not None} (shape: {subject_ref_images.shape if subject_ref_images is not None else 'None'})")
 
         # Create VACE context
         if vae is not None and (control_video is not None or subject_ref_images is not None):
@@ -2937,10 +2945,13 @@ def prepare_t2v_inputs(
                 arg_c["vace_context_scale"] = args.vace_context_scale
                 arg_null["vace_context"] = vace_context
                 arg_null["vace_context_scale"] = args.vace_context_scale
-                logger.info(f"Added VACE context to model inputs (scale: {args.vace_context_scale})")
+                logger.info(f"Added VACE context to model inputs (scale: {args.vace_context_scale}, context items: {len(vace_context)})")
         else:
             # For VACE models, we still need to provide empty vace_context
-            logger.warning("VACE model detected but no control video or subject references provided. Using empty context.")
+            if vae is None:
+                logger.warning("VACE model detected but VAE not available for creating context.")
+            else:
+                logger.warning("VACE model detected but no control video or subject references loaded successfully.")
             arg_c["vace_context"] = []
             arg_c["vace_context_scale"] = args.vace_context_scale
             arg_null["vace_context"] = []

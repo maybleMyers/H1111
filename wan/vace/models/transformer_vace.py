@@ -70,9 +70,9 @@ class BaseWanAttentionBlock(WanAttentionBlock):
 
     def forward(self, x, hints, context_scale=1.0, **kwargs):
         # Filter out kwargs that the parent class doesn't accept
-        # WanAttentionBlock.forward expects: x, e, seq_lens, grid_sizes, freqs, context, context_lens, t
+        # WanAttentionBlock.forward expects: x, e, seq_lens, grid_sizes, freqs, context, context_lens
         parent_kwargs = {}
-        for key in ['e', 'seq_lens', 'grid_sizes', 'freqs', 'context', 'context_lens', 't']:
+        for key in ['e', 'seq_lens', 'grid_sizes', 'freqs', 'context', 'context_lens']:
             if key in kwargs:
                 parent_kwargs[key] = kwargs[key]
 
