@@ -763,7 +763,7 @@ class DynamicModelManager:
                 num_layers = 40 if "14B" in model_path else 30
                 transformer_kwargs = {
                     'vace_layers': list(range(0, num_layers, 2)),  # Every 2nd layer: [0, 2, 4, 6, ...]
-                    'vace_in_dim': 16,  # Should match in_dim for standard VACE models
+                    'vace_in_dim': 96,  # Standard VACE models use 96 channels
                     'model_type': 't2v'
                 }
             
@@ -787,11 +787,19 @@ class DynamicModelManager:
                 # Detect model configuration from state dict
                 dim = sd.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
 
+                # Detect vace_in_dim from state dict (like ComfyUI does)
+                if "vace_patch_embedding.weight" in sd:
+                    vace_in_dim = sd["vace_patch_embedding.weight"].shape[1]
+                    logger.info(f"Detected vace_in_dim={vace_in_dim} from state dict")
+                else:
+                    vace_in_dim = transformer_kwargs.get('vace_in_dim', 96)
+                    logger.info(f"Using default vace_in_dim={vace_in_dim}")
+
                 # Create VACE model with empty weights (no memory allocation)
                 with init_empty_weights():
                     model = VaceWanTransformer3DModel(
                         vace_layers=transformer_kwargs.get('vace_layers', list(range(0, 40, 2))),
-                        vace_in_dim=transformer_kwargs.get('vace_in_dim', 16),  # Should match in_dim by default
+                        vace_in_dim=vace_in_dim,  # Use detected or default value
                         model_type='t2v',
                         patch_size=(1, 2, 2),
                         text_len=512,
