@@ -673,7 +673,8 @@ class AutoencoderKLWan_(nn.Module):
         self._enc_feat_map = [None] * self._enc_conv_num
 
 def _video_vae(z_dim=None, **kwargs):
-    cfg = dict(dim=96, z_dim=z_dim, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temperal_downsample=[False, True, True], dropout=0.0)
+    # Updated configuration to match Wan2.1_VAE.pth checkpoint
+    cfg = dict(dim=96, z_dim=z_dim, dim_mult=[1, 2, 2, 4], num_res_blocks=2, attn_scales=[], temperal_downsample=[False, True, True], dropout=0.0)
     cfg.update(**kwargs)
     return AutoencoderKLWan_(**cfg)
 
