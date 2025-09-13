@@ -14,7 +14,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
 import accelerate
-from accelerate import Accelerator
+from accelerate import Accelerator, init_empty_weights
 from functools import partial
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
@@ -775,60 +775,47 @@ class DynamicModelManager:
                     torch_dtype=loading_weight_dtype or self.dit_dtype
                 )
             else:
-                # Single file - load state dict and create model
-                # First, detect model size without loading full state dict
-                with safe_open(model_path, framework="pt", device="cpu") as f:
-                    # Just peek at one weight to determine model size
-                    patch_weight = f.get_tensor("patch_embedding.weight")
-                    dim = patch_weight.shape[0]
-                    del patch_weight  # Free this small tensor immediately
+                # Single file - use WAN2.2 memory-efficient loading approach
+                logger.info(f"Loading VACE model using memory-efficient approach from {model_path}")
 
-                # Create VACE model with proper configuration
-                model = VaceWanTransformer3DModel(
-                    vace_layers=transformer_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
-                    vace_in_dim=transformer_kwargs.get('vace_in_dim', 96),
-                    model_type='t2v',
-                    patch_size=(1, 2, 2),
-                    text_len=512,
-                    in_dim=16,  # Standard input dimension
-                    dim=dim,
-                    ffn_dim=8192 if dim == 3072 else 13824,  # Adjust based on model size
-                    freq_dim=256,
-                    text_dim=4096,
-                    out_dim=16,
-                    num_heads=24 if dim == 3072 else 40,
-                    num_layers=30 if dim == 3072 else 40,
-                    window_size=(-1, -1),
-                    qk_norm=True,
-                    cross_attn_norm=True,
-                    eps=1e-6
-                )
+                # Load state dict efficiently using load_safetensors utility
+                sd = load_safetensors(model_path, "cpu", disable_mmap=True,
+                                     dtype=loading_weight_dtype or self.dit_dtype)
 
-                # Load state dict efficiently - load weights one by one
-                with safe_open(model_path, framework="pt", device="cpu") as f:
-                    # Get model's state dict for comparison
-                    model_state = model.state_dict()
-                    missing = []
-                    unexpected = []
+                # Detect model configuration from state dict
+                dim = sd.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
 
-                    # Load each weight directly into the model
-                    for key in f.keys():
-                        if key in model_state:
-                            param = f.get_tensor(key)
-                            model_state[key].copy_(param)
-                            del param  # Free memory immediately
-                        else:
-                            unexpected.append(key)
+                # Create VACE model with empty weights (no memory allocation)
+                with init_empty_weights():
+                    model = VaceWanTransformer3DModel(
+                        vace_layers=transformer_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
+                        vace_in_dim=transformer_kwargs.get('vace_in_dim', 96),
+                        model_type='t2v',
+                        patch_size=(1, 2, 2),
+                        text_len=512,
+                        in_dim=16,  # Standard input dimension
+                        dim=dim,
+                        ffn_dim=8192 if dim == 3072 else 13824,  # Adjust based on model size
+                        freq_dim=256,
+                        text_dim=4096,
+                        out_dim=16,
+                        num_heads=24 if dim == 3072 else 40,
+                        num_layers=30 if dim == 3072 else 40,
+                        window_size=(-1, -1),
+                        qk_norm=True,
+                        cross_attn_norm=True,
+                        eps=1e-6
+                    )
+                    if loading_weight_dtype or self.dit_dtype:
+                        model.to(loading_weight_dtype or self.dit_dtype)
 
-                    # Check for missing keys
-                    for key in model_state.keys():
-                        if key not in f.keys():
-                            missing.append(key)
+                # Load state dict with assign=True for zero-copy assignment
+                info = model.load_state_dict(sd, strict=False, assign=True)
 
-                if missing:
-                    logger.warning(f"Missing keys in VACE model: {len(missing)} keys")
-                if unexpected:
-                    logger.warning(f"Unexpected keys in VACE model: {len(unexpected)} keys")
+                if info.missing_keys:
+                    logger.warning(f"Missing keys in VACE model: {len(info.missing_keys)} keys")
+                if info.unexpected_keys:
+                    logger.warning(f"Unexpected keys in VACE model: {len(info.unexpected_keys)} keys")
             
             # Move to target device and dtype
             model = model.to(device=loading_device, dtype=loading_weight_dtype or self.dit_dtype)

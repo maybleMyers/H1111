@@ -380,9 +380,17 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
     @classmethod
     def from_pretrained(cls, model_path, transformer_additional_kwargs=None,
                        low_cpu_mem_usage=True, torch_dtype=torch.bfloat16):
-        """Load VACE model from pretrained weights with memory-efficient loading."""
+        """Load VACE model from pretrained weights with memory-efficient loading using init_empty_weights."""
         import os
         from safetensors import safe_open
+        from accelerate import init_empty_weights
+
+        # Import load_safetensors if available
+        try:
+            from utils.safetensors_utils import load_safetensors
+        except ImportError:
+            # Fallback to basic loading
+            from safetensors.torch import load_file as load_safetensors
 
         if transformer_additional_kwargs is None:
             transformer_additional_kwargs = {}
@@ -395,58 +403,52 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         else:
             ckpt_path = model_path
 
-        # Detect model configuration without loading full state dict
+        # Load state dict efficiently
         if ckpt_path.endswith('.safetensors'):
-            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
-                # Just peek at one weight to determine model size
-                patch_weight_shape = f.get_tensor("patch_embedding.weight").shape
-                dim = patch_weight_shape[0]
+            # Use load_safetensors utility for efficient loading
+            if 'load_safetensors' in locals() and hasattr(load_safetensors, '__call__'):
+                state_dict = load_safetensors(ckpt_path, "cpu", disable_mmap=True, dtype=torch_dtype)
+            else:
+                # Fallback to basic loading
+                from safetensors.torch import load_file
+                state_dict = load_file(ckpt_path, device="cpu")
         else:
-            # For .bin files, we need to load to check dimensions
+            # For .bin files
             state_dict = torch.load(ckpt_path, map_location="cpu")
-            dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
 
-        # Create model instance with detected config
-        model = cls(
-            vace_layers=transformer_additional_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
-            vace_in_dim=transformer_additional_kwargs.get('vace_in_dim', 96),
-            model_type='t2v',
-            patch_size=(1, 2, 2),
-            text_len=512,
-            in_dim=16,
-            dim=dim,
-            ffn_dim=8192 if dim == 3072 else 13824,
-            freq_dim=256,
-            text_dim=4096,
-            out_dim=16,
-            num_heads=24 if dim == 3072 else 40,
-            num_layers=30 if dim == 3072 else 40,
-            window_size=(-1, -1),
-            qk_norm=True,
-            cross_attn_norm=True,
-            eps=1e-6
-        )
+        # Detect model configuration from state dict
+        dim = state_dict.get("patch_embedding.weight", torch.zeros(3072, 16)).shape[0]
 
-        # Load weights efficiently
-        if ckpt_path.endswith('.safetensors'):
-            # Memory-efficient loading for safetensors
-            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
-                state_dict = {}
-                for key in f.keys():
-                    state_dict[key] = f.get_tensor(key)
-                missing, unexpected = model.load_state_dict(state_dict, strict=False)
-                del state_dict  # Free memory immediately
-        else:
-            # Already loaded for .bin files
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # Create model instance with empty weights (no memory allocation)
+        with init_empty_weights():
+            model = cls(
+                vace_layers=transformer_additional_kwargs.get('vace_layers', [0, 5, 10, 15, 20, 25, 30, 35]),
+                vace_in_dim=transformer_additional_kwargs.get('vace_in_dim', 96),
+                model_type='t2v',
+                patch_size=(1, 2, 2),
+                text_len=512,
+                in_dim=16,
+                dim=dim,
+                ffn_dim=8192 if dim == 3072 else 13824,
+                freq_dim=256,
+                text_dim=4096,
+                out_dim=16,
+                num_heads=24 if dim == 3072 else 40,
+                num_layers=30 if dim == 3072 else 40,
+                window_size=(-1, -1),
+                qk_norm=True,
+                cross_attn_norm=True,
+                eps=1e-6
+            )
+            if torch_dtype is not None:
+                model.to(torch_dtype)
 
-        if missing:
-            print(f"Missing keys: {len(missing)}")
-        if unexpected:
-            print(f"Unexpected keys: {len(unexpected)}")
+        # Load state dict with assign=True for zero-copy assignment
+        info = model.load_state_dict(state_dict, strict=False, assign=True)
 
-        # Convert dtype if specified
-        if torch_dtype is not None:
-            model = model.to(torch_dtype)
+        if info.missing_keys:
+            print(f"Missing keys: {len(info.missing_keys)}")
+        if info.unexpected_keys:
+            print(f"Unexpected keys: {len(info.unexpected_keys)}")
 
         return model
