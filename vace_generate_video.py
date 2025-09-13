@@ -5446,8 +5446,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Load VAE (if needed for input processing) ---
     vae = None
-    # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
-    needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
+    # VAE is needed early for V2V, I2V, TI2V, FunControl T2V, and VACE models
+    needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) or vace_mode is not None # Added VACE condition
     if needs_vae_early:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
