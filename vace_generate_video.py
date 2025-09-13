@@ -1998,29 +1998,32 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
         # Import F at the top of the function scope if not already
         import torch.nn.functional as F
 
-        # Calculate new dimensions based on VAE stride - following official implementation
+        # Calculate new dimensions based on VAE stride
         new_depth = int((depth + vae_stride[0] - 1) // vae_stride[0])
-        # The official implementation ensures dimensions are proper multiples
-        # by adjusting height and width to be even multiples of stride * 2
-        height = 2 * (int(height) // (vae_stride[1] * 2))
-        width = 2 * (int(width) // (vae_stride[2] * 2))
-        new_height = height // vae_stride[1]
-        new_width = width // vae_stride[2]
+
+        # Ensure height and width are divisible by vae_stride for proper reshaping
+        # This is critical for the view operation to work correctly
+        adjusted_height = (height // vae_stride[1]) * vae_stride[1]
+        adjusted_width = (width // vae_stride[2]) * vae_stride[2]
+
+        # Calculate the downsampled dimensions
+        new_height = adjusted_height // vae_stride[1]
+        new_width = adjusted_width // vae_stride[2]
 
         # First extract single channel mask
         mask = mask[0, :, :, :]  # [depth, height_orig, width_orig]
 
-        # Resize mask to match the adjusted dimensions
-        # Always interpolate to ensure correct dimensions for reshaping
+        # Resize mask to the adjusted dimensions that are divisible by vae_stride
+        # This ensures the subsequent view operation will work
         mask = F.interpolate(
             mask.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
-            size=(depth, height, width),
+            size=(depth, adjusted_height, adjusted_width),
             mode='trilinear',
             align_corners=False
-        )[0, 0]  # Remove batch and channel dims [depth, height, width]
+        )[0, 0]  # Remove batch and channel dims [depth, adjusted_height, adjusted_width]
 
-        # Now reshape following official VACE implementation
-        # Reshape the spatial dimensions (height, width) into (new_height, 8, new_width, 8)
+        # Now reshape following the VACE approach (with typo fix)
+        # Reshape spatial dimensions to create multiple channels from spatial blocks
         mask = mask.view(
             depth, new_height, vae_stride[1], new_width, vae_stride[2]
         )  # [depth, new_height, 8, new_width, 8]
