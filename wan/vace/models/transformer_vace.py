@@ -45,7 +45,9 @@ class VaceWanAttentionBlock(WanAttentionBlock):
             all_c = list(torch.unbind(c))
             c = all_c.pop(-1)
 
-        c = super().forward(c, **kwargs)
+        # Filter out dtype as it's not expected by parent WanAttentionBlock
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k != 'dtype'}
+        c = super().forward(c, **filtered_kwargs)
         c_skip = self.after_proj(c)
         all_c += [c_skip, c]
         c = torch.stack(all_c)
@@ -186,9 +188,11 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         if self.sp_world_size > 1:
             c = torch.chunk(c, self.sp_world_size, dim=1)[self.sp_world_rank]
 
-        # arguments
+        # arguments - filter out dtype as it's not expected by WanAttentionBlock
         new_kwargs = dict(x=x)
-        new_kwargs.update(kwargs)
+        for k, v in kwargs.items():
+            if k != 'dtype':  # Skip dtype as it's not a valid argument for WanAttentionBlock
+                new_kwargs[k] = v
 
         for block in self.vace_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
