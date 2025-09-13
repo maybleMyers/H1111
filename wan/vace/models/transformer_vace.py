@@ -200,7 +200,8 @@ class VaceWanTransformer3DModel(WanTransformer3DModel):
         # if self.model_type == 'i2v':
         #     assert clip_fea is not None and y is not None
         # params
-        dtype = x.dtype
+        # x is a list of tensors, get dtype from first tensor
+        dtype = x[0].dtype if isinstance(x, list) and len(x) > 0 else x.dtype
         device = self.patch_embedding.weight.device
         if self.freqs.device != device and torch.device(type="meta") != device:
             self.freqs = self.freqs.to(device)
