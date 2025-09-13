@@ -1957,8 +1957,9 @@ def vace_encode_frames(frames: torch.Tensor, ref_images: Optional[torch.Tensor],
                 inactive_encoded = vae.encode([inactive.squeeze(0)])[0]
                 reactive_encoded = vae.encode([reactive.squeeze(0)])[0]
 
-            # Combine latents based on mask
-            latent = inactive_encoded + reactive_encoded
+            # Concatenate latents along channel dimension (following official implementation)
+            # This doubles the channels: 16 inactive + 16 reactive = 32 channels
+            latent = torch.cat([inactive_encoded, reactive_encoded], dim=0)
         else:
             # Encode without mask
             with torch.no_grad():
