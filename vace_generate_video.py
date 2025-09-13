@@ -2035,6 +2035,8 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
         )  # [64, depth, new_height, new_width]
 
         # Interpolate temporally to match new_depth
+        # Note: Official implementation uses (new_depth, height, width) not (new_depth, new_height, new_width)
+        # But we need to use new_height and new_width since we've already reshaped
         mask = F.interpolate(
             mask.unsqueeze(0),  # Add batch dim for interpolation
             size=(new_depth, new_height, new_width),
@@ -2042,12 +2044,8 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
         ).squeeze(0)  # Remove batch dim, result is [64, new_depth, new_height, new_width]
 
         # Handle reference images padding if needed
-        refs = ref_images[i] if i < len(ref_images) else None
-        if refs is not None:
-            # If we have reference images, pad the temporal dimension
-            ref_length = 1  # Assuming single reference frame
-            mask_pad = torch.zeros_like(mask[:, :ref_length, :, :])
-            mask = torch.cat((mask_pad, mask), dim=1)
+        # Don't pad here - the VAE encoding already handles reference frames
+        # This avoids the dimension mismatch between encoded frames and masks
 
         # Move to device if specified
         if device is not None:
