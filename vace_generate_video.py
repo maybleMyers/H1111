@@ -1995,25 +1995,33 @@ def vace_encode_masks(masks: Optional[torch.Tensor], ref_images: Optional[torch.
 
         c, depth, height, width = mask.shape
 
-        # Calculate new dimensions based on VAE stride
+        # Calculate new dimensions based on VAE stride - following official implementation
         new_depth = int((depth + vae_stride[0] - 1) // vae_stride[0])
-        # Ensure height and width are even multiples for proper reshaping
+        # Ensure height and width are divisible by vae_stride for proper reshaping
         height = 2 * (int(height) // (vae_stride[1] * 2))
         width = 2 * (int(width) // (vae_stride[2] * 2))
-        new_height = height // vae_stride[1]
-        new_width = width // vae_stride[2]
 
         # Import F at the top of the function scope if not already
         import torch.nn.functional as F
 
-        # Reshape mask following official VACE implementation
-        # Extract the first channel (assuming single channel mask)
+        # Following the official VACE implementation approach:
+        # First extract single channel mask
         mask = mask[0, :, :, :]  # [depth, height, width]
 
-        # Reshape to create 64 channels from spatial dimensions (8x8)
-        # This matches the official implementation's spatial downsampling approach
+        # Reshape spatial dimensions to create 64 channels from 8x8 spatial blocks
+        # The official implementation does this by viewing and permuting the tensor
         mask = mask.view(
-            depth, height // vae_stride[1], vae_stride[1], width // vae_stride[2], vae_stride[2]
+            depth, height, width
+        )
+
+        # Actually following the official implementation more closely:
+        # They reshape the spatial dimensions (height, width) into (new_height, 8, new_width, 8)
+        # then permute to get 64 channels
+        new_height = height // vae_stride[1]
+        new_width = width // vae_stride[2]
+
+        mask = mask.view(
+            depth, new_height, vae_stride[1], new_width, vae_stride[2]
         )  # [depth, new_height, 8, new_width, 8]
 
         mask = mask.permute(2, 4, 0, 1, 3)  # [8, 8, depth, new_height, new_width]
