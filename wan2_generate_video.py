@@ -3305,7 +3305,7 @@ def run_sampling(
                 logger.debug(f"Step {i}: Applying V2V conditioning to remapped positions {remapped_positions}")
 
                 # Create 2D timestep tensor for V2V scheduler (expects shape [B, F])
-                # Convert scalar timestep to frame-aware tensor
+                # The Pusa scheduler will handle frame-specific timestep modifications internally
                 num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
                 # Ensure t is a tensor (sometimes it might be extracted as a Python scalar)
                 if not isinstance(t, torch.Tensor):
@@ -3314,13 +3314,7 @@ def run_sampling(
                     t_tensor = t.to(device)
                 timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
 
-                # Apply frame-specific timestep modifications for REMAPPED conditioning frames
-                for frame_idx in remapped_positions:
-                    if frame_idx < num_frames:
-                        noise_mult = remapped_noise_mapping.get(frame_idx, 1.0)
-                        timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
-                
-                # Use 2D timestep for V2V scheduler
+                # Use 2D timestep for V2V scheduler (scheduler will apply frame-specific modifications)
                 timestep_for_scheduler = timestep_2d
             else:
                 # Use scalar timestep for regular schedulers
@@ -4823,7 +4817,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     latent = noise # Start with noise (already shaped correctly for T2V/I2V/V2V)
     
     # --- Apply Pusa Multi-Frame Conditioning Before Sampling ---
-    # This must happen BEFORE the sampling loop to inject conditioning frames into the initial latent
+    # This must happen BEFORE the sampling loop to properly add noise to conditioning frames
     if hasattr(args, 'pusa_conditioning_dict') and args.pusa_conditioning_dict and vae is not None:
         logger.info("Encoding Pusa conditioning images to latent space...")
 
@@ -4849,6 +4843,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Save remapped dict for use in sampling loop
         args._pusa_remapped_dict = remapped_dict
 
+        # Store clean latents for each conditioning frame
+        clean_conditioning_latents = {}
+
         # Process each conditioning image with remapped positions
         for frame_idx, (cond_image, noise_mult) in remapped_dict.items():
             # Determine the frame dimension based on tensor shape
@@ -4862,7 +4859,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
             if frame_idx < num_frames:  # Check frame index is valid
                 logger.debug(f"Encoding conditioning image for frame {frame_idx} (total frames: {num_frames})")
-                
+
                 # Convert PIL image to tensor and prepare for VAE encoding
                 # The cond_image is a PIL Image from the pusa utils
                 import torchvision.transforms as transforms
@@ -4870,37 +4867,77 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     transforms.ToTensor(),  # Converts to [C, H, W] with values [0, 1]
                 ])
                 img_tensor = transform(cond_image).unsqueeze(0).to(device)  # [1, 3, H, W]
-                
+
                 # Normalize to [-1, 1] for VAE
                 img_tensor = 2.0 * img_tensor - 1.0
-                
+
                 # Encode image to latent space
                 with torch.no_grad():
                     # VAE expects a list containing [C, F, H, W] tensor
                     # We'll treat each frame as a single-frame video
                     img_tensor_video = img_tensor.squeeze(0).unsqueeze(1)  # [3, 1, H, W] - remove batch, add frame dim
-                    
+
                     # vae.encode expects a list, returns a list
                     cond_latent_list = vae.encode([img_tensor_video])  # Returns list with [C', 1, H_lat, W_lat]
                     cond_latent = cond_latent_list[0].to(device)  # Get first element from list
-                    
+
                     # Remove the temporal dimension since we encoded a single frame
                     cond_latent = cond_latent.squeeze(1)  # [C', H_lat, W_lat]
-                    
-                    # Inject into the latent at the specified frame position
-                    if latent.dim() == 4:  # [C, F, H, W]
-                        latent[:, frame_idx, :, :] = cond_latent
-                    elif latent.dim() == 5:  # [B, C, F, H, W]
-                        latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
-                    
-                    logger.info(f"Injected conditioning latent at frame {frame_idx} (noise_mult={noise_mult})")
+
+                    # Store clean latent for later noise addition
+                    clean_conditioning_latents[frame_idx] = cond_latent
+
+                    # For V2V with Pusa scheduler, we need to add noise using the scheduler
+                    if hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler:
+                        # Get the maximum timestep (start of denoising)
+                        max_timestep = timesteps[0] if isinstance(timesteps[0], torch.Tensor) else torch.tensor(timesteps[0], device=device)
+
+                        # Create noise for this frame
+                        if latent.dim() == 5:  # [B, C, F, H, W]
+                            frame_noise = torch.randn_like(latent[:, :, frame_idx:frame_idx+1, :, :])
+                            clean_frame = cond_latent.unsqueeze(0).unsqueeze(2)  # Add batch and frame dims
+
+                            # Add noise using scheduler's method
+                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
+                                clean_frame,
+                                frame_noise,
+                                max_timestep.unsqueeze(0),  # Ensure it's a tensor
+                                noise_multiplier=noise_mult
+                            )
+                            latent[:, :, frame_idx, :, :] = noisy_frame.squeeze(2)  # Remove frame dim
+                        else:  # [C, F, H, W]
+                            frame_noise = torch.randn_like(latent[:, frame_idx:frame_idx+1, :, :])
+                            clean_frame = cond_latent.unsqueeze(1)  # Add frame dim
+
+                            # Add noise using scheduler's method
+                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
+                                clean_frame,
+                                frame_noise,
+                                max_timestep,
+                                noise_multiplier=noise_mult
+                            )
+                            latent[:, frame_idx, :, :] = noisy_frame.squeeze(1)  # Remove frame dim
+
+                        logger.info(f"Added noise to conditioning frame {frame_idx} with multiplier={noise_mult}")
+                    else:
+                        # For non-V2V Pusa, inject clean latent (original behavior)
+                        if latent.dim() == 4:  # [C, F, H, W]
+                            latent[:, frame_idx, :, :] = cond_latent
+                        elif latent.dim() == 5:  # [B, C, F, H, W]
+                            latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
+
+                        logger.info(f"Injected clean conditioning latent at frame {frame_idx}")
             else:
                 logger.warning(f"Skipping conditioning frame {frame_idx} - out of bounds (latent has {num_frames} frames)")
-        
+
+        # Save clean latents for potential use in sampling loop
+        if clean_conditioning_latents:
+            args._pusa_clean_latents = clean_conditioning_latents
+
         # Move VAE back to CPU to save memory
         vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
         clean_memory_on_device(device)
-        logger.info("Pusa conditioning images encoded and injected into initial latent")
+        logger.info("Pusa conditioning images encoded and noise added appropriately")
     
     # Create masks for TI2V before sampling loop (following official implementation)
     ti2v_mask1, ti2v_mask2 = None, None
