@@ -3085,9 +3085,9 @@ def run_sampling(
 
                         logger.debug(f"Step {i}: Added noise to conditioning frame {frame_idx} with multiplier={noise_mult}")
 
-                    # Modify timestep for this frame (always, not just when adding noise)
-                    if noise_mult > 0:
-                        timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
+                    # ALWAYS modify timestep for conditioning frames (following official implementation)
+                    # This ensures frames with multiplier=0 have timestep=0 and remain unchanged
+                    timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
 
                 # Update latent back to storage if we modified it
                 if latent.device != latent_on_device.device:
@@ -3405,9 +3405,9 @@ def run_sampling(
                     timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
 
                     # Apply frame-specific timestep modifications
+                    # ALWAYS apply multiplier (even when 0) to match official implementation
                     for frame_idx, (_, noise_mult) in args._pusa_remapped_dict.items():
-                        if noise_mult > 0:
-                            timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
+                        timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
 
                 # Use 2D timestep for V2V scheduler
                 timestep_for_scheduler = timestep_2d
@@ -5440,16 +5440,17 @@ def main():
                 noise_multipliers = parse_noise_multipliers(args.cond_noise_multipliers)
                 video_frames = process_conditioning_video(args.cond_video, width, height)
                 
-                # Automatically use last frame as input image if no input image provided
-                if not args.image_path and len(video_frames) > 0:
-                    import tempfile
-                    import os
-                    # Save last frame as temporary input image
-                    temp_dir = tempfile.mkdtemp()
-                    temp_image_path = os.path.join(temp_dir, "pusa_input_frame.png")
-                    video_frames[-1].save(temp_image_path)
-                    args.image_path = temp_image_path
-                    logger.info(f"Auto-extracted last frame as input image: {temp_image_path}")
+                # Official Pusa V2V does NOT extract frames for I2V - it uses pure T2V with conditioning
+                # Commenting out auto-extraction to match official implementation
+                # if not args.image_path and len(video_frames) > 0:
+                #     import tempfile
+                #     import os
+                #     # Save last frame as temporary input image
+                #     temp_dir = tempfile.mkdtemp()
+                #     temp_image_path = os.path.join(temp_dir, "pusa_input_frame.png")
+                #     video_frames[-1].save(temp_image_path)
+                #     args.image_path = temp_image_path
+                #     logger.info(f"Auto-extracted last frame as input image: {temp_image_path}")
                 
                 # Select specific frames based on positions
                 conditioning_images = []
