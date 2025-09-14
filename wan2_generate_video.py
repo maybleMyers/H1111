@@ -39,7 +39,7 @@ from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.pusa.flowmatch_pusa_scheduler import FlowMatchSchedulerPusa
-from wan.pusa.flowmatch_pusa_v2v_scheduler import FlowMatchSchedulerPusaV2V
+from wan.pusa.flow_match_pusa_v2v import FlowMatchSchedulerPusaV2V
 from wan.pusa.utils import (
     process_conditioning_images,
     process_conditioning_video,
