@@ -4913,7 +4913,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                                 max_timestep.unsqueeze(0),  # Ensure it's a tensor
                                 noise_multiplier=noise_mult
                             )
-                            latent[:, :, frame_idx, :, :] = noisy_frame.squeeze(2)  # Remove frame dim
+                            latent[:, :, frame_idx, :, :] = noisy_frame[:, :, 0, :, :]  # Select first frame instead of squeeze
                         else:  # [C, F, H, W]
                             frame_noise = torch.randn_like(latent[:, frame_idx:frame_idx+1, :, :])
                             clean_frame = cond_latent.unsqueeze(1)  # Add frame dim
@@ -4925,7 +4925,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                                 max_timestep,
                                 noise_multiplier=noise_mult
                             )
-                            latent[:, frame_idx, :, :] = noisy_frame.squeeze(1)  # Remove frame dim
+                            latent[:, frame_idx, :, :] = noisy_frame[:, 0, :, :]  # Select first frame instead of squeeze
 
                         logger.info(f"Added noise to conditioning frame {frame_idx} with multiplier={noise_mult}")
                     else:
