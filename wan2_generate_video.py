@@ -4919,18 +4919,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Ensure VAE is on the correct device
         vae.to_device(device)
 
-        # For Pusa V2V extension: remap conditioning positions for proper transition
-        # Input frames 19-20 should condition output frames 0-1, not 19-20
+        # For Pusa V2V extension: keep frames at their original positions
+        # The conditioning frames should remain at positions 17, 18, 19, 20 etc.
         remapped_dict = {}
         if hasattr(args, 'cond_video') and args.cond_video:
-            # This is V2V extension mode - remap positions for transition
-            logger.info("Pusa V2V Extension Mode: Remapping conditioning positions for transition")
-            position_list = sorted(args.pusa_conditioning_dict.keys())
-            for idx, (orig_pos, (cond_image, noise_mult)) in enumerate(args.pusa_conditioning_dict.items()):
-                # Map last frames of input to first frames of output for smooth transition
-                new_pos = idx  # 0, 1, 2... for transition frames
-                remapped_dict[new_pos] = (cond_image, noise_mult)
-                logger.info(f"Remapped conditioning: input frame {orig_pos} -> output frame {new_pos}")
+            # This is V2V extension mode - keep original positions for continuity
+            logger.info("Pusa V2V Extension Mode: Keeping conditioning frames at original positions")
+            remapped_dict = args.pusa_conditioning_dict  # Keep original positions
+            for orig_pos, (cond_image, noise_mult) in args.pusa_conditioning_dict.items():
+                logger.info(f"Conditioning frame at position {orig_pos} with noise_multiplier={noise_mult}")
         else:
             # Standard Pusa mode - keep original positions
             remapped_dict = args.pusa_conditioning_dict

@@ -8143,7 +8143,7 @@ with gr.Blocks(
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
-                        choices=["t2v-A14B", "i2v-A14B", "ti2v-5B"], 
+                        choices=["t2v-A14B", "i2v-A14B", "ti2v-5B", "v2v-A14B"], 
                         value="i2v-A14B",
                         info="Selects the model architecture and configuration to use."
                     )
