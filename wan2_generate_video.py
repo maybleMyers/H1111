@@ -2817,18 +2817,27 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
                 shift=args.flow_shift,
                 extra_one_step=True
             )
+            # V2V scheduler doesn't accept device parameter
+            scheduler.set_timesteps(
+                num_inference_steps=args.infer_steps,
+                shift=args.flow_shift
+            )
+            # Move timesteps to device after creation
+            scheduler.timesteps = scheduler.timesteps.to(device)
+            scheduler.sigmas = scheduler.sigmas.to(device)
         else:
             scheduler = FlowMatchSchedulerPusa(
-                num_train_timesteps=config.num_train_timesteps, 
+                num_train_timesteps=config.num_train_timesteps,
                 shift=args.flow_shift,
                 extra_one_step=True  # Following ComfyUI Pusa implementation
             )
-        
-        scheduler.set_timesteps(
-            num_inference_steps=args.infer_steps,
-            device=device,
-            shift=args.flow_shift
-        )
+            # Regular Pusa scheduler accepts device parameter
+            scheduler.set_timesteps(
+                num_inference_steps=args.infer_steps,
+                device=device,
+                shift=args.flow_shift
+            )
+
         timesteps = scheduler.timesteps
     else:
         raise NotImplementedError(f"Unsupported solver: {args.sample_solver}")
