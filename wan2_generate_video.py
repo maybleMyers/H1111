@@ -2884,7 +2884,15 @@ def run_sampling(
     arg_c, arg_null = inputs
 
     latent = noise # Initialize latent state
-    
+
+    # Initialize flag tracking for Pusa V2V conditional noise addition
+    pusa_v2v_noise_added_flag = None
+    if hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and hasattr(args, '_pusa_remapped_dict'):
+        # Create flag tensor to track which frames have had noise added
+        num_frames = latent.shape[2] if latent.dim() == 5 else latent.shape[1]
+        pusa_v2v_noise_added_flag = torch.zeros((1, num_frames), dtype=torch.bool, device=device)
+        logger.info(f"Initialized Pusa V2V noise tracking flags for {num_frames} frames")
+
     # Check if we should use context windows
     context_handler = None
     if model_options and "context_handler" in model_options:
@@ -3017,7 +3025,80 @@ def run_sampling(
             else:
                 # Single model mode
                 current_model = model
-            
+
+            # --- Pusa V2V Conditional Noise Addition ---
+            # Add noise to conditioning frames during denoising loop (following official implementation)
+            timestep_2d = None  # Initialize for later use
+            if (hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and
+                hasattr(args, '_pusa_remapped_dict') and pusa_v2v_noise_added_flag is not None):
+
+                # Create frame-specific timesteps for V2V
+                num_frames = latent_on_device.shape[2] if latent_on_device.dim() == 5 else latent_on_device.shape[1]
+                if not isinstance(t, torch.Tensor):
+                    t_tensor = torch.tensor(t, device=device)
+                else:
+                    t_tensor = t.to(device)
+                timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
+
+                # Process each conditioning frame
+                for frame_idx, (_, noise_mult) in args._pusa_remapped_dict.items():
+                    # Check if we need to add noise (only once when flag is False and multiplier > 0)
+                    if pusa_v2v_noise_added_flag[0, frame_idx] == False and noise_mult > 0:
+                        # Mark this frame as processed
+                        pusa_v2v_noise_added_flag[0, frame_idx] = True
+
+                        # Generate noise for this frame
+                        if latent_on_device.dim() == 5:  # [B, C, F, H, W]
+                            frame_noise = torch.randn(
+                                latent_on_device.shape[0], latent_on_device.shape[1], 1,
+                                latent_on_device.shape[3], latent_on_device.shape[4],
+                                device=device, dtype=latent_on_device.dtype, generator=seed_g
+                            )
+                        else:  # [C, F, H, W]
+                            frame_noise = torch.randn(
+                                latent_on_device.shape[0], 1,
+                                latent_on_device.shape[2], latent_on_device.shape[3],
+                                device=device, dtype=latent_on_device.dtype, generator=seed_g
+                            )
+
+                        # Add noise using scheduler's method
+                        if latent_on_device.dim() == 5:  # [B, C, F, H, W]
+                            clean_frame = latent_on_device[:, :, frame_idx:frame_idx+1, :, :]
+                            timestep_cond = torch.ones_like(timestep_2d) * timestep_2d.max()
+                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
+                                clean_frame,
+                                frame_noise,
+                                timestep_cond[:, frame_idx:frame_idx+1],
+                                noise_multiplier=noise_mult
+                            )
+                            latent_on_device[:, :, frame_idx, :, :] = noisy_frame[:, :, 0, :, :]
+                        else:  # [C, F, H, W]
+                            clean_frame = latent_on_device[:, frame_idx:frame_idx+1, :, :]
+                            timestep_cond = torch.ones(1, device=device) * t
+                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
+                                clean_frame.unsqueeze(0),  # Add batch dim
+                                frame_noise.unsqueeze(0),  # Add batch dim
+                                timestep_cond,
+                                noise_multiplier=noise_mult
+                            )
+                            latent_on_device[:, frame_idx, :, :] = noisy_frame[0, :, 0, :, :]
+
+                        logger.debug(f"Step {i}: Added noise to conditioning frame {frame_idx} with multiplier={noise_mult}")
+
+                    # Modify timestep for this frame (always, not just when adding noise)
+                    if noise_mult > 0:
+                        timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
+
+                # Update latent back to storage if we modified it
+                if latent.device != latent_on_device.device:
+                    latent = latent_on_device.to(latent_storage_device)
+
+                # Re-prepare model input list after potential modifications
+                if len(latent_on_device.shape) == 5:
+                    latent_model_input_list = [latent_on_device[i] for i in range(latent_on_device.shape[0])]
+                elif len(latent_on_device.shape) == 4:
+                    latent_model_input_list = [latent_on_device]
+
             # --- (Keep existing prediction logic: cond, uncond, slg, cfg) ---
             # Define helper function for model calls with optional context windows
             def calc_cond_batch(model_to_use, conds_list, x_input, ts, opts):
@@ -3299,7 +3380,7 @@ def run_sampling(
                 "return_dict": False,
                 "generator": seed_g
             }
-            
+
             # Add V2V conditioning if using Pusa V2V scheduler
             if (hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler and
                 hasattr(args, '_pusa_remapped_dict')):
@@ -3313,17 +3394,22 @@ def run_sampling(
                 })
                 logger.debug(f"Step {i}: Applying V2V conditioning to remapped positions {remapped_positions}")
 
-                # Create 2D timestep tensor for V2V scheduler (expects shape [B, F])
-                # The Pusa scheduler will handle frame-specific timestep modifications internally
-                num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
-                # Ensure t is a tensor (sometimes it might be extracted as a Python scalar)
-                if not isinstance(t, torch.Tensor):
-                    t_tensor = torch.tensor(t, device=device)
-                else:
-                    t_tensor = t.to(device)
-                timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
+                # Use the timestep_2d that was already created and modified in the noise addition section
+                # If it wasn't created (no noise addition needed), create it now
+                if timestep_2d is None:
+                    num_frames = latent_on_device.shape[2] if len(latent_on_device.shape) == 5 else latent_on_device.shape[1]
+                    if not isinstance(t, torch.Tensor):
+                        t_tensor = torch.tensor(t, device=device)
+                    else:
+                        t_tensor = t.to(device)
+                    timestep_2d = t_tensor.unsqueeze(0).unsqueeze(1).repeat(1, num_frames)
 
-                # Use 2D timestep for V2V scheduler (scheduler will apply frame-specific modifications)
+                    # Apply frame-specific timestep modifications
+                    for frame_idx, (_, noise_mult) in args._pusa_remapped_dict.items():
+                        if noise_mult > 0:
+                            timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mult
+
+                # Use 2D timestep for V2V scheduler
                 timestep_for_scheduler = timestep_2d
             else:
                 # Use scalar timestep for regular schedulers
@@ -4893,48 +4979,19 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     # Remove the temporal dimension since we encoded a single frame
                     cond_latent = cond_latent.squeeze(1)  # [C', H_lat, W_lat]
 
-                    # Store clean latent for later noise addition
+                    # Store clean latent for later use
                     clean_conditioning_latents[frame_idx] = cond_latent
 
-                    # For V2V with Pusa scheduler, we need to add noise using the scheduler
+                    # For V2V with Pusa scheduler, inject clean latents now
+                    # Noise will be added conditionally during the denoising loop
+                    if latent.dim() == 4:  # [C, F, H, W]
+                        latent[:, frame_idx, :, :] = cond_latent
+                    elif latent.dim() == 5:  # [B, C, F, H, W]
+                        latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
+
                     if hasattr(args, 'pusa_use_v2v_scheduler') and args.pusa_use_v2v_scheduler:
-                        # Get the maximum timestep (start of denoising)
-                        max_timestep = timesteps[0] if isinstance(timesteps[0], torch.Tensor) else torch.tensor(timesteps[0], device=device)
-
-                        # Create noise for this frame
-                        if latent.dim() == 5:  # [B, C, F, H, W]
-                            frame_noise = torch.randn_like(latent[:, :, frame_idx:frame_idx+1, :, :])
-                            clean_frame = cond_latent.unsqueeze(0).unsqueeze(2)  # Add batch and frame dims
-
-                            # Add noise using scheduler's method
-                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
-                                clean_frame,
-                                frame_noise,
-                                max_timestep.unsqueeze(0),  # Ensure it's a tensor
-                                noise_multiplier=noise_mult
-                            )
-                            latent[:, :, frame_idx, :, :] = noisy_frame[:, :, 0, :, :]  # Select first frame instead of squeeze
-                        else:  # [C, F, H, W]
-                            frame_noise = torch.randn_like(latent[:, frame_idx:frame_idx+1, :, :])
-                            clean_frame = cond_latent.unsqueeze(1)  # Add frame dim
-
-                            # Add noise using scheduler's method
-                            noisy_frame = scheduler.add_noise_for_conditioning_frames(
-                                clean_frame,
-                                frame_noise,
-                                max_timestep,
-                                noise_multiplier=noise_mult
-                            )
-                            latent[:, frame_idx, :, :] = noisy_frame[:, 0, :, :]  # Select first frame instead of squeeze
-
-                        logger.info(f"Added noise to conditioning frame {frame_idx} with multiplier={noise_mult}")
+                        logger.info(f"Injected clean conditioning latent at frame {frame_idx} (noise will be added during denoising if multiplier={noise_mult} > 0)")
                     else:
-                        # For non-V2V Pusa, inject clean latent (original behavior)
-                        if latent.dim() == 4:  # [C, F, H, W]
-                            latent[:, frame_idx, :, :] = cond_latent
-                        elif latent.dim() == 5:  # [B, C, F, H, W]
-                            latent[:, :, frame_idx, :, :] = cond_latent.unsqueeze(0)  # Add batch dim
-
                         logger.info(f"Injected clean conditioning latent at frame {frame_idx}")
             else:
                 logger.warning(f"Skipping conditioning frame {frame_idx} - out of bounds (latent has {num_frames} frames)")
