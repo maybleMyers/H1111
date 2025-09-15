@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-import re # <-- IMPORTED FOR PARSING LORA KEYS
+import re
 from typing import Optional, Union, List, Dict
 
 import torch
@@ -939,7 +939,7 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     logger.info(f"Detected DiT dtype: {dit_dtype}")
     return dit_dtype
 
-# START <<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V3 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# START <<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V5 (FINAL) <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
@@ -950,92 +950,92 @@ def load_wan_model(
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
-    lora_multipliers: Optional[List[float]] = None, # Unused for now but kept for API
+    lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
 ) -> WanModel:
-    assert not fp8_scaled, "FP8 scaling is not compatible with this modified LoRA loader."
+    assert not fp8_scaled, "FP8 scaling is not compatible with this LoRA loader."
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
-    
-    # --- Step 1: Analyze LoRA to determine the final model architecture ---
-    total_layers = config.num_layers
-    merged_lora_sd = {}
 
-    if lora_weights_list and len(lora_weights_list) > 0:
-        logger.info("Pusa LoRA detected. Analyzing architecture before model creation...")
-        max_block_index = -1
-        
-        # Merge all provided LoRA state dicts into one
-        for lora_sd in lora_weights_list:
-            merged_lora_sd.update(lora_sd)
-
-        # Scan the merged LoRA keys
-        for key in merged_lora_sd.keys():
-            # Find keys like "blocks.47.ffn.0.weight" to detect new blocks
-            # This regex is more general and handles potential prefixes
-            match = re.search(r"blocks\.(\d+)\.", key)
-            if match:
-                block_idx = int(match.group(1))
-                if block_idx > max_block_index:
-                    max_block_index = block_idx
-        
-        if max_block_index != -1 and (max_block_index + 1) > config.num_layers:
-            total_layers = max_block_index + 1
-            num_new_blocks = total_layers - config.num_layers
-            logger.info(f"Pusa LoRA adds {num_new_blocks} new blocks.")
-            logger.info(f"Base layers: {config.num_layers}, Total layers: {total_layers}")
-        else:
-            logger.info("LoRA does not seem to add new blocks. Treating as standard weight patch.")
-            
-    # --- Step 2: Load the base model state dict from potentially multiple files ---
-    sd = {}
-    dit_path_list = dit_path if isinstance(dit_path, list) else [dit_path]
-    logger.info(f"Loading DiT base model state dict from: {dit_path_list}")
-    for path in dit_path_list:
-        sd.update(load_safetensors(path, loading_device, disable_mmap=True, dtype=dit_weight_dtype))
-
-    # remove "model.diffusion_model." prefix if it exists
-    sd_keys = list(sd.keys())
-    for key in sd_keys:
-        if key.startswith("model.diffusion_model."):
-            sd[key[22:]] = sd.pop(key)
-
-    # --- Step 3: Merge LoRA weights into the base state dict ---
-    if merged_lora_sd:
-        logger.info("Merging LoRA weights into base model state dict.")
-        # Make sure LoRA keys don't have the prefix either
-        lora_keys = list(merged_lora_sd.keys())
-        for key in lora_keys:
-            if key.startswith("model.diffusion_model."):
-                merged_lora_sd[key[22:]] = merged_lora_sd.pop(key)
-        
-        sd.update(merged_lora_sd)
-        del merged_lora_sd, lora_weights_list
-        clean_memory_on_device(loading_device)
-
-    # Check for ref_conv layer weights
-    has_ref_conv = "ref_conv.weight" in sd
-    in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16
-    if has_ref_conv: logger.info(f"Detected ref_conv layer in weights. Input channels: {in_dim_ref_conv}")
-
-    # --- Step 4: Create the correctly-sized empty model ---
+    # --- Step 1: Create and load the base model ---
+    logger.info(f"Creating WanModel with {config.num_layers} base layers.")
     with init_empty_weights():
-        logger.info(f"Creating WanModel with {total_layers} layers.")
         model = WanModel(
             model_type="i2v" if config.i2v else "t2v",
             dim=config.dim, eps=config.eps, ffn_dim=config.ffn_dim, freq_dim=config.freq_dim,
-            in_dim=config.in_dim, num_heads=config.num_heads, num_layers=total_layers, # <-- CRITICAL
+            in_dim=config.in_dim, num_heads=config.num_heads, num_layers=config.num_layers,
             out_dim=config.out_dim, text_len=config.text_len, attn_mode=attn_mode,
-            split_attn=split_attn, add_ref_conv=has_ref_conv, in_dim_ref_conv=in_dim_ref_conv,
+            split_attn=split_attn, add_ref_conv=False, in_dim_ref_conv=16, # Assume no ref_conv for now
         )
         if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
 
-    # --- Step 5: Load the final merged state dict into the model ---
+    dit_path_list = dit_path if isinstance(dit_path, list) else [dit_path]
+    logger.info(f"Loading DiT base model state dict from: {dit_path_list}")
+    sd = {}
+    for path in dit_path_list:
+        sd.update(load_safetensors(path, "cpu", disable_mmap=True, dtype=dit_weight_dtype))
+    
+    # Clean keys and load
+    sd_keys = list(sd.keys())
+    for key in sd_keys:
+        if key.startswith("model.diffusion_model."):
+            sd[key[22:]] = sd.pop(key)
+    
     info = model.load_state_dict(sd, strict=False, assign=True)
-    logger.info(f"Loaded merged state dict into model. Load info: {info}")
-    if info.missing_keys: logger.warning(f"Missing keys during load: {info.missing_keys}")
-    if info.unexpected_keys: logger.warning(f"Unexpected keys during load: {info.unexpected_keys}")
+    logger.info(f"Loaded base model weights. Info: {info}")
+    
+    # --- Step 2: Apply LoRA weights by merging them into the base model ---
+    if lora_weights_list and lora_multipliers:
+        logger.info(f"Applying {len(lora_weights_list)} LoRA(s) to the model...")
+        
+        # Move model to calculation device (e.g., CUDA) before modifying weights
+        model.to(device)
+
+        for lora_sd, multiplier in zip(lora_weights_list, lora_multipliers):
+            lora_A_weights = {k: v for k, v in lora_sd.items() if 'lora_A' in k}
+
+            for lora_A_key, lora_A_tensor in lora_A_weights.items():
+                lora_B_key = lora_A_key.replace('lora_A', 'lora_B')
+                if lora_B_key in lora_sd:
+                    lora_B_tensor = lora_sd[lora_B_key]
+                    
+                    # Derive the target module's weight key in the main model
+                    target_key = lora_A_key.replace('.lora_A.default.weight', '.weight')
+                    
+                    # Clean the key for lookup
+                    if target_key.startswith("model.diffusion_model."):
+                        target_key = target_key[22:]
+
+                    try:
+                        module_path, param_name = target_key.rsplit('.', 1)
+                        parent_module = model.get_submodule(module_path)
+                        original_weight = getattr(parent_module, param_name)
+                    except (AttributeError, ValueError):
+                        logger.warning(f"Could not find target parameter for LoRA key: {lora_A_key}")
+                        continue
+                        
+                    # Calculate and apply the delta
+                    rank = lora_A_tensor.shape[0]
+                    scale = multiplier / rank
+
+                    lora_A_tensor = lora_A_tensor.to(device=device, dtype=torch.float32)
+                    lora_B_tensor = lora_B_tensor.to(device=device, dtype=torch.float32)
+
+                    delta_W = (lora_B_tensor @ lora_A_tensor) * scale
+                    
+                    original_weight.data += delta_W.to(device=original_weight.device, dtype=original_weight.dtype)
+        
+        logger.info("Finished applying LoRA weights.")
+        
+        # If the target loading device is CPU (for swapping), move it back
+        if loading_device.type == 'cpu':
+            logger.info("Moving merged model back to CPU for block swapping.")
+            model.to(loading_device)
+
+    else:
+        logger.info("No LoRA weights to apply.")
 
     return model
+# END <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V5 (FINAL) <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
