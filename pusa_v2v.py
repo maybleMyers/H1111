@@ -73,6 +73,8 @@ class DynamicModelManager:
 
         print(f"Loading {model_type} noise DiT model...")
         loading_device = "cpu"
+        # The model weights are already bfloat16, so we load as-is.
+        # Autocast will handle computation.
         dit_weight_dtype = self.dit_dtype
 
         lora_weights_list = self.lora_weights_list_low if model_type == 'low' else self.lora_weights_list_high
@@ -96,7 +98,7 @@ class DynamicModelManager:
             clean_memory_on_device(self.device)
 
 def optimize_model(model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype):
-    # Follow wan2_generate_video.py logic exactly
+    # Match the robust logic from wan2_generate_video.py
     target_dtype = dit_dtype
     target_device = None
 
@@ -104,6 +106,7 @@ def optimize_model(model: WanModel, args: argparse.Namespace, device: torch.devi
         print(f"Move model to device: {device}")
         target_device = device
 
+    # Move and cast at the same time for efficiency.
     model.to(target_device, target_dtype)
 
     if args.blocks_to_swap > 0:
@@ -112,6 +115,7 @@ def optimize_model(model: WanModel, args: argparse.Namespace, device: torch.devi
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
+        # ensure all parameters are on the right device
         model.to(device)
 
     model.eval().requires_grad_(False)
@@ -175,7 +179,7 @@ def main():
     parser.add_argument("--dit_low_noise_path", type=str, required=True, help="Path to the low noise DiT model (.safetensors file or directory).")
     parser.add_argument("--high_lora_path", type=str, required=True, help="Path(s) to Pusa LoRA for high noise model. Comma-separated.")
     parser.add_argument("--low_lora_path", type=str, required=True, help="Path(s) to Pusa LoRA for low noise model. Comma-separated.")
-    parser.add_argument("--base_dir", type=str, default="model_zoo/PusaV1/Wan2.2-T2V-A14B", help="Directory of T5 and VAE models.")
+    parser.add_argument("--base_dir", type=str, default="wan", help="Directory of T5 and VAE models.")
     parser.add_argument("--high_lora_alpha", type=str, default="1.0", help="Alpha(s) for high noise LoRA. Comma-separated.")
     parser.add_argument("--low_lora_alpha", type=str, default="1.0", help="Alpha(s) for low noise LoRA. Comma-separated.")
     parser.add_argument("--num_inference_steps", type=int, default=30, help="Number of inference steps.")
@@ -187,18 +191,15 @@ def main():
     parser.add_argument("--fps", type=int, default=24, help="FPS for the saved video.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--blocks_to_swap", type=int, default=8, help="Number of DiT blocks to swap to CPU. Default: 8.")
-    # --- ADDED: Restored argument ---
     parser.add_argument("--concatenate", action="store_true", help="Automatically concatenate the original video with the generated video. Only works with `--extend_from_end`.")
     args = parser.parse_args()
 
-    # --- ADDED: Argument Validation and Input Preparation ---
     if args.extend_from_end is not None and args.cond_position is not None:
         raise ValueError("Cannot use both `--extend_from_end` and `--cond_position`. Please choose one.")
     if args.extend_from_end is None and args.cond_position is None:
         raise ValueError("Either `--extend_from_end` or `--cond_position` must be specified for conditioning.")
     if args.concatenate and args.extend_from_end is None:
         raise ValueError("`--concatenate` can only be used with `--extend_from_end` for video extension.")
-    # ---
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -231,12 +232,11 @@ def main():
     # --- Prepare Inputs ---
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     torch.manual_seed(seed)
-    if device == "cuda": torch.cuda.manual_seed(seed)
+    if device.type == "cuda": torch.cuda.manual_seed(seed)
 
     all_video_frames = process_video_frames(args.video_path, target_width=args.width, target_height=args.height)
     noise_mult_list = [float(x.strip()) for x in args.noise_multipliers.split(',')]
 
-    # --- MODIFIED: Logic to handle both conditioning modes ---
     if args.extend_from_end:
         print(f"Video extension mode: Using last {args.extend_from_end} frames for conditioning.")
         if args.extend_from_end > len(all_video_frames):
@@ -252,14 +252,12 @@ def main():
         if len(noise_mult_list) != len(cond_pos_list):
             raise ValueError(f"Number of noise multipliers ({len(noise_mult_list)}) must match conditioning positions ({len(cond_pos_list)}).")
         
-        # In standard mode, the source frames are the frames AT the conditioning positions
         conditioning_video = [all_video_frames[i] for i in cond_pos_list if i < len(all_video_frames)]
 
     # Get latents for conditioning frames
     vae.to_device(device)
     cond_latents = {}
     with torch.no_grad():
-        # Correctly map source frames from conditioning_video to target positions in cond_pos_list
         for i, source_frame in enumerate(conditioning_video):
             target_frame_idx = cond_pos_list[i]
             img_tensor = torch.from_numpy(np.array(source_frame)).permute(2, 0, 1).float() / 127.5 - 1.0
@@ -268,7 +266,6 @@ def main():
             cond_latents[target_frame_idx] = latent.squeeze(1).cpu() # C,H,W
     vae.to_device("cpu")
     clean_memory_on_device(device)
-    # ---
 
     # Prepare context and initial noise
     t5.model.to(device)
@@ -286,7 +283,10 @@ def main():
     noise = torch.randn(1, 16, lat_f, lat_h, lat_w, dtype=dtype, device="cpu")
 
     for frame_idx, latent in cond_latents.items():
-        noise[:, :, frame_idx, :, :] = latent.unsqueeze(0).to(dtype)
+        if frame_idx < lat_f:
+            noise[:, :, frame_idx, :, :] = latent.unsqueeze(0).to(dtype)
+        else:
+            print(f"Warning: Conditioning frame index {frame_idx} is out of bounds for latent length {lat_f}. Skipping.")
 
     # --- Setup Pipeline and Run ---
     scheduler = FlowMatchSchedulerPusaV2V()
@@ -303,31 +303,23 @@ def main():
         model_type = 'high' if t.item() >= boundary else 'low'
         current_model = model_manager.get_model(model_type)
 
-        # 1. Prepare the 2D PER-FRAME timestep tensor. This is the "control signal" for the SCHEDULER.
-        # It tells the scheduler how much to denoise each individual frame.
         timestep_2d = t.unsqueeze(0).unsqueeze(1).repeat(1, lat_f)
         for frame_idx in cond_pos_list:
-            # For conditioned frames, the timestep is scaled down (or set to 0),
-            # telling the scheduler to preserve them.
             timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mapping.get(frame_idx, 1.0)
-
-        with torch.no_grad():
+        
+        # <<< START FIX >>>
+        # Use torch.autocast for automatic mixed-precision handling
+        with torch.autocast(device_type=device.type, dtype=dtype), torch.no_grad():
             latent_model_input = [latent.squeeze(0)]
-
-            # 2. Prepare a simple 1D timestep. This is what the MODEL expects.
-            # The model predicts noise for the whole video based on a single time value.
             timestep_1d = t.unsqueeze(0)
 
-            # 3. Call the model with the 1D timestep to get a single noise prediction.
             pred_cond = current_model(latent_model_input, t=timestep_1d, **arg_c)[0]
             pred_uncond = current_model(latent_model_input, t=timestep_1d, **arg_null)[0]
             noise_pred = pred_uncond + args.cfg_scale * (pred_cond - pred_uncond)
+        # <<< END FIX >>>
 
-        # 4. Call the specialized Pusa V2V scheduler's step function.
-        # It takes the noise prediction and uses the 2D timestep control signal
-        # to correctly update each frame, preserving the conditioned ones.
         latent, _ = scheduler.step(model_output=noise_pred, 
-                                   timestep=timestep_2d, # Use the 2D tensor here
+                                   timestep=timestep_2d,
                                    sample=latent,
                                    cond_frame_latent_indices=cond_pos_list,
                                    noise_multipliers=noise_mapping)
@@ -349,7 +341,6 @@ def main():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename_base = os.path.basename(args.video_path).split('.')[0]
     
-    # --- MODIFIED: Output saving logic to handle concatenation ---
     if args.extend_from_end:
         mode_str = f"extend_{args.extend_from_end}f"
     else:
@@ -370,7 +361,6 @@ def main():
     print(f"Saving video to {video_filename}")
     save_video(video_to_save, video_filename, fps=args.fps)
     print("Video saved successfully.")
-    # ---
 
 
 if __name__ == "__main__":
