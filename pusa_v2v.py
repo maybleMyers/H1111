@@ -328,7 +328,8 @@ def main():
     print("Decoding final latent...")
     vae.to_device(device)
     with torch.no_grad():
-        decoded_frames_list = vae.decode([final_latent.squeeze(0)])
+        latent_to_decode = final_latent.to(device)
+        decoded_frames_list = vae.decode([latent_to_decode.squeeze(0)])
     video_tensor = decoded_frames_list[0]
     video_tensor = (video_tensor.permute(1, 2, 3, 0) + 1) / 2
     video_tensor = (video_tensor.clamp(0, 1) * 255).byte().cpu().numpy()
