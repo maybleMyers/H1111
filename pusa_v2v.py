@@ -302,11 +302,11 @@ def main():
             timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mapping.get(frame_idx, 1.0)
 
         with torch.no_grad():
-            latent_model_input = [latent.squeeze(0).to(dtype)]
+            latent_model_input = [latent.squeeze(0)]
 
             # 2. Prepare a simple 1D timestep. This is what the MODEL expects.
             # The model predicts noise for the whole video based on a single time value.
-            timestep_1d = t.unsqueeze(0).to(dtype)
+            timestep_1d = t.unsqueeze(0)
 
             # 3. Call the model with the 1D timestep to get a single noise prediction.
             pred_cond = current_model(latent_model_input, t=timestep_1d, **arg_c)[0]
