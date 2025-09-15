@@ -292,15 +292,33 @@ def main():
         boundary = args.switch_DiT_boundary * 1000
         model_type = 'high' if t.item() >= boundary else 'low'
         current_model = model_manager.get_model(model_type)
+
+        # 1. Prepare the 2D PER-FRAME timestep tensor. This is the "control signal" for the SCHEDULER.
+        # It tells the scheduler how much to denoise each individual frame.
         timestep_2d = t.unsqueeze(0).unsqueeze(1).repeat(1, lat_f)
         for frame_idx in cond_pos_list:
+            # For conditioned frames, the timestep is scaled down (or set to 0),
+            # telling the scheduler to preserve them.
             timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mapping.get(frame_idx, 1.0)
+
         with torch.no_grad():
             latent_model_input = [latent.squeeze(0)]
-            pred_cond = current_model(latent_model_input, t=timestep_2d, **arg_c)[0]
-            pred_uncond = current_model(latent_model_input, t=timestep_2d, **arg_null)[0]
+
+            # 2. Prepare a simple 1D timestep. This is what the MODEL expects.
+            # The model predicts noise for the whole video based on a single time value.
+            timestep_1d = t.unsqueeze(0)
+
+            # 3. Call the model with the 1D timestep to get a single noise prediction.
+            pred_cond = current_model(latent_model_input, t=timestep_1d, **arg_c)[0]
+            pred_uncond = current_model(latent_model_input, t=timestep_1d, **arg_null)[0]
             noise_pred = pred_uncond + args.cfg_scale * (pred_cond - pred_uncond)
-        latent, _ = scheduler.step(noise_pred, t, latent,
+
+        # 4. Call the specialized Pusa V2V scheduler's step function.
+        # It takes the noise prediction and uses the 2D timestep control signal
+        # to correctly update each frame, preserving the conditioned ones.
+        latent, _ = scheduler.step(model_output=noise_pred, 
+                                   timestep=timestep_2d, # Use the 2D tensor here
+                                   sample=latent,
                                    cond_frame_latent_indices=cond_pos_list,
                                    noise_multipliers=noise_mapping)
 
