@@ -154,13 +154,12 @@ def _get_model_files(path: str) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Pusa V2V (Optimized V3): Video-to-Video with block swapping and extension")
+    parser.add_argument("--task", type=str, default="t2v-A14B", help="The task configuration to use from wan.configs.")
     parser.add_argument("--video_path", type=str, required=True, help="Path to the conditioning video.")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for video generation.")
     parser.add_argument("--negative_prompt", type=str, default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards", help="Negative text prompt.")
-    # --- MODIFIED: Restored mutually exclusive arguments ---
     parser.add_argument("--cond_position", type=str, default=None, help="Comma-separated list of frame indices for conditioning.")
     parser.add_argument("--extend_from_end", type=int, default=None, help="Number of frames from the end of `--video_path` to use for conditioning the start of the new video. Mutually exclusive with `--cond_position`.")
-    # ---
     parser.add_argument("--noise_multipliers", type=str, required=True, help="Comma-separated noise multipliers for conditioning frames.")
     parser.add_argument("--dit_high_noise_path", type=str, required=True, help="Path to the high noise DiT model (.safetensors file or directory).")
     parser.add_argument("--dit_low_noise_path", type=str, required=True, help="Path to the low noise DiT model (.safetensors file or directory).")
@@ -196,7 +195,7 @@ def main():
 
     # --- Setup Models ---
     print("Loading models...")
-    task_config = WAN_CONFIGS["t2v-A14B"]
+    task_config = WAN_CONFIGS[args.task]
     high_model_files = _get_model_files(args.dit_high_noise_path)
     low_model_files = _get_model_files(args.dit_low_noise_path)
     
