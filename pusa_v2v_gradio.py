@@ -422,7 +422,7 @@ def create_interface():
                         blocks_to_swap = gr.Slider(
                             label="Blocks to Swap",
                             minimum=0,
-                            maximum=16,
+                            maximum=40,
                             value=8,
                             step=1,
                             info="Number of DiT blocks to swap to CPU for VRAM management (0 to disable)"
@@ -436,7 +436,7 @@ def create_interface():
                     with gr.Row():
                         lora_folder = gr.Textbox(
                             label="LoRA Folder",
-                            value="model_zoo/PusaV1/Wan2.2-Models"
+                            value="lora",
                         )
                         refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
 
@@ -486,17 +486,17 @@ def create_interface():
 
                     dit_high_noise_path = gr.Textbox(
                         label="High Noise DiT Path (File or Dir)",
-                        value="model_zoo/PusaV1/Wan2.2-T2V-A14B/high_noise_model"
+                        value="wan/wan22_t2v_14B_high_noise_bf16.safetensors"
                     )
 
                     dit_low_noise_path = gr.Textbox(
                         label="Low Noise DiT Path (File or Dir)",
-                        value="model_zoo/PusaV1/Wan2.2-T2V-A14B/low_noise_model"
+                        value="wan/wan22_t2v_14B_low_noise_bf16.safetensors"
                     )
 
                     base_dir = gr.Textbox(
                         label="Base Model Directory (T5, VAE)",
-                        value="model_zoo/PusaV1/Wan2.2-T2V-A14B"
+                        value="wan"
                     )
 
                     output_dir = gr.Textbox(
