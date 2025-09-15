@@ -25,12 +25,12 @@ def clean_memory_on_device(device: torch.device):
 
 # Pusa Schedulers (essential for the V2V logic)
 from wan.pusa.flow_match_pusa_v2v import FlowMatchSchedulerPusaV2V
-from wan.configs import WAN_CONFIGS
+from Wan2_2.wan.configs import WAN_CONFIGS
 
 # Model Loading Components
-from wan.modules.model import WanModel, load_wan_model
+from Wan2_2.wan.modules.model import WanModel, load_wan_model
 from wan.modules.vae import WanVAE
-from wan.modules.t5 import T5EncoderModel
+from Wan2_2.wan.modules.t5 import T5EncoderModel
 
 class DynamicModelManager:
     """Manages dynamic loading and unloading of DiT models during inference."""
