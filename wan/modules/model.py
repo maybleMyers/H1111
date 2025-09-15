@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import re # <-- IMPORTED FOR PARSING LORA KEYS
 from typing import Optional, Union, List, Dict
 
 import torch
@@ -938,11 +939,10 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     logger.info(f"Detected DiT dtype: {dit_dtype}")
     return dit_dtype
 
-
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
-    dit_path: str,
+    dit_path: Union[str, List[str]], # Can now be a list
     attn_mode: str,
     split_attn: bool,
     loading_device: Union[str, torch.device],
@@ -952,68 +952,68 @@ def load_wan_model(
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
 ) -> WanModel:
-    # dit_weight_dtype is None for fp8_scaled
-    assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
+    assert not fp8_scaled, "FP8 scaling is not compatible with this modified LoRA loader."
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
-
-    wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
     
-    # Check if we should use efficient LoRA loading
-    if lora_weights_list is not None and len(lora_weights_list) > 0:
-        logger.info(f"Loading DiT model with LoRA weights (efficient hook-based method)")
-        logger.info(f"Loading from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
-        
-        # Import the efficient loading function
-        from utils.lora_utils import load_safetensors_with_lora_and_fp8
-        
-        # Use hook-based loading that merges LoRA during load
-        sd = load_safetensors_with_lora_and_fp8(
-            model_files=dit_path,
-            lora_weights_list=lora_weights_list,
-            lora_multipliers=lora_multipliers,
-            fp8_optimization=False,  # We'll handle fp8 separately if needed
-            calc_device=device,  # Use target device for calculations
-            move_to_device=(wan_loading_device == device),
-            target_keys=None,  # Apply to all keys
-            exclude_keys=None,
-        )
-        
-        # Detect actual input dimensions from checkpoint
-        if "patch_embedding.weight" in sd:
-            actual_in_dim = sd["patch_embedding.weight"].shape[1]
-            if actual_in_dim != config.in_dim:
-                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
-                config = type(config)(config.__dict__)  # Create a copy
-                config.in_dim = actual_in_dim
-    else:
-        # Original loading without LoRA
-        logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
-        sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
-        
-        # Detect actual input dimensions from checkpoint
-        if "patch_embedding.weight" in sd:
-            actual_in_dim = sd["patch_embedding.weight"].shape[1]
-            if actual_in_dim != config.in_dim:
-                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
-                config = type(config)(config.__dict__)  # Create a copy
-                config.in_dim = actual_in_dim
+    # --- Step 1: Analyze LoRA to determine the final model architecture ---
+    total_layers = config.num_layers
+    merged_lora_sd = {}
 
-    # remove "model.diffusion_model." prefix: 1.3B model has this prefix
-    sd_keys = list(sd.keys()) # Keep original keys for potential prefix removal
+    if lora_weights_list and len(lora_weights_list) > 0:
+        logger.info("Pusa LoRA detected. Analyzing architecture before model creation...")
+        max_block_index = -1
+        
+        # We assume one Pusa LoRA is provided per model, but handle multiple just in case
+        for lora_sd in lora_weights_list: 
+            for key in lora_sd.keys():
+                # Find keys like "blocks.47.ffn.0.weight" to detect new blocks
+                match = re.search(r"blocks\.(\d+)\.", key)
+                if match:
+                    block_idx = int(match.group(1))
+                    if block_idx > max_block_index:
+                        max_block_index = block_idx
+            # Merge LoRA weights, new weights will overwrite existing ones
+            merged_lora_sd.update(lora_sd)
+
+        if max_block_index != -1 and (max_block_index + 1) > config.num_layers:
+            total_layers = max_block_index + 1
+            num_new_blocks = total_layers - config.num_layers
+            logger.info(f"Pusa LoRA adds {num_new_blocks} new blocks.")
+            logger.info(f"Base layers: {config.num_layers}, Total layers: {total_layers}")
+        else:
+            logger.info("LoRA does not seem to add new blocks. Treating as standard weight patch.")
+            
+    # --- Step 2: Load the base model state dict ---
+    logger.info(f"Loading DiT base model state dict from {dit_path}")
+    sd = load_safetensors(dit_path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+
+    # remove "model.diffusion_model." prefix if it exists
+    sd_keys = list(sd.keys())
     for key in sd_keys:
         if key.startswith("model.diffusion_model."):
             sd[key[22:]] = sd.pop(key)
 
+    # --- Step 3: Merge LoRA weights into the base state dict ---
+    if merged_lora_sd:
+        logger.info("Merging LoRA weights into base model state dict.")
+        sd.update(merged_lora_sd)
+        # Clean up memory
+        del merged_lora_sd
+        del lora_weights_list
+        clean_memory_on_device(loading_device)
+
+
     # Check for ref_conv layer weights
     has_ref_conv = "ref_conv.weight" in sd
-    in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16 # Default if not found
+    in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16
     if has_ref_conv:
-        logger.info(f"Detected ref_conv layer in model weights. Input channels: {in_dim_ref_conv}")    
+        logger.info(f"Detected ref_conv layer in model weights. Input channels: {in_dim_ref_conv}")
 
+    # --- Step 4: Create the correctly-sized empty model ---
     with init_empty_weights():
-        logger.info(f"Creating WanModel")
+        logger.info(f"Creating WanModel with {total_layers} layers.")
         model = WanModel(
             model_type="i2v" if config.i2v else "t2v",
             dim=config.dim,
@@ -1022,44 +1022,23 @@ def load_wan_model(
             freq_dim=config.freq_dim,
             in_dim=config.in_dim,
             num_heads=config.num_heads,
-            num_layers=config.num_layers,
+            num_layers=total_layers, # <-- CRITICAL CHANGE HERE
             out_dim=config.out_dim,
             text_len=config.text_len,
             attn_mode=attn_mode,
             split_attn=split_attn,
-            add_ref_conv=has_ref_conv,             # <<< Pass detected flag
-            in_dim_ref_conv=in_dim_ref_conv,             
+            add_ref_conv=has_ref_conv,
+            in_dim_ref_conv=in_dim_ref_conv,
         )
-        if dit_weight_dtype is not None and not fp8_scaled: # Don't pre-cast if optimizing to FP8 later
+        if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
 
-    # ... (fp8 optimization - sd is already loaded) ...
-    if fp8_scaled:
-        # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
-        logger.info(f"Optimizing model weights to fp8. This may take a while.")
-        sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu", use_scaled_mm=use_scaled_mm)
-
-        if loading_device.type != "cpu":
-            # make sure all the model weights are on the loading_device
-            logger.info(f"Moving weights to {loading_device}")
-            for key in sd.keys():
-                sd[key] = sd[key].to(loading_device)
-
-    # Load the potentially modified state dict
-    # Use strict=False initially if ref_conv might be missing in older models but present in the class
-    # After confirming your models, you might set strict=True if all target models have the layer or None.
+    # --- Step 5: Load the final merged state dict into the model ---
     info = model.load_state_dict(sd, strict=False, assign=True)
-    logger.info(f"Loaded DiT model from {dit_path}, info={info}")
-    if not info.missing_keys and not info.unexpected_keys:
-         logger.info("State dict loaded successfully (strict check passed).")
-    else:
-         logger.warning(f"State dict load info: Missing={info.missing_keys}, Unexpected={info.unexpected_keys}")
-         # If add_ref_conv is True but ref_conv keys are missing, it's an issue.
-         if has_ref_conv and any("ref_conv" in k for k in info.missing_keys):
-              raise ValueError("Model configuration indicates ref_conv=True, but weights are missing!")
-         # If add_ref_conv is False but ref_conv keys are unexpected, it's also an issue with model/config mismatch.
-         if not has_ref_conv and any("ref_conv" in k for k in info.unexpected_keys):
-              raise ValueError("Model configuration indicates ref_conv=False, but weights are present!")
-
+    logger.info(f"Loaded merged state dict into model. Load info: {info}")
+    if info.missing_keys:
+        logger.warning(f"Missing keys during load: {info.missing_keys}")
+    if info.unexpected_keys:
+        logger.warning(f"Unexpected keys during load: {info.unexpected_keys}")
 
     return model
