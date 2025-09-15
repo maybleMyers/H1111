@@ -939,7 +939,6 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     logger.info(f"Detected DiT dtype: {dit_dtype}")
     return dit_dtype
 
-# START <<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V5 (FINAL) <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
@@ -956,7 +955,7 @@ def load_wan_model(
     assert not fp8_scaled, "FP8 scaling is not compatible with this LoRA loader."
 
     device = torch.device(device)
-    loading_device = torch.device(loading_device)
+    loading_device = torch.device(loading_device) # This is 'cpu' when swapping
 
     # --- Step 1: Create and load the base model ---
     logger.info(f"Creating WanModel with {config.num_layers} base layers.")
@@ -966,7 +965,7 @@ def load_wan_model(
             dim=config.dim, eps=config.eps, ffn_dim=config.ffn_dim, freq_dim=config.freq_dim,
             in_dim=config.in_dim, num_heads=config.num_heads, num_layers=config.num_layers,
             out_dim=config.out_dim, text_len=config.text_len, attn_mode=attn_mode,
-            split_attn=split_attn, add_ref_conv=False, in_dim_ref_conv=16, # Assume no ref_conv for now
+            split_attn=split_attn, add_ref_conv=False, in_dim_ref_conv=16,
         )
         if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
@@ -975,23 +974,23 @@ def load_wan_model(
     logger.info(f"Loading DiT base model state dict from: {dit_path_list}")
     sd = {}
     for path in dit_path_list:
+        # Always load base model to CPU to avoid VRAM spike
         sd.update(load_safetensors(path, "cpu", disable_mmap=True, dtype=dit_weight_dtype))
     
-    # Clean keys and load
     sd_keys = list(sd.keys())
     for key in sd_keys:
         if key.startswith("model.diffusion_model."):
             sd[key[22:]] = sd.pop(key)
     
     info = model.load_state_dict(sd, strict=False, assign=True)
-    logger.info(f"Loaded base model weights. Info: {info}")
+    logger.info(f"Loaded base model weights to CPU. Info: {info}")
     
-    # --- Step 2: Apply LoRA weights by merging them into the base model ---
+    # --- Step 2: Apply LoRA weights by merging them into the CPU model ---
     if lora_weights_list and lora_multipliers:
-        logger.info(f"Applying {len(lora_weights_list)} LoRA(s) to the model...")
+        logger.info(f"Applying {len(lora_weights_list)} LoRA(s) to the CPU model...")
         
-        # Move model to calculation device (e.g., CUDA) before modifying weights
-        model.to(device)
+        # The model stays on the CPU during this whole process.
+        # model.to(device) <-- REMOVED THIS LINE TO PREVENT OOM
 
         for lora_sd, multiplier in zip(lora_weights_list, lora_multipliers):
             lora_A_weights = {k: v for k, v in lora_sd.items() if 'lora_A' in k}
@@ -1001,10 +1000,7 @@ def load_wan_model(
                 if lora_B_key in lora_sd:
                     lora_B_tensor = lora_sd[lora_B_key]
                     
-                    # Derive the target module's weight key in the main model
                     target_key = lora_A_key.replace('.lora_A.default.weight', '.weight')
-                    
-                    # Clean the key for lookup
                     if target_key.startswith("model.diffusion_model."):
                         target_key = target_key[22:]
 
@@ -1016,26 +1012,21 @@ def load_wan_model(
                         logger.warning(f"Could not find target parameter for LoRA key: {lora_A_key}")
                         continue
                         
-                    # Calculate and apply the delta
                     rank = lora_A_tensor.shape[0]
                     scale = multiplier / rank
 
+                    # Perform calculation on GPU for speed, then move result back to CPU
                     lora_A_tensor = lora_A_tensor.to(device=device, dtype=torch.float32)
                     lora_B_tensor = lora_B_tensor.to(device=device, dtype=torch.float32)
-
                     delta_W = (lora_B_tensor @ lora_A_tensor) * scale
                     
+                    # Add the delta to the original weight (which is on CPU)
                     original_weight.data += delta_W.to(device=original_weight.device, dtype=original_weight.dtype)
         
         logger.info("Finished applying LoRA weights.")
         
-        # If the target loading device is CPU (for swapping), move it back
-        if loading_device.type == 'cpu':
-            logger.info("Moving merged model back to CPU for block swapping.")
-            model.to(loading_device)
-
     else:
         logger.info("No LoRA weights to apply.")
 
+    # The returned model is fully merged and on the CPU, ready for the optimize_model step.
     return model
-# END <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V5 (FINAL) <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
