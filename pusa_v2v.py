@@ -96,14 +96,24 @@ class DynamicModelManager:
             clean_memory_on_device(self.device)
 
 def optimize_model(model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype):
-    model.to(dtype=dit_dtype)
+    # Follow wan2_generate_video.py logic exactly
+    target_dtype = dit_dtype
+    target_device = None
+
+    if args.blocks_to_swap == 0:
+        print(f"Move model to device: {device}")
+        target_device = device
+
+    model.to(target_device, target_dtype)
+
     if args.blocks_to_swap > 0:
-        print(f"Enabling swap of {args.blocks_to_swap} blocks to CPU from device: {device}")
+        print(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
         model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
         model.to(device)
+
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
 
