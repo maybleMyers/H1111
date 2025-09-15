@@ -307,8 +307,6 @@ def main():
         for frame_idx in cond_pos_list:
             timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mapping.get(frame_idx, 1.0)
         
-        # <<< START FIX >>>
-        # Use torch.autocast for automatic mixed-precision handling
         with torch.autocast(device_type=device.type, dtype=dtype), torch.no_grad():
             latent_model_input = [latent.squeeze(0)]
             timestep_1d = t.unsqueeze(0)
@@ -316,13 +314,12 @@ def main():
             pred_cond = current_model(latent_model_input, t=timestep_1d, **arg_c)[0]
             pred_uncond = current_model(latent_model_input, t=timestep_1d, **arg_null)[0]
             noise_pred = pred_uncond + args.cfg_scale * (pred_cond - pred_uncond)
-        # <<< END FIX >>>
 
-        latent, _ = scheduler.step(model_output=noise_pred, 
-                                   timestep=timestep_2d,
-                                   sample=latent,
-                                   cond_frame_latent_indices=cond_pos_list,
-                                   noise_multipliers=noise_mapping)
+        latent = scheduler.step(model_output=noise_pred, 
+                                timestep=timestep_2d,
+                                sample=latent,
+                                cond_frame_latent_indices=cond_pos_list,
+                                noise_multipliers=noise_mapping)
 
     final_latent = latent.cpu()
     model_manager.cleanup()
