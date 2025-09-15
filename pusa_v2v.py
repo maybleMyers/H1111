@@ -1,4 +1,5 @@
-# START OF FILE wan22_14b_v2v_pusa_optimized_v3.py
+# Fixed version of pusa_v2v.py with proper LoRA loading
+# Based on wan22_14b_v2v_pusa_optimized_v3.py with corrected LoRA implementation
 
 from PIL import Image
 import torch
@@ -13,6 +14,12 @@ import glob
 import numpy as np
 from tqdm import tqdm
 from safetensors.torch import load_file
+from typing import Dict, List, Optional, Tuple
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- START: Ported components from wan2_generate_video.py ---
 
@@ -31,6 +38,227 @@ from Wan2_2.wan.configs import WAN_CONFIGS
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
 from wan.modules.t5 import T5EncoderModel
+from utils.safetensors_utils import load_safetensors
+
+def apply_pusa_loras(
+    model_state_dict: Dict[str, torch.Tensor],
+    lora_weights_list: List[Dict[str, torch.Tensor]],
+    lora_multipliers: List[float],
+    device: torch.device = torch.device("cuda"),
+    model_type: str = "unknown"
+) -> Dict[str, torch.Tensor]:
+    """
+    Apply Pusa LoRA weights to model state dict using proper PEFT-style merging.
+
+    This function handles LoRA weights in the format used by Pusa models:
+    - Keys ending with .lora_A.weight (down projection)
+    - Keys ending with .lora_B.weight (up projection)
+    - Optional .alpha keys for scaling
+
+    Args:
+        model_state_dict: The base model's state dictionary
+        lora_weights_list: List of LoRA weight dictionaries
+        lora_multipliers: List of multipliers for each LoRA
+        device: Device to perform calculations on
+        model_type: Type of model (for logging)
+
+    Returns:
+        Modified state dict with LoRA weights merged
+    """
+    if not lora_weights_list or len(lora_weights_list) == 0:
+        logger.info(f"No LoRA weights to apply for {model_type} model")
+        return model_state_dict
+
+    # Ensure multipliers match LoRA count
+    if lora_multipliers is None:
+        lora_multipliers = [1.0] * len(lora_weights_list)
+    while len(lora_multipliers) < len(lora_weights_list):
+        lora_multipliers.append(1.0)
+
+    logger.info(f"Applying {len(lora_weights_list)} LoRA(s) to {model_type} model with multipliers: {lora_multipliers}")
+
+    # Track applied weights
+    total_updated = 0
+    unused_lora_keys = set()
+
+    # Process each LoRA
+    for lora_idx, (lora_sd, multiplier) in enumerate(zip(lora_weights_list, lora_multipliers)):
+        logger.info(f"Processing LoRA {lora_idx + 1}/{len(lora_weights_list)} with multiplier {multiplier}")
+
+        # Build mapping of LoRA pairs
+        lora_pairs = {}
+        for key in lora_sd.keys():
+            if ".lora_B.weight" in key or ".lora_B.default.weight" in key:
+                # Found an up projection weight
+                base_key = key.replace(".lora_B.weight", "").replace(".lora_B.default.weight", "")
+
+                # Find corresponding down weight
+                down_key_options = [
+                    key.replace(".lora_B.", ".lora_A."),
+                    base_key + ".lora_A.weight",
+                    base_key + ".lora_A.default.weight"
+                ]
+
+                down_key = None
+                for dk in down_key_options:
+                    if dk in lora_sd:
+                        down_key = dk
+                        break
+
+                if down_key:
+                    # Map to model parameter name
+                    # Remove diffusion_model prefix if present
+                    target_key = base_key
+                    if target_key.startswith("diffusion_model."):
+                        target_key = target_key[len("diffusion_model."):]
+
+                    # Remove .default if present
+                    target_key = target_key.replace(".default", "")
+
+                    # Add .weight suffix if not present
+                    if not target_key.endswith(".weight"):
+                        target_key = target_key + ".weight"
+
+                    # Check for alpha
+                    alpha_key = base_key + ".alpha"
+                    if alpha_key not in lora_sd:
+                        alpha_key = base_key + ".lora_alpha"
+
+                    lora_pairs[target_key] = {
+                        'up': key,
+                        'down': down_key,
+                        'alpha': alpha_key if alpha_key in lora_sd else None
+                    }
+
+        # Track unused keys
+        used_keys = set()
+        updated_count = 0
+
+        # Apply LoRA weights to model parameters
+        for param_name, param_value in model_state_dict.items():
+            if param_name in lora_pairs:
+                lora_info = lora_pairs[param_name]
+
+                # Get LoRA weights
+                up_weight = lora_sd[lora_info['up']]
+                down_weight = lora_sd[lora_info['down']]
+
+                # Get alpha value
+                if lora_info['alpha'] and lora_info['alpha'] in lora_sd:
+                    alpha = float(lora_sd[lora_info['alpha']])
+                else:
+                    # Default alpha is the rank
+                    alpha = down_weight.shape[0]
+
+                # Calculate scale
+                rank = down_weight.shape[0]
+                scale = (alpha / rank) * multiplier
+
+                # Move to computation device
+                param_compute = param_value.to(device, dtype=torch.float32)
+                up_compute = up_weight.to(device, dtype=torch.float32)
+                down_compute = down_weight.to(device, dtype=torch.float32)
+
+                # Handle different tensor shapes
+                if len(param_value.shape) == 2:
+                    # Linear layer
+                    if len(up_compute.shape) == 4:
+                        # Conv weights being used as linear
+                        up_compute = up_compute.squeeze(3).squeeze(2)
+                        down_compute = down_compute.squeeze(3).squeeze(2)
+                    delta = scale * torch.mm(up_compute, down_compute)
+                elif len(param_value.shape) == 4:
+                    # Convolutional layer
+                    if down_compute.shape[2:4] == (1, 1):
+                        # 1x1 convolution
+                        delta = scale * (up_compute.squeeze(3).squeeze(2) @ down_compute.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                    else:
+                        # 3x3 convolution
+                        delta = scale * torch.nn.functional.conv2d(
+                            down_compute.permute(1, 0, 2, 3),
+                            up_compute
+                        ).permute(1, 0, 2, 3)
+                else:
+                    logger.warning(f"Unsupported parameter shape for {param_name}: {param_value.shape}")
+                    continue
+
+                # Apply the update
+                param_merged = param_compute + delta
+                model_state_dict[param_name] = param_merged.to(param_value.device, dtype=param_value.dtype)
+
+                updated_count += 1
+                used_keys.add(lora_info['up'])
+                used_keys.add(lora_info['down'])
+                if lora_info['alpha']:
+                    used_keys.add(lora_info['alpha'])
+
+        # Check for unused keys
+        for key in lora_sd.keys():
+            if key not in used_keys and key.endswith(('.weight', '.alpha')):
+                unused_lora_keys.add(key)
+
+        logger.info(f"LoRA {lora_idx + 1}: Updated {updated_count} parameters")
+        total_updated += updated_count
+
+    if unused_lora_keys:
+        logger.warning(f"Unused LoRA keys ({len(unused_lora_keys)}): {list(unused_lora_keys)[:5]}...")
+
+    logger.info(f"Total parameters updated with LoRA weights: {total_updated}")
+    return model_state_dict
+
+
+def load_wan_model_with_proper_loras(
+    config: any,
+    device: torch.device,
+    dit_path: List[str],
+    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
+    lora_multipliers: Optional[List[float]] = None,
+    dit_weight_dtype: torch.dtype = torch.bfloat16,
+    model_type: str = "unknown"
+) -> WanModel:
+    """
+    Load WAN model with proper LoRA application.
+
+    This function loads the base model and applies LoRA weights correctly
+    by merging them into the model state dict before loading.
+    """
+    # Load base model weights
+    logger.info(f"Loading base {model_type} model from {dit_path}")
+    loading_device = torch.device("cpu")
+
+    # Load state dict
+    state_dict = load_safetensors(dit_path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+
+    # Remove model.diffusion_model prefix if present
+    sd_keys = list(state_dict.keys())
+    for key in sd_keys:
+        if key.startswith("model.diffusion_model."):
+            state_dict[key[22:]] = state_dict.pop(key)
+
+    # Apply LoRA weights if provided
+    if lora_weights_list and len(lora_weights_list) > 0:
+        state_dict = apply_pusa_loras(
+            state_dict,
+            lora_weights_list,
+            lora_multipliers,
+            device=device,
+            model_type=model_type
+        )
+
+    # Create model and load merged state dict
+    # Use the standard load_wan_model but without LoRA parameters
+    model = load_wan_model(
+        config, device, dit_path,
+        "torch", False, loading_device, dit_weight_dtype, False,
+        lora_weights_list=None,  # Don't pass LoRAs here since we already merged them
+        lora_multipliers=None
+    )
+
+    # Load our merged state dict
+    model.load_state_dict(state_dict, strict=False)
+
+    return model
+
 
 class DynamicModelManager:
     """Manages dynamic loading and unloading of DiT models during inference."""
@@ -72,19 +300,22 @@ class DynamicModelManager:
             clean_memory_on_device(self.device)
 
         print(f"Loading {model_type} noise DiT model...")
-        loading_device = "cpu"
-        # The model weights are already bfloat16, so we load as-is.
-        # Autocast will handle computation.
         dit_weight_dtype = self.dit_dtype
 
         lora_weights_list = self.lora_weights_list_low if model_type == 'low' else self.lora_weights_list_high
         lora_multipliers = self.lora_multipliers_low if model_type == 'low' else self.lora_multipliers_high
-        
-        model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type],
-            "torch", False, loading_device, dit_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+
+        # Use the new loading function with proper LoRA support
+        model = load_wan_model_with_proper_loras(
+            self.config,
+            self.device,
+            self.model_paths[model_type],
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            dit_weight_dtype=dit_weight_dtype,
+            model_type=model_type
         )
+
         optimize_model(model, self.args, self.device, self.dit_dtype)
         self.current_model = model
         self.current_model_type = model_type
@@ -167,7 +398,7 @@ def _get_model_files(path: str) -> list[str]:
         raise FileNotFoundError(f"Model path not found: {path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Pusa V2V (Optimized V3): Video-to-Video with block swapping and extension")
+    parser = argparse.ArgumentParser(description="Pusa V2V (Fixed): Video-to-Video with proper LoRA loading")
     parser.add_argument("--task", type=str, default="t2v-A14B", help="The task configuration to use from wan.configs.")
     parser.add_argument("--video_path", type=str, required=True, help="Path to the conditioning video.")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for video generation.")
@@ -209,20 +440,28 @@ def main():
     task_config = WAN_CONFIGS[args.task]
     high_model_files = _get_model_files(args.dit_high_noise_path)
     low_model_files = _get_model_files(args.dit_low_noise_path)
-    
+
     vae = WanVAE(vae_path=os.path.join(args.base_dir, "Wan2.1_VAE.pth"), device=device, dtype=dtype, cache_device="cpu")
     t5 = T5EncoderModel(text_len=task_config.text_len, device=device, weight_path=os.path.join(args.base_dir, "models_t5_umt5-xxl-enc-bf16.pth"))
-    
+
     model_manager = DynamicModelManager(task_config, device, dtype, args)
     model_manager.set_model_paths(low_model_files, high_model_files)
 
     # --- Load LoRAs ---
     def load_loras(lora_paths_str, lora_alphas_str):
-        if not lora_paths_str or not lora_paths_str.strip(): return None, None
+        if not lora_paths_str or not lora_paths_str.strip():
+            return None, None
         paths = [p.strip() for p in lora_paths_str.split(',')]
         alphas = [float(a.strip()) for a in lora_alphas_str.split(',')]
-        if len(paths) != len(alphas): raise ValueError("Number of LoRA paths must match number of alphas.")
-        weights = [load_file(p, device="cpu") for p in paths]
+        if len(paths) != len(alphas):
+            raise ValueError("Number of LoRA paths must match number of alphas.")
+
+        logger.info(f"Loading {len(paths)} LoRA file(s)")
+        weights = []
+        for path in paths:
+            logger.info(f"Loading LoRA from: {path}")
+            lora_sd = load_file(path, device="cpu")
+            weights.append(lora_sd)
         return weights, alphas
 
     low_loras, low_alphas = load_loras(args.low_lora_path, args.low_lora_alpha)
@@ -243,7 +482,7 @@ def main():
             raise ValueError(f"`--extend_from_end` ({args.extend_from_end}) is greater than video length ({len(all_video_frames)}).")
         if len(noise_mult_list) != args.extend_from_end:
             raise ValueError(f"Number of noise multipliers ({len(noise_mult_list)}) must match `--extend_from_end` ({args.extend_from_end}).")
-        
+
         conditioning_video = all_video_frames[-args.extend_from_end:]
         cond_pos_list = list(range(args.extend_from_end))
     else:
@@ -251,7 +490,7 @@ def main():
         cond_pos_list = [int(x.strip()) for x in args.cond_position.split(',')]
         if len(noise_mult_list) != len(cond_pos_list):
             raise ValueError(f"Number of noise multipliers ({len(noise_mult_list)}) must match conditioning positions ({len(cond_pos_list)}).")
-        
+
         conditioning_video = [all_video_frames[i] for i in cond_pos_list if i < len(all_video_frames)]
 
     # Get latents for conditioning frames
@@ -306,7 +545,7 @@ def main():
         timestep_2d = t.unsqueeze(0).unsqueeze(1).repeat(1, lat_f)
         for frame_idx in cond_pos_list:
             timestep_2d[:, frame_idx] = timestep_2d[:, frame_idx] * noise_mapping.get(frame_idx, 1.0)
-        
+
         with torch.autocast(device_type=device.type, dtype=dtype), torch.no_grad():
             latent_model_input = [latent.squeeze(0)]
             timestep_1d = t.unsqueeze(0)
@@ -315,7 +554,7 @@ def main():
             pred_uncond = current_model(latent_model_input, t=timestep_1d, **arg_null)[0]
             noise_pred = pred_uncond + args.cfg_scale * (pred_cond - pred_uncond)
 
-        latent = scheduler.step(model_output=noise_pred, 
+        latent = scheduler.step(model_output=noise_pred,
                                 timestep=timestep_2d,
                                 sample=latent,
                                 cond_frame_latent_indices=cond_pos_list,
@@ -338,14 +577,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename_base = os.path.basename(args.video_path).split('.')[0]
-    
+
     if args.extend_from_end:
         mode_str = f"extend_{args.extend_from_end}f"
     else:
         mode_str = f"cond_{'_'.join(map(str, cond_pos_list))}"
-    
+
     base_video_filename = f"wan22_v2v_{output_filename_base}_{timestamp}_{mode_str}"
-    
+
     if args.concatenate and args.extend_from_end:
         print("Concatenating original video with the generated video...")
         final_video_frames = all_video_frames + generated_frames_pil
