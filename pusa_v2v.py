@@ -28,7 +28,7 @@ from wan.pusa.flow_match_pusa_v2v import FlowMatchSchedulerPusaV2V
 from Wan2_2.wan.configs import WAN_CONFIGS
 
 # Model Loading Components
-from Wan2_2.wan.modules.model import WanModel, load_wan_model
+from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.t5 import T5EncoderModel
 
