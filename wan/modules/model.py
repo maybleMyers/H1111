@@ -939,17 +939,18 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     logger.info(f"Detected DiT dtype: {dit_dtype}")
     return dit_dtype
 
+# START <<<<<<<<<<<<<<<<<<<<<<<<<<<< MODIFIED SECTION V3 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
-    dit_path: Union[str, List[str]], # Can now be a list
+    dit_path: Union[str, List[str]],
     attn_mode: str,
     split_attn: bool,
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
-    lora_multipliers: Optional[List[float]] = None,
+    lora_multipliers: Optional[List[float]] = None, # Unused for now but kept for API
     use_scaled_mm: bool = False,
 ) -> WanModel:
     assert not fp8_scaled, "FP8 scaling is not compatible with this modified LoRA loader."
@@ -965,18 +966,20 @@ def load_wan_model(
         logger.info("Pusa LoRA detected. Analyzing architecture before model creation...")
         max_block_index = -1
         
-        # We assume one Pusa LoRA is provided per model, but handle multiple just in case
-        for lora_sd in lora_weights_list: 
-            for key in lora_sd.keys():
-                # Find keys like "blocks.47.ffn.0.weight" to detect new blocks
-                match = re.search(r"blocks\.(\d+)\.", key)
-                if match:
-                    block_idx = int(match.group(1))
-                    if block_idx > max_block_index:
-                        max_block_index = block_idx
-            # Merge LoRA weights, new weights will overwrite existing ones
+        # Merge all provided LoRA state dicts into one
+        for lora_sd in lora_weights_list:
             merged_lora_sd.update(lora_sd)
 
+        # Scan the merged LoRA keys
+        for key in merged_lora_sd.keys():
+            # Find keys like "blocks.47.ffn.0.weight" to detect new blocks
+            # This regex is more general and handles potential prefixes
+            match = re.search(r"blocks\.(\d+)\.", key)
+            if match:
+                block_idx = int(match.group(1))
+                if block_idx > max_block_index:
+                    max_block_index = block_idx
+        
         if max_block_index != -1 and (max_block_index + 1) > config.num_layers:
             total_layers = max_block_index + 1
             num_new_blocks = total_layers - config.num_layers
@@ -985,9 +988,12 @@ def load_wan_model(
         else:
             logger.info("LoRA does not seem to add new blocks. Treating as standard weight patch.")
             
-    # --- Step 2: Load the base model state dict ---
-    logger.info(f"Loading DiT base model state dict from {dit_path}")
-    sd = load_safetensors(dit_path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+    # --- Step 2: Load the base model state dict from potentially multiple files ---
+    sd = {}
+    dit_path_list = dit_path if isinstance(dit_path, list) else [dit_path]
+    logger.info(f"Loading DiT base model state dict from: {dit_path_list}")
+    for path in dit_path_list:
+        sd.update(load_safetensors(path, loading_device, disable_mmap=True, dtype=dit_weight_dtype))
 
     # remove "model.diffusion_model." prefix if it exists
     sd_keys = list(sd.keys())
@@ -998,37 +1004,30 @@ def load_wan_model(
     # --- Step 3: Merge LoRA weights into the base state dict ---
     if merged_lora_sd:
         logger.info("Merging LoRA weights into base model state dict.")
+        # Make sure LoRA keys don't have the prefix either
+        lora_keys = list(merged_lora_sd.keys())
+        for key in lora_keys:
+            if key.startswith("model.diffusion_model."):
+                merged_lora_sd[key[22:]] = merged_lora_sd.pop(key)
+        
         sd.update(merged_lora_sd)
-        # Clean up memory
-        del merged_lora_sd
-        del lora_weights_list
+        del merged_lora_sd, lora_weights_list
         clean_memory_on_device(loading_device)
-
 
     # Check for ref_conv layer weights
     has_ref_conv = "ref_conv.weight" in sd
     in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16
-    if has_ref_conv:
-        logger.info(f"Detected ref_conv layer in model weights. Input channels: {in_dim_ref_conv}")
+    if has_ref_conv: logger.info(f"Detected ref_conv layer in weights. Input channels: {in_dim_ref_conv}")
 
     # --- Step 4: Create the correctly-sized empty model ---
     with init_empty_weights():
         logger.info(f"Creating WanModel with {total_layers} layers.")
         model = WanModel(
             model_type="i2v" if config.i2v else "t2v",
-            dim=config.dim,
-            eps=config.eps,
-            ffn_dim=config.ffn_dim,
-            freq_dim=config.freq_dim,
-            in_dim=config.in_dim,
-            num_heads=config.num_heads,
-            num_layers=total_layers, # <-- CRITICAL CHANGE HERE
-            out_dim=config.out_dim,
-            text_len=config.text_len,
-            attn_mode=attn_mode,
-            split_attn=split_attn,
-            add_ref_conv=has_ref_conv,
-            in_dim_ref_conv=in_dim_ref_conv,
+            dim=config.dim, eps=config.eps, ffn_dim=config.ffn_dim, freq_dim=config.freq_dim,
+            in_dim=config.in_dim, num_heads=config.num_heads, num_layers=total_layers, # <-- CRITICAL
+            out_dim=config.out_dim, text_len=config.text_len, attn_mode=attn_mode,
+            split_attn=split_attn, add_ref_conv=has_ref_conv, in_dim_ref_conv=in_dim_ref_conv,
         )
         if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
@@ -1036,9 +1035,7 @@ def load_wan_model(
     # --- Step 5: Load the final merged state dict into the model ---
     info = model.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded merged state dict into model. Load info: {info}")
-    if info.missing_keys:
-        logger.warning(f"Missing keys during load: {info.missing_keys}")
-    if info.unexpected_keys:
-        logger.warning(f"Unexpected keys during load: {info.unexpected_keys}")
+    if info.missing_keys: logger.warning(f"Missing keys during load: {info.missing_keys}")
+    if info.unexpected_keys: logger.warning(f"Unexpected keys during load: {info.unexpected_keys}")
 
     return model
