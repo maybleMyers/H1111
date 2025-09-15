@@ -226,8 +226,19 @@ def load_wan_model_with_proper_loras(
     logger.info(f"Loading base {model_type} model from {dit_path}")
     loading_device = torch.device("cpu")
 
-    # Load state dict
-    state_dict = load_safetensors(dit_path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+    # Load state dict - handle both single file and list of files
+    if isinstance(dit_path, list) and len(dit_path) == 1:
+        # Single file in a list
+        state_dict = load_safetensors(dit_path[0], loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+    elif isinstance(dit_path, list):
+        # Multiple files - need to merge them
+        state_dict = {}
+        for path in dit_path:
+            partial_sd = load_safetensors(path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+            state_dict.update(partial_sd)
+    else:
+        # Single file path as string
+        state_dict = load_safetensors(dit_path, loading_device, disable_mmap=True, dtype=dit_weight_dtype)
 
     # Remove model.diffusion_model prefix if present
     sd_keys = list(state_dict.keys())
