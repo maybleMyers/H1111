@@ -190,7 +190,7 @@ def main():
         raise ValueError("`--concatenate` can only be used with `--extend_from_end` for video extension.")
     # ---
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
     # --- Setup Models ---
