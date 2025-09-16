@@ -853,6 +853,263 @@ def wan22_batch_handler(
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
+# Pusa Support Functions
+def get_pusa_lora_options(lora_folder: str = "pusa/pusa_lora") -> List[str]:
+    """Get available LoRA files from Pusa folder"""
+    if not os.path.exists(lora_folder):
+        os.makedirs(lora_folder, exist_ok=True)
+        return ["None"]
+
+    lora_files = ["None"]
+    for file in os.listdir(lora_folder):
+        if file.endswith('.safetensors'):
+            lora_files.append(file)
+
+    return sorted(lora_files)
+
+def refresh_pusa_loras(lora_folder: str) -> List[gr.update]:
+    """Refresh all 8 Pusa LoRA dropdowns"""
+    choices = get_pusa_lora_options(lora_folder)
+    updates = []
+
+    # Set defaults for first two LoRAs
+    for i in range(8):
+        if i == 0 and "high_noise_pusa.safetensors" in choices:
+            updates.append(gr.update(choices=choices, value="high_noise_pusa.safetensors"))
+            updates.append(gr.update(value=1.5))  # multiplier
+        elif i == 1 and "low_noise_pusa.safetensors" in choices:
+            updates.append(gr.update(choices=choices, value="low_noise_pusa.safetensors"))
+            updates.append(gr.update(value=1.4))  # multiplier
+        else:
+            updates.append(gr.update(choices=choices, value="None"))
+            updates.append(gr.update(value=1.0))  # multiplier
+
+    return updates
+
+def toggle_pusa_conditioning_mode(enable_extension: bool, use_positions: bool):
+    """Toggle between extension and position conditioning modes"""
+    return (
+        gr.update(visible=enable_extension),  # extension_controls
+        gr.update(visible=use_positions)  # position_controls
+    )
+
+# Pusa Extended Video Generation
+def pusa_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    input_video: str,
+    enable_extension: bool,
+    extend_frames: int,
+    noise_multipliers: str,
+    use_positions: bool,
+    cond_positions: str,
+    concatenate: bool,
+    width: int,
+    height: int,
+    fps: int,
+    seed: int,
+    num_inference_steps: int,
+    cfg_scale: float,
+    switch_boundary: float,
+    num_persistent_params: float,
+    batch_size: int,
+    # Model paths
+    high_model_path: str,
+    low_model_path: str,
+    vae_path: str,
+    t5_path: str,
+    base_dir: str,
+    output_dir: str,
+    # LoRA configuration (8 LoRAs)
+    lora_folder: str,
+    lora1: str, lora2: str, lora3: str, lora4: str,
+    lora5: str, lora6: str, lora7: str, lora8: str,
+    mult1: float, mult2: float, mult3: float, mult4: float,
+    mult5: float, mult6: float, mult7: float, mult8: float,
+    apply_low1: bool, apply_low2: bool, apply_low3: bool, apply_low4: bool,
+    apply_low5: bool, apply_low6: bool, apply_low7: bool, apply_low8: bool,
+    apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
+    apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
+) -> Generator[Tuple[List[str], str, str], None, None]:
+    """Handler for Pusa extended video generation with DiffSynth backend"""
+    global stop_event
+    stop_event.clear()
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_generated_videos = []
+
+    for batch_idx in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, "Generation stopped by user.", ""
+            return
+
+        # Handle seed
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + batch_idx
+
+        status_text = f"Processing Item {batch_idx+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), status_text, "Starting generation..."
+
+        # Build command for Pusa script
+        run_id = f"pusa_{int(time.time())}_{current_seed}"
+
+        cmd = [
+            sys.executable,
+            "pusa/PusaV1/examples/pusavideo/wan22_14b_v2v_pusa_single_file.py",
+            "--video_path", str(input_video),
+            "--prompt", str(prompt),
+            "--negative_prompt", str(negative_prompt),
+            "--noise_multipliers", str(noise_multipliers),
+            "--num_inference_steps", str(num_inference_steps),
+            "--high_model", os.path.join("wan", high_model_path),
+            "--low_model", os.path.join("wan", low_model_path),
+            "--base_dir", str(base_dir),
+            "--switch_DiT_boundary", str(switch_boundary),
+            "--cfg_scale", str(cfg_scale),
+            "--width", str(width),
+            "--height", str(height),
+            "--fps", str(fps),
+            "--output_dir", str(output_dir),
+            "--num_persistent_params", f"{num_persistent_params}e9"
+        ]
+
+        # Handle conditioning mode
+        if enable_extension:
+            cmd.extend(["--extend_from_end", str(extend_frames)])
+            if concatenate:
+                cmd.append("--concatenate")
+        elif use_positions and cond_positions:
+            cmd.extend(["--cond_position", cond_positions])
+        else:
+            yield all_generated_videos, "Error: Must specify either extension mode or conditioning positions", ""
+            continue
+
+        # Parse and add LoRAs
+        loras = [lora1, lora2, lora3, lora4, lora5, lora6, lora7, lora8]
+        mults = [mult1, mult2, mult3, mult4, mult5, mult6, mult7, mult8]
+        apply_lows = [apply_low1, apply_low2, apply_low3, apply_low4, apply_low5, apply_low6, apply_low7, apply_low8]
+        apply_highs = [apply_high1, apply_high2, apply_high3, apply_high4, apply_high5, apply_high6, apply_high7, apply_high8]
+
+        # Collect high noise LoRAs
+        high_lora_paths = []
+        high_lora_alphas = []
+        for i, (lora, mult, apply_high) in enumerate(zip(loras, mults, apply_highs)):
+            if apply_high and lora and lora != "None":
+                # Add full path if it's just a filename
+                if not os.path.sep in lora:
+                    lora_path = os.path.join(lora_folder, lora)
+                else:
+                    lora_path = lora
+                high_lora_paths.append(lora_path)
+                high_lora_alphas.append(str(mult))
+
+        # Collect low noise LoRAs
+        low_lora_paths = []
+        low_lora_alphas = []
+        for i, (lora, mult, apply_low) in enumerate(zip(loras, mults, apply_lows)):
+            if apply_low and lora and lora != "None":
+                # Add full path if it's just a filename
+                if not os.path.sep in lora:
+                    lora_path = os.path.join(lora_folder, lora)
+                else:
+                    lora_path = lora
+                low_lora_paths.append(lora_path)
+                low_lora_alphas.append(str(mult))
+
+        # Add LoRA arguments if any exist
+        if high_lora_paths:
+            cmd.extend(["--high_lora_path", ",".join(high_lora_paths)])
+            cmd.extend(["--high_lora_alpha", ",".join(high_lora_alphas)])
+
+        if low_lora_paths:
+            cmd.extend(["--low_lora_path", ",".join(low_lora_paths)])
+            cmd.extend(["--low_lora_alpha", ",".join(low_lora_alphas)])
+
+        # Execute command
+        try:
+            print(f"Executing Pusa command: {' '.join(cmd)}")
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            # Monitor output
+            output_lines = []
+            last_video_path = None
+
+            while True:
+                if stop_event.is_set():
+                    process.terminate()
+                    yield all_generated_videos, "Generation stopped by user", ""
+                    return
+
+                # Read stdout
+                line = process.stdout.readline()
+                if not line:
+                    # Check if process has finished
+                    if process.poll() is not None:
+                        break
+                    continue
+
+                line = line.strip()
+                if line:
+                    print(f"[Pusa] {line}")
+                    output_lines.append(line)
+
+                    # Parse progress messages
+                    if "Loading models" in line:
+                        yield all_generated_videos.copy(), status_text, "Loading models..."
+                    elif "Generating" in line:
+                        yield all_generated_videos.copy(), status_text, "Generating video frames..."
+                    elif "Saving video to" in line:
+                        # Extract output path
+                        import re
+                        match = re.search(r"Saving video to (.+\.mp4)", line)
+                        if match:
+                            last_video_path = match.group(1)
+                    elif "Video saved successfully" in line or "complete" in line.lower():
+                        if last_video_path and os.path.exists(last_video_path):
+                            all_generated_videos.append(last_video_path)
+
+                    # Update status with last few lines
+                    recent_output = "\n".join(output_lines[-5:])
+                    yield all_generated_videos.copy(), status_text, recent_output
+
+            # Wait for process to complete
+            process.wait()
+
+            # Read any remaining stderr
+            stderr_output = process.stderr.read()
+            if stderr_output:
+                print(f"[Pusa stderr] {stderr_output}")
+
+            if process.returncode != 0:
+                error_msg = f"Generation failed with code {process.returncode}"
+                if stderr_output:
+                    error_msg += f"\nError: {stderr_output}"
+                yield all_generated_videos, error_msg, ""
+            else:
+                yield all_generated_videos.copy(), status_text, "Generation completed!"
+
+        except Exception as e:
+            error_msg = f"Error during generation: {str(e)}"
+            print(f"[Pusa Error] {error_msg}")
+            yield all_generated_videos, error_msg, ""
+
+        # Small delay between batches
+        time.sleep(0.2)
+
+    yield all_generated_videos, "Pusa batch generation complete!", ""
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -8292,7 +8549,237 @@ with gr.Blocks(
                         interactive=True
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
-        
+
+        # Pusa Tab (Extended Video Generation with DiffSynth backend) - Reorganized to match Wan2.2 layout
+        with gr.Tab(id=15, label="Pusa") as pusa_tab:
+            # Top section: Prompts and batch controls (same as Wan2.2)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    pusa_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A fast action video featuring a cute tabby cat wearing a pink hat, eating a blueberry and cucumber sandwich.",
+                        lines=5
+                    )
+                    pusa_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    pusa_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    pusa_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    pusa_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    pusa_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="pusa_progress_text")
+
+            # Generate and Stop buttons
+            with gr.Row():
+                pusa_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                pusa_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            # Main content area with two columns (similar to Wan2.2)
+            with gr.Row():
+                # Left column: Input and generation settings
+                with gr.Column():
+                    # Input video
+                    pusa_input_video = gr.Video(label="Input Video (for extension)", format="mp4")
+
+                    # Extension mode controls
+                    pusa_enable_extension = gr.Checkbox(
+                        label="Enable Video Extension Mode",
+                        value=True,
+                        info="Use last N frames from input video to condition the start of new video"
+                    )
+                    with gr.Group(visible=True) as pusa_extension_controls:
+                        with gr.Row():
+                            pusa_extend_frames = gr.Number(
+                                label="Frames from End",
+                                value=6,
+                                minimum=1,
+                                maximum=20,
+                                step=1,
+                                info="Number of frames from the end to use for conditioning"
+                            )
+                            pusa_video_length = gr.Number(
+                                label="Video Length (frames)",
+                                value=81,
+                                minimum=81,
+                                maximum=500,
+                                step=1,
+                                info="Total number of frames to generate"
+                            )
+                        pusa_noise_multipliers = gr.Textbox(
+                            label="Noise Multipliers",
+                            value="0.1,0.1,0.1,0.1,0.1,0.1",
+                            info="Comma-separated noise values (one per conditioning frame)"
+                        )
+                        pusa_concatenate = gr.Checkbox(
+                            label="Concatenate with Original",
+                            value=True,
+                            info="Automatically join original video with generated video"
+                        )
+
+                    # Alternative conditioning mode
+                    pusa_use_positions = gr.Checkbox(
+                        label="Use Specific Frame Positions",
+                        value=False,
+                        info="Specify exact frame positions for conditioning instead of extension mode"
+                    )
+                    with gr.Group(visible=False) as pusa_position_controls:
+                        pusa_cond_positions = gr.Textbox(
+                            label="Conditioning Positions",
+                            placeholder="0,10,20,30",
+                            info="Comma-separated frame indices for conditioning"
+                        )
+
+                    # Generation settings
+                    with gr.Row():
+                        pusa_width = gr.Number(label="Width", value=832, minimum=128, maximum=2048, step=8)
+                        pusa_height = gr.Number(label="Height", value=480, minimum=128, maximum=2048, step=8)
+                    with gr.Row():
+                        pusa_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
+                        pusa_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                    pusa_num_inference_steps = gr.Slider(
+                        label="Inference Steps",
+                        minimum=10,
+                        maximum=100,
+                        value=40,
+                        step=1
+                    )
+                    pusa_cfg_scale = gr.Slider(
+                        label="CFG Scale",
+                        minimum=1.0,
+                        maximum=20.0,
+                        value=3.0,
+                        step=0.1
+                    )
+                    pusa_switch_boundary = gr.Slider(
+                        label="DiT Switch Boundary",
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.875,
+                        step=0.001,
+                        info="Switch from high to low noise model at this threshold"
+                    )
+                    pusa_num_persistent_params = gr.Number(
+                        label="Persistent Parameters (billions)",
+                        value=10.6,
+                        minimum=0,
+                        maximum=20,
+                        step=0.1,
+                        info="VRAM management parameter"
+                    )
+
+                # Right column: Output gallery and LoRAs (matching Wan2.2 style)
+                with gr.Column():
+                    pusa_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_pusa", allow_preview=True, preview=True
+                    )
+
+                    # LoRA Configuration with Accordion (matching Wan2.2)
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            pusa_lora_folder = gr.Textbox(label="LoRA Folder", value="pusa/pusa_lora")
+                            pusa_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+
+                        pusa_lora_weights = []
+                        pusa_lora_multipliers = []
+                        pusa_lora_apply_low = []
+                        pusa_lora_apply_high = []
+
+                        # First 4 LoRAs in main accordion
+                        for i in range(4):
+                            # Set default values for the first two LoRAs
+                            if i == 0:
+                                default_lora = "high_noise_pusa.safetensors"
+                                default_mult = 1.5
+                                default_high = True
+                                default_low = False
+                            elif i == 1:
+                                default_lora = "low_noise_pusa.safetensors"
+                                default_mult = 1.4
+                                default_high = False
+                                default_low = True
+                            else:
+                                default_lora = "None"
+                                default_mult = 1.0
+                                default_high = False
+                                default_low = False
+
+                            with gr.Row():
+                                pusa_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_pusa_lora_options("pusa/pusa_lora"),
+                                    value=default_lora, allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                pusa_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=default_mult, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                pusa_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=default_low, scale=1
+                                ))
+                                pusa_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=default_high, scale=1
+                                ))
+
+                        # Additional 4 LoRAs in nested accordion
+                        with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                            for i in range(4, 8):
+                                with gr.Row():
+                                    pusa_lora_weights.append(gr.Dropdown(
+                                        label=f"LoRA {i+1}", choices=get_pusa_lora_options("pusa/pusa_lora"),
+                                        value="None", allow_custom_value=False, interactive=True, scale=2
+                                    ))
+                                    pusa_lora_multipliers.append(gr.Slider(
+                                        label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                    ))
+                                with gr.Row():
+                                    pusa_lora_apply_low.append(gr.Checkbox(
+                                        label="Apply to Low Noise", value=False, scale=1
+                                    ))
+                                    pusa_lora_apply_high.append(gr.Checkbox(
+                                        label="Apply to High Noise", value=False, scale=1
+                                    ))
+
+            # Model paths at the bottom in an accordion (matching Wan2.2)
+            with gr.Accordion("Model Paths & Configuration", open=True):
+                with gr.Row():
+                    pusa_high_model_path = gr.Textbox(
+                        label="High Noise Model",
+                        value="wan22_i2v_14B_high_noise_bf16.safetensors",
+                        info="Path relative to wan/ directory"
+                    )
+                    pusa_low_model_path = gr.Textbox(
+                        label="Low Noise Model",
+                        value="wan22_i2v_14B_low_noise_bf16.safetensors",
+                        info="Path relative to wan/ directory"
+                    )
+                with gr.Row():
+                    pusa_vae_path = gr.Textbox(
+                        label="VAE Model",
+                        value="Wan2.2-VACE-Fun-A14B.safetensors",
+                        info="Path relative to wan/ directory"
+                    )
+                    pusa_t5_path = gr.Textbox(
+                        label="T5 Model Directory",
+                        value="t5",
+                        info="Path relative to wan/ directory"
+                    )
+                    pusa_base_dir = gr.Textbox(
+                        label="Base Model Directory",
+                        value="wan",
+                        info="Base directory containing T5 and VAE models"
+                    )
+                with gr.Row():
+                    pusa_output_dir = gr.Textbox(
+                        label="Output Directory",
+                        value="outputs/pusa"
+                    )
+
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
             with gr.Row():
@@ -8954,6 +9441,7 @@ with gr.Blocks(
             with gr.Row():
                 send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
                 send_to_wan22_btn = gr.Button("Send to Wan2.2", variant="primary")
+                send_to_pusa_btn = gr.Button("Send to Pusa", variant="primary")
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
@@ -10688,6 +11176,9 @@ with gr.Blocks(
     def change_to_wan22_tab():
         return gr.Tabs(selected=12)  # Wan2.2 tab index
 
+    def change_to_pusa_tab():
+        return gr.Tabs(selected=15)  # Pusa tab index
+
 
     send_to_wanx_i2v_btn.click(
         fn=lambda m: ("Parameters ready for WanX-i2v", m),
@@ -10864,7 +11355,83 @@ with gr.Blocks(
     ).then(
         fn=change_to_wan22_tab, inputs=None, outputs=[tabs]
     )
-    
+
+    # Pusa send-to logic
+    def handle_send_to_pusa_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+        """Handle parameters and video transfer from Video Info to Pusa tab"""
+        if not video_path:
+            return "No video selected to send to Pusa", {}, None
+
+        status_msg = "Video and parameters ready for Pusa extended generation."
+        if not metadata:
+            status_msg = "Video sent to Pusa (no parameters found in metadata)."
+            metadata = {}
+
+        return status_msg, metadata, video_path
+
+    send_to_pusa_btn.click(
+        fn=handle_send_to_pusa_tab,
+        inputs=[metadata_output, video_input],
+        outputs=[status, params_state, pusa_input_video]
+    ).then(
+        lambda params: [
+            params.get("prompt", ""),
+            params.get("negative_prompt", ""),
+            True,  # enable_extension (default to extension mode)
+            6,  # extend_frames (default)
+            params.get("frame_num", 81),  # video_length - get from metadata if available
+            "0.1,0.1,0.1,0.1,0.1,0.1",  # noise_multipliers (default)
+            False,  # use_positions
+            "",  # cond_positions
+            True,  # concatenate
+            params.get("width", 832),
+            params.get("height", 480),
+            params.get("fps", 24),
+            params.get("seed", -1),
+            params.get("sample_steps", 40),
+            params.get("sample_guide_scale", 3.0),
+            params.get("dual_dit_boundary", 0.875),
+            10.6,  # num_persistent_params
+            1,  # batch_size
+            # Model paths - use defaults, user can adjust if needed
+            "wan22_i2v_14B_high_noise_bf16.safetensors",
+            "wan22_i2v_14B_low_noise_bf16.safetensors",
+            "Wan2.2-VACE-Fun-A14B.safetensors",
+            "t5",
+            "wan",
+            "outputs/pusa"
+        ] if params else [gr.update()]*25,  # Changed to 25 for the extra video_length field
+        inputs=[params_state],
+        outputs=[
+            pusa_prompt,
+            pusa_negative_prompt,
+            pusa_enable_extension,
+            pusa_extend_frames,
+            pusa_video_length,  # Added video_length output
+            pusa_noise_multipliers,
+            pusa_use_positions,
+            pusa_cond_positions,
+            pusa_concatenate,
+            pusa_width,
+            pusa_height,
+            pusa_fps,
+            pusa_seed,
+            pusa_num_inference_steps,
+            pusa_cfg_scale,
+            pusa_switch_boundary,
+            pusa_num_persistent_params,
+            pusa_batch_size,
+            pusa_high_model_path,
+            pusa_low_model_path,
+            pusa_vae_path,
+            pusa_t5_path,
+            pusa_base_dir,
+            pusa_output_dir
+        ]
+    ).then(
+        fn=change_to_pusa_tab, inputs=None, outputs=[tabs]
+    )
+
     # FramePack-Extension send-to logic
     def handle_send_to_fpe_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
         """Prepare parameters and video path for the FramePack-Extension tab."""
@@ -11909,6 +12476,88 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # Pusa Event Handlers
+    pusa_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Pusa token counter
+    pusa_prompt.change(
+        fn=count_prompt_tokens,
+        inputs=[pusa_prompt],
+        outputs=[pusa_token_counter]
+    )
+
+    # Toggle conditioning modes
+    pusa_enable_extension.change(
+        fn=lambda ext, pos: toggle_pusa_conditioning_mode(ext, False),
+        inputs=[pusa_enable_extension, pusa_use_positions],
+        outputs=[pusa_extension_controls, pusa_position_controls]
+    )
+
+    pusa_use_positions.change(
+        fn=lambda pos, ext: toggle_pusa_conditioning_mode(False, pos),
+        inputs=[pusa_use_positions, pusa_enable_extension],
+        outputs=[pusa_extension_controls, pusa_position_controls]
+    )
+
+    # LoRA refresh
+    pusa_lora_refresh_outputs = []
+    for i in range(8):
+        pusa_lora_refresh_outputs.extend([pusa_lora_weights[i], pusa_lora_multipliers[i]])
+
+    pusa_lora_refresh_btn.click(
+        fn=refresh_pusa_loras,
+        inputs=[pusa_lora_folder],
+        outputs=pusa_lora_refresh_outputs
+    )
+
+    # Main generation handler - build proper input list
+    pusa_generation_inputs = [
+        pusa_prompt,
+        pusa_negative_prompt,
+        pusa_input_video,
+        pusa_enable_extension,
+        pusa_extend_frames,
+        pusa_noise_multipliers,
+        pusa_use_positions,
+        pusa_cond_positions,
+        pusa_concatenate,
+        pusa_width,
+        pusa_height,
+        pusa_fps,
+        pusa_seed,
+        pusa_num_inference_steps,
+        pusa_cfg_scale,
+        pusa_switch_boundary,
+        pusa_num_persistent_params,
+        pusa_batch_size,
+        # Model paths
+        pusa_high_model_path,
+        pusa_low_model_path,
+        pusa_vae_path,
+        pusa_t5_path,
+        pusa_base_dir,
+        pusa_output_dir,
+        # LoRA configuration
+        pusa_lora_folder
+    ]
+
+    # Add all LoRA inputs in order
+    for i in range(8):
+        pusa_generation_inputs.append(pusa_lora_weights[i])
+    for i in range(8):
+        pusa_generation_inputs.append(pusa_lora_multipliers[i])
+    for i in range(8):
+        pusa_generation_inputs.append(pusa_lora_apply_low[i])
+    for i in range(8):
+        pusa_generation_inputs.append(pusa_lora_apply_high[i])
+
+    pusa_generate_btn.click(
+        fn=pusa_batch_handler,
+        inputs=pusa_generation_inputs,
+        outputs=[pusa_output, pusa_batch_progress, pusa_progress_text],
+        queue=True
     )
 
     #Video Info
