@@ -1,3 +1,5 @@
+![GUI Screenshot](images/screenshot.png)  
+
 To use Pusa
 activate your venv then
 goto pusa/PusaV1 and run pip install -e .
