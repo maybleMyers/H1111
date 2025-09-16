@@ -933,6 +933,10 @@ def pusa_batch_handler(
     apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
 ) -> Generator[Tuple[List[str], str, str], None, None]:
     """Handler for Pusa extended video generation with DiffSynth backend"""
+    import queue
+    import threading
+    import re
+
     global stop_event
     stop_event.clear()
 
@@ -1043,60 +1047,83 @@ def pusa_batch_handler(
                 universal_newlines=True
             )
 
-            # Monitor output
+            # Monitor output using threading to prevent blocking
             output_lines = []
             last_video_path = None
+            output_queue = queue.Queue()
 
+            def read_output(pipe, pipe_name):
+                if pipe is None:
+                    return
+                for line in pipe:
+                    output_queue.put((pipe_name, line))
+                pipe.close()
+
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "stdout"))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "stderr"))
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # Process output from both streams
             while True:
                 if stop_event.is_set():
                     process.terminate()
                     yield all_generated_videos, "Generation stopped by user", ""
                     return
 
-                # Read stdout
-                line = process.stdout.readline()
-                if not line:
-                    # Check if process has finished
-                    if process.poll() is not None:
+                # Check if process is still running
+                poll_status = process.poll()
+
+                # Read from queue with timeout
+                try:
+                    pipe_name, line = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    # Check if process finished and threads are done
+                    if poll_status is not None and not stdout_thread.is_alive() and not stderr_thread.is_alive():
                         break
                     continue
 
                 line = line.strip()
                 if line:
-                    print(f"[Pusa] {line}")
+                    # Print to console with proper prefix
+                    if pipe_name == "stderr":
+                        print(f"[Pusa stderr] {line}")
+                    else:
+                        print(f"[Pusa] {line}")
+
                     output_lines.append(line)
 
                     # Parse progress messages
                     if "Loading models" in line:
                         yield all_generated_videos.copy(), status_text, "Loading models..."
-                    elif "Generating" in line:
-                        yield all_generated_videos.copy(), status_text, "Generating video frames..."
+                    elif "Models loaded successfully" in line:
+                        yield all_generated_videos.copy(), status_text, "Models loaded"
+                    elif "Generating new video frames" in line:
+                        yield all_generated_videos.copy(), status_text, "Generating frames..."
+                    elif "Video generation complete" in line:
+                        yield all_generated_videos.copy(), status_text, "Saving video..."
                     elif "Saving video to" in line:
                         # Extract output path
-                        import re
                         match = re.search(r"Saving video to (.+\.mp4)", line)
                         if match:
                             last_video_path = match.group(1)
-                    elif "Video saved successfully" in line or "complete" in line.lower():
+                    elif "Video saved successfully" in line:
                         if last_video_path and os.path.exists(last_video_path):
                             all_generated_videos.append(last_video_path)
+                        yield all_generated_videos.copy(), status_text, "Video saved successfully!"
 
                     # Update status with last few lines
-                    recent_output = "\n".join(output_lines[-5:])
+                    recent_output = "\n".join(output_lines[-10:])  # Show last 10 lines
                     yield all_generated_videos.copy(), status_text, recent_output
 
-            # Wait for process to complete
+            # Wait for threads to complete
+            stdout_thread.join()
+            stderr_thread.join()
             process.wait()
-
-            # Read any remaining stderr
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                print(f"[Pusa stderr] {stderr_output}")
 
             if process.returncode != 0:
                 error_msg = f"Generation failed with code {process.returncode}"
-                if stderr_output:
-                    error_msg += f"\nError: {stderr_output}"
+                # Stderr has already been captured in output_lines
                 yield all_generated_videos, error_msg, ""
             else:
                 yield all_generated_videos.copy(), status_text, "Generation completed!"
