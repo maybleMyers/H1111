@@ -914,12 +914,13 @@ def pusa_batch_handler(
     num_persistent_params: float,
     batch_size: int,
     # Model paths
-    high_model_path: str,
-    low_model_path: str,
+    model_folder: str,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
     vae_path: str,
     t5_path: str,
-    base_dir: str,
-    output_dir: str,
+    save_path: str,
     # LoRA configuration (8 LoRAs)
     lora_folder: str,
     lora1: str, lora2: str, lora3: str, lora4: str,
@@ -936,7 +937,7 @@ def pusa_batch_handler(
     stop_event.clear()
 
     # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(save_path, exist_ok=True)
 
     all_generated_videos = []
 
@@ -966,15 +967,15 @@ def pusa_batch_handler(
             "--negative_prompt", str(negative_prompt),
             "--noise_multipliers", str(noise_multipliers),
             "--num_inference_steps", str(num_inference_steps),
-            "--high_model", os.path.join("wan", high_model_path),
-            "--low_model", os.path.join("wan", low_model_path),
-            "--base_dir", str(base_dir),
+            "--high_model", os.path.join(model_folder, dit_high_noise_path),
+            "--low_model", os.path.join(model_folder, dit_low_noise_path),
+            "--base_dir", str(model_folder),  # Use model_folder as base_dir
             "--switch_DiT_boundary", str(switch_boundary),
             "--cfg_scale", str(cfg_scale),
             "--width", str(width),
             "--height", str(height),
             "--fps", str(fps),
-            "--output_dir", str(output_dir),
+            "--output_dir", str(save_path),
             "--num_persistent_params", f"{num_persistent_params}e9"
         ]
 
@@ -8745,40 +8746,50 @@ with gr.Blocks(
                                         label="Apply to High Noise", value=False, scale=1
                                     ))
 
-            # Model paths at the bottom in an accordion (matching Wan2.2)
+            # Model paths at the bottom - EXACTLY the same as Wan2.2 since Pusa uses the same models
             with gr.Accordion("Model Paths & Configuration", open=True):
                 with gr.Row():
-                    pusa_high_model_path = gr.Textbox(
-                        label="High Noise Model",
-                        value="wan22_i2v_14B_high_noise_bf16.safetensors",
-                        info="Path relative to wan/ directory"
+                    pusa_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    pusa_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    pusa_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model (.safetensors)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    pusa_low_model_path = gr.Textbox(
-                        label="Low Noise Model",
-                        value="wan22_i2v_14B_low_noise_bf16.safetensors",
-                        info="Path relative to wan/ directory"
+                    pusa_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model (.safetensors)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    pusa_clip_path = gr.Dropdown(
+                        label="CLIP Model (.pth, for i2v)",
+                        choices=get_wan_of_clip_models("wan"),
+                        value=get_default_clip_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        visible=True
                     )
                 with gr.Row():
-                    pusa_vae_path = gr.Textbox(
-                        label="VAE Model",
-                        value="Wan2.2-VACE-Fun-A14B.safetensors",
-                        info="Path relative to wan/ directory"
+                    pusa_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    pusa_t5_path = gr.Textbox(
-                        label="T5 Model Directory",
-                        value="t5",
-                        info="Path relative to wan/ directory"
+                    pusa_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    pusa_base_dir = gr.Textbox(
-                        label="Base Model Directory",
-                        value="wan",
-                        info="Base directory containing T5 and VAE models"
-                    )
-                with gr.Row():
-                    pusa_output_dir = gr.Textbox(
-                        label="Output Directory",
-                        value="outputs/pusa"
-                    )
+                pusa_save_path = gr.Textbox(label="Save Path", value="outputs/pusa")
 
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -11393,14 +11404,15 @@ with gr.Blocks(
             params.get("dual_dit_boundary", 0.875),
             10.6,  # num_persistent_params
             1,  # batch_size
-            # Model paths - use defaults, user can adjust if needed
-            "wan22_i2v_14B_high_noise_bf16.safetensors",
-            "wan22_i2v_14B_low_noise_bf16.safetensors",
-            "Wan2.2-VACE-Fun-A14B.safetensors",
-            "t5",
-            "wan",
-            "outputs/pusa"
-        ] if params else [gr.update()]*25,  # Changed to 25 for the extra video_length field
+            # Model paths - use intelligent defaults like Wan2.2
+            "wan",  # model_folder
+            get_default_low_noise_model("wan"),  # dit_low_noise_path
+            get_default_high_noise_model("wan"),  # dit_high_noise_path
+            get_default_clip_model("wan"),  # clip_path
+            get_default_vae_model("wan"),  # vae_path
+            get_default_t5_model("wan"),  # t5_path
+            "outputs/pusa"  # save_path
+        ] if params else [gr.update()]*26,  # Updated count for new model fields
         inputs=[params_state],
         outputs=[
             pusa_prompt,
@@ -11421,12 +11433,13 @@ with gr.Blocks(
             pusa_switch_boundary,
             pusa_num_persistent_params,
             pusa_batch_size,
-            pusa_high_model_path,
-            pusa_low_model_path,
+            pusa_model_folder,
+            pusa_dit_low_noise_path,
+            pusa_dit_high_noise_path,
+            pusa_clip_path,
             pusa_vae_path,
             pusa_t5_path,
-            pusa_base_dir,
-            pusa_output_dir
+            pusa_save_path
         ]
     ).then(
         fn=change_to_pusa_tab, inputs=None, outputs=[tabs]
@@ -12512,6 +12525,23 @@ with gr.Blocks(
         outputs=pusa_lora_refresh_outputs
     )
 
+    # Model refresh button for Pusa
+    def update_pusa_model_dropdowns(model_folder: str):
+        """Update all Pusa model dropdowns based on folder contents"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_high_noise_models(model_folder)),
+            gr.update(choices=get_wan_of_clip_models(model_folder)),
+            gr.update(choices=get_wan_of_vae_models(model_folder)),
+            gr.update(choices=get_wan_of_t5_models(model_folder))
+        ]
+
+    pusa_refresh_models_btn.click(
+        fn=update_pusa_model_dropdowns,
+        inputs=[pusa_model_folder],
+        outputs=[pusa_dit_low_noise_path, pusa_dit_high_noise_path, pusa_clip_path, pusa_vae_path, pusa_t5_path]
+    )
+
     # Main generation handler - build proper input list
     pusa_generation_inputs = [
         pusa_prompt,
@@ -12532,13 +12562,14 @@ with gr.Blocks(
         pusa_switch_boundary,
         pusa_num_persistent_params,
         pusa_batch_size,
-        # Model paths
-        pusa_high_model_path,
-        pusa_low_model_path,
+        # Model paths (matching Wan2.2 structure)
+        pusa_model_folder,
+        pusa_dit_low_noise_path,
+        pusa_dit_high_noise_path,
+        pusa_clip_path,
         pusa_vae_path,
         pusa_t5_path,
-        pusa_base_dir,
-        pusa_output_dir,
+        pusa_save_path,
         # LoRA configuration
         pusa_lora_folder
     ]
