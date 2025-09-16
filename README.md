@@ -1,6 +1,8 @@
 ![GUI Screenshot](images/screenshot.png)
 
 # Recent update
+9/16/2025  
+    Support Pusa video extension via the pusa2 branch.  It works pretty good :D.  
 9/8/2025  
     Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2 long video generation, video extension for wan 2.2 to the wan2.2b branch.  
 7/31/2025  
