@@ -8009,7 +8009,7 @@ with gr.Blocks(
                                 )
                     
                     # Pusa Extension Controls
-                    with gr.Accordion("Pusa Extension (Advanced Flow Matching)", open=False):
+                    with gr.Accordion("Pusa Extension (Advanced Flow Matching)", open=False, visible=False):
                         gr.Markdown("**Note:** These options only apply when Sample Solver is set to 'pusa'")
                         with gr.Group(visible=False) as wan22_pusa_controls:
                             # Legacy Pusa Controls (for backward compatibility)
