@@ -9589,7 +9589,7 @@ with gr.Blocks(
                     )
 
         # WanX Image to Video Tab
-        with gr.Tab(id=4, label="WanX-i2v") as wanx_i2v_tab:
+        with gr.Tab(id=4, label="WanX-i2v", visible=False) as wanx_i2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     wanx_prompt = gr.Textbox(
@@ -9795,7 +9795,7 @@ with gr.Blocks(
         #WanX-t2v Tab
 
         # WanX Text to Video Tab
-        with gr.Tab(id=5, label="WanX-t2v") as wanx_t2v_tab:
+        with gr.Tab(id=5, label="WanX-t2v", visible=False) as wanx_t2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
                     wanx_t2v_prompt = gr.Textbox(
