@@ -961,7 +961,7 @@ def pusa_batch_handler(
             current_seed = seed + batch_idx
 
         status_text = f"Processing Item {batch_idx+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), status_text, "Starting generation..."
+        yield all_generated_videos.copy(), None, status_text, "Starting generation..."
 
         # Build command for Pusa script
         run_id = f"pusa_{int(time.time())}_{current_seed}"
