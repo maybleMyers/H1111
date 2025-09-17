@@ -9,7 +9,11 @@ Here are the pusa loras: https://huggingface.co/RaphaelLiu/Pusa-Wan2.2-V1/tree/m
 This implementation is using the diffsynth backend, not musubi. You need to adjust persistent parameters to your gpu. for 480p 10.6 works on a 32gb gpu.  
 I have only tested it with wan22_t2v_14B_high_noise_bf16.safetensors and  wan22_t2v_14B_low_noise_bf16.safetensors from https://huggingface.co/maybleMyers/wan_files_for_h1111/ you should probably use the bf16 models for compatibility.  
 
-Thanks to these people for making pusa possible:
+To use lightx2v 4 step acceleration download the loras from here and put them in the pusa/pusa_lora subfolder.  
+https://huggingface.co/vivienfanghua/Wan2.2-Lightning/tree/main/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1  
+
+
+# Thanks to these people for making pusa possible:
 
 ```bibtex
 @article{liu2025pusa,
