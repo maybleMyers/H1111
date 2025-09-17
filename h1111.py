@@ -979,6 +979,7 @@ def pusa_batch_handler(
             "--width", str(width),
             "--height", str(height),
             "--fps", str(fps),
+            "--seed", str(current_seed),
             "--output_dir", str(save_path),
             "--num_persistent_params", f"{num_persistent_params}e9"
         ]
@@ -1253,6 +1254,12 @@ def pusa_i2v_batch_handler(
             "--cfg_scale", str(cfg_scale),
             "--shift", str(sigma_shift),
             "--output_dir", str(save_path),
+            "--width", str(width),
+            "--height", str(height),
+            "--num_frames", str(video_length),
+            "--fps", str(fps),
+            "--seed", str(current_seed),
+            "--num_persistent_params", f"{num_persistent_params}e9"
         ]
 
         # Add lightx2v flag if enabled
@@ -8918,7 +8925,9 @@ with gr.Blocks(
                         pusa_height = gr.Number(label="Height", value=480, minimum=128, maximum=2048, step=8)
                     with gr.Row():
                         pusa_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
+                    with gr.Row():
                         pusa_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        pusa_random_seed_btn = gr.Button("🎲", scale=0.1)
                     pusa_num_inference_steps = gr.Slider(
                         label="Inference Steps",
                         minimum=10,
@@ -9139,6 +9148,8 @@ with gr.Blocks(
                         pusa_i2v_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
                     with gr.Row():
                         pusa_i2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        pusa_i2v_random_seed_btn = gr.Button("🎲", scale=0.1)
+                    with gr.Row():
                         pusa_i2v_sigma_shift = gr.Slider(
                             label="Sigma Shift",
                             minimum=0.0,
@@ -13024,6 +13035,13 @@ with gr.Blocks(
         outputs=[pusa_extension_controls, pusa_position_controls]
     )
 
+    # Random seed button for Pusa-ext
+    pusa_random_seed_btn.click(
+        fn=set_random_seed,
+        inputs=None,
+        outputs=[pusa_seed]
+    )
+
     # LoRA refresh
     pusa_lora_refresh_outputs = []
     for i in range(8):
@@ -13182,6 +13200,13 @@ with gr.Blocks(
         inputs=pusa_i2v_generation_inputs,
         outputs=[pusa_i2v_output, pusa_i2v_batch_progress, pusa_i2v_progress_text],
         queue=True
+    )
+
+    # Random seed button for Pusa-i2v
+    pusa_i2v_random_seed_btn.click(
+        fn=set_random_seed,
+        inputs=None,
+        outputs=[pusa_i2v_seed]
     )
 
     #Video Info
