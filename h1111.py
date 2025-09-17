@@ -1239,16 +1239,16 @@ def pusa_i2v_batch_handler(
 
     # Ensure we have matching counts
     if len(image_paths) != len(positions):
-        yield [], f"Error: Number of images ({len(image_paths)}) must match number of positions ({len(positions)})", ""
+        yield [], [], f"Error: Number of images ({len(image_paths)}) must match number of positions ({len(positions)})", ""
         return
 
     if len(image_paths) != len(noise_mults):
-        yield [], f"Error: Number of images ({len(image_paths)}) must match number of noise multipliers ({len(noise_mults)})", ""
+        yield [], [], f"Error: Number of images ({len(image_paths)}) must match number of noise multipliers ({len(noise_mults)})", ""
         return
 
     for batch_idx in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, "Generation stopped by user.", ""
+            yield all_generated_videos, [], "Generation stopped by user.", ""
             return
 
         # Handle seed
@@ -1259,7 +1259,7 @@ def pusa_i2v_batch_handler(
             current_seed = seed + batch_idx
 
         status_text = f"Processing Item {batch_idx+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), status_text, "Starting generation..."
+        yield all_generated_videos.copy(), [], status_text, "Starting generation..."
 
         # Build command for multi-frames Pusa script
         run_id = f"pusa_i2v_{int(time.time())}_{current_seed}"
@@ -9346,14 +9346,14 @@ with gr.Blocks(
                     pusa_i2v_dit_low_noise_path = gr.Dropdown(
                         label="DiT Low Noise Model (.safetensors)",
                         choices=get_wan_of_low_noise_models("wan"),
-                        value=get_default_low_noise_model("wan"),
+                        value="wan22_t2v_14B_low_noise_bf16.safetensors",
                         allow_custom_value=True,
                         interactive=True
                     )
                     pusa_i2v_dit_high_noise_path = gr.Dropdown(
                         label="DiT High Noise Model (.safetensors)",
                         choices=get_wan_of_high_noise_models("wan"),
-                        value=get_default_high_noise_model("wan"),
+                        value="wan22_t2v_14B_high_noise_bf16.safetensors",
                         allow_custom_value=True,
                         interactive=True
                     )
