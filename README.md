@@ -11,12 +11,6 @@
     I have added support for the wan 2.2 i2v 14b and 5b models on the wan2.2b branch. 24GB gpu needed as of now for vae things. Download the appropriate models from https://huggingface.co/maybleMyers/wan_files_for_h1111/  . Use the 2.1 vae for 14b and the 2.2 vae for 5b.  
 7/27/2025  
     Make multitalk memory management better, it was oom'ing on longer gens but should be stable now.  
-7/26/2025  
-    Add fusion lora support to wanX-i2v, updated torch27 requirements. Some bug fixes.  
-7/13/2025  
-    Add BBoxes to multitalk to define who is talking/grooving to the music. You will need to install gradio_image_annotation or reinstall requirements.    
-7/7/2025  
-    Support FusioniX lora from vrgamedevgirl with multitalk.  
 
 # H1111
 
@@ -204,6 +198,10 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+9/17/2025  
+    Support Pusa 4 image to video via the pusa2 branch. Add lightx2v support for 4 step gen.  
+9/16/2025  
+    Support Pusa video extension via the pusa2 branch.  
 9/8/2025  
     Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2 long video generation, video extension for wan 2.2 to the wan2.2b branch.  
 7/31/2025  
