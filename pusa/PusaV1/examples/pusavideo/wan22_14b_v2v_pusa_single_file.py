@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--width", type=int, default=832, help="Width of the output video. Default: 832")
     parser.add_argument("--height", type=int, default=480, help="Height of the output video. Default: 480")
     parser.add_argument("--fps", type=int, default=24, help="fps to save video in")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for generation. Default: 0")
     args = parser.parse_args()
 
     # --- Argument Validation and Input Preparation ---
@@ -219,7 +220,7 @@ def main():
         conditioning_noise_multipliers=noise_mult_list,
         num_inference_steps=args.num_inference_steps,
         height=args.height, width=args.width, num_frames=81,
-        seed=0, tiled=True,
+        seed=args.seed, tiled=True,
         switch_DiT_boundary=args.switch_DiT_boundary,
         cfg_scale=args.cfg_scale,
         sigma_shift=args.shift
