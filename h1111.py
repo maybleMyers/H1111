@@ -1138,6 +1138,256 @@ def pusa_batch_handler(
 
     yield all_generated_videos, "Pusa batch generation complete!", ""
 
+# Pusa I2V Multi-frames Generation
+def pusa_i2v_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    image1: str,
+    image2: str,
+    image3: str,
+    image4: str,
+    cond_positions: str,
+    noise_multipliers: str,
+    width: int,
+    height: int,
+    video_length: int,
+    fps: int,
+    seed: int,
+    num_inference_steps: int,
+    cfg_scale: float,
+    switch_boundary: float,
+    num_persistent_params: float,
+    sigma_shift: float,
+    batch_size: int,
+    # Model paths
+    model_folder: str,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    save_path: str,
+    # LoRA configuration (8 LoRAs)
+    lora_folder: str,
+    lora1: str, lora2: str, lora3: str, lora4: str,
+    lora5: str, lora6: str, lora7: str, lora8: str,
+    mult1: float, mult2: float, mult3: float, mult4: float,
+    mult5: float, mult6: float, mult7: float, mult8: float,
+    apply_low1: bool, apply_low2: bool, apply_low3: bool, apply_low4: bool,
+    apply_low5: bool, apply_low6: bool, apply_low7: bool, apply_low8: bool,
+    apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
+    apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
+    lightx2v: bool = False,
+) -> Generator[Tuple[List[str], str, str], None, None]:
+    """Handler for Pusa I2V multi-frames generation"""
+    import queue
+    import threading
+    import re
+
+    global stop_event
+    stop_event.clear()
+
+    # Create output directory
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+
+    # Collect non-None images
+    image_paths = []
+    for img in [image1, image2, image3, image4]:
+        if img and os.path.exists(img):
+            image_paths.append(img)
+
+    if not image_paths:
+        yield [], "Error: No valid images provided", ""
+        return
+
+    # Parse positions and noise multipliers
+    try:
+        positions = [int(x.strip()) for x in cond_positions.split(',') if x.strip()]
+        noise_mults = [float(x.strip()) for x in noise_multipliers.split(',') if x.strip()]
+    except ValueError as e:
+        yield [], f"Error parsing positions or noise multipliers: {e}", ""
+        return
+
+    # Ensure we have matching counts
+    if len(image_paths) != len(positions):
+        yield [], f"Error: Number of images ({len(image_paths)}) must match number of positions ({len(positions)})", ""
+        return
+
+    if len(image_paths) != len(noise_mults):
+        yield [], f"Error: Number of images ({len(image_paths)}) must match number of noise multipliers ({len(noise_mults)})", ""
+        return
+
+    for batch_idx in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, "Generation stopped by user.", ""
+            return
+
+        # Handle seed
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + batch_idx
+
+        status_text = f"Processing Item {batch_idx+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), status_text, "Starting generation..."
+
+        # Build command for multi-frames Pusa script
+        run_id = f"pusa_i2v_{int(time.time())}_{current_seed}"
+
+        cmd = [
+            sys.executable,
+            "pusa/PusaV1/examples/pusavideo/wan22_14b_multi_frames_pusa_single_file.py",
+            "--image_paths", *image_paths,
+            "--prompt", str(prompt),
+            "--negative_prompt", str(negative_prompt),
+            "--cond_position", str(cond_positions),
+            "--noise_multipliers", str(noise_multipliers),
+            "--num_inference_steps", str(num_inference_steps),
+            "--high_model", os.path.join(model_folder, dit_high_noise_path),
+            "--low_model", os.path.join(model_folder, dit_low_noise_path),
+            "--base_dir", str(model_folder),
+            "--switch_DiT_boundary", str(switch_boundary),
+            "--cfg_scale", str(cfg_scale),
+            "--shift", str(sigma_shift),
+            "--output_dir", str(save_path),
+        ]
+
+        # Add lightx2v flag if enabled
+        if lightx2v:
+            cmd.append("--lightx2v")
+
+        # Parse and add LoRAs
+        loras = [lora1, lora2, lora3, lora4, lora5, lora6, lora7, lora8]
+        mults = [mult1, mult2, mult3, mult4, mult5, mult6, mult7, mult8]
+        apply_lows = [apply_low1, apply_low2, apply_low3, apply_low4, apply_low5, apply_low6, apply_low7, apply_low8]
+        apply_highs = [apply_high1, apply_high2, apply_high3, apply_high4, apply_high5, apply_high6, apply_high7, apply_high8]
+
+        # Collect high noise LoRAs
+        high_lora_paths = []
+        high_lora_alphas = []
+        for i, (lora, mult, apply_high) in enumerate(zip(loras, mults, apply_highs)):
+            if apply_high and lora and lora != "None":
+                if not os.path.sep in lora:
+                    lora_path = os.path.join(lora_folder, lora)
+                else:
+                    lora_path = lora
+                high_lora_paths.append(lora_path)
+                high_lora_alphas.append(str(mult))
+
+        # Collect low noise LoRAs
+        low_lora_paths = []
+        low_lora_alphas = []
+        for i, (lora, mult, apply_low) in enumerate(zip(loras, mults, apply_lows)):
+            if apply_low and lora and lora != "None":
+                if not os.path.sep in lora:
+                    lora_path = os.path.join(lora_folder, lora)
+                else:
+                    lora_path = lora
+                low_lora_paths.append(lora_path)
+                low_lora_alphas.append(str(mult))
+
+        # Add LoRA arguments if any exist
+        if high_lora_paths:
+            cmd.extend(["--high_lora_path", high_lora_paths[0]])
+            cmd.extend(["--high_lora_alpha", high_lora_alphas[0]])
+
+        if low_lora_paths:
+            cmd.extend(["--low_lora_path", low_lora_paths[0]])
+            cmd.extend(["--low_lora_alpha", low_lora_alphas[0]])
+
+        # Execute command
+        try:
+            print(f"Executing Pusa I2V command: {' '.join(cmd)}")
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            # Process output in real-time
+            output_lines = []
+            output_queue = queue.Queue()
+
+            def read_output(pipe, pipe_name):
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        output_queue.put((pipe_name, line))
+                pipe.close()
+
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "stdout"))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "stderr"))
+            stdout_thread.start()
+            stderr_thread.start()
+
+            last_video_path = None
+            poll_status = None
+
+            while True:
+                if stop_event.is_set():
+                    process.terminate()
+                    yield all_generated_videos.copy(), "Generation stopped by user.", ""
+                    stdout_thread.join(timeout=1)
+                    stderr_thread.join(timeout=1)
+                    return
+
+                poll_status = process.poll()
+
+                try:
+                    pipe_name, line = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if poll_status is not None and not stdout_thread.is_alive() and not stderr_thread.is_alive():
+                        break
+                    continue
+
+                line = line.strip()
+                if line:
+                    if pipe_name == "stderr":
+                        print(f"[Pusa I2V stderr] {line}")
+                    else:
+                        print(f"[Pusa I2V] {line}")
+
+                    output_lines.append(line)
+
+                    # Parse progress messages
+                    if "Loading models" in line:
+                        yield all_generated_videos.copy(), status_text, "Loading models..."
+                    elif "Models loaded successfully" in line:
+                        yield all_generated_videos.copy(), status_text, "Models loaded"
+                    elif "Generating" in line:
+                        yield all_generated_videos.copy(), status_text, "Generating frames..."
+                    elif "Saved to" in line:
+                        match = re.search(r"Saved to (.+\.mp4)", line)
+                        if match:
+                            last_video_path = match.group(1)
+
+            # Wait for threads to complete
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+
+            # Check if video was generated
+            if poll_status == 0 and last_video_path and os.path.exists(last_video_path):
+                all_generated_videos.append(last_video_path)
+                yield all_generated_videos.copy(), status_text, f"Video saved: {os.path.basename(last_video_path)}"
+            else:
+                error_output = "\n".join(output_lines[-20:])
+                yield all_generated_videos, f"Error in batch {batch_idx+1}", error_output
+
+        except Exception as e:
+            error_msg = f"Error during generation: {str(e)}"
+            print(f"[Pusa I2V Error] {error_msg}")
+            yield all_generated_videos, error_msg, ""
+
+        # Small delay between batches
+        time.sleep(0.2)
+
+    yield all_generated_videos, "Pusa I2V batch generation complete!", ""
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -8578,8 +8828,8 @@ with gr.Blocks(
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
 
-        # Pusa Tab (Extended Video Generation with DiffSynth backend) - Reorganized to match Wan2.2 layout
-        with gr.Tab(id=15, label="Pusa") as pusa_tab:
+        # Pusa-ext Tab (Extended Video Generation with DiffSynth backend) - Reorganized to match Wan2.2 layout
+        with gr.Tab(id=15, label="Pusa-ext") as pusa_tab:
             # Top section: Prompts and batch controls (same as Wan2.2)
             with gr.Row():
                 with gr.Column(scale=4):
@@ -8817,6 +9067,239 @@ with gr.Blocks(
                         interactive=True
                     )
                 pusa_save_path = gr.Textbox(label="Save Path", value="outputs/pusa")
+
+        # Pusa-i2v Tab (Multi-frame Image to Video Generation)
+        with gr.Tab(id=16, label="Pusa-i2v") as pusa_i2v_tab:
+            # Top section: Prompts and batch controls (same as Pusa-ext)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    pusa_i2v_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A fast action video featuring a cute tabby cat wearing a pink hat, eating a blueberry and cucumber sandwich.",
+                        lines=5
+                    )
+                    pusa_i2v_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    pusa_i2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    pusa_i2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    pusa_i2v_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    pusa_i2v_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="pusa_i2v_progress_text")
+
+            # Generate and Stop buttons
+            with gr.Row():
+                pusa_i2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                pusa_i2v_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            # Main content area with two columns
+            with gr.Row():
+                # Left column: Input and generation settings
+                with gr.Column():
+                    # Input images (4 separate images instead of video)
+                    gr.Markdown("### Input Images")
+                    with gr.Row():
+                        pusa_i2v_image1 = gr.Image(label="Image 1", type="filepath")
+                        pusa_i2v_image2 = gr.Image(label="Image 2", type="filepath")
+                    with gr.Row():
+                        pusa_i2v_image3 = gr.Image(label="Image 3 (optional)", type="filepath")
+                        pusa_i2v_image4 = gr.Image(label="Image 4 (optional)", type="filepath")
+
+                    # Conditioning positions and noise multipliers
+                    gr.Markdown("### Conditioning Settings")
+                    pusa_i2v_cond_positions = gr.Textbox(
+                        label="Conditioning Positions",
+                        value="0,7,14,20",
+                        info="Comma-separated frame indices for each image"
+                    )
+                    pusa_i2v_noise_multipliers = gr.Textbox(
+                        label="Noise Multipliers",
+                        value="0.0,0.1,0.2,0.3",
+                        info="Comma-separated noise values (0=clean) for each image"
+                    )
+
+                    # Generation settings (same as Pusa-ext)
+                    with gr.Row():
+                        pusa_i2v_width = gr.Number(label="Width", value=1280, minimum=128, maximum=2048, step=8)
+                        pusa_i2v_height = gr.Number(label="Height", value=720, minimum=128, maximum=2048, step=8)
+                    with gr.Row():
+                        pusa_i2v_video_length = gr.Number(
+                            label="Video Length (frames)",
+                            value=81,
+                            minimum=21,
+                            maximum=201,
+                            step=1,
+                            info="Total number of frames to generate"
+                        )
+                        pusa_i2v_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
+                    with gr.Row():
+                        pusa_i2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        pusa_i2v_sigma_shift = gr.Slider(
+                            label="Sigma Shift",
+                            minimum=0.0,
+                            maximum=20.0,
+                            value=5.0,
+                            step=0.1,
+                            info="Flow matching scheduler parameter"
+                        )
+                    pusa_i2v_num_inference_steps = gr.Slider(
+                        label="Inference Steps",
+                        minimum=10,
+                        maximum=100,
+                        value=30,
+                        step=1
+                    )
+                    pusa_i2v_cfg_scale = gr.Slider(
+                        label="CFG Scale",
+                        minimum=1.0,
+                        maximum=20.0,
+                        value=3.0,
+                        step=0.1
+                    )
+                    pusa_i2v_switch_boundary = gr.Slider(
+                        label="DiT Switch Boundary",
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.875,
+                        step=0.001,
+                        info="Switch from high to low noise model at this threshold"
+                    )
+                    pusa_i2v_num_persistent_params = gr.Number(
+                        label="Persistent Parameters (billions)",
+                        value=6.0,
+                        minimum=0,
+                        maximum=20,
+                        step=0.1,
+                        info="VRAM management parameter"
+                    )
+                    pusa_i2v_lightx2v = gr.Checkbox(
+                        label="Use LightX2V Acceleration",
+                        value=False, visible=False,
+                        info="Enable LightX2V for faster generation"
+                    )
+
+                # Right column: Output gallery and LoRAs (same as Pusa-ext)
+                with gr.Column():
+                    pusa_i2v_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_pusa_i2v", allow_preview=True, preview=True
+                    )
+
+                    # LoRA Configuration with Accordion (same as Pusa-ext)
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            pusa_i2v_lora_folder = gr.Textbox(label="LoRA Folder", value="pusa/pusa_lora")
+                            pusa_i2v_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+
+                        pusa_i2v_lora_weights = []
+                        pusa_i2v_lora_multipliers = []
+                        pusa_i2v_lora_apply_low = []
+                        pusa_i2v_lora_apply_high = []
+
+                        # First 4 LoRAs in main accordion
+                        for i in range(4):
+                            # Set default values for the first two LoRAs
+                            if i == 0:
+                                default_lora = "high_noise_pusa.safetensors"
+                                default_mult = 1.5
+                                default_high = True
+                                default_low = False
+                            elif i == 1:
+                                default_lora = "low_noise_pusa.safetensors"
+                                default_mult = 1.4
+                                default_high = False
+                                default_low = True
+                            else:
+                                default_lora = "None"
+                                default_mult = 1.0
+                                default_high = False
+                                default_low = False
+
+                            with gr.Row():
+                                pusa_i2v_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_pusa_lora_options("pusa/pusa_lora"),
+                                    value=default_lora, allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                pusa_i2v_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=default_mult, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                pusa_i2v_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=default_low, scale=1
+                                ))
+                                pusa_i2v_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=default_high, scale=1
+                                ))
+
+                        # Additional 4 LoRAs in nested accordion
+                        with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                            for i in range(4, 8):
+                                with gr.Row():
+                                    pusa_i2v_lora_weights.append(gr.Dropdown(
+                                        label=f"LoRA {i+1}", choices=get_pusa_lora_options("pusa/pusa_lora"),
+                                        value="None", allow_custom_value=False, interactive=True, scale=2
+                                    ))
+                                    pusa_i2v_lora_multipliers.append(gr.Slider(
+                                        label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                    ))
+                                with gr.Row():
+                                    pusa_i2v_lora_apply_low.append(gr.Checkbox(
+                                        label="Apply to Low Noise", value=False, scale=1
+                                    ))
+                                    pusa_i2v_lora_apply_high.append(gr.Checkbox(
+                                        label="Apply to High Noise", value=False, scale=1
+                                    ))
+
+            # Model paths at the bottom - EXACTLY the same as Pusa-ext since they use the same models
+            with gr.Accordion("Model Paths & Configuration", open=True):
+                with gr.Row():
+                    pusa_i2v_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    pusa_i2v_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    pusa_i2v_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model (.safetensors)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    pusa_i2v_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model (.safetensors)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    pusa_i2v_clip_path = gr.Dropdown(
+                        label="CLIP Model (.pth, for i2v)",
+                        choices=get_wan_of_clip_models("wan"),
+                        value=get_default_clip_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        visible=True
+                    )
+                with gr.Row():
+                    pusa_i2v_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    pusa_i2v_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                pusa_i2v_save_path = gr.Textbox(label="Save Path", value="outputs/pusa_i2v")
 
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
@@ -12615,6 +13098,89 @@ with gr.Blocks(
         fn=pusa_batch_handler,
         inputs=pusa_generation_inputs,
         outputs=[pusa_output, pusa_batch_progress, pusa_progress_text],
+        queue=True
+    )
+
+    # Pusa-i2v Event Handlers
+    pusa_i2v_prompt.change(fn=count_prompt_tokens, inputs=pusa_i2v_prompt, outputs=pusa_i2v_token_counter)
+    pusa_i2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Refresh model dropdowns for Pusa-i2v
+    pusa_i2v_refresh_models_btn.click(
+        fn=lambda folder: [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_clip_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ],
+        inputs=pusa_i2v_model_folder,
+        outputs=[
+            pusa_i2v_dit_low_noise_path,
+            pusa_i2v_dit_high_noise_path,
+            pusa_i2v_clip_path,
+            pusa_i2v_vae_path,
+            pusa_i2v_t5_path
+        ]
+    )
+
+    # Refresh LoRA dropdowns for Pusa-i2v
+    pusa_i2v_lora_refresh_btn.click(
+        fn=refresh_pusa_loras,
+        inputs=pusa_i2v_lora_folder,
+        outputs=pusa_i2v_lora_weights
+    )
+
+    # Connect Pusa-i2v generation button
+    pusa_i2v_generation_inputs = [
+        pusa_i2v_prompt,
+        pusa_i2v_negative_prompt,
+        pusa_i2v_image1,
+        pusa_i2v_image2,
+        pusa_i2v_image3,
+        pusa_i2v_image4,
+        pusa_i2v_cond_positions,
+        pusa_i2v_noise_multipliers,
+        pusa_i2v_width,
+        pusa_i2v_height,
+        pusa_i2v_video_length,
+        pusa_i2v_fps,
+        pusa_i2v_seed,
+        pusa_i2v_num_inference_steps,
+        pusa_i2v_cfg_scale,
+        pusa_i2v_switch_boundary,
+        pusa_i2v_num_persistent_params,
+        pusa_i2v_sigma_shift,
+        pusa_i2v_batch_size,
+        # Model paths
+        pusa_i2v_model_folder,
+        pusa_i2v_dit_low_noise_path,
+        pusa_i2v_dit_high_noise_path,
+        pusa_i2v_clip_path,
+        pusa_i2v_vae_path,
+        pusa_i2v_t5_path,
+        pusa_i2v_save_path,
+        # LoRA folder
+        pusa_i2v_lora_folder
+    ]
+
+    # Add all LoRA inputs in order
+    for i in range(8):
+        pusa_i2v_generation_inputs.append(pusa_i2v_lora_weights[i])
+    for i in range(8):
+        pusa_i2v_generation_inputs.append(pusa_i2v_lora_multipliers[i])
+    for i in range(8):
+        pusa_i2v_generation_inputs.append(pusa_i2v_lora_apply_low[i])
+    for i in range(8):
+        pusa_i2v_generation_inputs.append(pusa_i2v_lora_apply_high[i])
+
+    # Add lightx2v checkbox
+    pusa_i2v_generation_inputs.append(pusa_i2v_lightx2v)
+
+    pusa_i2v_generate_btn.click(
+        fn=pusa_i2v_batch_handler,
+        inputs=pusa_i2v_generation_inputs,
+        outputs=[pusa_i2v_output, pusa_i2v_batch_progress, pusa_i2v_progress_text],
         queue=True
     )
 

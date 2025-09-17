@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--switch_DiT_boundary", type=float, default=0.875, help="Boundary to switch between DiT models.")
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Directory to save the output video.")
     parser.add_argument("--cfg_scale", type=float, default=3.0, help="Classifier-free guidance scale.")
+    parser.add_argument("--shift", type=float, default=5.0, help="Sigma shift parameter for flow matching scheduler. Default: 5.0")
     parser.add_argument("--lightx2v", action="store_true", help="Use lightx2v for acceleration.")
     parser.add_argument("--concatenate", action="store_true", help="Automatically concatenate the original video with the generated video for a final extended output. Only works with `--extend_from_end`.")
     parser.add_argument("--num_persistent_params", type=float, default=6e9, help="Number of persistent parameters in DiT for VRAM management. Use scientific notation (e.g., 6e9 for 6 billion).")
@@ -220,7 +221,8 @@ def main():
         height=args.height, width=args.width, num_frames=81,
         seed=0, tiled=True,
         switch_DiT_boundary=args.switch_DiT_boundary,
-        cfg_scale=args.cfg_scale
+        cfg_scale=args.cfg_scale,
+        sigma_shift=args.shift
     )
     print("Video generation complete.")
 
