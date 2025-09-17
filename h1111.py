@@ -912,6 +912,7 @@ def pusa_batch_handler(
     cfg_scale: float,
     switch_boundary: float,
     num_persistent_params: float,
+    sigma_shift: float,
     batch_size: int,
     # Model paths
     model_folder: str,
@@ -980,6 +981,7 @@ def pusa_batch_handler(
             "--base_dir", str(model_folder),  # Use model_folder as base_dir
             "--switch_DiT_boundary", str(switch_boundary),
             "--cfg_scale", str(cfg_scale),
+            "--shift", str(sigma_shift),
             "--width", str(width),
             "--height", str(height),
             "--fps", str(fps),
@@ -9020,7 +9022,16 @@ with gr.Blocks(
                         pusa_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
                     with gr.Row():
                         pusa_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        pusa_random_seed_btn = gr.Button("🎲", scale=0.1)
+                        pusa_random_seed_btn = gr.Button("🎲", min_width=50)
+                    with gr.Row():
+                        pusa_sigma_shift = gr.Slider(
+                            label="Sigma Shift",
+                            minimum=0.0,
+                            maximum=20.0,
+                            value=5.0,
+                            step=0.1,
+                            info="Flow matching scheduler parameter"
+                        )
                     pusa_num_inference_steps = gr.Slider(
                         label="Inference Steps",
                         minimum=1,
@@ -9260,7 +9271,7 @@ with gr.Blocks(
                         pusa_i2v_fps = gr.Number(label="FPS", value=24, minimum=1, maximum=60, step=1)
                     with gr.Row():
                         pusa_i2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        pusa_i2v_random_seed_btn = gr.Button("🎲", scale=0.1)
+                        pusa_i2v_random_seed_btn = gr.Button("🎲", min_width=50)
                     with gr.Row():
                         pusa_i2v_sigma_shift = gr.Slider(
                             label="Sigma Shift",
@@ -13215,6 +13226,7 @@ with gr.Blocks(
         pusa_cfg_scale,
         pusa_switch_boundary,
         pusa_num_persistent_params,
+        pusa_sigma_shift,
         pusa_batch_size,
         # Model paths (matching Wan2.2 structure)
         pusa_model_folder,
