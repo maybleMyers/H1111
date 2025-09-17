@@ -931,9 +931,10 @@ def pusa_batch_handler(
     apply_low5: bool, apply_low6: bool, apply_low7: bool, apply_low8: bool,
     apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
     apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
+    lightx2v: str = "Disabled",  # New parameter for LightX2V
     # Preview settings
-    enable_preview: bool,
-    preview_steps: int,
+    enable_preview: bool = False,
+    preview_steps: int = 0,
 ) -> Generator[Tuple[List[str], Any, str, str], None, None]:
     """Handler for Pusa extended video generation with DiffSynth backend"""
     import queue
@@ -1038,6 +1039,10 @@ def pusa_batch_handler(
         if low_lora_paths:
             cmd.extend(["--low_lora_path", ",".join(low_lora_paths)])
             cmd.extend(["--low_lora_alpha", ",".join(low_lora_alphas)])
+
+        # Add lightx2v flag if enabled
+        if lightx2v == "Enabled":
+            cmd.append("--lightx2v")
 
         # Add preview parameters if enabled
         if enable_preview and preview_steps > 0:
@@ -1221,7 +1226,7 @@ def pusa_i2v_batch_handler(
     apply_low5: bool, apply_low6: bool, apply_low7: bool, apply_low8: bool,
     apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
     apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
-    lightx2v: bool = False,
+    lightx2v: str = "Disabled",  # Changed from bool to str for Radio button
     # Preview settings
     enable_preview: bool = False,
     preview_steps: int = 0,
@@ -1309,7 +1314,7 @@ def pusa_i2v_batch_handler(
         ]
 
         # Add lightx2v flag if enabled
-        if lightx2v:
+        if lightx2v == "Enabled":
             cmd.append("--lightx2v")
 
         # Parse and add LoRAs
@@ -8973,7 +8978,7 @@ with gr.Blocks(
                                 minimum=1,
                                 maximum=20,
                                 step=1,
-                                info="Number of frames from the end to use for conditioning"
+                                info="Number of latent frames from the end to use for conditioning"
                             )
                             pusa_video_length = gr.Number(
                                 label="Video Length (frames)",
@@ -9003,7 +9008,7 @@ with gr.Blocks(
                     with gr.Group(visible=False) as pusa_position_controls:
                         pusa_cond_positions = gr.Textbox(
                             label="Conditioning Positions",
-                            placeholder="0,10,20,30",
+                            placeholder="0,10,20",
                             info="Comma-separated frame indices for conditioning"
                         )
 
@@ -9018,7 +9023,7 @@ with gr.Blocks(
                         pusa_random_seed_btn = gr.Button("🎲", scale=0.1)
                     pusa_num_inference_steps = gr.Slider(
                         label="Inference Steps",
-                        minimum=10,
+                        minimum=1,
                         maximum=100,
                         value=40,
                         step=1
@@ -9038,14 +9043,21 @@ with gr.Blocks(
                         step=0.001,
                         info="Switch from high to low noise model at this threshold"
                     )
-                    pusa_num_persistent_params = gr.Number(
-                        label="Persistent Parameters (billions)",
-                        value=10.6,
-                        minimum=0,
-                        maximum=20,
-                        step=0.1,
-                        info="VRAM management parameter"
-                    )
+                    with gr.Row():
+                        pusa_num_persistent_params = gr.Number(
+                            label="Persistent Parameters (billions)",
+                            value=10.6,
+                            minimum=0,
+                            maximum=20,
+                            step=0.1,
+                            info="VRAM management parameter"
+                        )
+                        pusa_lightx2v = gr.Radio(
+                            label="USE LightX2V",
+                            choices=["Disabled", "Enabled"],
+                            value="Disabled",
+                            info="Enable LightX2V LoRAs for 4 step generation"
+                        )
 
                 # Right column: Output gallery and LoRAs (matching Wan2.2 style)
                 with gr.Column():
@@ -9057,7 +9069,7 @@ with gr.Blocks(
 
                     # Preview Configuration
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        pusa_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        pusa_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
                         pusa_preview_steps = gr.Slider(
                             minimum=1, maximum=50, step=1, value=5,
                             label="Preview Every N Steps",
@@ -9141,14 +9153,14 @@ with gr.Blocks(
                     pusa_dit_low_noise_path = gr.Dropdown(
                         label="DiT Low Noise Model (.safetensors)",
                         choices=get_wan_of_low_noise_models("wan"),
-                        value=get_default_low_noise_model("wan"),
+                        value="wan22_t2v_14B_low_noise_bf16.safetensors",
                         allow_custom_value=True,
                         interactive=True
                     )
                     pusa_dit_high_noise_path = gr.Dropdown(
                         label="DiT High Noise Model (.safetensors)",
                         choices=get_wan_of_high_noise_models("wan"),
-                        value=get_default_high_noise_model("wan"),
+                        value="wan22_t2v_14B_high_noise_bf16.safetensors",
                         allow_custom_value=True,
                         interactive=True
                     )
@@ -9260,7 +9272,7 @@ with gr.Blocks(
                         )
                     pusa_i2v_num_inference_steps = gr.Slider(
                         label="Inference Steps",
-                        minimum=10,
+                        minimum=1,
                         maximum=100,
                         value=30,
                         step=1
@@ -9280,19 +9292,21 @@ with gr.Blocks(
                         step=0.001,
                         info="Switch from high to low noise model at this threshold"
                     )
-                    pusa_i2v_num_persistent_params = gr.Number(
-                        label="Persistent Parameters (billions)",
-                        value=6.0,
-                        minimum=0,
-                        maximum=20,
-                        step=0.1,
-                        info="VRAM management parameter"
-                    )
-                    pusa_i2v_lightx2v = gr.Checkbox(
-                        label="Use LightX2V Acceleration",
-                        value=False, visible=False,
-                        info="Enable LightX2V for faster generation"
-                    )
+                    with gr.Row():
+                        pusa_i2v_num_persistent_params = gr.Number(
+                            label="Persistent Parameters (billions)",
+                            value=6.0,
+                            minimum=0,
+                            maximum=20,
+                            step=0.1,
+                            info="VRAM management parameter"
+                        )
+                        pusa_i2v_lightx2v = gr.Radio(
+                            label="LightX2V",
+                            choices=["Disabled", "Enabled"],
+                            value="Disabled",
+                            info="Enable LightX2V LoRAs for 4 step generation"
+                        )
 
                 # Right column: Output gallery and LoRAs (same as Pusa-ext)
                 with gr.Column():
@@ -9304,7 +9318,7 @@ with gr.Blocks(
 
                     # Preview Configuration
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        pusa_i2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        pusa_i2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
                         pusa_i2v_preview_steps = gr.Slider(
                             minimum=1, maximum=50, step=1, value=5,
                             label="Preview Every N Steps",
@@ -13223,6 +13237,9 @@ with gr.Blocks(
         pusa_generation_inputs.append(pusa_lora_apply_low[i])
     for i in range(8):
         pusa_generation_inputs.append(pusa_lora_apply_high[i])
+
+    # Add lightx2v input
+    pusa_generation_inputs.append(pusa_lightx2v)
 
     # Add preview settings to inputs
     pusa_generation_inputs.extend([pusa_enable_preview, pusa_preview_steps])
