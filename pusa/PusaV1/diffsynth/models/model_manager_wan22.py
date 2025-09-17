@@ -444,8 +444,14 @@ class ModelManagerWan22:
         try:
             for model, model_path, model_name in zip(self.model, self.model_path, self.model_name):
                 path_str = "".join(model_path) if isinstance(model_path, list) else model_path
-                
-                if f"/{model_type}_noise_model/" in path_str:
+
+                # Check both path-based and name-based model type identification
+                # For directory loading: check if path contains "/{model_type}_noise_model/"
+                # For single file loading: check if model name ends with "_{model_type}"
+                is_target_model = (f"/{model_type}_noise_model/" in path_str or
+                                 model_name.endswith(f"_{model_type}"))
+
+                if is_target_model:
                     print(f"    Loading safetensors LoRA to {model_name} ({model_path}).")
                     model = self._load_and_merge_lora_weight_from_safetensors(
                         model, file_path, lora_down_key, lora_up_key, lora_alpha

@@ -198,11 +198,22 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
             self.text_encoder, tokenizer_path = text_encoder_model_and_path
             self.prompter.fetch_models(self.text_encoder)
             self.prompter.fetch_tokenizer(os.path.join(os.path.dirname(tokenizer_path), "google/umt5-xxl"))
-        dit = model_manager.fetch_model("wan_video_pusa", index=2)
-        if isinstance(dit, list):
-            self.dit, self.dit2 = dit
+
+        # Try to fetch models with tagged names first (for single file loading)
+        high_dit = model_manager.fetch_model("wan_video_pusa_high")
+        low_dit = model_manager.fetch_model("wan_video_pusa_low")
+
+        if high_dit is not None and low_dit is not None:
+            # Both tagged models found (single file mode)
+            self.dit = high_dit
+            self.dit2 = low_dit
         else:
-            self.dit = dit
+            # Fall back to original behavior for backward compatibility (directory mode)
+            dit = model_manager.fetch_model("wan_video_pusa", index=2)
+            if isinstance(dit, list):
+                self.dit, self.dit2 = dit
+            else:
+                self.dit = dit
         self.vae = model_manager.fetch_model("wan_video_vae")
         self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
         self.motion_controller = model_manager.fetch_model("wan_video_motion_controller")
@@ -414,6 +425,8 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
         progress_bar_st=None,
         visualize_attention=False,
         output_dir=None,
+        preview_handler=None,
+        preview_interval=0,
     ):
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
@@ -582,15 +595,23 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
 
             # Scheduler
             latents = self.scheduler.step(
-                noise_pred, 
-                timestep, 
-                latents, 
-                cond_frame_latent_indices=cond_frame_latent_indices, 
+                noise_pred,
+                timestep,
+                latents,
+                cond_frame_latent_indices=cond_frame_latent_indices,
                 noise_multipliers=noise_multipliers
             )
 
-            
-            
+            # Generate preview if enabled
+            if preview_handler and preview_interval > 0 and (progress_id + 1) % preview_interval == 0:
+                if (progress_id + 1) < len(self.scheduler.timesteps):  # Skip final step
+                    print(f"[Pipeline] Generating preview at step {progress_id + 1} (interval: {preview_interval})")
+                    # Clone latents and move to CPU for preview
+                    preview_latents = latents.clone().squeeze(0).cpu()  # [C, F, H, W]
+                    preview_handler.process_preview(preview_latents, progress_id)
+            elif preview_handler:
+                print(f"[Pipeline] Skipping preview at step {progress_id + 1} (next at {((progress_id + 1) // preview_interval + 1) * preview_interval})")
+
         if visualize_attention:
             from ..models.wan_video_pusa import _VISUALIZE_ATTENTION_CONFIG
             _VISUALIZE_ATTENTION_CONFIG["enabled"] = False

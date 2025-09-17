@@ -1,0 +1,273 @@
+# FlowMatch Pusa V2V Scheduler - Enhanced for Video-to-Video and Multi-Frame Conditioning
+# Based on Pusa-VidGen repository implementation
+# Copyright 2024-2025 Implementation for wan2_generate_video.py
+
+import torch
+import numpy as np
+from typing import Optional, Dict, List, Union
+
+
+class FlowMatchSchedulerPusaV2V:
+    """
+    FlowMatch scheduler specifically designed for Pusa V2V (Video-to-Video) and multi-frame conditioning.
+    This implementation adds frame-specific noise control and conditioning capabilities.
+    """
+    
+    def __init__(
+        self,
+        num_inference_steps: int = 100,
+        num_train_timesteps: int = 1000,
+        shift: float = 5.0,
+        sigma_max: float = 1.0,
+        sigma_min: float = 0.0,
+        inverse_timesteps: bool = False,
+        extra_one_step: bool = False,
+        reverse_sigmas: bool = False,
+    ):
+        """
+        Initialize FlowMatchSchedulerPusaV2V.
+        
+        Args:
+            num_inference_steps: Number of inference steps for sampling
+            num_train_timesteps: Number of training timesteps (typically 1000)
+            shift: Shift parameter for sigma transformation
+            sigma_max: Maximum sigma value
+            sigma_min: Minimum sigma value
+            inverse_timesteps: Whether to inverse the timestep order
+            extra_one_step: Whether to exclude the last step in linspace
+            reverse_sigmas: Whether to reverse sigma values (1 - sigma)
+        """
+        self.num_train_timesteps = num_train_timesteps
+        self.shift = shift
+        self.sigma_max = sigma_max
+        self.sigma_min = sigma_min
+        self.inverse_timesteps = inverse_timesteps
+        self.extra_one_step = extra_one_step
+        self.reverse_sigmas = reverse_sigmas
+        
+        # Initialize with default timesteps
+        self.set_timesteps(num_inference_steps)
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int = 100,
+        denoising_strength: float = 1.0,
+        training: bool = False,
+        shift: Optional[float] = None,
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Set timesteps for the scheduler.
+        
+        Args:
+            num_inference_steps: Number of inference steps
+            denoising_strength: Strength of denoising (0.0 to 1.0)
+            training: Whether in training mode (enables special weighting)
+            shift: Override shift parameter
+            device: Target device for tensors
+        """
+        if shift is not None:
+            self.shift = shift
+            
+        # Calculate sigma start based on denoising strength
+        sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
+        
+        if self.extra_one_step:
+            self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
+        else:
+            self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps)
+            
+        if self.inverse_timesteps:
+            self.sigmas = torch.flip(self.sigmas, dims=[0])
+            
+        # Apply shift transformation - this is the key Pusa transformation
+        self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+        
+        if self.reverse_sigmas:
+            self.sigmas = 1 - self.sigmas
+            
+        # Convert sigmas to timesteps
+        self.timesteps = self.sigmas * self.num_train_timesteps
+        
+        # Move to device if specified
+        if device is not None:
+            self.timesteps = self.timesteps.to(device)
+            self.sigmas = self.sigmas.to(device)
+        
+        # Training mode weighting (experimental)
+        if training:
+            x = self.timesteps
+            y = torch.exp(-2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2)
+            y_shifted = y - y.min()
+            self.linear_timesteps_weights = y_shifted * (num_inference_steps / y_shifted.sum())
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        return_dict: bool = True,
+        to_final: bool = False,
+        cond_frame_latent_indices: Optional[List[int]] = None,
+        noise_multipliers: Optional[Dict[int, float]] = None,
+        **kwargs
+    ):
+        """
+        Perform one step of the Pusa V2V scheduler with frame-specific conditioning.
+        
+        Args:
+            model_output: The direct output from the model
+            timestep: Current timestep
+            sample: Current sample (latent)
+            return_dict: Whether to return a dict or tuple
+            to_final: Whether this is the final step
+            cond_frame_latent_indices: List of frame indices that have conditioning
+            noise_multipliers: Dict mapping frame indices to noise multiplier values
+            **kwargs: Additional arguments (for compatibility)
+            
+        Returns:
+            Previous sample (latent) for the next step
+        """
+        # Ensure tensors are on the same device
+        if isinstance(timestep, torch.Tensor):
+            self.timesteps = self.timesteps.to(timestep.device)
+            self.sigmas = self.sigmas.to(timestep.device)
+            model_output = model_output.to(timestep.device)
+            sample = sample.to(timestep.device)
+
+        if len(timestep.shape) == 1:
+            # Single timestep case
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
+            if to_final or timestep_id + 1 >= len(self.timesteps):
+                sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+            else:
+                sigma_ = self.sigmas[timestep_id + 1]
+            prev_sample = sample + model_output * (sigma_ - sigma)
+        else:
+            # Multi-frame timestep case with conditioning support
+            timestep_full = timestep.clone()
+            timestep = torch.ones_like(timestep) * timestep.max()
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(1) - timestep).abs(), dim=0)
+            sigma = self.sigmas[timestep_id].unsqueeze(0).unsqueeze(1).unsqueeze(3).unsqueeze(4).to(sample.device)
+            
+            # Handle sigma_ calculation for each timestep_id element
+            if to_final or torch.any(timestep_id + 1 >= len(self.timesteps)):
+                default_value = 1.0 if (self.inverse_timesteps or self.reverse_sigmas) else 0.0
+                sigma_ = torch.ones_like(timestep_id, dtype=self.sigmas.dtype, device=sample.device) * default_value
+                valid_indices = timestep_id + 1 < len(self.timesteps)
+                if torch.any(valid_indices):
+                    valid_timestep_ids = timestep_id[valid_indices] 
+                    sigma_[valid_indices] = self.sigmas[(valid_timestep_ids + 1).to(torch.long)]
+            else:
+                sigma_ = self.sigmas[(timestep_id + 1).to(torch.long)]
+            
+            # Apply frame-specific conditioning (key V2V feature)
+            if cond_frame_latent_indices is not None and noise_multipliers is not None:
+                for latent_idx in cond_frame_latent_indices:
+                    # Handle zero timestep (clean conditioning frames)
+                    # timestep_full should be shape [B, F] where B=1 typically
+                    if len(timestep_full.shape) == 2 and latent_idx < timestep_full.shape[1]:
+                        if timestep_full[:, latent_idx] == 0:
+                            sigma[:, :, latent_idx] = 0
+                            sigma_[latent_idx] = 0
+                            continue
+                    elif len(timestep_full.shape) == 1:
+                        # Handle case where timestep_full might be 1D
+                        if timestep_full[latent_idx if latent_idx < len(timestep_full) else 0] == 0:
+                            sigma[:, :, latent_idx] = 0
+                            sigma_[latent_idx] = 0
+                            continue
+                    
+                    # Apply noise multiplier for this frame
+                    multiplier = noise_multipliers.get(latent_idx, 1.0)
+                    if latent_idx < sigma.shape[2]:  # Ensure index is valid
+                        sigma[:, :, latent_idx] = sigma[:, :, latent_idx] * multiplier
+                    if isinstance(sigma_, torch.Tensor) and len(sigma_.shape) > 0 and latent_idx < len(sigma_):
+                        sigma_[latent_idx] = sigma_[latent_idx] * multiplier
+                    
+            # Reshape sigma_ to match sigma's dimensions
+            sigma_ = sigma_.unsqueeze(0).unsqueeze(1).unsqueeze(3).unsqueeze(4).to(sample.device)
+            
+            # Handle zero timestep cleanup
+            if torch.any(timestep == 0):
+                zero_indices = torch.where(timestep == 0)[1].to(torch.long)
+                sigma[:, :, zero_indices] = 0
+                
+            prev_sample = sample + model_output * (sigma_ - sigma)
+            
+        if not return_dict:
+            return (prev_sample,)
+        
+        # Return compatible format
+        from types import SimpleNamespace
+        return SimpleNamespace(prev_sample=prev_sample)
+
+    def add_noise(
+        self,
+        original_samples: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add noise to samples according to the noise schedule.
+        
+        Args:
+            original_samples: Original clean samples
+            noise: Noise to be added
+            timestep: Timestep for noise addition
+            
+        Returns:
+            Noisy samples
+        """
+        if isinstance(timestep, torch.Tensor):
+            self.timesteps = self.timesteps.to(timestep.device)
+            self.sigmas = self.sigmas.to(timestep.device)
+            
+        if len(timestep.shape) == 1:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
+        else:
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(-1).unsqueeze(-1) - timestep.unsqueeze(0)).abs(), dim=0)
+            sigma = self.sigmas[timestep_id].unsqueeze(1).unsqueeze(3).unsqueeze(4).to(original_samples.device)
+            
+        sample = (1 - sigma) * original_samples + sigma * noise
+        return sample
+
+    def return_to_timestep(self, timestep, sample, sample_stabilized):
+        """Return to a specific timestep (for advanced sampling)"""
+        if isinstance(timestep, torch.Tensor):
+            self.timesteps = self.timesteps.to(timestep.device)
+            self.sigmas = self.sigmas.to(timestep.device)
+            
+        if len(timestep.shape) == 1:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
+        else:
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(1) - timestep).abs(), dim=0)
+            sigma = self.sigmas[timestep_id].unsqueeze(0).unsqueeze(1).unsqueeze(3).unsqueeze(4).to(sample.device)
+            
+        model_output = (sample - sample_stabilized) / sigma
+        return model_output
+
+    def training_target(self, sample, noise, timestep):
+        """Get training target for flow matching"""
+        target = noise - sample
+        return target
+
+    def training_weight(self, timestep):
+        """Get training weight for this timestep"""
+        if isinstance(timestep, torch.Tensor):
+            self.timesteps = self.timesteps.to(timestep.device)
+            self.linear_timesteps_weights = self.linear_timesteps_weights.to(timestep.device)
+            
+        if len(timestep.shape) == 1:
+            timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
+        else:
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(1) - timestep.to(self.timesteps.device)).abs(), dim=0) 
+            
+        weights = self.linear_timesteps_weights[timestep_id].to(self.timesteps.device)
+        return weights
+
+    def __len__(self):
+        return len(self.timesteps) if self.timesteps is not None else 0
