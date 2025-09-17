@@ -4,7 +4,7 @@
 9/17/2025  
     Support Pusa 4 image to video via the pusa2 branch. Add lightx2v support for 4 step gen.  
 9/16/2025  
-    Support Pusa video extension via the pusa2 branch.  
+    Support Pusa video extension via the pusa2 branch. Seems to work best when you use more loras than just base pusa lora.   
 9/8/2025  
     Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2 long video generation, video extension for wan 2.2 to the wan2.2b branch.  
 7/31/2025  
