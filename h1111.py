@@ -931,7 +931,10 @@ def pusa_batch_handler(
     apply_low5: bool, apply_low6: bool, apply_low7: bool, apply_low8: bool,
     apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
     apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
-) -> Generator[Tuple[List[str], str, str], None, None]:
+    # Preview settings
+    enable_preview: bool,
+    preview_steps: int,
+) -> Generator[Tuple[List[str], Any, str, str], None, None]:
     """Handler for Pusa extended video generation with DiffSynth backend"""
     import queue
     import threading
@@ -1036,6 +1039,10 @@ def pusa_batch_handler(
             cmd.extend(["--low_lora_path", ",".join(low_lora_paths)])
             cmd.extend(["--low_lora_alpha", ",".join(low_lora_alphas)])
 
+        # Add preview parameters if enabled
+        if enable_preview and preview_steps > 0:
+            cmd.extend(["--preview", str(preview_steps)])
+
         # Execute command
         try:
             print(f"Executing Pusa command: {' '.join(cmd)}")
@@ -1053,6 +1060,15 @@ def pusa_batch_handler(
             last_video_path = None
             output_queue = queue.Queue()
 
+            # Preview monitoring setup
+            current_preview_list = []
+            last_preview_mtime = 0
+            preview_base_dir = os.path.join(save_path, "previews")
+            # Generate a unique timestamp for this batch item's preview
+            import datetime
+            timestamp_preview = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_pusa_v2v_{timestamp_preview}.mp4")
+
             def read_output(pipe, pipe_name):
                 if pipe is None:
                     return
@@ -1069,7 +1085,7 @@ def pusa_batch_handler(
             while True:
                 if stop_event.is_set():
                     process.terminate()
-                    yield all_generated_videos, "Generation stopped by user", ""
+                    yield all_generated_videos, current_preview_list, "Generation stopped by user", ""
                     return
 
                 # Check if process is still running
@@ -1096,13 +1112,13 @@ def pusa_batch_handler(
 
                     # Parse progress messages
                     if "Loading models" in line:
-                        yield all_generated_videos.copy(), status_text, "Loading models..."
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Loading models..."
                     elif "Models loaded successfully" in line:
-                        yield all_generated_videos.copy(), status_text, "Models loaded"
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Models loaded"
                     elif "Generating new video frames" in line:
-                        yield all_generated_videos.copy(), status_text, "Generating frames..."
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Generating frames..."
                     elif "Video generation complete" in line:
-                        yield all_generated_videos.copy(), status_text, "Saving video..."
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Saving video..."
                     elif "Saving video to" in line:
                         # Extract output path
                         match = re.search(r"Saving video to (.+\.mp4)", line)
@@ -1111,11 +1127,18 @@ def pusa_batch_handler(
                     elif "Video saved successfully" in line:
                         if last_video_path and os.path.exists(last_video_path):
                             all_generated_videos.append(last_video_path)
-                        yield all_generated_videos.copy(), status_text, "Video saved successfully!"
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Video saved successfully!"
+
+                    # Check for preview file updates
+                    if enable_preview and os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
 
                     # Update status with last few lines
                     recent_output = "\n".join(output_lines[-10:])  # Show last 10 lines
-                    yield all_generated_videos.copy(), status_text, recent_output
+                    yield all_generated_videos.copy(), current_preview_list, status_text, recent_output
 
             # Wait for threads to complete
             stdout_thread.join()
@@ -1125,19 +1148,19 @@ def pusa_batch_handler(
             if process.returncode != 0:
                 error_msg = f"Generation failed with code {process.returncode}"
                 # Stderr has already been captured in output_lines
-                yield all_generated_videos, error_msg, ""
+                yield all_generated_videos, current_preview_list, error_msg, ""
             else:
-                yield all_generated_videos.copy(), status_text, "Generation completed!"
+                yield all_generated_videos.copy(), current_preview_list, status_text, "Generation completed!"
 
         except Exception as e:
             error_msg = f"Error during generation: {str(e)}"
             print(f"[Pusa Error] {error_msg}")
-            yield all_generated_videos, error_msg, ""
+            yield all_generated_videos, current_preview_list, error_msg, ""
 
         # Small delay between batches
         time.sleep(0.2)
 
-    yield all_generated_videos, "Pusa batch generation complete!", ""
+    yield all_generated_videos, current_preview_list, "Pusa batch generation complete!", ""
 
 # Pusa I2V Multi-frames Generation
 def pusa_i2v_batch_handler(
@@ -1179,7 +1202,10 @@ def pusa_i2v_batch_handler(
     apply_high1: bool, apply_high2: bool, apply_high3: bool, apply_high4: bool,
     apply_high5: bool, apply_high6: bool, apply_high7: bool, apply_high8: bool,
     lightx2v: bool = False,
-) -> Generator[Tuple[List[str], str, str], None, None]:
+    # Preview settings
+    enable_preview: bool = False,
+    preview_steps: int = 0,
+) -> Generator[Tuple[List[str], Any, str, str], None, None]:
     """Handler for Pusa I2V multi-frames generation"""
     import queue
     import threading
@@ -1305,6 +1331,10 @@ def pusa_i2v_batch_handler(
             cmd.extend(["--low_lora_path", low_lora_paths[0]])
             cmd.extend(["--low_lora_alpha", low_lora_alphas[0]])
 
+        # Add preview parameters if enabled
+        if enable_preview and preview_steps > 0:
+            cmd.extend(["--preview", str(preview_steps)])
+
         # Execute command
         try:
             print(f"Executing Pusa I2V command: {' '.join(cmd)}")
@@ -1320,6 +1350,15 @@ def pusa_i2v_batch_handler(
             # Process output in real-time
             output_lines = []
             output_queue = queue.Queue()
+
+            # Preview monitoring setup
+            current_preview_list = []
+            last_preview_mtime = 0
+            preview_base_dir = os.path.join(save_path, "previews")
+            # Generate a unique timestamp for this batch item's preview
+            import datetime
+            timestamp_preview = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_pusa_i2v_{timestamp_preview}.mp4")
 
             def read_output(pipe, pipe_name):
                 for line in iter(pipe.readline, ''):
@@ -1338,7 +1377,7 @@ def pusa_i2v_batch_handler(
             while True:
                 if stop_event.is_set():
                     process.terminate()
-                    yield all_generated_videos.copy(), "Generation stopped by user.", ""
+                    yield all_generated_videos.copy(), current_preview_list, "Generation stopped by user.", ""
                     stdout_thread.join(timeout=1)
                     stderr_thread.join(timeout=1)
                     return
@@ -1363,15 +1402,22 @@ def pusa_i2v_batch_handler(
 
                     # Parse progress messages
                     if "Loading models" in line:
-                        yield all_generated_videos.copy(), status_text, "Loading models..."
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Loading models..."
                     elif "Models loaded successfully" in line:
-                        yield all_generated_videos.copy(), status_text, "Models loaded"
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Models loaded"
                     elif "Generating" in line:
-                        yield all_generated_videos.copy(), status_text, "Generating frames..."
+                        yield all_generated_videos.copy(), current_preview_list, status_text, "Generating frames..."
                     elif "Saved to" in line:
                         match = re.search(r"Saved to (.+\.mp4)", line)
                         if match:
                             last_video_path = match.group(1)
+
+                    # Check for preview file updates
+                    if enable_preview and os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
 
             # Wait for threads to complete
             stdout_thread.join(timeout=2)
@@ -1380,20 +1426,20 @@ def pusa_i2v_batch_handler(
             # Check if video was generated
             if poll_status == 0 and last_video_path and os.path.exists(last_video_path):
                 all_generated_videos.append(last_video_path)
-                yield all_generated_videos.copy(), status_text, f"Video saved: {os.path.basename(last_video_path)}"
+                yield all_generated_videos.copy(), current_preview_list, status_text, f"Video saved: {os.path.basename(last_video_path)}"
             else:
                 error_output = "\n".join(output_lines[-20:])
-                yield all_generated_videos, f"Error in batch {batch_idx+1}", error_output
+                yield all_generated_videos, current_preview_list, f"Error in batch {batch_idx+1}", error_output
 
         except Exception as e:
             error_msg = f"Error during generation: {str(e)}"
             print(f"[Pusa I2V Error] {error_msg}")
-            yield all_generated_videos, error_msg, ""
+            yield all_generated_videos, current_preview_list, error_msg, ""
 
         # Small delay between batches
         time.sleep(0.2)
 
-    yield all_generated_videos, "Pusa I2V batch generation complete!", ""
+    yield all_generated_videos, current_preview_list, "Pusa I2V batch generation complete!", ""
 
 ### Multitalk
 def multitalk_batch_handler(
@@ -8967,6 +9013,18 @@ with gr.Blocks(
                         show_label=True, elem_id="gallery_pusa", allow_preview=True, preview=True
                     )
 
+                    # Preview Configuration
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        pusa_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        pusa_preview_steps = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps",
+                            info="Generates preview video during sampling"
+                        )
+                        pusa_preview_output = gr.Video(
+                            label="Latent Preview", height=300
+                        )
+
                     # LoRA Configuration with Accordion (matching Wan2.2)
                     with gr.Accordion("LoRA", open=True):
                         with gr.Row():
@@ -9201,6 +9259,18 @@ with gr.Blocks(
                         columns=[2], rows=[2], object_fit="contain", height="auto",
                         show_label=True, elem_id="gallery_pusa_i2v", allow_preview=True, preview=True
                     )
+
+                    # Preview Configuration
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        pusa_i2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
+                        pusa_i2v_preview_steps = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps",
+                            info="Generates preview video during sampling"
+                        )
+                        pusa_i2v_preview_output = gr.Video(
+                            label="Latent Preview", height=300
+                        )
 
                     # LoRA Configuration with Accordion (same as Pusa-ext)
                     with gr.Accordion("LoRA", open=True):
@@ -13112,10 +13182,13 @@ with gr.Blocks(
     for i in range(8):
         pusa_generation_inputs.append(pusa_lora_apply_high[i])
 
+    # Add preview settings to inputs
+    pusa_generation_inputs.extend([pusa_enable_preview, pusa_preview_steps])
+
     pusa_generate_btn.click(
         fn=pusa_batch_handler,
         inputs=pusa_generation_inputs,
-        outputs=[pusa_output, pusa_batch_progress, pusa_progress_text],
+        outputs=[pusa_output, pusa_preview_output, pusa_batch_progress, pusa_progress_text],
         queue=True
     )
 
@@ -13195,10 +13268,13 @@ with gr.Blocks(
     # Add lightx2v checkbox
     pusa_i2v_generation_inputs.append(pusa_i2v_lightx2v)
 
+    # Add preview settings to inputs
+    pusa_i2v_generation_inputs.extend([pusa_i2v_enable_preview, pusa_i2v_preview_steps])
+
     pusa_i2v_generate_btn.click(
         fn=pusa_i2v_batch_handler,
         inputs=pusa_i2v_generation_inputs,
-        outputs=[pusa_i2v_output, pusa_i2v_batch_progress, pusa_i2v_progress_text],
+        outputs=[pusa_i2v_output, pusa_i2v_preview_output, pusa_i2v_batch_progress, pusa_i2v_progress_text],
         queue=True
     )
 

@@ -87,6 +87,7 @@ def main():
     parser.add_argument("--height", type=int, default=480, help="Height of the output video. Default: 480")
     parser.add_argument("--fps", type=int, default=24, help="fps to save video in")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation. Default: 0")
+    parser.add_argument("--preview", type=int, default=0, help="Preview interval in steps (0 to disable)")
     args = parser.parse_args()
 
     # --- Argument Validation and Input Preparation ---
@@ -191,6 +192,19 @@ def main():
     all_video_frames = process_video_frames(args.video_path, target_width=args.width, target_height=args.height)
     noise_mult_list = [float(x.strip()) for x in args.noise_multipliers.split(',')]
 
+    # Initialize preview handler if enabled
+    preview_handler = None
+    if args.preview > 0:
+        from diffsynth.utils.latent_preview import LatentPreviewHandler
+        timestamp_preview = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        preview_suffix = f"pusa_v2v_{timestamp_preview}"
+        preview_handler = LatentPreviewHandler(
+            save_path=args.output_dir,
+            fps=args.fps // 4,  # Lower FPS for preview
+            preview_suffix=preview_suffix
+        )
+        print(f"Preview enabled: generating preview every {args.preview} steps")
+
     if args.extend_from_end:
         print(f"Video extension mode: Using last {args.extend_from_end} frames for conditioning.")
         if args.extend_from_end > len(all_video_frames):
@@ -223,7 +237,9 @@ def main():
         seed=args.seed, tiled=True,
         switch_DiT_boundary=args.switch_DiT_boundary,
         cfg_scale=args.cfg_scale,
-        sigma_shift=args.shift
+        sigma_shift=args.shift,
+        preview_handler=preview_handler,
+        preview_interval=args.preview
     )
     print("Video generation complete.")
 

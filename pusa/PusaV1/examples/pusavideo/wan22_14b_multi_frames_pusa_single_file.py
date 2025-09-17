@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--fps", type=int, default=24, help="FPS to save video in. Default: 24")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate. Default: 81")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation. Default: 0")
+    parser.add_argument("--preview", type=int, default=0, help="Preview interval in steps (0 to disable)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,6 +107,19 @@ def main():
     cond_pos_list = [int(x.strip()) for x in args.cond_position.split(',')]
     noise_mult_list = [float(x.strip()) for x in args.noise_multipliers.split(',')]
 
+    # Initialize preview handler if enabled
+    preview_handler = None
+    if args.preview > 0:
+        from diffsynth.utils.latent_preview import LatentPreviewHandler
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        preview_suffix = f"pusa_i2v_{timestamp}"
+        preview_handler = LatentPreviewHandler(
+            save_path=args.output_dir,
+            fps=args.fps // 4,  # Lower FPS for preview
+            preview_suffix=preview_suffix
+        )
+        print(f"Preview enabled: generating preview every {args.preview} steps")
+
     images = []
     target_w, target_h = args.width, args.height
     for p in args.image_paths:
@@ -142,6 +156,8 @@ def main():
         switch_DiT_boundary=args.switch_DiT_boundary,
         cfg_scale=args.cfg_scale,
         sigma_shift=args.shift,
+        preview_handler=preview_handler,
+        preview_interval=args.preview
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

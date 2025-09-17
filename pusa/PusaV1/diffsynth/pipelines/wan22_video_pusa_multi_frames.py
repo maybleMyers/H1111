@@ -425,6 +425,8 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
         progress_bar_st=None,
         visualize_attention=False,
         output_dir=None,
+        preview_handler=None,
+        preview_interval=0,
     ):
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
@@ -593,15 +595,20 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
 
             # Scheduler
             latents = self.scheduler.step(
-                noise_pred, 
-                timestep, 
-                latents, 
-                cond_frame_latent_indices=cond_frame_latent_indices, 
+                noise_pred,
+                timestep,
+                latents,
+                cond_frame_latent_indices=cond_frame_latent_indices,
                 noise_multipliers=noise_multipliers
             )
 
-            
-            
+            # Generate preview if enabled
+            if preview_handler and preview_interval > 0 and (progress_id + 1) % preview_interval == 0:
+                if (progress_id + 1) < len(self.scheduler.timesteps):  # Skip final step
+                    # Clone latents and move to CPU for preview
+                    preview_latents = latents.clone().squeeze(0).cpu()  # [C, F, H, W]
+                    preview_handler.process_preview(preview_latents, progress_id)
+
         if visualize_attention:
             from ..models.wan_video_pusa import _VISUALIZE_ATTENTION_CONFIG
             _VISUALIZE_ATTENTION_CONFIG["enabled"] = False
