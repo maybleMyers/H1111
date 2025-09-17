@@ -101,8 +101,12 @@ class LatentPreviewHandler:
             step_num: Current denoising step number
         """
         try:
+            print(f"[Preview] Processing preview at step {step_num + 1}")
+            print(f"[Preview] Latents shape: {latents.shape}, device: {latents.device}")
+
             # Decode latents to RGB on CPU
             rgb_frames = self.decode_latent2rgb(latents)  # [F, 3, H, W]
+            print(f"[Preview] RGB frames shape after decode: {rgb_frames.shape}")
 
             # Upscale 8x using bicubic interpolation
             upscaled = F.interpolate(
@@ -111,12 +115,16 @@ class LatentPreviewHandler:
                 mode='bicubic',
                 align_corners=False
             )
+            print(f"[Preview] Upscaled shape: {upscaled.shape}")
 
             # Save to video file
             self.save_video(upscaled)
+            print(f"[Preview] Preview saved to: {self.preview_path}")
 
         except Exception as e:
-            print(f"Error generating preview at step {step_num}: {e}")
+            print(f"[Preview Error] Error generating preview at step {step_num}: {e}")
+            import traceback
+            traceback.print_exc()
 
     @torch.no_grad()
     def save_video(self, frames):

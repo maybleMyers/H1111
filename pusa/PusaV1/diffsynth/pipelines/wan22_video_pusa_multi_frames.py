@@ -605,9 +605,12 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
             # Generate preview if enabled
             if preview_handler and preview_interval > 0 and (progress_id + 1) % preview_interval == 0:
                 if (progress_id + 1) < len(self.scheduler.timesteps):  # Skip final step
+                    print(f"[Pipeline] Generating preview at step {progress_id + 1} (interval: {preview_interval})")
                     # Clone latents and move to CPU for preview
                     preview_latents = latents.clone().squeeze(0).cpu()  # [C, F, H, W]
                     preview_handler.process_preview(preview_latents, progress_id)
+            elif preview_handler:
+                print(f"[Pipeline] Skipping preview at step {progress_id + 1} (next at {((progress_id + 1) // preview_interval + 1) * preview_interval})")
 
         if visualize_attention:
             from ..models.wan_video_pusa import _VISUALIZE_ATTENTION_CONFIG
