@@ -487,7 +487,7 @@ def wan22_batch_handler(
     
     for i in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, [], "Generation stopped by user.", ""
+            yield all_generated_videos, None, "Generation stopped by user.", ""
             return
 
         current_seed = base_seed
@@ -497,7 +497,7 @@ def wan22_batch_handler(
             current_seed = base_seed + i
 
         status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), [], status_text, "Starting item..."
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
 
         # --- Prepare command for a single generation ---
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
@@ -731,7 +731,7 @@ def wan22_batch_handler(
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
                 except: process.kill(); process.wait()
-                yield all_generated_videos, [], "Generation stopped by user.", ""
+                yield all_generated_videos, None, "Generation stopped by user.", ""
                 return
 
             line_strip = line.strip()
@@ -846,7 +846,7 @@ def wan22_batch_handler(
             status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
             progress_text_update = "Subprocess failed. Check console."
         
-        yield all_generated_videos.copy(), [], status_text, progress_text_update
+        yield all_generated_videos.copy(), None, status_text, progress_text_update
         
         clear_cuda_cache()
         time.sleep(0.2)
@@ -1061,7 +1061,7 @@ def pusa_batch_handler(
             output_queue = queue.Queue()
 
             # Preview monitoring setup
-            current_preview_list = []
+            current_preview_list = None
             last_preview_mtime = 0
             preview_base_dir = os.path.join(save_path, "previews")
             # Generate a unique timestamp for this batch item's preview
@@ -1133,7 +1133,7 @@ def pusa_batch_handler(
                     if enable_preview and os.path.exists(preview_mp4_path):
                         current_mtime = os.path.getmtime(preview_mp4_path)
                         if current_mtime > last_preview_mtime:
-                            current_preview_list = [preview_mp4_path]
+                            current_preview_list = preview_mp4_path
                             last_preview_mtime = current_mtime
 
                     # Update status with last few lines
@@ -1239,16 +1239,16 @@ def pusa_i2v_batch_handler(
 
     # Ensure we have matching counts
     if len(image_paths) != len(positions):
-        yield [], [], f"Error: Number of images ({len(image_paths)}) must match number of positions ({len(positions)})", ""
+        yield [], None, f"Error: Number of images ({len(image_paths)}) must match number of positions ({len(positions)})", ""
         return
 
     if len(image_paths) != len(noise_mults):
-        yield [], [], f"Error: Number of images ({len(image_paths)}) must match number of noise multipliers ({len(noise_mults)})", ""
+        yield [], None, f"Error: Number of images ({len(image_paths)}) must match number of noise multipliers ({len(noise_mults)})", ""
         return
 
     for batch_idx in range(int(batch_size)):
         if stop_event.is_set():
-            yield all_generated_videos, [], "Generation stopped by user.", ""
+            yield all_generated_videos, None, "Generation stopped by user.", ""
             return
 
         # Handle seed
@@ -1259,7 +1259,7 @@ def pusa_i2v_batch_handler(
             current_seed = seed + batch_idx
 
         status_text = f"Processing Item {batch_idx+1}/{batch_size} (Seed: {current_seed})"
-        yield all_generated_videos.copy(), [], status_text, "Starting generation..."
+        yield all_generated_videos.copy(), None, status_text, "Starting generation..."
 
         # Build command for multi-frames Pusa script
         run_id = f"pusa_i2v_{int(time.time())}_{current_seed}"
@@ -1352,7 +1352,7 @@ def pusa_i2v_batch_handler(
             output_queue = queue.Queue()
 
             # Preview monitoring setup
-            current_preview_list = []
+            current_preview_list = None
             last_preview_mtime = 0
             preview_base_dir = os.path.join(save_path, "previews")
             # Generate a unique timestamp for this batch item's preview
@@ -1416,7 +1416,7 @@ def pusa_i2v_batch_handler(
                     if enable_preview and os.path.exists(preview_mp4_path):
                         current_mtime = os.path.getmtime(preview_mp4_path)
                         if current_mtime > last_preview_mtime:
-                            current_preview_list = [preview_mp4_path]
+                            current_preview_list = preview_mp4_path
                             last_preview_mtime = current_mtime
 
             # Wait for threads to complete
@@ -2547,7 +2547,7 @@ def phantom_batch_handler(
             current_seed_for_item = seed_val + i
 
         status_text = f"Processing Phantom Item {i+1}/{batch_size_val} (Seed: {current_seed_for_item})"
-        yield all_generated_videos.copy(), [], status_text, "Starting item..."
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
 
         item_videos = []
         item_previews_temp = []
