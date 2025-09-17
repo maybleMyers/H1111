@@ -8965,7 +8965,14 @@ with gr.Blocks(
                 with gr.Column():
                     # Input video
                     pusa_input_video = gr.Video(label="Input Video (for extension)", format="mp4")
-
+                    pusa_video_length = gr.Slider(
+                        label="Video Length",
+                        value=81,
+                        minimum=21,
+                        maximum=201,
+                        step=1,
+                        info="Total number of frames to generate"
+                    )
                     # Extension mode controls
                     pusa_enable_extension = gr.Checkbox(
                         label="Enable Video Extension Mode",
@@ -8978,18 +8985,11 @@ with gr.Blocks(
                                 label="Frames from End",
                                 value=6,
                                 minimum=1,
-                                maximum=20,
+                                maximum=121,
                                 step=1,
                                 info="Number of latent frames from the end to use for conditioning"
                             )
-                            pusa_video_length = gr.Number(
-                                label="Video Length (frames)",
-                                value=81,
-                                minimum=81,
-                                maximum=500,
-                                step=1,
-                                info="Total number of frames to generate"
-                            )
+
                         pusa_noise_multipliers = gr.Textbox(
                             label="Noise Multipliers",
                             value="0.1,0.1,0.1,0.1,0.1,0.1",
@@ -9000,7 +9000,6 @@ with gr.Blocks(
                             value=True,
                             info="Automatically join original video with generated video"
                         )
-
                     # Alternative conditioning mode
                     pusa_use_positions = gr.Checkbox(
                         label="Use Specific Frame Positions",
@@ -9155,7 +9154,6 @@ with gr.Blocks(
                                         label="Apply to High Noise", value=False, scale=1
                                     ))
 
-            # Model paths at the bottom - EXACTLY the same as Wan2.2 since Pusa uses the same models
             with gr.Accordion("Model Paths & Configuration", open=True):
                 with gr.Row():
                     pusa_model_folder = gr.Textbox(label="Model Folder", value="wan")
@@ -12048,7 +12046,7 @@ with gr.Blocks(
             params.get("negative_prompt", ""),
             True,  # enable_extension (default to extension mode)
             6,  # extend_frames (default)
-            params.get("frame_num", 81),  # video_length - get from metadata if available
+            gr.update(value=params.get("frame_num", 81), interactive=True),  # video_length - keep interactive
             "0.1,0.1,0.1,0.1,0.1,0.1",  # noise_multipliers (default)
             False,  # use_positions
             "",  # cond_positions

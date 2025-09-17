@@ -6,6 +6,42 @@ import argparse
 from diffsynth import ModelManagerWan22, Wan22VideoPusaV2VPipeline, save_video
 import datetime
 import cv2
+import json
+import subprocess
+
+def add_metadata_to_video(video_path: str, parameters: dict) -> None:
+    """Add generation parameters to video metadata using ffmpeg."""
+    # Convert parameters to JSON string
+    params_json = json.dumps(parameters, indent=2)
+
+    # Temporary output path
+    temp_path = video_path.replace(".mp4", "_temp.mp4")
+
+    # FFmpeg command to add metadata without re-encoding
+    cmd = [
+        'ffmpeg',
+        '-i', video_path,
+        '-metadata', f'comment={params_json}',
+        '-codec', 'copy',
+        temp_path
+    ]
+
+    try:
+        # Execute FFmpeg command
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Replace original file with metadata-enhanced file
+        os.replace(temp_path, video_path)
+        print(f"Metadata added successfully to {video_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error adding metadata: {e}")
+        # Clean up temporary file if it exists
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    except Exception as e:
+        print(f"Error adding metadata: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 def process_video_frames(video_path, target_width=832, target_height=480):
     if not os.path.isfile(video_path):
@@ -246,32 +282,84 @@ def main():
     # --- Save Output ---
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename_base = os.path.basename(args.video_path).split('.')[0]
 
-    # Create a descriptive filename stem
-    if args.extend_from_end:
-        mode_str = f"extend_{args.extend_from_end}frames"
-    else:
-        mode_str = f"cond_{str(cond_pos_list)}"
-
-    base_video_filename = f"wan22_v2v_{output_filename_base}_{timestamp}_{mode_str}_noise_{str(noise_mult_list)}_cfg_{args.cfg_scale}_steps_{args.num_inference_steps}"
-    if args.lightx2v:
-        base_video_filename += "_lightx2v"
+    # Create a simple filename with just seed and timestamp
+    base_video_filename = f"pusa_v2v_{args.seed}_{timestamp}"
 
     # Decide which frames to save based on the --concatenate flag
     if args.concatenate and args.extend_from_end:
         print("Concatenating original video with the generated video...")
         final_video_frames = all_video_frames + video
-        final_filename_stem = base_video_filename.replace(f"extend_{args.extend_from_end}frames", f"extended_total_{len(final_video_frames)}frames")
         video_to_save = final_video_frames
-        video_filename = os.path.join(args.output_dir, final_filename_stem + ".mp4")
+        total_frames_str = f"_total{len(final_video_frames)}"
     else:
         video_to_save = video
-        video_filename = os.path.join(args.output_dir, base_video_filename + ".mp4")
+        total_frames_str = ""
+
+    video_filename = os.path.join(args.output_dir, base_video_filename + total_frames_str + ".mp4")
 
     print(f"Saving video to {video_filename}")
     save_video(video_to_save, video_filename, fps=args.fps, quality=5)
     print("Video saved successfully.")
+
+    # Prepare and add metadata to the video
+    metadata_dict = {
+        "model_type": "Pusa V2V",
+        "video_path": args.video_path,
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "seed": args.seed,
+        "width": args.width,
+        "height": args.height,
+        "num_frames": 81,
+        "fps": args.fps,
+        "num_inference_steps": args.num_inference_steps,
+        "cfg_scale": args.cfg_scale,
+        "sigma_shift": args.shift,
+        "switch_DiT_boundary": args.switch_DiT_boundary,
+        "high_model": args.high_model,
+        "low_model": args.low_model,
+        "base_dir": args.base_dir,
+        "num_persistent_params": args.num_persistent_params,
+        "lightx2v": args.lightx2v,
+        "concatenate": args.concatenate,
+        "timestamp": timestamp,
+    }
+
+    # Add conditional parameters
+    if args.extend_from_end:
+        metadata_dict["extend_from_end"] = args.extend_from_end
+        metadata_dict["conditioning_mode"] = "extend"
+    else:
+        metadata_dict["cond_position"] = args.cond_position
+        metadata_dict["conditioning_indices"] = cond_pos_list
+        metadata_dict["conditioning_mode"] = "position"
+
+    metadata_dict["noise_multipliers"] = noise_mult_list
+
+    # Add LoRA information if used
+    if args.high_lora_path and args.high_lora_path.strip():
+        metadata_dict["high_lora_paths"] = args.high_lora_path
+        metadata_dict["high_lora_alphas"] = args.high_lora_alpha
+
+    if args.low_lora_path and args.low_lora_path.strip():
+        metadata_dict["low_lora_paths"] = args.low_lora_path
+        metadata_dict["low_lora_alphas"] = args.low_lora_alpha
+
+    # Save metadata as JSON file alongside the video
+    metadata_filename = video_filename.replace(".mp4", "_metadata.json")
+    try:
+        with open(metadata_filename, 'w') as meta_file:
+            json.dump(metadata_dict, meta_file, indent=2)
+        print(f"Metadata saved to {metadata_filename}")
+    except Exception as e:
+        print(f"Error saving metadata file: {e}")
+
+    # Also add metadata to the video file itself
+    try:
+        add_metadata_to_video(video_filename, metadata_dict)
+    except Exception as e:
+        print(f"Warning: Failed to embed metadata in video: {e}")
 
 if __name__ == "__main__":
     main()
