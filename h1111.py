@@ -1070,10 +1070,9 @@ def pusa_batch_handler(
             preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_pusa_v2v_{timestamp_preview}.mp4")
 
             def read_output(pipe, pipe_name):
-                if pipe is None:
-                    return
-                for line in pipe:
-                    output_queue.put((pipe_name, line))
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        output_queue.put((pipe_name, line))
                 pipe.close()
 
             stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "stdout"))
