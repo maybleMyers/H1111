@@ -138,9 +138,9 @@ def main():
 
     if args.lightx2v:
         # Lightx2v for acceleration
-        high_lora_path = "./model_zoo/PusaV1/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors"
+        high_lora_path = "pusa/pusa_lora/high_noise_model.safetensors"
         model_manager.load_loras_wan22_lightx2v(high_lora_path, model_type="high")
-        low_lora_path = "./model_zoo/PusaV1/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors"
+        low_lora_path = "pusa/pusa_lora/low_noise_model.safetensors"
         model_manager.load_loras_wan22_lightx2v(low_lora_path, model_type="low")
 
     # Parse multiple LoRA paths and alphas (handle empty strings)
