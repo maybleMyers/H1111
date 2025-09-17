@@ -32,6 +32,12 @@ def main():
     parser.add_argument("--cfg_scale", type=float, default=3.0, help="Classifier-free guidance scale.")
     parser.add_argument("--shift", type=float, default=5.0, help="Sigma shift parameter for flow matching scheduler. Default: 5.0")
     parser.add_argument("--lightx2v", action="store_true", help="Use lightx2v for acceleration.")
+    parser.add_argument("--num_persistent_params", type=float, default=6e9, help="Number of persistent parameters in DiT for VRAM management. Use scientific notation (e.g., 6e9 for 6 billion).")
+    parser.add_argument("--width", type=int, default=1280, help="Width of the output video. Default: 1280")
+    parser.add_argument("--height", type=int, default=720, help="Height of the output video. Default: 720")
+    parser.add_argument("--fps", type=int, default=24, help="FPS to save video in. Default: 24")
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate. Default: 81")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for generation. Default: 0")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,14 +90,14 @@ def main():
     model_manager.load_loras_wan22(args.low_lora_path, lora_alpha=args.low_lora_alpha, model_type="low")
 
     pipe = Wan22VideoPusaMultiFramesPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device=device)
-    pipe.enable_vram_management(num_persistent_param_in_dit=6*10**9)
+    pipe.enable_vram_management(num_persistent_param_in_dit=args.num_persistent_params)
     print(f"Models loaded successfully")
 
     cond_pos_list = [int(x.strip()) for x in args.cond_position.split(',')]
     noise_mult_list = [float(x.strip()) for x in args.noise_multipliers.split(',')]
 
     images = []
-    target_w, target_h = 1280, 720
+    target_w, target_h = args.width, args.height
     for p in args.image_paths:
         img = Image.open(p).convert("RGB")
         original_w, original_h = img.size
@@ -121,8 +127,8 @@ def main():
         negative_prompt=args.negative_prompt,
         multi_frame_images=multi_frame_images,
         num_inference_steps=args.num_inference_steps,
-        height=720, width=1280, num_frames=81,
-        seed=0, tiled=True,
+        height=args.height, width=args.width, num_frames=args.num_frames,
+        seed=args.seed, tiled=True,
         switch_DiT_boundary=args.switch_DiT_boundary,
         cfg_scale=args.cfg_scale,
         sigma_shift=args.shift,
@@ -136,7 +142,7 @@ def main():
         video_filename = os.path.join(args.output_dir, f"wan22_multi_frame_output_{timestamp}_cond_{str(cond_pos_list)}_noise_{str(noise_mult_list)}_high_alpha_{args.high_lora_alpha}_low_alpha_{args.low_lora_alpha}_cfg_{args.cfg_scale}_steps_{args.num_inference_steps}.mp4")
 
     print(f"Saved to {video_filename}")
-    save_video(video, video_filename, fps=24, quality=5)
+    save_video(video, video_filename, fps=args.fps, quality=5)
 
 if __name__ == "__main__":
     main()
