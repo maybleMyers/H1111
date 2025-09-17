@@ -89,9 +89,19 @@ def main():
     model_manager.load_loras_wan22(args.high_lora_path, lora_alpha=args.high_lora_alpha, model_type="high")
     model_manager.load_loras_wan22(args.low_lora_path, lora_alpha=args.low_lora_alpha, model_type="low")
 
-    pipe = Wan22VideoPusaMultiFramesPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device=device)
-    pipe.enable_vram_management(num_persistent_param_in_dit=args.num_persistent_params)
-    print(f"Models loaded successfully")
+    # Create pipeline with CPU device first to avoid loading to GPU
+    pipe = Wan22VideoPusaMultiFramesPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cpu")
+
+    # Now set the actual device and enable VRAM management
+    pipe.device = device
+    pipe.enable_vram_management(num_persistent_param_in_dit=int(args.num_persistent_params))
+
+    # Clear any cached memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"Models loaded successfully with VRAM management enabled")
+    print(f"  Persistent parameters in DiT: {args.num_persistent_params/1e9:.2f}B")
 
     cond_pos_list = [int(x.strip()) for x in args.cond_position.split(',')]
     noise_mult_list = [float(x.strip()) for x in args.noise_multipliers.split(',')]
