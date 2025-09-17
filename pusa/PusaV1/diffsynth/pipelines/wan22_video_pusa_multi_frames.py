@@ -198,11 +198,22 @@ class Wan22VideoPusaMultiFramesPipeline(BasePipeline):
             self.text_encoder, tokenizer_path = text_encoder_model_and_path
             self.prompter.fetch_models(self.text_encoder)
             self.prompter.fetch_tokenizer(os.path.join(os.path.dirname(tokenizer_path), "google/umt5-xxl"))
-        dit = model_manager.fetch_model("wan_video_pusa", index=2)
-        if isinstance(dit, list):
-            self.dit, self.dit2 = dit
+
+        # Try to fetch models with tagged names first (for single file loading)
+        high_dit = model_manager.fetch_model("wan_video_pusa_high")
+        low_dit = model_manager.fetch_model("wan_video_pusa_low")
+
+        if high_dit is not None and low_dit is not None:
+            # Both tagged models found (single file mode)
+            self.dit = high_dit
+            self.dit2 = low_dit
         else:
-            self.dit = dit
+            # Fall back to original behavior for backward compatibility (directory mode)
+            dit = model_manager.fetch_model("wan_video_pusa", index=2)
+            if isinstance(dit, list):
+                self.dit, self.dit2 = dit
+            else:
+                self.dit = dit
         self.vae = model_manager.fetch_model("wan_video_vae")
         self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
         self.motion_controller = model_manager.fetch_model("wan_video_motion_controller")
