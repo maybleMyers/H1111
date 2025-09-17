@@ -1115,6 +1115,14 @@ def pusa_batch_handler(
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Loading models..."
                     elif "Models loaded successfully" in line:
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Models loaded"
+                    elif "Preview saved to:" in line:
+                        # Extract preview path from log message
+                        match = re.search(r"Preview saved to: (.+\.mp4)", line)
+                        if match:
+                            preview_path = match.group(1)
+                            if os.path.exists(preview_path):
+                                current_preview_list = preview_path
+                                yield all_generated_videos.copy(), current_preview_list, status_text, "Preview updated"
                     elif "Generating new video frames" in line:
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Generating frames..."
                     elif "Video generation complete" in line:
@@ -1129,16 +1137,29 @@ def pusa_batch_handler(
                             all_generated_videos.append(last_video_path)
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Video saved successfully!"
 
-                    # Check for preview file updates
-                    if enable_preview and os.path.exists(preview_mp4_path):
-                        current_mtime = os.path.getmtime(preview_mp4_path)
-                        if current_mtime > last_preview_mtime:
-                            current_preview_list = preview_mp4_path
-                            last_preview_mtime = current_mtime
+                    # Parse tqdm progress from stderr
+                    if pipe_name == "stderr":
+                        tqdm_match = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*\[([^\]]+)\]", line)
+                        if tqdm_match:
+                            percentage = tqdm_match.group(1)
+                            current_step = tqdm_match.group(2)
+                            total_steps = tqdm_match.group(3)
+                            time_info = tqdm_match.group(4)
+                            progress_text = f"Step {current_step}/{total_steps} ({percentage}%) - {time_info}"
+                            yield all_generated_videos.copy(), current_preview_list, status_text, progress_text
+                            continue
 
-                    # Update status with last few lines
-                    recent_output = "\n".join(output_lines[-10:])  # Show last 10 lines
-                    yield all_generated_videos.copy(), current_preview_list, status_text, recent_output
+                    # Also check preview directory for any new preview files (as backup)
+                    if enable_preview and os.path.exists(preview_base_dir):
+                        preview_files = [f for f in os.listdir(preview_base_dir) if f.startswith("latent_preview_pusa_v2v") and f.endswith(".mp4")]
+                        if preview_files:
+                            # Get the most recent preview file
+                            preview_files_full = [os.path.join(preview_base_dir, f) for f in preview_files]
+                            newest_preview = max(preview_files_full, key=os.path.getmtime)
+                            current_mtime = os.path.getmtime(newest_preview)
+                            if current_mtime > last_preview_mtime:
+                                current_preview_list = newest_preview
+                                last_preview_mtime = current_mtime
 
             # Wait for threads to complete
             stdout_thread.join()
@@ -1405,19 +1426,41 @@ def pusa_i2v_batch_handler(
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Loading models..."
                     elif "Models loaded successfully" in line:
                         yield all_generated_videos.copy(), current_preview_list, status_text, "Models loaded"
-                    elif "Generating" in line:
-                        yield all_generated_videos.copy(), current_preview_list, status_text, "Generating frames..."
+                    elif "Preview saved to:" in line:
+                        # Extract preview path from log message
+                        match = re.search(r"Preview saved to: (.+\.mp4)", line)
+                        if match:
+                            preview_path = match.group(1)
+                            if os.path.exists(preview_path):
+                                current_preview_list = preview_path
+                                yield all_generated_videos.copy(), current_preview_list, status_text, "Preview updated"
                     elif "Saved to" in line:
                         match = re.search(r"Saved to (.+\.mp4)", line)
                         if match:
                             last_video_path = match.group(1)
 
-                    # Check for preview file updates
-                    if enable_preview and os.path.exists(preview_mp4_path):
-                        current_mtime = os.path.getmtime(preview_mp4_path)
-                        if current_mtime > last_preview_mtime:
-                            current_preview_list = preview_mp4_path
-                            last_preview_mtime = current_mtime
+                    # Parse tqdm progress from stderr
+                    if pipe_name == "stderr":
+                        tqdm_match = re.search(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*\[([^\]]+)\]", line)
+                        if tqdm_match:
+                            percentage = tqdm_match.group(1)
+                            current_step = tqdm_match.group(2)
+                            total_steps = tqdm_match.group(3)
+                            time_info = tqdm_match.group(4)
+                            progress_text = f"Step {current_step}/{total_steps} ({percentage}%) - {time_info}"
+                            yield all_generated_videos.copy(), current_preview_list, status_text, progress_text
+
+                    # Also check preview directory for any new preview files (as backup)
+                    if enable_preview and os.path.exists(preview_base_dir):
+                        preview_files = [f for f in os.listdir(preview_base_dir) if f.startswith("latent_preview_pusa_i2v") and f.endswith(".mp4")]
+                        if preview_files:
+                            # Get the most recent preview file
+                            preview_files_full = [os.path.join(preview_base_dir, f) for f in preview_files]
+                            newest_preview = max(preview_files_full, key=os.path.getmtime)
+                            current_mtime = os.path.getmtime(newest_preview)
+                            if current_mtime > last_preview_mtime:
+                                current_preview_list = newest_preview
+                                last_preview_mtime = current_mtime
 
             # Wait for threads to complete
             stdout_thread.join(timeout=2)
