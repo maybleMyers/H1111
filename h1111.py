@@ -8986,7 +8986,7 @@ with gr.Blocks(
                         with gr.Row():
                             pusa_extend_frames = gr.Number(
                                 label="Frames from End",
-                                value=6,
+                                value=5,
                                 minimum=1,
                                 maximum=121,
                                 step=1,
@@ -8995,7 +8995,7 @@ with gr.Blocks(
 
                         pusa_noise_multipliers = gr.Textbox(
                             label="Noise Multipliers",
-                            value="0.1,0.1,0.1,0.1,0.1,0.1",
+                            value="0,0.2,0.4,0.6,0.8",
                             info="Comma-separated noise values (one per conditioning frame)"
                         )
                         pusa_concatenate = gr.Checkbox(
