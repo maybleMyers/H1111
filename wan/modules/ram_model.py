@@ -382,8 +382,6 @@ class WanAttentionBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def _forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-
-
         assert e.dtype == torch.float32
         e = self.modulation.to(torch.float32) + e
         e = e.chunk(6, dim=1)
@@ -392,7 +390,7 @@ class WanAttentionBlock(nn.Module):
         # --- Self-Attention ---
         x_in_self_attn = self.norm1(x).float() * (1 + e[1]) + e[0]
         y = self.self_attn(x_in_self_attn, seq_lens, grid_sizes, freqs)
-        
+
         # The residual stream `x` should remain bfloat16
         x = x + y * e[2]
         del y
@@ -400,17 +398,17 @@ class WanAttentionBlock(nn.Module):
         # --- Cross-Attention ---
         x_in_cross_attn = self.norm3(x)
         cross_attn_out = self.cross_attn(x_in_cross_attn, context, context_lens)
-        
+
         x = x + cross_attn_out
         del context, cross_attn_out
 
         # --- FFN ---
         x_in_ffn = self.norm2(x).float() * (1 + e[4]) + e[3]
         y = self.ffn(x_in_ffn)
-        
+
         x = x + y * e[5]
         del y
-        
+
         return x
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
