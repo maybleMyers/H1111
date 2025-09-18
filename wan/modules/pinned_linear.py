@@ -1,11 +1,6 @@
 """
 Pinned Memory Linear Layer
 
-Ultra-fast linear layer using pinned memory for near-instant CPU→GPU transfers.
-This solves race conditions in async transfers by making transfers so fast
-they're effectively synchronous.
-
-Performance: ~0.1-0.5ms per transfer (10-100x faster than regular CPU→GPU)
 """
 
 import os
@@ -21,7 +16,7 @@ logger = logging.getLogger(__name__)
 PINNED_BUFFER = None
 BUFFER_OFFSET = 0
 WEIGHT_REGISTRY: Dict[str, Tuple[int, torch.Size, torch.dtype]] = {}
-BUFFER_SIZE_GB = float(os.getenv("PINNED_BUFFER_GB", "8"))  # 14B model needs ~8GB
+BUFFER_SIZE_GB = float(os.getenv("PINNED_BUFFER_GB", "64"))  # 14B model needs ~8GB
 
 
 def initialize_pinned_buffer(size_gb: float = None):
