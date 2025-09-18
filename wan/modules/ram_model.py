@@ -382,29 +382,43 @@ class WanAttentionBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def _forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
-            seq_lens(Tensor): Shape [B], length of each sequence in batch
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-        """
+
         assert e.dtype == torch.float32
         e = self.modulation.to(torch.float32) + e
         e = e.chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
-        x = x + y.to(torch.float32) * e[2]
+        # --- Self-Attention ---
+        x_in_self_attn = self.norm1(x).float() * (1 + e[1]) + e[0]
+        print(f"Self-Attn In   | x: dtype={x_in_self_attn.dtype}, mean={x_in_self_attn.mean():.4f}, std={x_in_self_attn.std():.4f}")
+        y = self.self_attn(x_in_self_attn, seq_lens, grid_sizes, freqs)
+        print(f"Self-Attn Out  | y: dtype={y.dtype}, mean={y.mean():.4f}, std={y.std():.4f}")
+        
+        # The residual stream `x` should remain bfloat16
+        x = x + y * e[2]
         del y
+        print(f"After Self-Attn| x: dtype={x.dtype}, mean={x.mean():.4f}, std={x.std():.4f}")
 
-        x = x + self.cross_attn(self.norm3(x), context, context_lens)
-        del context
-        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-        x = x + y.to(torch.float32) * e[5]
+        # --- Cross-Attention ---
+        x_in_cross_attn = self.norm3(x)
+        print(f"Cross-Attn In  | x: dtype={x_in_cross_attn.dtype}, mean={x_in_cross_attn.mean():.4f}, std={x_in_cross_attn.std():.4f}")
+        cross_attn_out = self.cross_attn(x_in_cross_attn, context, context_lens)
+        print(f"Cross-Attn Out | y: dtype={cross_attn_out.dtype}, mean={cross_attn_out.mean():.4f}, std={cross_attn_out.std():.4f}")
+        
+        x = x + cross_attn_out
+        del context, cross_attn_out
+        print(f"After Cross-Attn| x: dtype={x.dtype}, mean={x.mean():.4f}, std={x.std():.4f}")
+
+        # --- FFN ---
+        x_in_ffn = self.norm2(x).float() * (1 + e[4]) + e[3]
+        print(f"FFN In         | x: dtype={x_in_ffn.dtype}, mean={x_in_ffn.mean():.4f}, std={x_in_ffn.std():.4f}")
+        y = self.ffn(x_in_ffn)
+        print(f"FFN Out        | y: dtype={y.dtype}, mean={y.mean():.4f}, std={y.std():.4f}")
+        
+        x = x + y * e[5]
         del y
+        print(f"End of block   | x: dtype={x.dtype}, mean={x.mean():.4f}, std={x.std():.4f}")
+        
         return x
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
