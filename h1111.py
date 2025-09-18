@@ -8971,7 +8971,8 @@ with gr.Blocks(
                         minimum=21,
                         maximum=201,
                         step=1,
-                        info="Total number of frames to generate"
+                        info="Total number of frames to generate",
+                        interactive=True
                     )
                     # Extension mode controls
                     pusa_enable_extension = gr.Checkbox(
@@ -12046,7 +12047,7 @@ with gr.Blocks(
             params.get("negative_prompt", ""),
             True,  # enable_extension (default to extension mode)
             6,  # extend_frames (default)
-            gr.update(value=params.get("frame_num", 81), interactive=True),  # video_length - keep interactive
+            # Removed video_length from outputs to keep it interactive
             "0.1,0.1,0.1,0.1,0.1,0.1",  # noise_multipliers (default)
             False,  # use_positions
             "",  # cond_positions
@@ -12068,14 +12069,14 @@ with gr.Blocks(
             get_default_vae_model("wan"),  # vae_path
             get_default_t5_model("wan"),  # t5_path
             "outputs/pusa"  # save_path
-        ] if params else [gr.update()]*26,  # Updated count for new model fields
+        ] if params else [gr.update()]*25,  # Updated count - removed video_length
         inputs=[params_state],
         outputs=[
             pusa_prompt,
             pusa_negative_prompt,
             pusa_enable_extension,
             pusa_extend_frames,
-            pusa_video_length,  # Added video_length output
+            # Removed pusa_video_length to keep it interactive
             pusa_noise_multipliers,
             pusa_use_positions,
             pusa_cond_positions,
