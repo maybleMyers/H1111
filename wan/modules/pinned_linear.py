@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 PINNED_BUFFER = None
 BUFFER_OFFSET = 0
 WEIGHT_REGISTRY: Dict[str, Tuple[int, torch.Size, torch.dtype]] = {}
-BUFFER_SIZE_GB = float(os.getenv("PINNED_BUFFER_GB", "4"))
+BUFFER_SIZE_GB = float(os.getenv("PINNED_BUFFER_GB", "8"))  # 14B model needs ~8GB
 
 
 def initialize_pinned_buffer(size_gb: float = None):
