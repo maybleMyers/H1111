@@ -836,8 +836,6 @@ def load_wan_model(
             device=device,
             
         )
-        if dit_weight_dtype is not None:
-            model.to(dit_weight_dtype)
 
     dit_path_list = dit_path if isinstance(dit_path, list) else [dit_path]
     logger.info(f"Loading DiT base model state dict from: {dit_path_list}")
