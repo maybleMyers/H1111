@@ -30,7 +30,8 @@ from utils.safetensors_utils import mem_eff_save_file, load_safetensors
 from utils.lora_utils import filter_lora_state_dict
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
-from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
+#from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
+from wan.modules.ram_model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
@@ -447,6 +448,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
+        "--use-bouncing-linear",
+        action="store_true",
+        help="Enable CPU Bouncing Linear strategy for extreme VRAM savings (replaces --blocks-to-swap)."
+    )
+    parser.add_argument(
         "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
@@ -535,6 +541,11 @@ def parse_args() -> argparse.Namespace:
         logger.warning("--mixed_dtype with LoRA: LoRA weights will be merged at the model's original precision")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
          logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
+    if args.use_bouncing_linear and args.blocks_to_swap > 0:
+        raise ValueError(
+            "--use-bouncing-linear and --blocks-to-swap cannot be used together. "
+            "The bouncing linear strategy is a more advanced replacement."
+        )
     return args
 
 class DynamicModelManager:
@@ -712,7 +723,8 @@ class DynamicModelManager:
         model = load_wan_model(
             self.config, self.device, self.model_paths[model_type], 
             self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
+            use_bouncing_linear=self.args.use_bouncing_linear
         )
         
         # Optimize model
@@ -1521,7 +1533,8 @@ def load_dit_model(
     model = load_wan_model(
         config, device, dit_path, args.attn_mode, False, 
         loading_device, loading_weight_dtype, False,
-        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low
+        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
+        use_bouncing_linear=args.use_bouncing_linear
     )
     return model
 
@@ -1742,13 +1755,14 @@ def optimize_model(
                 fullgraph=compile_fullgraph.lower() in "true",
             )
 
-    if args.blocks_to_swap > 0:
+    if args.blocks_to_swap > 0 and not args.use_bouncing_linear:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
         model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
-        # make sure the model is on the right device
+        # If using bouncing linear, this moves only the non-bouncing layers to the GPU.
+        # If not, it moves the whole model.
         model.to(device)
 
     model.eval().requires_grad_(False)
