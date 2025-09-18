@@ -83,12 +83,16 @@ class CPUBouncingLinear(nn.Module):
         self.out_features = out_features
         self.device = device
 
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device="cpu"))
-        self.bias = nn.Parameter(torch.empty(out_features, device="cpu")) if bias else None
-        
-        self.weight.share_memory_()
-        if self.bias is not None:
-            self.bias.share_memory_()
+        weight_tensor = torch.empty(out_features, in_features, device="cpu")
+        weight_tensor.share_memory_()
+        self.weight = nn.Parameter(weight_tensor)
+
+        if bias:
+            bias_tensor = torch.empty(out_features, device="cpu")
+            bias_tensor.share_memory_()
+            self.bias = nn.Parameter(bias_tensor)
+        else:
+            self.bias = None
 
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         if self.bias is not None:
