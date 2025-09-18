@@ -184,6 +184,33 @@ class CPUBouncingLinear(nn.Module):
             bound = 1 / fan_in**0.5
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def _apply(self, fn):
+        """
+        Override the default _apply method to prevent moving parameters to GPU.
+        
+        This method is called by .to(), .cuda(), .cpu(), etc.
+        We ensure that `self.weight` and `self.bias` always remain on the CPU,
+        while allowing other potential buffers or submodules to be moved as intended.
+        """
+        # First, call the parent's _apply to handle submodules and non-parameter buffers.
+        # This is important for proper module behavior.
+        super()._apply(fn)
+        
+        # Explicitly keep the main parameters on the CPU.
+        # The `fn` function contains the target device and dtype. By calling `cpu()`,
+        # we ignore the target device for these specific parameters.
+        if self.weight is not None:
+            self.weight.data = self.weight.data.cpu()
+            if self.weight.grad is not None:
+                self.weight.grad.data = self.weight.grad.data.cpu()
+
+        if self.bias is not None:
+            self.bias.data = self.bias.data.cpu()
+            if self.bias.grad is not None:
+                self.bias.grad.data = self.bias.grad.data.cpu()
+        
+        return self
+    
     def forward(self, x):
         """
         Forward pass through CPU linear layer.
