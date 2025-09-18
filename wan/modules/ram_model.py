@@ -13,7 +13,7 @@ import logging
 from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
 
 # 1. Import the new CPUBouncingLinear layer
-from linear import CPUBouncingLinear
+from wan.modules.linear import CPUBouncingLinear
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
