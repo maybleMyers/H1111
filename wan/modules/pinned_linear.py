@@ -56,6 +56,10 @@ def register_weight_in_pinned_buffer(name: str, weight: torch.Tensor) -> bool:
     if PINNED_BUFFER is None:
         return False
 
+    # Skip meta tensors (they don't have data yet)
+    if weight.is_meta:
+        return False
+
     # Calculate required size
     numel = weight.numel()
 
@@ -198,6 +202,10 @@ class PinnedMemoryLinear(nn.Module):
         """Register this layer's weights in the pinned memory buffer."""
         global PINNED_BUFFER
 
+        # Skip if weights are meta tensors (will register after loading real weights)
+        if self.weight.is_meta:
+            return
+
         # Initialize buffer if not already done
         if PINNED_BUFFER is None:
             initialize_pinned_buffer()
@@ -211,7 +219,7 @@ class PinnedMemoryLinear(nn.Module):
             if success:
                 logger.debug(f"Registered {self.layer_id} in pinned buffer")
             else:
-                logger.debug(f"Could not register {self.layer_id} in pinned buffer (full or failed)")
+                logger.debug(f"Could not register {self.layer_id} in pinned buffer (full, meta, or failed)")
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
