@@ -898,6 +898,7 @@ def pusa_batch_handler(
     prompt: str,
     negative_prompt: str,
     input_video: str,
+    video_length: int,
     enable_extension: bool,
     extend_frames: int,
     noise_multipliers: str,
@@ -986,6 +987,7 @@ def pusa_batch_handler(
             "--height", str(height),
             "--fps", str(fps),
             "--seed", str(current_seed),
+            "--video_length", str(video_length),
             "--output_dir", str(save_path),
             "--num_persistent_params", f"{num_persistent_params}e9"
         ]
@@ -13211,6 +13213,7 @@ with gr.Blocks(
         pusa_prompt,
         pusa_negative_prompt,
         pusa_input_video,
+        pusa_video_length,
         pusa_enable_extension,
         pusa_extend_frames,
         pusa_noise_multipliers,

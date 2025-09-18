@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--height", type=int, default=480, help="Height of the output video. Default: 480")
     parser.add_argument("--fps", type=int, default=24, help="fps to save video in")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation. Default: 0")
+    parser.add_argument("--video_length", type=int, default=81, help="Number of frames to generate. Default: 81")
     parser.add_argument("--preview", type=int, default=0, help="Preview interval in steps (0 to disable)")
     args = parser.parse_args()
 
@@ -269,7 +270,7 @@ def main():
         conditioning_indices=cond_pos_list,
         conditioning_noise_multipliers=noise_mult_list,
         num_inference_steps=args.num_inference_steps,
-        height=args.height, width=args.width, num_frames=81,
+        height=args.height, width=args.width, num_frames=args.video_length,
         seed=args.seed, tiled=True,
         switch_DiT_boundary=args.switch_DiT_boundary,
         cfg_scale=args.cfg_scale,
@@ -311,7 +312,7 @@ def main():
         "seed": args.seed,
         "width": args.width,
         "height": args.height,
-        "num_frames": 81,
+        "num_frames": args.video_length,
         "fps": args.fps,
         "num_inference_steps": args.num_inference_steps,
         "cfg_scale": args.cfg_scale,
