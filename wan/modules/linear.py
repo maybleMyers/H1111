@@ -77,8 +77,8 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # make compute stream wait for this transfer
         torch.cuda.current_stream().wait_event(evt)
-
-        out = F.linear(x, w, b)
+        x_fp32 = x.to(torch.float32)
+        out = F.linear(x_fp32, w, b)
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
