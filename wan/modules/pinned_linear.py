@@ -229,6 +229,19 @@ class PinnedMemoryLinear(nn.Module):
         # Re-register in pinned buffer after loading new weights
         self._register_in_pinned_buffer()
 
+    def _apply(self, fn):
+        """Override to ensure weights ALWAYS stay on CPU."""
+        # Apply function to everything except weights
+        super()._apply(lambda t: t if t is self.weight or t is self.bias else fn(t))
+
+        # Ensure weights stay on CPU
+        if self.weight is not None and not self.weight.is_cpu:
+            self.weight.data = self.weight.data.cpu()
+        if self.bias is not None and self.bias is not None and not self.bias.is_cpu:
+            self.bias.data = self.bias.data.cpu()
+
+        return self
+
     def forward(self, x):
         """Forward pass using pinned memory transfers."""
         return PinnedLinearFn.apply(
