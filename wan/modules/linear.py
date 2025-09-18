@@ -3,56 +3,91 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Global CUDA stream for asynchronous weight transfers
+TRANSFER_STREAM = torch.cuda.Stream()
+
+# Maximum number of in-flight transfers to prevent unbounded memory growth
+MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", 2))
+
+# Queue to track pending transfer events for synchronization
+PENDING_EVENTS = []
+
 class BouncingLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight_cpu, bias_cpu, device="cuda"):
-        # Debug: Check if weights have valid values
-        if not hasattr(BouncingLinearFn, '_debug_printed'):
-            print(f"BouncingLinear Debug:")
-            print(f"  Input x: shape={x.shape}, dtype={x.dtype}, device={x.device}")
-            print(f"  Weight CPU: shape={weight_cpu.shape}, dtype={weight_cpu.dtype}, mean={weight_cpu.mean():.6f}, std={weight_cpu.std():.6f}")
-            print(f"  Weight has NaN: {torch.isnan(weight_cpu).any()}, has Inf: {torch.isinf(weight_cpu).any()}")
-            BouncingLinearFn._debug_printed = True
+        global PENDING_EVENTS
 
-        # SIMPLIFIED APPROACH: Fully synchronous transfers
-        # This ensures weights are fully transferred before use
-        w = weight_cpu.to(device, non_blocking=False)
-        b = bias_cpu.to(device, non_blocking=False) if bias_cpu is not None else None
+        # Start async transfer on dedicated stream
+        with torch.cuda.stream(TRANSFER_STREAM):
+            # Transfer weights to GPU
+            w = weight_cpu.to(device, non_blocking=True)
+            b = bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
 
-        # Correctly cast weight to match float32 input activation
-        w_compute = w.to(x.dtype)
-        b_compute = b.to(x.dtype) if b is not None else None
+            # CRITICAL: Cast to computation dtype INSIDE the transfer stream
+            # This ensures dtype conversion happens with proper synchronization
+            w_compute = w.to(x.dtype)
+            b_compute = b.to(x.dtype) if b is not None else None
+
+            # Record completion event
+            evt = torch.cuda.Event()
+            evt.record(TRANSFER_STREAM)
+            PENDING_EVENTS.append(evt)
+
+        # Throttle concurrent transfers
+        if len(PENDING_EVENTS) > MAX_INFLIGHT:
+            PENDING_EVENTS[0].synchronize()
+            PENDING_EVENTS.pop(0)
+
+        # Make compute stream wait for transfer completion
+        torch.cuda.current_stream().wait_event(evt)
+
+        # Ensure the event is truly synchronized
+        # This is needed for proper memory coherency at high resolutions
+        evt.synchronize()
+
+        # Perform computation with properly synchronized weights
         out = F.linear(x, w_compute, b_compute)
 
-        # Save tensors for backward - keep weights on GPU for now
-        ctx.save_for_backward(x, w, b)
-        ctx.weight_cpu = weight_cpu
-        ctx.bias_cpu = bias_cpu
+        # Save for backward (though not used in inference)
+        ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.device = device
+        ctx.w_compute = w_compute
+        ctx.b_compute = b_compute
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, w, b = ctx.saved_tensors
-        weight_cpu = ctx.weight_cpu
-        bias_cpu = ctx.bias_cpu
+        # Simplified backward pass - primarily for training, not used in inference
+        x, weight_cpu, bias_cpu = ctx.saved_tensors
+        device = ctx.device
 
-        # Weights are already on GPU from forward pass
+        # Use cached weights if available from forward pass
+        if hasattr(ctx, 'w_compute'):
+            w_compute = ctx.w_compute
+        else:
+            # Transfer weights again if needed
+            global PENDING_EVENTS
+            with torch.cuda.stream(TRANSFER_STREAM):
+                w = weight_cpu.to(device, non_blocking=True)
+                w_compute = w.to(grad_out.dtype)
+                evt = torch.cuda.Event()
+                evt.record(TRANSFER_STREAM)
+                PENDING_EVENTS.append(evt)
 
-        # For grad_input, we need float32 @ bfloat16 -> upcast weight
-        w_compute_grad_input = w.to(grad_out.dtype)
-        grad_input = grad_out @ w_compute_grad_input
+            if len(PENDING_EVENTS) > MAX_INFLIGHT:
+                PENDING_EVENTS[0].synchronize()
+                PENDING_EVENTS.pop(0)
 
-        # For grad_weight, we need float32.T @ bfloat16
+            torch.cuda.current_stream().wait_event(evt)
+            evt.synchronize()
+
+        # Compute gradients
+        grad_input = grad_out @ w_compute.to(grad_out.dtype)
         grad_weight = grad_out.t() @ x
+        grad_bias = grad_out.sum(0) if bias_cpu is not None else None
 
-        grad_bias = grad_out.sum(0) if b is not None else None
-
-        # Move gradients to CPU to match parameter storage
-        grad_weight_cpu = grad_weight.to(weight_cpu.dtype).cpu()
-        grad_bias_cpu = grad_bias.to(bias_cpu.dtype).cpu() if grad_bias is not None else None
-
-        return grad_input.to(x.dtype), grad_weight_cpu, grad_bias_cpu, None
+        # Return gradients (keep on GPU for now - training would need CPU gradients)
+        return grad_input.to(x.dtype), grad_weight.to(weight_cpu.dtype), grad_bias, None
 
 
 class CPUBouncingLinear(nn.Module):

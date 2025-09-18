@@ -10,13 +10,24 @@ from accelerate import init_empty_weights
 
 import logging
 
-from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
-
-# 1. Import the new CPUBouncingLinear layer
-from wan.modules.linear import CPUBouncingLinear
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
+
+# 1. Import the linear layer implementations
+import os
+USE_PINNED = os.getenv("USE_PINNED_LINEAR", "true").lower() == "true"
+
+if USE_PINNED:
+    try:
+        from wan.modules.pinned_linear import PinnedMemoryLinear as CPUBouncingLinear
+        logger.info("Using PinnedMemoryLinear for ultra-fast weight transfers")
+    except Exception as e:
+        logger.warning(f"Failed to import PinnedMemoryLinear: {e}, falling back to CPUBouncingLinear")
+        from wan.modules.linear import CPUBouncingLinear
+else:
+    from wan.modules.linear import CPUBouncingLinear
 
 from utils.device_utils import clean_memory_on_device
 
