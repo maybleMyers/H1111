@@ -383,6 +383,7 @@ class WanAttentionBlock(nn.Module):
 
     def _forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
 
+
         assert e.dtype == torch.float32
         e = self.modulation.to(torch.float32) + e
         e = e.chunk(6, dim=1)

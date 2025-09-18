@@ -54,7 +54,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
         w_compute_grad_input = w.to(grad_out.dtype)
         grad_input = grad_out @ w_compute_grad_input
-
+        
         grad_weight = grad_out.t() @ x
         
         grad_bias = grad_out.sum(0) if bias_cpu is not None else None
