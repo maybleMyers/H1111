@@ -2143,6 +2143,244 @@ def infinitetalk_batch_handler(
         
     yield all_generated_videos, None, "InfiniteTalk Batch complete.", ""
 
+# Wanimate handler function (based on wan22_batch_handler)
+def wanimate_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    reference_image: str,  # Changed from image_path to reference_image
+    drive_video: str,  # Added drive video for animation
+    mode: str,  # "animation" or "replacement"
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    batch_size: int,
+    save_path: str,
+    # Preprocessing options
+    run_preprocess: bool,
+    retarget: bool,
+    use_flux: bool,
+    # Advanced options
+    relighting_lora: bool,
+    refert_num: int,
+    clip_len: int,
+    # Model Paths & Performance
+    checkpoint_dir: str,
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_t5: bool,
+    vae_path: str,
+    t5_path: str,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    vae_fp32: bool,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    os.makedirs(save_path, exist_ok=True)
+
+    if not reference_image:
+        yield [], None, "Error: Reference image is required for Wanimate.", ""
+        return
+
+    if not drive_video:
+        yield [], None, "Error: Drive video is required for Wanimate.", ""
+        return
+
+    all_generated_videos = []
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting item..."
+
+        # --- Prepare command for Wanimate ---
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"wanimate_{run_id}"
+
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--animate_mode",
+            "--task", "animate",
+            "--prompt", str(prompt),
+            "--animate_reference", str(reference_image),
+            "--animate_drive_video", str(drive_video),
+            "--animate_checkpoint", str(checkpoint_dir),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--flow_shift", str(flow_shift),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+        ]
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Add mode-specific options
+        if mode == "replacement":
+            command.append("--animate_replace")
+            if relighting_lora:
+                command.append("--animate_relighting_lora")
+
+        # Preprocessing options
+        if run_preprocess:
+            command.append("--animate_preprocess")
+            if retarget:
+                command.append("--animate_retarget")
+            if use_flux:
+                command.append("--animate_use_flux")
+
+        # Advanced options
+        command.extend(["--animate_refert_num", str(refert_num)])
+        command.extend(["--animate_clip_len", str(clip_len)])
+
+        # Model paths
+        if vae_path and vae_path != "Default":
+            command.extend(["--vae", os.path.join("wan", vae_path)])
+        if t5_path and t5_path != "Default":
+            command.extend(["--t5", os.path.join("wan", t5_path)])
+
+        # Performance options
+        if fp8:
+            command.append("--fp8")
+        if fp8_t5:
+            command.append("--fp8_t5")
+        if mixed_dtype:
+            command.append("--mixed_dtype")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+
+        # Preview options
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # --- Execute Subprocess ---
+        print(f"Running Wanimate Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, None, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"WANIMATE_SUBPROCESS: {line_strip}")
+            progress_text_update = line_strip
+
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_elapsed = tqdm_match.group(3)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Processing"
+
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item:
+            params_for_meta = {
+                "model_type": "Wanimate",
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "reference_image": os.path.basename(reference_image) if reference_image else None,
+                "drive_video": os.path.basename(drive_video) if drive_video else None,
+                "mode": mode,
+                "width": width,
+                "height": height,
+                "frame_num": frame_num,
+                "fps": fps,
+                "checkpoint_dir": checkpoint_dir,
+                "seed": current_seed,
+                "sample_steps": sample_steps,
+                "flow_shift": flow_shift,
+                "sample_guide_scale": sample_guide_scale,
+                "preprocessing": {
+                    "run_preprocess": run_preprocess,
+                    "retarget": retarget,
+                    "use_flux": use_flux
+                },
+                "advanced": {
+                    "relighting_lora": relighting_lora,
+                    "refert_num": refert_num,
+                    "clip_len": clip_len
+                }
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+            all_generated_videos.append((current_video_file_for_item, f"Wanimate - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), None, status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, None, "Wanimate batch complete.", ""
+
 def save_framepack_defaults(*values):
     os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
     settings_to_save = {}
@@ -8108,6 +8346,163 @@ with gr.Blocks(
                 infinitetalk_wav2vec_dir = gr.Textbox(label="Wav2Vec Directory", value="wan/chinese-wav2vec2-base")
                 infinitetalk_t5_tokenizer_path = gr.Textbox(label="T5 Tokenizer Override (optional)", value="wan/google/umt5-xxl")
                 infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")
+
+        # Wanimate Tab (Character Animation/Replacement)
+        with gr.Tab(id=17, label="Wanimate") as wanimate_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    wanimate_prompt = gr.Textbox(
+                        scale=3,
+                        label="Scene Description",
+                        value="A person talking in an office environment.",
+                        lines=5
+                    )
+                    wanimate_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="low quality, blurry, distorted, deformed",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    wanimate_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    wanimate_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    wanimate_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    wanimate_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wanimate_progress_text")
+
+            with gr.Row():
+                wanimate_generate_btn = gr.Button("Generate Animation", elem_classes="green-btn")
+                wanimate_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    wanimate_reference_image = gr.Image(label="Reference Image (Required)", type="filepath")
+                    wanimate_drive_video = gr.Video(label="Drive Video (Required)", format="mp4")
+                    wanimate_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                    # Animation Mode Selection
+                    wanimate_mode = gr.Radio(
+                        label="Mode",
+                        choices=[
+                            ("Animation (Pose Transfer)", "animation"),
+                            ("Replacement (Character Swap)", "replacement")
+                        ],
+                        value="animation",
+                        info="Choose between animating the reference or replacing characters"
+                    )
+
+                    # Preprocessing Options
+                    with gr.Accordion("Preprocessing Pipeline", open=False):
+                        wanimate_run_preprocess = gr.Checkbox(
+                            label="Run Preprocessing",
+                            value=False,
+                            info="Process video to extract poses and masks"
+                        )
+                        with gr.Group(visible=False) as wanimate_preprocess_controls:
+                            wanimate_retarget = gr.Checkbox(
+                                label="Enable Pose Retargeting",
+                                value=False,
+                                info="Retarget poses to match reference character"
+                            )
+                            wanimate_use_flux = gr.Checkbox(
+                                label="Use FLUX for Image Editing",
+                                value=False,
+                                info="Use FLUX model for advanced pose retargeting (requires FLUX model)"
+                            )
+
+                    # Advanced Options
+                    with gr.Accordion("Advanced Options", open=False):
+                        wanimate_relighting_lora = gr.Checkbox(
+                            label="Use Relighting LoRA",
+                            value=False,
+                            info="Apply relighting LoRA for replacement mode"
+                        )
+                        wanimate_refert_num = gr.Radio(
+                            label="Temporal Guidance Frames",
+                            choices=[1, 5],
+                            value=1,
+                            info="Number of frames for temporal guidance"
+                        )
+                        wanimate_clip_len = gr.Number(
+                            label="Clip Length",
+                            value=77,
+                            minimum=9,
+                            maximum=201,
+                            step=4,
+                            info="Frames per clip (must be 4n+1)"
+                        )
+
+                    gr.Markdown("### Generation Parameters")
+                    # Width and height inputs
+                    with gr.Row():
+                        wanimate_width = gr.Number(label="Width", value=832, interactive=True)
+                        wanimate_calc_height_btn = gr.Button("→")
+                        wanimate_calc_width_btn = gr.Button("←")
+                        wanimate_height = gr.Number(label="Height", value=480, interactive=True)
+                    wanimate_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    wanimate_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    wanimate_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    wanimate_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    wanimate_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                    with gr.Row():
+                        wanimate_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        wanimate_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    wanimate_output = gr.Gallery(
+                        label="Generated Animations (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_wanimate", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        wanimate_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        wanimate_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        wanimate_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="wanimate_preview_gallery"
+                        )
+
+            with gr.Accordion("Model Configuration", open=True):
+                with gr.Row():
+                    wanimate_checkpoint_dir = gr.Textbox(
+                        label="Checkpoint Directory",
+                        value="wan/animate",
+                        info="Path to Wanimate model checkpoint directory"
+                    )
+                    wanimate_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    wanimate_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    wanimate_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+
+                with gr.Accordion("Performance Settings", open=False):
+                    with gr.Row():
+                        wanimate_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                        wanimate_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                    with gr.Row():
+                        wanimate_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                        wanimate_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                        wanimate_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                        wanimate_vae_fp32 = gr.Checkbox(
+                            label="Use FP32 VAE (higher quality, more VRAM)",
+                            value=True,
+                        )
+
+            with gr.Row():
+                wanimate_save_path = gr.Textbox(label="Save Path", value="outputs/wanimate")
+                wanimate_selected_index = gr.Number(value=-1, visible=False)  # Hidden component for tracking
 
         # Text to Video Tab
         with gr.Tab(id=1, label="Hunyuan-t2v"):
@@ -14103,6 +14498,145 @@ with gr.Blocks(
     # Phantom Tab Event Handlers
     phantom_prompt.change(fn=count_prompt_tokens, inputs=phantom_prompt, outputs=phantom_token_counter)
     phantom_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Wanimate Tab Event Handlers
+    wanimate_prompt.change(fn=count_prompt_tokens, inputs=wanimate_prompt, outputs=wanimate_token_counter)
+    wanimate_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Wanimate preprocessing visibility toggle
+    wanimate_run_preprocess.change(
+        fn=lambda x: gr.update(visible=x),
+        inputs=[wanimate_run_preprocess],
+        outputs=[wanimate_preprocess_controls]
+    )
+
+    # Wanimate dimension calculators (reuse existing functions)
+    def calculate_wanimate_width(height, original_dims):
+        if not original_dims:
+            return gr.update()
+        try:
+            orig_width, orig_height = map(int, original_dims.split('x'))
+            aspect_ratio = orig_width / orig_height
+            new_width = round(height * aspect_ratio)
+            # Round to nearest 16
+            new_width = round(new_width / 16) * 16
+            return gr.update(value=new_width)
+        except:
+            return gr.update()
+
+    def calculate_wanimate_height(width, original_dims):
+        if not original_dims:
+            return gr.update()
+        try:
+            orig_width, orig_height = map(int, original_dims.split('x'))
+            aspect_ratio = orig_height / orig_width
+            new_height = round(width * aspect_ratio)
+            # Round to nearest 16
+            new_height = round(new_height / 16) * 16
+            return gr.update(value=new_height)
+        except:
+            return gr.update()
+
+    wanimate_calc_height_btn.click(
+        fn=calculate_wanimate_height,
+        inputs=[wanimate_width, wanimate_original_dims],
+        outputs=[wanimate_height]
+    )
+
+    wanimate_calc_width_btn.click(
+        fn=calculate_wanimate_width,
+        inputs=[wanimate_height, wanimate_original_dims],
+        outputs=[wanimate_width]
+    )
+
+    # Random seed button
+    wanimate_random_seed_btn.click(
+        fn=set_random_seed,
+        outputs=wanimate_seed
+    )
+
+    # Model refresh functionality
+    def update_wanimate_model_dropdowns(checkpoint_dir: str):
+        """Update Wanimate model dropdowns based on folder contents"""
+        return [
+            gr.update(choices=get_wan_of_vae_models(checkpoint_dir)),
+            gr.update(choices=get_wan_of_t5_models(checkpoint_dir))
+        ]
+
+    wanimate_refresh_models_btn.click(
+        fn=update_wanimate_model_dropdowns,
+        inputs=[wanimate_checkpoint_dir],
+        outputs=[wanimate_vae_path, wanimate_t5_path]
+    )
+
+    # Connect generate button to handler
+    wanimate_generate_btn.click(
+        fn=wanimate_batch_handler,
+        inputs=[
+            wanimate_prompt,
+            wanimate_negative_prompt,
+            wanimate_reference_image,
+            wanimate_drive_video,
+            wanimate_mode,
+            wanimate_width,
+            wanimate_height,
+            wanimate_frame_num,
+            wanimate_fps,
+            wanimate_seed,
+            wanimate_sample_steps,
+            wanimate_flow_shift,
+            wanimate_sample_guide_scale,
+            wanimate_batch_size,
+            wanimate_save_path,
+            # Preprocessing options
+            wanimate_run_preprocess,
+            wanimate_retarget,
+            wanimate_use_flux,
+            # Advanced options
+            wanimate_relighting_lora,
+            wanimate_refert_num,
+            wanimate_clip_len,
+            # Model Paths & Performance
+            wanimate_checkpoint_dir,
+            wanimate_attn_mode,
+            wanimate_mixed_dtype,
+            wanimate_block_swap,
+            wanimate_fp8,
+            wanimate_fp8_t5,
+            wanimate_vae_path,
+            wanimate_t5_path,
+            # Previews
+            wanimate_enable_preview,
+            wanimate_preview_steps,
+            wanimate_vae_fp32,
+        ],
+        outputs=[wanimate_output, wanimate_preview_output, wanimate_batch_progress, wanimate_progress_text],
+        queue=True
+    )
+
+    # Gallery selection handler
+    def handle_wanimate_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    wanimate_output.select(fn=handle_wanimate_gallery_select, outputs=wanimate_selected_index)
+
+    # Update dimensions when video is loaded
+    def update_wanimate_video_dimensions(video_path):
+        """Extract video dimensions and update UI"""
+        if not video_path:
+            return gr.update(), gr.update(), gr.update()
+
+        info = get_video_info(video_path)
+        if info:
+            original_dims_str = f"{info['width']}x{info['height']}"
+            return gr.update(value=info['width']), gr.update(value=info['height']), gr.update(value=original_dims_str)
+        return gr.update(), gr.update(), gr.update()
+
+    wanimate_drive_video.change(
+        fn=update_wanimate_video_dimensions,
+        inputs=[wanimate_drive_video],
+        outputs=[wanimate_width, wanimate_height, wanimate_original_dims]
+    )
 
     phantom_recommend_flow_btn.click(
         fn=recommend_wanx_flow_shift, # Reusing WanX logic as it's dimension-based

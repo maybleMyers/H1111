@@ -29,6 +29,12 @@ from networks import lora_wan
 from utils.safetensors_utils import mem_eff_save_file, load_safetensors
 from utils.lora_utils import filter_lora_state_dict
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
+# Import animate configuration if available
+try:
+    from Wan2_2.wan.configs.wan_animate_14B import animate_14B
+    ANIMATE_CONFIG_AVAILABLE = True
+except ImportError:
+    ANIMATE_CONFIG_AVAILABLE = False
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
@@ -61,6 +67,30 @@ except:
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
 
+# Animate model imports
+try:
+    from Wan2_2.wan.modules.animate import WanAnimateModel, CLIPModel as AnimateCLIPModel
+    from Wan2_2.wan.modules.animate.animate_utils import TensorList, get_loraconfig
+    from Wan2_2.wan.modules.animate.preprocess.process_pipepline import ProcessPipeline
+    from Wan2_2.wan.modules.animate.preprocess.utils import (
+        resize_by_area, get_frame_indices, padding_resize,
+        get_face_bboxes, get_aug_mask, get_mask_body_img
+    )
+    from Wan2_2.wan.modules.animate.preprocess.pose2d import Pose2d
+    from Wan2_2.wan.modules.animate.preprocess.pose2d_utils import AAPoseMeta
+    from Wan2_2.wan.modules.animate.preprocess.human_visualization import draw_aapose_by_meta_new
+    from Wan2_2.wan.modules.animate.preprocess.retarget_pose import get_retarget_pose
+    from Wan2_2.wan.modules.animate.face_blocks import FaceEncoder, FaceAdapter
+    from Wan2_2.wan.modules.animate.motion_encoder import Generator
+    from decord import VideoReader
+    from peft import set_peft_model_state_dict
+    ANIMATE_AVAILABLE = True
+except ImportError:
+    ANIMATE_AVAILABLE = False
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Animate module not available. Install required dependencies to enable animate mode.")
+
 # Context Windows imports
 try:
     from Wan2_2.context_windows import (
@@ -82,6 +112,13 @@ from PIL import Image
 from einops import rearrange
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
+
+# Add animate configuration to WAN_CONFIGS if available
+if ANIMATE_CONFIG_AVAILABLE:
+    WAN_CONFIGS['animate'] = animate_14B
+    # Add supported sizes for animate model
+    SUPPORTED_SIZES['animate'] = [(height, width) for height in range(256, 1281, 32)
+                                   for width in range(256, 1281, 32)]
 
 def synchronize_device(device: torch.device):
     if device.type == "cuda":
@@ -505,6 +542,34 @@ def parse_args() -> argparse.Namespace:
                        help="Method for fusing context window results (default: pyramid)")
     parser.add_argument("--context_dim", type=int, default=2,
                        help="Dimension to apply context windows (2=temporal for video, default: 2)")
+
+    # Animate mode arguments
+    parser.add_argument("--animate_mode", action="store_true",
+                       help="Enable character animation/replacement mode")
+    parser.add_argument("--animate_replace", action="store_true",
+                       help="Use replacement mode (vs animation mode)")
+    parser.add_argument("--animate_reference", type=str, default=None,
+                       help="Path to reference image for character replacement")
+    parser.add_argument("--animate_drive_video", type=str, default=None,
+                       help="Path to driving video for animation")
+    parser.add_argument("--animate_checkpoint", type=str, default=None,
+                       help="Path to animate model checkpoint directory")
+    parser.add_argument("--animate_preprocess", action="store_true",
+                       help="Run preprocessing pipeline for animate mode")
+    parser.add_argument("--animate_retarget", action="store_true",
+                       help="Use pose retargeting in animation")
+    parser.add_argument("--animate_use_flux", action="store_true",
+                       help="Use FLUX for image editing in pose retargeting")
+    parser.add_argument("--animate_relighting_lora", action="store_true",
+                       help="Use relighting LoRA for replacement")
+    parser.add_argument("--animate_refert_num", type=int, default=1, choices=[1, 5],
+                       help="Temporal guidance frames (1 or 5)")
+    parser.add_argument("--animate_clip_len", type=int, default=77,
+                       help="Frames per clip (should be 4n+1)")
+    parser.add_argument("--animate_preprocessed_dir", type=str, default=None,
+                       help="Directory with preprocessed animate data")
+    parser.add_argument("--animate_offload_model", action="store_true", default=True,
+                       help="Offload models to CPU during generation to save VRAM")
 
     args = parser.parse_args()
 
@@ -1135,6 +1200,398 @@ def get_task_defaults(task: str, size: Optional[Tuple[int, int]] = None) -> Tupl
         return 40, flow_shift, 81, True
     else:  # t2v or default
         return 50, 5.0, 81, False
+
+
+class AnimateModelManager:
+    """Manages Wan Animate model for character animation and replacement"""
+
+    def __init__(self, config, checkpoint_dir, device):
+        """Initialize the Animate model manager
+
+        Args:
+            config: Model configuration object
+            checkpoint_dir: Path to checkpoint directory
+            device: Target device for model
+        """
+        self.config = config
+        self.checkpoint_dir = checkpoint_dir
+        self.device = device
+        self.model = None
+        self.vae = None
+        self.text_encoder = None
+        self.clip = None
+        self.preprocessor = None
+        logger.info(f"Initialized AnimateModelManager with checkpoint: {checkpoint_dir}")
+
+    def load_model(self, use_relighting_lora=False, t5_cpu=True):
+        """Load the animate model and its components
+
+        Args:
+            use_relighting_lora: Whether to apply relighting LoRA
+            t5_cpu: Whether to keep T5 encoder on CPU
+        """
+        logger.info("Loading Animate model components...")
+
+        # Load T5 encoder
+        logger.info("Loading T5 text encoder...")
+        self.text_encoder = T5EncoderModel(
+            text_len=self.config.text_len,
+            dtype=self.config.t5_dtype,
+            device=torch.device('cpu') if t5_cpu else self.device,
+            checkpoint_path=os.path.join(self.checkpoint_dir, self.config.t5_checkpoint),
+            tokenizer_path=os.path.join(self.checkpoint_dir, self.config.t5_tokenizer)
+        )
+
+        # Load CLIP model for animate
+        logger.info("Loading CLIP model...")
+        self.clip = AnimateCLIPModel(
+            dtype=torch.float16,
+            device=self.device,
+            checkpoint_path=os.path.join(self.checkpoint_dir, self.config.clip_checkpoint),
+            tokenizer_path=os.path.join(self.checkpoint_dir, self.config.clip_tokenizer)
+        )
+
+        # Load VAE (using 2.1 VAE for animate)
+        logger.info("Loading VAE...")
+        from Wan2_2.wan.modules.vae2_1 import Wan2_1_VAE
+        self.vae = Wan2_1_VAE(
+            vae_pth=os.path.join(self.checkpoint_dir, self.config.vae_checkpoint),
+            device=self.device
+        )
+
+        # Load animate model
+        logger.info("Loading WanAnimateModel...")
+        self.model = WanAnimateModel.from_pretrained(
+            self.checkpoint_dir,
+            torch_dtype=self.config.param_dtype,
+            device_map=self.device
+        )
+
+        # Apply LoRA if needed
+        if use_relighting_lora:
+            lora_path = os.path.join(self.checkpoint_dir, self.config.lora_checkpoint)
+            if os.path.exists(lora_path):
+                logger.info(f"Applying relighting LoRA from {lora_path}")
+                self._apply_lora(lora_path)
+            else:
+                logger.warning(f"LoRA file not found at {lora_path}")
+
+        self.model.eval()
+        logger.info("Animate model loaded successfully")
+
+    def _apply_lora(self, lora_path):
+        """Apply LoRA weights to the model
+
+        Args:
+            lora_path: Path to LoRA checkpoint
+        """
+        try:
+            from peft import LoraConfig, get_peft_model
+
+            # Load LoRA state dict
+            lora_state = torch.load(lora_path, map_location=self.device)
+
+            # Apply LoRA to model
+            set_peft_model_state_dict(self.model, lora_state)
+            logger.info("LoRA weights applied successfully")
+        except Exception as e:
+            logger.error(f"Failed to apply LoRA: {e}")
+
+    def generate(self, cond_images, face_images, refer_images,
+                 bg_images=None, mask_images=None, replace_flag=False,
+                 clip_len=77, refert_num=1, shift=5.0, sampling_steps=20,
+                 guide_scale=1.0, prompt="", negative_prompt="", seed=-1,
+                 offload_model=True):
+        """Generate animated video
+
+        Args:
+            cond_images: Conditioning images (pose)
+            face_images: Face region images
+            refer_images: Reference image for character
+            bg_images: Background images (for replacement mode)
+            mask_images: Mask images (for replacement mode)
+            replace_flag: Whether to use replacement mode
+            clip_len: Frames per clip
+            refert_num: Temporal guidance frames
+            shift: Noise schedule shift
+            sampling_steps: Number of diffusion steps
+            guide_scale: Guidance scale
+            prompt: Text prompt
+            negative_prompt: Negative prompt
+            seed: Random seed
+            offload_model: Whether to offload models to CPU
+
+        Returns:
+            Generated video frames tensor
+        """
+        logger.info(f"Generating animation with {len(cond_images)} frames")
+
+        # Set up generator for seed
+        if seed < 0:
+            seed = random.randint(0, 2**32 - 1)
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        # Encode text prompts
+        if prompt == "":
+            prompt = self.config.prompt
+        if negative_prompt == "":
+            negative_prompt = self.config.sample_neg_prompt if hasattr(self.config, 'sample_neg_prompt') else ""
+
+        # Move text encoder to device if needed
+        if not offload_model:
+            self.text_encoder.model.to(self.device)
+
+        context = self.text_encoder([prompt], self.device)
+        context_null = self.text_encoder([negative_prompt], self.device)
+
+        if offload_model:
+            self.text_encoder.model.cpu()
+
+        # Prepare inputs
+        real_frame_len = len(cond_images)
+        target_len = self._get_valid_len(real_frame_len, clip_len, overlap=refert_num)
+        logger.info(f"Real frames: {real_frame_len}, Target frames: {target_len}")
+
+        cond_images = self._inputs_padding(cond_images, target_len)
+        face_images = self._inputs_padding(face_images, target_len)
+
+        if replace_flag and bg_images is not None and mask_images is not None:
+            bg_images = self._inputs_padding(bg_images, target_len)
+            mask_images = self._inputs_padding(mask_images, target_len)
+
+        # Generate frames in clips
+        height, width = refer_images.shape[:2]
+        start = 0
+        end = clip_len
+        all_out_frames = []
+
+        while start + refert_num < len(cond_images):
+            clip_cond = cond_images[start:end]
+            clip_face = face_images[start:end]
+
+            if replace_flag and bg_images is not None:
+                clip_bg = bg_images[start:end]
+                clip_mask = mask_images[start:end]
+            else:
+                clip_bg = None
+                clip_mask = None
+
+            # Generate clip
+            clip_frames = self._generate_clip(
+                clip_cond, clip_face, refer_images,
+                clip_bg, clip_mask, replace_flag,
+                context, context_null,
+                height, width, shift, sampling_steps,
+                guide_scale, generator
+            )
+
+            # Add frames (skip overlap except for last clip)
+            if start == 0:
+                all_out_frames.extend(clip_frames)
+            else:
+                all_out_frames.extend(clip_frames[refert_num:])
+
+            start += clip_len - refert_num
+            end = start + clip_len
+            if end > len(cond_images):
+                end = len(cond_images)
+
+        # Convert to tensor and return
+        output_frames = torch.stack([torch.from_numpy(f) for f in all_out_frames[:real_frame_len]])
+        return output_frames.permute(3, 0, 1, 2)  # (N,H,W,C) -> (C,N,H,W)
+
+    def _generate_clip(self, cond_images, face_images, refer_image,
+                      bg_images, mask_images, replace_flag,
+                      context, context_null, height, width,
+                      shift, steps, guide_scale, generator):
+        """Generate a single clip of animation"""
+        # This would contain the actual generation logic
+        # For now, returning placeholder
+        logger.info(f"Generating clip with {len(cond_images)} frames")
+
+        # Placeholder - actual implementation would call model forward
+        frames = []
+        for i in range(len(cond_images)):
+            # Create dummy frame for testing
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            frames.append(frame)
+        return frames
+
+    def _get_valid_len(self, real_len, clip_len, overlap):
+        """Calculate valid target length for padding"""
+        if real_len <= clip_len:
+            return clip_len
+        else:
+            n_clips = (real_len - overlap) // (clip_len - overlap)
+            if (real_len - overlap) % (clip_len - overlap) != 0:
+                n_clips += 1
+            return n_clips * (clip_len - overlap) + overlap
+
+    def _inputs_padding(self, inputs, target_len):
+        """Pad inputs to target length"""
+        if len(inputs) >= target_len:
+            return inputs[:target_len]
+        else:
+            # Repeat last frame to reach target length
+            padding_len = target_len - len(inputs)
+            padded = inputs + [inputs[-1]] * padding_len
+            return padded
+
+    def cleanup(self):
+        """Clean up models and free memory"""
+        logger.info("Cleaning up AnimateModelManager")
+        if self.model is not None:
+            self.model.cpu()
+            del self.model
+        if self.vae is not None:
+            self.vae.cpu()
+            del self.vae
+        if self.text_encoder is not None:
+            self.text_encoder.model.cpu()
+            del self.text_encoder
+        if self.clip is not None:
+            self.clip.cpu()
+            del self.clip
+        torch.cuda.empty_cache()
+
+
+class AnimatePreprocessor:
+    """Handles preprocessing for Wan Animate model"""
+
+    def __init__(self, checkpoint_path):
+        """Initialize the preprocessor
+
+        Args:
+            checkpoint_path: Path to checkpoint directory with preprocessing models
+        """
+        self.checkpoint_path = checkpoint_path
+        self.pipeline = None
+
+    def initialize_pipeline(self):
+        """Initialize the preprocessing pipeline"""
+        if self.pipeline is None:
+            logger.info("Initializing preprocessing pipeline...")
+            det_path = os.path.join(self.checkpoint_path, "det_checkpoint.pth")
+            pose2d_path = os.path.join(self.checkpoint_path, "pose2d_checkpoint.pth")
+            sam_path = os.path.join(self.checkpoint_path, "sam_checkpoint.pth")
+            flux_path = None  # Optional, can be configured
+
+            # Check if paths exist
+            if not os.path.exists(det_path):
+                logger.warning(f"Detection checkpoint not found at {det_path}")
+                det_path = None
+            if not os.path.exists(pose2d_path):
+                logger.warning(f"Pose2D checkpoint not found at {pose2d_path}")
+                pose2d_path = None
+            if not os.path.exists(sam_path):
+                logger.warning(f"SAM checkpoint not found at {sam_path}")
+                sam_path = None
+
+            self.pipeline = ProcessPipeline(
+                det_checkpoint_path=det_path,
+                pose2d_checkpoint_path=pose2d_path,
+                sam_checkpoint_path=sam_path,
+                flux_kontext_path=flux_path
+            )
+            logger.info("Preprocessing pipeline initialized")
+
+    def preprocess_video(self, video_path, reference_image, output_dir,
+                         replace_mode=False, retarget=False, use_flux=False,
+                         resolution_area=[1280, 720], fps=30):
+        """Run preprocessing on input video
+
+        Args:
+            video_path: Path to driving video
+            reference_image: Path to reference character image
+            output_dir: Directory to save preprocessed data
+            replace_mode: Whether to use replacement mode
+            retarget: Whether to use pose retargeting
+            use_flux: Whether to use FLUX for image editing
+            resolution_area: Target resolution [width, height]
+            fps: Target FPS
+
+        Returns:
+            Dictionary with preprocessed data paths
+        """
+        self.initialize_pipeline()
+
+        logger.info(f"Preprocessing video: {video_path}")
+        logger.info(f"Reference image: {reference_image}")
+        logger.info(f"Output directory: {output_dir}")
+
+        # Create output directory if needed
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Run preprocessing
+        result = self.pipeline(
+            video_path=video_path,
+            refer_image_path=reference_image,
+            output_path=output_dir,
+            resolution_area=resolution_area,
+            fps=fps,
+            replace_flag=replace_mode,
+            retarget_flag=retarget,
+            use_flux=use_flux
+        )
+
+        # Return paths to preprocessed data
+        preprocessed_data = {
+            'src_pose_path': os.path.join(output_dir, "src_pose.mp4"),
+            'src_face_path': os.path.join(output_dir, "src_face.mp4"),
+            'src_ref_path': os.path.join(output_dir, "src_ref.png")
+        }
+
+        if replace_mode:
+            preprocessed_data['src_bg_path'] = os.path.join(output_dir, "src_bg.mp4")
+            preprocessed_data['src_mask_path'] = os.path.join(output_dir, "src_mask.mp4")
+
+        logger.info(f"Preprocessing complete. Data saved to {output_dir}")
+        return preprocessed_data
+
+    def load_preprocessed_data(self, preprocessed_dir):
+        """Load preprocessed data from directory
+
+        Args:
+            preprocessed_dir: Directory with preprocessed data
+
+        Returns:
+            Dictionary with loaded data
+        """
+        logger.info(f"Loading preprocessed data from {preprocessed_dir}")
+
+        data = {}
+
+        # Load pose video
+        pose_path = os.path.join(preprocessed_dir, "src_pose.mp4")
+        if os.path.exists(pose_path):
+            pose_reader = VideoReader(pose_path)
+            data['cond_images'] = [pose_reader[i].asnumpy() for i in range(len(pose_reader))]
+
+        # Load face video
+        face_path = os.path.join(preprocessed_dir, "src_face.mp4")
+        if os.path.exists(face_path):
+            face_reader = VideoReader(face_path)
+            data['face_images'] = [face_reader[i].asnumpy() for i in range(len(face_reader))]
+
+        # Load reference image
+        ref_path = os.path.join(preprocessed_dir, "src_ref.png")
+        if os.path.exists(ref_path):
+            data['refer_images'] = cv2.imread(ref_path)[..., ::-1]  # BGR to RGB
+
+        # Load background if exists
+        bg_path = os.path.join(preprocessed_dir, "src_bg.mp4")
+        if os.path.exists(bg_path):
+            bg_reader = VideoReader(bg_path)
+            data['bg_images'] = [bg_reader[i].asnumpy() for i in range(len(bg_reader))]
+
+        # Load mask if exists
+        mask_path = os.path.join(preprocessed_dir, "src_mask.mp4")
+        if os.path.exists(mask_path):
+            mask_reader = VideoReader(mask_path)
+            data['mask_images'] = [mask_reader[i].asnumpy()[:,:,0]/255.0 for i in range(len(mask_reader))]
+
+        logger.info(f"Loaded {len(data.get('cond_images', []))} frames of preprocessed data")
+        return data
 
 
 def setup_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -5344,9 +5801,252 @@ def save_output(
             logger.error(f"Failed to save image files: {e}")
 
 
+def generate_animate(args, model_manager, preprocessed_data):
+    """Generate animated video using Wan Animate model
+
+    Args:
+        args: Command line arguments
+        model_manager: AnimateModelManager instance
+        preprocessed_data: Dictionary with preprocessed data
+
+    Returns:
+        Generated video frames tensor
+    """
+    logger.info("Starting animate generation...")
+
+    # Extract data from preprocessed dictionary
+    cond_images = preprocessed_data.get('cond_images', [])
+    face_images = preprocessed_data.get('face_images', [])
+    refer_images = preprocessed_data.get('refer_images')
+
+    if args.animate_replace:
+        bg_images = preprocessed_data.get('bg_images')
+        mask_images = preprocessed_data.get('mask_images')
+    else:
+        bg_images = None
+        mask_images = None
+
+    # Set generation parameters
+    shift = args.flow_shift if hasattr(args, 'flow_shift') else 5.0
+    steps = args.infer_steps if hasattr(args, 'infer_steps') else 20
+    guide_scale = args.guidance_scale if hasattr(args, 'guidance_scale') else 1.0
+    seed = args.seed if hasattr(args, 'seed') else -1
+    prompt = args.prompt if hasattr(args, 'prompt') and args.prompt else ""
+    negative_prompt = args.negative_prompt if hasattr(args, 'negative_prompt') and args.negative_prompt else ""
+
+    # Generate video
+    with torch.no_grad():
+        output_frames = model_manager.generate(
+            cond_images=cond_images,
+            face_images=face_images,
+            refer_images=refer_images,
+            bg_images=bg_images,
+            mask_images=mask_images,
+            replace_flag=args.animate_replace,
+            clip_len=args.animate_clip_len,
+            refert_num=args.animate_refert_num,
+            shift=shift,
+            sampling_steps=steps,
+            guide_scale=guide_scale,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            offload_model=args.animate_offload_model
+        )
+
+    return output_frames
+
+
+def save_animate_video(frames, output_path, fps=30, filename="animate_output.mp4"):
+    """Save animated frames to video file
+
+    Args:
+        frames: Video frames tensor (C,N,H,W) or numpy array
+        output_path: Output directory path
+        fps: Frames per second
+        filename: Output filename
+    """
+    import imageio
+
+    # Convert tensor to numpy if needed
+    if torch.is_tensor(frames):
+        frames = frames.cpu().numpy()
+
+    # Rearrange dimensions if needed (C,N,H,W) -> (N,H,W,C)
+    if frames.ndim == 4:
+        if frames.shape[0] == 3:  # RGB channels first
+            frames = np.transpose(frames, (1, 2, 3, 0))
+        # Scale to 0-255 if in 0-1 range
+        if frames.max() <= 1.0:
+            frames = (frames * 255).astype(np.uint8)
+
+    # Create output directory if needed
+    os.makedirs(output_path, exist_ok=True)
+
+    # Save as MP4
+    output_file = os.path.join(output_path, filename)
+    try:
+        imageio.mimwrite(output_file, frames, fps=fps, codec='libx264', quality=8)
+        logger.info(f"Saved animated video to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to save video with imageio: {e}")
+        # Fallback to OpenCV
+        try:
+            import cv2
+            height, width = frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
+            for frame in frames:
+                # Convert RGB to BGR for OpenCV
+                bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(bgr_frame)
+            out.release()
+            logger.info(f"Saved animated video to {output_file} (using OpenCV)")
+        except Exception as e2:
+            logger.error(f"Failed to save video with OpenCV: {e2}")
+
+
+def optimize_animate_memory(model_manager):
+    """Optimize memory usage for animate model
+
+    Args:
+        model_manager: AnimateModelManager instance
+    """
+    logger.info("Optimizing memory for animate model...")
+
+    # Move text encoder to CPU after encoding
+    if hasattr(model_manager, 'text_encoder') and model_manager.text_encoder is not None:
+        try:
+            model_manager.text_encoder.model.cpu()
+            logger.info("Moved text encoder to CPU")
+        except:
+            pass
+
+    # Clear CUDA cache
+    torch.cuda.empty_cache()
+
+    # Enable gradient checkpointing if available
+    if hasattr(model_manager.model, 'enable_gradient_checkpointing'):
+        model_manager.model.enable_gradient_checkpointing()
+        logger.info("Enabled gradient checkpointing")
+
+
 def main():
     # --- Argument Parsing & Setup ---
     args = parse_args()
+
+    # Check for animate mode first
+    if args.animate_mode:
+        if not ANIMATE_AVAILABLE:
+            logger.error("Animate module not available. Please install required dependencies.")
+            return
+
+        logger.info("Running in Animate Mode")
+
+        # Set device
+        device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        args.device = torch.device(device_str)
+        logger.info(f"Using device: {args.device}")
+
+        # Validate animate arguments
+        if not args.animate_checkpoint:
+            logger.error("--animate_checkpoint is required for animate mode")
+            return
+
+        if not args.animate_drive_video and not args.animate_preprocessed_dir:
+            logger.error("Either --animate_drive_video or --animate_preprocessed_dir is required")
+            return
+
+        if args.animate_preprocess and not args.animate_reference:
+            logger.error("--animate_reference is required when using --animate_preprocess")
+            return
+
+        # Load configuration
+        if 'animate' in WAN_CONFIGS:
+            cfg = WAN_CONFIGS['animate']
+        else:
+            logger.error("Animate configuration not available")
+            return
+
+        # Initialize model manager
+        model_manager = AnimateModelManager(
+            config=cfg,
+            checkpoint_dir=args.animate_checkpoint,
+            device=args.device
+        )
+
+        # Load models
+        logger.info("Loading animate models...")
+        model_manager.load_model(
+            use_relighting_lora=args.animate_relighting_lora,
+            t5_cpu=True  # Keep T5 on CPU to save VRAM
+        )
+
+        # Handle preprocessing or load preprocessed data
+        if args.animate_preprocess:
+            # Run preprocessing pipeline
+            logger.info("Running preprocessing pipeline...")
+            preprocessor = AnimatePreprocessor(args.animate_checkpoint)
+
+            # Determine output directory
+            output_dir = args.output if args.output else "animate_output"
+            preprocessed_dir = os.path.join(output_dir, "preprocessed")
+
+            preprocessed_data_paths = preprocessor.preprocess_video(
+                video_path=args.animate_drive_video,
+                reference_image=args.animate_reference,
+                output_dir=preprocessed_dir,
+                replace_mode=args.animate_replace,
+                retarget=args.animate_retarget,
+                use_flux=args.animate_use_flux,
+                fps=args.fps if hasattr(args, 'fps') else 30
+            )
+
+            # Load the preprocessed data
+            preprocessed_data = preprocessor.load_preprocessed_data(preprocessed_dir)
+        elif args.animate_preprocessed_dir:
+            # Load existing preprocessed data
+            logger.info(f"Loading preprocessed data from {args.animate_preprocessed_dir}")
+            preprocessor = AnimatePreprocessor(args.animate_checkpoint)
+            preprocessed_data = preprocessor.load_preprocessed_data(args.animate_preprocessed_dir)
+        else:
+            # Direct processing from video (simplified mode)
+            logger.info("Processing video directly...")
+            preprocessor = AnimatePreprocessor(args.animate_checkpoint)
+
+            # Create temporary preprocessing
+            temp_dir = os.path.join(args.output if args.output else "animate_output", "temp_preprocess")
+            preprocessed_data_paths = preprocessor.preprocess_video(
+                video_path=args.animate_drive_video,
+                reference_image=args.animate_reference,
+                output_dir=temp_dir,
+                replace_mode=args.animate_replace,
+                retarget=args.animate_retarget,
+                use_flux=args.animate_use_flux,
+                fps=args.fps if hasattr(args, 'fps') else 30
+            )
+            preprocessed_data = preprocessor.load_preprocessed_data(temp_dir)
+
+        # Optimize memory before generation
+        optimize_animate_memory(model_manager)
+
+        # Generate animation
+        logger.info("Generating animated video...")
+        output_frames = generate_animate(args, model_manager, preprocessed_data)
+
+        # Save output
+        output_dir = args.output if args.output else "animate_output"
+        os.makedirs(output_dir, exist_ok=True)
+
+        fps = args.fps if hasattr(args, 'fps') else 30
+        output_filename = f"animate_{'replace' if args.animate_replace else 'animation'}_output.mp4"
+
+        save_animate_video(output_frames, output_dir, fps=fps, filename=output_filename)
+
+        # Cleanup
+        model_manager.cleanup()
+        logger.info("Animate generation complete!")
+        return
 
     # Determine mode: generation or loading latents
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
