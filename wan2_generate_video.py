@@ -1264,7 +1264,7 @@ class AnimateModelManager:
         self.model = WanAnimateModel.from_pretrained(
             self.checkpoint_dir,
             torch_dtype=self.config.param_dtype,
-            device_map=self.device
+            device_map=str(self.device) if self.device.type != 'cpu' else 'cpu'
         )
 
         # Apply LoRA if needed
