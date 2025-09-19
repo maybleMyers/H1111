@@ -1231,7 +1231,7 @@ class AnimateModelManager:
             t5_cpu: Whether to keep T5 encoder on CPU
             blocks_to_swap: Number of blocks to swap to CPU for memory management
         """
-        logger.info("Loading Animate model components..."))
+        logger.info("Loading Animate model components...")
 
         # Load T5 encoder
         logger.info("Loading T5 text encoder...")
