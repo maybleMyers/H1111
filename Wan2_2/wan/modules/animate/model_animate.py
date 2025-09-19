@@ -19,6 +19,13 @@ from ...distributed.sequence_parallel import (
     get_world_size,
 )
 
+# Import block swapping utilities
+import sys
+import os
+# Add the parent directory to path to import from modules
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../..')))
+from modules.custom_offloading_utils import ModelOffloader, clean_memory_on_device
+
 
 from ..model import (
     Head,
@@ -310,6 +317,11 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # head
         self.head = HeadAnimate(dim, out_dim, patch_size, eps)
 
+        # offloading attributes for block swapping
+        self.blocks_to_swap = None
+        self.offloader = None
+        self.num_blocks = len(self.blocks)
+
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
@@ -432,12 +444,24 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context=context,
             context_lens=context_lens)
 
+        # Clean memory before blocks processing if using block swap
+        if self.blocks_to_swap:
+            clean_memory_on_device(device)
+
         if self.use_context_parallel:
             x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
 
         for idx, block in enumerate(self.blocks):
+            # Wait for block to be ready if using block swap
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(idx)
+
             x = block(x, **kwargs)
             x = self.after_transformer_block(idx, x, motion_vec)
+
+            # Submit block swap job after using block
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, idx)
 
         # head
         x = self.head(x, e)
@@ -495,6 +519,38 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         for m in self.time_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=.02)
+        nn.init.normal_(self.time_projection[-1].weight, std=.02)
 
-        # init output layer
-        nn.init.zeros_(self.head.head.weight)
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+        """Enable block swapping for memory management"""
+        self.blocks_to_swap = blocks_to_swap
+        self.num_blocks = len(self.blocks)
+
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 1
+        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+
+        self.offloader = ModelOffloader(
+            "wan_animate_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
+        )
+        print(
+            f"WanAnimateModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        """Move model to device except for blocks that will be swapped"""
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_blocks = self.blocks
+            self.blocks = None
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.blocks = save_blocks
+
+    def prepare_block_swap_before_forward(self):
+        """Prepare block devices before forward pass"""
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
