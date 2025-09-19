@@ -17,17 +17,23 @@ from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
 
 # 1. Import the linear layer implementations
 import os
-USE_PINNED = os.getenv("USE_PINNED_LINEAR", "true").lower() == "true"
+USE_PINNED = os.getenv("USE_PINNED_LINEAR", "false").lower() == "true"
 
-if USE_PINNED:
-    try:
-        from wan.modules.pinned_linear import PinnedMemoryLinear as CPUBouncingLinear
-        logger.info("Using PinnedMemoryLinear for ultra-fast weight transfers")
-    except Exception as e:
-        logger.warning(f"Failed to import PinnedMemoryLinear: {e}, falling back to CPUBouncingLinear")
+# Prioritize the improved RamTorch implementation
+try:
+    from RamTorch.ramtorch.modules.linear import CPUBouncingLinear
+    logger.info("Using improved RamTorch CPUBouncingLinear with double buffering")
+except ImportError as e:
+    logger.warning(f"Failed to import RamTorch implementation: {e}, falling back to WAN implementations")
+    if USE_PINNED:
+        try:
+            from wan.modules.pinned_linear import PinnedMemoryLinear as CPUBouncingLinear
+            logger.info("Using PinnedMemoryLinear for ultra-fast weight transfers")
+        except Exception as e:
+            logger.warning(f"Failed to import PinnedMemoryLinear: {e}, falling back to local CPUBouncingLinear")
+            from wan.modules.linear import CPUBouncingLinear
+    else:
         from wan.modules.linear import CPUBouncingLinear
-else:
-    from wan.modules.linear import CPUBouncingLinear
 
 from utils.device_utils import clean_memory_on_device
 
