@@ -6027,7 +6027,7 @@ def main():
             preprocessor = AnimatePreprocessor(args.animate_checkpoint)
 
             # Create temporary preprocessing
-            temp_dir = os.path.join(args.output if args.output else "animate_output", "temp_preprocess")
+            temp_dir = os.path.join(args.save_path if args.save_path else "animate_output", "temp_preprocess")
             preprocessed_data_paths = preprocessor.preprocess_video(
                 video_path=args.animate_drive_video,
                 reference_image=args.animate_reference,
