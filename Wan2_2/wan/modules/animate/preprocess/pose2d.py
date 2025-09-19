@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import onnxruntime
 
-from pose2d_utils import (
+from .pose2d_utils import (
     read_img,
     box_convert_simple,
     bbox_from_detector,

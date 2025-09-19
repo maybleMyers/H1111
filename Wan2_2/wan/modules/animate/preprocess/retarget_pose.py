@@ -7,7 +7,7 @@ from tqdm import tqdm
 import math 
 from typing import NamedTuple, List
 import copy
-from pose2d_utils import AAPoseMeta
+from .pose2d_utils import AAPoseMeta
 
 
 # load skeleton name and bone lines

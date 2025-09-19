@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, List
 import random
-from pose2d_utils import AAPoseMeta
+from .pose2d_utils import AAPoseMeta
 
 
 def draw_handpose(canvas, keypoints, hand_score_th=0.6):
