@@ -466,13 +466,11 @@ class T5EncoderModel:
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
-        # init model
-        with init_empty_weights():
-            model = umt5_xxl(encoder_only=True, return_tokenizer=False)
-
+        # Initialize model directly on CPU first
+        model = umt5_xxl(encoder_only=True, return_tokenizer=False)
         model = model.eval().requires_grad_(False)
-        
-        # Load model weights first to detect original dtype
+
+        # Load model weights
         if checkpoint_path is not None:
             logger.info(f"loading {checkpoint_path}")
             model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
@@ -484,14 +482,14 @@ class T5EncoderModel:
                 sd = torch.load(weight_path, map_location="cpu", weights_only=True)
             # remove prefix "encoder." from the state dict
             sd = {k.replace("encoder.", ""): v for k, v in sd.items()}
-            model.load_state_dict(sd, strict=True, assign=True)
+            model.load_state_dict(sd, strict=False)
 
         # Detect original model dtype from weights
         original_dtype = None
         for param in model.parameters():
             original_dtype = param.dtype
             break
-        
+
         # Determine target dtype: preserve original unless fp8 mode or explicit override
         if fp8:
             target_dtype = torch.float8_e4m3fn
