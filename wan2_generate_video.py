@@ -1482,9 +1482,10 @@ class AnimatePreprocessor:
         """Initialize the preprocessing pipeline"""
         if self.pipeline is None:
             logger.info("Initializing preprocessing pipeline...")
-            det_path = os.path.join(self.checkpoint_path, "det_checkpoint.pth")
-            pose2d_path = os.path.join(self.checkpoint_path, "pose2d_checkpoint.pth")
-            sam_path = os.path.join(self.checkpoint_path, "sam_checkpoint.pth")
+            # Use actual checkpoint paths from directory structure
+            det_path = os.path.join(self.checkpoint_path, "process_checkpoint", "det", "yolov10m.onnx")
+            pose2d_path = os.path.join(self.checkpoint_path, "process_checkpoint", "pose2d", "vitpose_h_wholebody.onnx")
+            sam_path = os.path.join(self.checkpoint_path, "process_checkpoint", "sam2", "sam2_hiera_large.pt")
             flux_path = None  # Optional, can be configured
 
             # Check if paths exist
