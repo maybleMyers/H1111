@@ -1,6 +1,6 @@
-torch==2.7.0+cu128
-torchvision==0.22.0+cu128 
-torchaudio==2.7.0
+torch
+torchvision
+torchaudio
 absl-py==2.1.0
 accelerate==1.2.1
 aiofiles==23.2.1
