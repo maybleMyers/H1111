@@ -1261,11 +1261,13 @@ class AnimateModelManager:
 
         # Load animate model
         logger.info("Loading WanAnimateModel...")
+        # Load model on CPU first to avoid device issues with safetensors
         self.model = WanAnimateModel.from_pretrained(
             self.checkpoint_dir,
-            torch_dtype=self.config.param_dtype,
-            device_map=str(self.device) if self.device.type != 'cpu' else 'cpu'
+            torch_dtype=self.config.param_dtype
         )
+        # Then move to target device
+        self.model = self.model.to(self.device)
 
         # Apply LoRA if needed
         if use_relighting_lora:
