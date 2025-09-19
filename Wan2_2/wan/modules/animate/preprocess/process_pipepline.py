@@ -3,9 +3,24 @@ import os
 import numpy as np
 import shutil
 import torch
-from diffusers import FluxKontextPipeline
+
+# Try to import FluxKontextPipeline (optional, only for FLUX retargeting)
+try:
+    from diffusers import FluxKontextPipeline
+    FLUX_AVAILABLE = True
+except ImportError:
+    FluxKontextPipeline = None
+    FLUX_AVAILABLE = False
+
 import cv2
-from loguru import logger
+
+# Try to import loguru (optional for logging)
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+
 from PIL import Image
 try:
     import moviepy.editor as mpy
@@ -13,27 +28,51 @@ except:
     import moviepy as mpy
 
 from decord import VideoReader
-from pose2d import Pose2d
-from pose2d_utils import AAPoseMeta
-from utils import resize_by_area, get_frame_indices, padding_resize, get_face_bboxes, get_aug_mask, get_mask_body_img
-from human_visualization import draw_aapose_by_meta_new
-from retarget_pose import get_retarget_pose
-import sam2.modeling.sam.transformer as transformer
-transformer.USE_FLASH_ATTN = False
-transformer.MATH_KERNEL_ON = True
-transformer.OLD_GPU = True
-from sam_utils import build_sam2_video_predictor
+from .pose2d import Pose2d
+from .pose2d_utils import AAPoseMeta
+from .utils import resize_by_area, get_frame_indices, padding_resize, get_face_bboxes, get_aug_mask, get_mask_body_img
+from .human_visualization import draw_aapose_by_meta_new
+from .retarget_pose import get_retarget_pose
+
+# Try to import SAM2 (optional for mask generation)
+try:
+    import sam2.modeling.sam.transformer as transformer
+    transformer.USE_FLASH_ATTN = False
+    transformer.MATH_KERNEL_ON = True
+    transformer.OLD_GPU = True
+    from .sam_utils import build_sam2_video_predictor
+    SAM_AVAILABLE = True
+except ImportError:
+    SAM_AVAILABLE = False
+    build_sam2_video_predictor = None
 
 
 class ProcessPipeline():
-    def __init__(self, det_checkpoint_path, pose2d_checkpoint_path, sam_checkpoint_path, flux_kontext_path):
-        self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
+    def __init__(self, det_checkpoint_path=None, pose2d_checkpoint_path=None, sam_checkpoint_path=None, flux_kontext_path=None):
+        # Initialize Pose2D if checkpoints are provided
+        if pose2d_checkpoint_path is not None and det_checkpoint_path is not None:
+            self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
+        else:
+            self.pose2d = None
+            logger.info("Pose2D not initialized - checkpoints not provided")
 
+        # Initialize SAM if available and checkpoint provided
         model_cfg = "sam2_hiera_l.yaml"
-        if sam_checkpoint_path is not None:
+        if sam_checkpoint_path is not None and SAM_AVAILABLE:
             self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path)
-        if flux_kontext_path is not None:
+        elif sam_checkpoint_path is not None:
+            logger.warning("SAM2 not available. Mask generation will be disabled.")
+            self.predictor = None
+        else:
+            self.predictor = None
+        # Initialize FLUX if available and path provided
+        if flux_kontext_path is not None and FLUX_AVAILABLE:
             self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
+        elif flux_kontext_path is not None:
+            logger.warning("FluxKontextPipeline not available. FLUX retargeting will be disabled.")
+            self.flux_kontext = None
+        else:
+            self.flux_kontext = None
 
     def __call__(self, video_path, refer_image_path, output_path, resolution_area=[1280, 720], fps=30, iterations=3, k=7, w_len=1, h_len=1, retarget_flag=False, use_flux=False, replace_flag=False):
         if replace_flag:
