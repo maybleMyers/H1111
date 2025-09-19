@@ -1223,14 +1223,15 @@ class AnimateModelManager:
         self.preprocessor = None
         logger.info(f"Initialized AnimateModelManager with checkpoint: {checkpoint_dir}")
 
-    def load_model(self, use_relighting_lora=False, t5_cpu=True):
+    def load_model(self, use_relighting_lora=False, t5_cpu=True, blocks_to_swap=0):
         """Load the animate model and its components
 
         Args:
             use_relighting_lora: Whether to apply relighting LoRA
             t5_cpu: Whether to keep T5 encoder on CPU
+            blocks_to_swap: Number of blocks to swap to CPU for memory management
         """
-        logger.info("Loading Animate model components...")
+        logger.info("Loading Animate model components..."))
 
         # Load T5 encoder
         logger.info("Loading T5 text encoder...")
@@ -1261,13 +1262,28 @@ class AnimateModelManager:
 
         # Load animate model
         logger.info("Loading WanAnimateModel...")
+        # Determine loading device based on blocks_to_swap
+        loading_device = "cpu" if blocks_to_swap > 0 else self.device
+
         # Load model on CPU first to avoid device issues with safetensors
         self.model = WanAnimateModel.from_pretrained(
             self.checkpoint_dir,
             torch_dtype=self.config.param_dtype
         )
-        # Then move to target device
-        self.model = self.model.to(self.device)
+
+        # Handle block swapping for memory management
+        if blocks_to_swap > 0:
+            logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {self.device}")
+            if hasattr(self.model, 'enable_block_swap'):
+                self.model.enable_block_swap(blocks_to_swap, self.device, supports_backward=False)
+                self.model.move_to_device_except_swap_blocks(self.device)
+                self.model.prepare_block_swap_before_forward()
+            else:
+                logger.warning("Model does not support block swapping, moving entire model to device")
+                self.model = self.model.to(self.device)
+        else:
+            # Move entire model to target device
+            self.model = self.model.to(self.device)
 
         # Apply LoRA if needed
         if use_relighting_lora:
@@ -5981,7 +5997,8 @@ def main():
         logger.info("Loading animate models...")
         model_manager.load_model(
             use_relighting_lora=args.animate_relighting_lora,
-            t5_cpu=True  # Keep T5 on CPU to save VRAM
+            t5_cpu=True,  # Keep T5 on CPU to save VRAM
+            blocks_to_swap=args.blocks_to_swap  # Pass blocks_to_swap for memory management
         )
 
         # Handle preprocessing or load preprocessed data
