@@ -1455,7 +1455,9 @@ class AnimateModelManager:
             self.model.cpu()
             del self.model
         if self.vae is not None:
-            self.vae.cpu()
+            # Wan2_1_VAE has the actual model in self.model attribute
+            if hasattr(self.vae, 'model'):
+                self.vae.model.cpu()
             del self.vae
         if self.text_encoder is not None:
             self.text_encoder.model.cpu()
