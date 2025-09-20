@@ -1462,21 +1462,27 @@ class AnimateModelManager:
             return  # Already loaded
 
         logger.info("Loading WanAnimateModel (deferred loading)...")
-        # Load model on CPU first to avoid device issues with safetensors
-        self.model = WanAnimateModel.from_pretrained(
-            self.checkpoint_dir,
-            torch_dtype=self.config.param_dtype
-        )
 
         # Handle block swapping for memory management
         if self.blocks_to_swap > 0:
+            # Load model on CPU first when using block swapping
+            self.model = WanAnimateModel.from_pretrained(
+                self.checkpoint_dir,
+                torch_dtype=self.config.param_dtype,
+                device_map='cpu'  # Critical: load to CPU first for block swapping
+            )
+
             logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
             self.model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
             self.model.move_to_device_except_swap_blocks(self.device)
             self.model.prepare_block_swap_before_forward()
         else:
-            # Move entire model to target device
-            self.model = self.model.to(self.device)
+            # Standard loading for non-swapping case - load directly to device
+            self.model = WanAnimateModel.from_pretrained(
+                self.checkpoint_dir,
+                torch_dtype=self.config.param_dtype,
+                device_map=self.device
+            )
 
         # Apply LoRA if needed
         if self.use_relighting_lora:
@@ -1657,6 +1663,16 @@ class AnimateModelManager:
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=self.device)
             y = torch.concat([y_ref, y_reft], dim=1)
 
+            # Move VAE to CPU to free memory for DIT inference
+            logger.info("Moving VAE to CPU to free memory for DIT inference...")
+            if hasattr(self.vae, 'model'):
+                self.vae.model = self.vae.model.cpu()
+            elif hasattr(self.vae, 'to'):
+                self.vae = self.vae.cpu()
+            torch.cuda.empty_cache()
+            logger.info(f"GPU memory after VAE offload: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                       f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+
             # Load DIT model after VAE encoding is complete
             self._load_dit_model_if_needed()
 
@@ -1713,10 +1729,25 @@ class AnimateModelManager:
                 )[0]
                 latents[0] = temp_x0.squeeze(0)
 
+            # Move VAE back to GPU for decoding
+            logger.info("Moving VAE back to GPU for decoding...")
+            if hasattr(self.vae, 'model'):
+                self.vae.model = self.vae.model.to(self.device)
+            elif hasattr(self.vae, 'to'):
+                self.vae = self.vae.to(self.device)
+
             # Decode latents back to pixel space
             x0 = latents
             x0 = [x.to(dtype=torch.float32) for x in x0]
             out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))  # Skip first frame (mask)
+
+            # Move VAE back to CPU after decoding
+            logger.info("Moving VAE back to CPU after decoding...")
+            if hasattr(self.vae, 'model'):
+                self.vae.model = self.vae.model.cpu()
+            elif hasattr(self.vae, 'to'):
+                self.vae = self.vae.cpu()
+            torch.cuda.empty_cache()
 
         # Convert output to numpy for saving
         # out_frames shape: [1, 3, T, H, W]
