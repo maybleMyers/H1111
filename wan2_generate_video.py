@@ -1465,12 +1465,14 @@ class AnimateModelManager:
 
         # Handle block swapping for memory management
         if self.blocks_to_swap > 0:
-            # Load model without device_map when using block swapping
-            # The model will be loaded to CPU first
+            # Load model to CPU when using block swapping
             self.model = WanAnimateModel.from_pretrained(
                 self.checkpoint_dir,
                 torch_dtype=self.config.param_dtype,
             )
+            # Ensure model is on CPU for block swapping
+            self.model = self.model.cpu()
+            logger.info("Model loaded to CPU for block swapping")
 
             logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
             self.model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
