@@ -1455,7 +1455,11 @@ class AnimateModelManager:
         # Convert inputs to tensors
         clip_len = len(cond_images)
         T = clip_len
-        H, W = height, width
+        # Get dimensions from actual cond_images to ensure consistency with pose_latents
+        if len(cond_images) > 0:
+            H, W = cond_images[0].shape[:2]
+        else:
+            H, W = height, width  # fallback to refer_images dimensions if no cond_images
         lat_h = H // 8
         lat_w = W // 8
         lat_t = T // 4 + 1
