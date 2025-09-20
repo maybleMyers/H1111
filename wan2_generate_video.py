@@ -1458,11 +1458,15 @@ class AnimateModelManager:
         # Get dimensions from actual cond_images to ensure consistency with pose_latents
         if len(cond_images) > 0:
             H, W = cond_images[0].shape[:2]
+            logger.info(f"DEBUG: Input cond_images[0] shape: {cond_images[0].shape}")
         else:
             H, W = height, width  # fallback to refer_images dimensions if no cond_images
+
+        logger.info(f"DEBUG: Calculated dimensions - H: {H}, W: {W}")
         lat_h = H // 8
         lat_w = W // 8
         lat_t = T // 4 + 1
+        logger.info(f"DEBUG: Calculated latent dimensions - lat_h: {lat_h}, lat_w: {lat_w}, lat_t: {lat_t}")
 
         # Prepare batch tensors
         batch = {
@@ -1507,6 +1511,10 @@ class AnimateModelManager:
         conditioning_pixel_values = batch["conditioning_pixel_values"]
         face_pixel_values = batch["face_pixel_values"]
 
+        logger.info(f"DEBUG: ref_pixel_values shape: {ref_pixel_values.shape}")
+        logger.info(f"DEBUG: conditioning_pixel_values shape: {conditioning_pixel_values.shape}")
+        logger.info(f"DEBUG: face_pixel_values shape: {face_pixel_values.shape}")
+
         # Generate initial noise
         target_shape = [lat_t + 1, lat_h, lat_w]
         noise = [
@@ -1543,17 +1551,34 @@ class AnimateModelManager:
 
             # Encode to latent space using VAE
             # VAE expects tensors with shape [B, C, T, H, W] and iterates over B dimension
+            logger.info(f"DEBUG: Before VAE encode - conditioning_pixel_values shape: {conditioning_pixel_values.shape}")
             pose_latents_no_ref = self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
+            logger.info(f"DEBUG: pose_latents_no_ref shapes: {[p.shape for p in pose_latents_no_ref]}")
             pose_latents_no_ref = torch.stack(pose_latents_no_ref)
+            logger.info(f"DEBUG: After stack, pose_latents_no_ref shape: {pose_latents_no_ref.shape}")
             pose_latents = torch.cat([pose_latents_no_ref], dim=2)
 
             # For reference image, rearrange to [1, C, 1, H, W] for VAE
             ref_pixel_values_for_vae = rearrange(ref_pixel_values, "1 c h w -> 1 c 1 h w")
+            logger.info(f"DEBUG: ref_pixel_values_for_vae shape: {ref_pixel_values_for_vae.shape}")
             ref_latents = self.vae.encode(ref_pixel_values_for_vae.to(torch.bfloat16))
+            logger.info(f"DEBUG: ref_latents shapes before stack: {[r.shape for r in ref_latents]}")
             ref_latents = torch.stack(ref_latents)
+            logger.info(f"DEBUG: After stack, ref_latents shape: {ref_latents.shape}")
+            logger.info(f"DEBUG: ref_latents[0] shape: {ref_latents[0].shape}")
+
+            # Verify dimensions match expectations
+            expected_lat_h = H // 8
+            expected_lat_w = W // 8
+            actual_lat_h = ref_latents[0].shape[-2]
+            actual_lat_w = ref_latents[0].shape[-1]
+            if expected_lat_h != actual_lat_h or expected_lat_w != actual_lat_w:
+                logger.warning(f"DEBUG: Dimension mismatch! Expected latent ({expected_lat_h}, {expected_lat_w}), got ({actual_lat_h}, {actual_lat_w})")
 
             # Create mask and y tensors
             mask_ref = self._get_i2v_mask(1, lat_h, lat_w, 1, device=self.device)
+            logger.info(f"DEBUG: mask_ref shape: {mask_ref.shape}")
+            logger.info(f"DEBUG: Before concat - mask_ref shape: {mask_ref.shape}, ref_latents[0] shape: {ref_latents[0].shape}")
             y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=self.device)
 
             # CLIP encoding for reference image
@@ -6093,6 +6118,14 @@ def generate_animate(args, model_manager, preprocessed_data):
     cond_images = preprocessed_data.get('cond_images', [])
     face_images = preprocessed_data.get('face_images', [])
     refer_images = preprocessed_data.get('refer_images')
+
+    # Debug print dimensions
+    if len(cond_images) > 0:
+        logger.info(f"DEBUG: First cond_image shape: {cond_images[0].shape}")
+    if len(face_images) > 0:
+        logger.info(f"DEBUG: First face_image shape: {face_images[0].shape}")
+    if refer_images is not None:
+        logger.info(f"DEBUG: refer_images shape: {refer_images.shape}")
 
     if args.animate_replace:
         bg_images = preprocessed_data.get('bg_images')
