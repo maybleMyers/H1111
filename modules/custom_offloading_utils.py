@@ -235,13 +235,15 @@ class ModelOffloader(Offloader):
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward")
 
+        # Keep first blocks on device
         for b in blocks[0 : self.num_blocks - self.blocks_to_swap]:
             b.to(self.device)
             weighs_to_device(b, self.device)  # make sure weights are on device
 
+        # Keep swap blocks on CPU - DON'T move to device!
         for b in blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first
-            weighs_to_device(b, "cpu")  # make sure weights are on cpu
+            b.to("cpu")  # Keep entire block on CPU
+            weighs_to_device(b, "cpu")  # Ensure weights stay on CPU
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
