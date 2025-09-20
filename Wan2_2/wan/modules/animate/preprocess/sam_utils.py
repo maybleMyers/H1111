@@ -144,6 +144,12 @@ def build_sam2_video_predictor(
         ]
 
     hydra_overrides.extend(hydra_overrides_extra)
+
+    # Override the model target to use the correct module path
+    # The default config uses 'video_predictor.SAM2VideoPredictor' which doesn't exist
+    # We'll use the local wrapper instead
+    hydra_overrides.append("++model._target_=Wan2_2.wan.modules.animate.preprocess.video_predictor.SAM2VideoPredictor")
+
     # Read config and init model
     cfg = compose(config_name=config_file, overrides=hydra_overrides)
     OmegaConf.resolve(cfg)
