@@ -6043,7 +6043,7 @@ def main():
         output_frames = generate_animate(args, model_manager, preprocessed_data)
 
         # Save output
-        output_dir = args.output if args.output else "animate_output"
+        output_dir = args.save_path if args.save_path else "animate_output"
         os.makedirs(output_dir, exist_ok=True)
 
         fps = args.fps if hasattr(args, 'fps') else 30
