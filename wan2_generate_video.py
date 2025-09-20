@@ -1542,14 +1542,14 @@ class AnimateModelManager:
             )
 
             # Encode to latent space using VAE
-            # VAE expects a list of tensors with shape [C, T, H, W]
-            pose_latents_no_ref = self.vae.encode([conditioning_pixel_values[0].to(torch.bfloat16)])
+            # VAE expects tensors with shape [B, C, T, H, W] and iterates over B dimension
+            pose_latents_no_ref = self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
             pose_latents_no_ref = torch.stack(pose_latents_no_ref)
             pose_latents = torch.cat([pose_latents_no_ref], dim=2)
 
-            # For reference image, ensure correct shape [C, T, H, W] where T=1
-            ref_pixel_values_for_vae = rearrange(ref_pixel_values, "1 c h w -> c 1 h w")
-            ref_latents = self.vae.encode([ref_pixel_values_for_vae.to(torch.bfloat16)])
+            # For reference image, rearrange to [1, C, 1, H, W] for VAE
+            ref_pixel_values_for_vae = rearrange(ref_pixel_values, "1 c h w -> 1 c 1 h w")
+            ref_latents = self.vae.encode(ref_pixel_values_for_vae.to(torch.bfloat16))
             ref_latents = torch.stack(ref_latents)
 
             # Create mask and y tensors
@@ -1567,12 +1567,12 @@ class AnimateModelManager:
                 mask_pixel_values = rearrange(mask_pixel_values, "b t c h w -> (b t) c h w")
                 mask_pixel_values = F.interpolate(mask_pixel_values, size=(H//8, W//8), mode='nearest')
                 mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
-                y_reft = self.vae.encode([bg_pixel_values[0]])[0]
+                y_reft = self.vae.encode(bg_pixel_values)[0]
                 msk_reft = self._get_i2v_mask(lat_t, lat_h, lat_w, 0, mask_pixel_values=mask_pixel_values, device=self.device)
             else:
-                # For non-replace mode, use zeros with correct shape [C, T, H, W]
-                zeros_for_vae = torch.zeros(3, T, H, W, device=self.device, dtype=torch.bfloat16)
-                y_reft = self.vae.encode([zeros_for_vae])[0]
+                # For non-replace mode, use zeros with correct shape [1, C, T, H, W]
+                zeros_for_vae = torch.zeros(1, 3, T, H, W, device=self.device, dtype=torch.bfloat16)
+                y_reft = self.vae.encode(zeros_for_vae)[0]
                 msk_reft = self._get_i2v_mask(lat_t, lat_h, lat_w, 0, device=self.device)
 
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=self.device)
