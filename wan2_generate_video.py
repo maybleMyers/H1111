@@ -5937,11 +5937,6 @@ def optimize_animate_memory(model_manager):
     # Clear CUDA cache
     torch.cuda.empty_cache()
 
-    # Enable gradient checkpointing if available
-    if hasattr(model_manager.model, 'enable_gradient_checkpointing'):
-        model_manager.model.enable_gradient_checkpointing()
-        logger.info("Enabled gradient checkpointing")
-
 
 def main():
     # --- Argument Parsing & Setup ---
