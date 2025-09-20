@@ -526,8 +526,13 @@ class T5EncoderModel:
 
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(device)
-        mask = mask.to(device)
+        # Move inputs to the same device as the model
+        model_device = next(self.model.parameters()).device
+        ids = ids.to(model_device)
+        mask = mask.to(model_device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.model(ids, mask)
+        # Move output to requested device if different
+        if model_device != device:
+            context = [c.to(device) for c in context]
         return [u[:v] for u, v in zip(context, seq_lens)]
