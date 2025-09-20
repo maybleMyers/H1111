@@ -1463,7 +1463,9 @@ class AnimateModelManager:
             self.text_encoder.model.cpu()
             del self.text_encoder
         if self.clip is not None:
-            self.clip.cpu()
+            # CLIPModel has the actual model in self.model attribute
+            if hasattr(self.clip, 'model'):
+                self.clip.model.cpu()
             del self.clip
         torch.cuda.empty_cache()
 
