@@ -1395,6 +1395,55 @@ class AnimateModelManager:
         output_frames = torch.stack([torch.from_numpy(f) for f in all_out_frames[:real_frame_len]])
         return output_frames.permute(3, 0, 1, 2)  # (N,H,W,C) -> (C,N,H,W)
 
+    def _padding_resize(self, img_ori, height=512, width=512, padding_color=(0, 0, 0), interpolation=cv2.INTER_LINEAR):
+        """Resize image with padding to maintain aspect ratio
+
+        Args:
+            img_ori: Original image as numpy array
+            height: Target height
+            width: Target width
+            padding_color: RGB color for padding
+            interpolation: OpenCV interpolation method
+
+        Returns:
+            Resized and padded image
+        """
+        ori_height = img_ori.shape[0]
+        ori_width = img_ori.shape[1]
+        channel = img_ori.shape[2] if len(img_ori.shape) > 2 else 1
+
+        # Handle single channel images
+        if len(img_ori.shape) == 2:
+            img_ori = img_ori[:, :, np.newaxis]
+            channel = 1
+
+        img_pad = np.zeros((height, width, channel))
+        if channel == 1:
+            img_pad[:, :, 0] = padding_color[0]
+        else:
+            img_pad[:, :, 0] = padding_color[0]
+            img_pad[:, :, 1] = padding_color[1]
+            img_pad[:, :, 2] = padding_color[2]
+
+        if (ori_height / ori_width) > (height / width):
+            new_width = int(height / ori_height * ori_width)
+            img = cv2.resize(img_ori, (new_width, height), interpolation=interpolation)
+            padding = int((width - new_width) / 2)
+            if len(img.shape) == 2:
+                img = img[:, :, np.newaxis]
+            img_pad[:, padding: padding + new_width, :] = img
+        else:
+            new_height = int(width / ori_width * ori_height)
+            img = cv2.resize(img_ori, (width, new_height), interpolation=interpolation)
+            padding = int((height - new_height) / 2)
+            if len(img.shape) == 2:
+                img = img[:, :, np.newaxis]
+            img_pad[padding: padding + new_height, :, :] = img
+
+        img_pad = np.uint8(img_pad)
+
+        return img_pad if channel > 1 else img_pad[:, :, 0]  # Return 2D array for single channel
+
     def _get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
         """Generate mask for i2v-style conditioning"""
         if mask_pixel_values is None:
@@ -1468,14 +1517,19 @@ class AnimateModelManager:
         lat_t = T // 4 + 1
         logger.info(f"DEBUG: Calculated latent dimensions - lat_h: {lat_h}, lat_w: {lat_w}, lat_t: {lat_t}")
 
-        # Prepare batch tensors
+        # Resize reference image to match conditioning dimensions (following source repository approach)
+        logger.info(f"DEBUG: Original refer_image shape: {refer_image.shape}")
+        refer_image_resized = self._padding_resize(refer_image, height=H, width=W)
+        logger.info(f"DEBUG: Resized refer_image shape: {refer_image_resized.shape}")
+
+        # Prepare batch tensors - use H, W for actual dimensions instead of height, width parameters
         batch = {
-            "conditioning_pixel_values": torch.zeros(1, 3, clip_len, height, width),
-            "bg_pixel_values": torch.zeros(1, 3, clip_len, height, width),
-            "mask_pixel_values": torch.zeros(1, 1, clip_len, height, width),
+            "conditioning_pixel_values": torch.zeros(1, 3, clip_len, H, W),
+            "bg_pixel_values": torch.zeros(1, 3, clip_len, H, W),
+            "mask_pixel_values": torch.zeros(1, 1, clip_len, H, W),
             "face_pixel_values": torch.zeros(1, 3, clip_len, 512, 512),
-            "refer_pixel_values": torch.zeros(1, 3, height, width),
-            "refer_t_pixel_values": torch.zeros(1, 3, height, width)  # For temporal reference (simplified for first clip)
+            "refer_pixel_values": torch.zeros(1, 3, H, W),
+            "refer_t_pixel_values": torch.zeros(1, 3, H, W)  # For temporal reference (simplified for first clip)
         }
 
         # Convert numpy arrays to tensors and normalize
@@ -1488,7 +1542,7 @@ class AnimateModelManager:
             "t h w c -> 1 c t h w",
         )
         batch["refer_pixel_values"] = rearrange(
-            torch.tensor(refer_image / 127.5 - 1, dtype=torch.float32),
+            torch.tensor(refer_image_resized / 127.5 - 1, dtype=torch.float32),
             "h w c -> 1 c h w"
         )
 
