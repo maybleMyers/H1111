@@ -84,6 +84,13 @@ try:
     from Wan2_2.wan.modules.animate.motion_encoder import Generator
     from decord import VideoReader
     from peft import set_peft_model_state_dict
+    # Import schedulers for animate diffusion
+    from Wan2_2.wan.utils.fm_solvers import (
+        FlowDPMSolverMultistepScheduler,
+        get_sampling_sigmas,
+        retrieve_timesteps,
+    )
+    from Wan2_2.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     ANIMATE_AVAILABLE = True
 except ImportError:
     ANIMATE_AVAILABLE = False
@@ -1411,21 +1418,215 @@ class AnimateModelManager:
         output_frames = torch.stack([torch.from_numpy(f) for f in all_out_frames[:real_frame_len]])
         return output_frames.permute(3, 0, 1, 2)  # (N,H,W,C) -> (C,N,H,W)
 
+    def _get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
+        """Generate mask for i2v-style conditioning"""
+        if mask_pixel_values is None:
+            msk = torch.zeros(1, (lat_t-1) * 4 + 1, lat_h, lat_w, device=device)
+        else:
+            msk = mask_pixel_values.clone()
+        msk[:, :mask_len] = 1
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+        msk = msk.transpose(1, 2)[0]
+        return msk
+
     def _generate_clip(self, cond_images, face_images, refer_image,
                       bg_images, mask_images, replace_flag,
                       context, context_null, height, width,
                       shift, steps, guide_scale, generator):
-        """Generate a single clip of animation"""
-        # This would contain the actual generation logic
-        # For now, returning placeholder
-        logger.info(f"Generating clip with {len(cond_images)} frames")
+        """Generate a single clip of animation with actual diffusion process"""
+        from einops import rearrange
+        import torch.nn.functional as F
+        import math
 
-        # Placeholder - actual implementation would call model forward
+        logger.info(f"Generating clip with {len(cond_images)} frames using diffusion")
+
+        # Convert inputs to tensors
+        clip_len = len(cond_images)
+        T = clip_len
+        H, W = height, width
+        lat_h = H // 8
+        lat_w = W // 8
+        lat_t = T // 4 + 1
+
+        # Prepare batch tensors
+        batch = {
+            "conditioning_pixel_values": torch.zeros(1, 3, clip_len, height, width),
+            "bg_pixel_values": torch.zeros(1, 3, clip_len, height, width),
+            "mask_pixel_values": torch.zeros(1, 1, clip_len, height, width),
+            "face_pixel_values": torch.zeros(1, 3, clip_len, 512, 512),
+            "refer_pixel_values": torch.zeros(1, 3, height, width),
+            "refer_t_pixel_values": torch.zeros(1, 3, height, width)  # For temporal reference (simplified for first clip)
+        }
+
+        # Convert numpy arrays to tensors and normalize
+        batch["conditioning_pixel_values"] = rearrange(
+            torch.tensor(np.stack(cond_images) / 127.5 - 1, dtype=torch.float32),
+            "t h w c -> 1 c t h w",
+        )
+        batch["face_pixel_values"] = rearrange(
+            torch.tensor(np.stack(face_images) / 127.5 - 1, dtype=torch.float32),
+            "t h w c -> 1 c t h w",
+        )
+        batch["refer_pixel_values"] = rearrange(
+            torch.tensor(refer_image / 127.5 - 1, dtype=torch.float32),
+            "h w c -> 1 c h w"
+        )
+
+        if replace_flag and bg_images is not None:
+            batch["bg_pixel_values"] = rearrange(
+                torch.tensor(np.stack(bg_images) / 127.5 - 1, dtype=torch.float32),
+                "t h w c -> 1 c t h w",
+            )
+            batch["mask_pixel_values"] = rearrange(
+                torch.tensor(np.stack(mask_images)[:, :, :, None], dtype=torch.float32),
+                "t h w c -> 1 t c h w",
+            )
+
+        # Move to device with proper dtype
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(device=self.device, dtype=torch.bfloat16)
+
+        ref_pixel_values = batch["refer_pixel_values"]
+        conditioning_pixel_values = batch["conditioning_pixel_values"]
+        face_pixel_values = batch["face_pixel_values"]
+
+        # Generate initial noise
+        target_shape = [lat_t + 1, lat_h, lat_w]
+        noise = [
+            torch.randn(
+                16,  # VAE latent channels
+                target_shape[0],
+                target_shape[1],
+                target_shape[2],
+                dtype=torch.float32,
+                device=self.device,
+                generator=generator,
+            )
+        ]
+
+        # Calculate max sequence length
+        max_seq_len = int(math.ceil(np.prod(target_shape) // 4)) * 4  # Ensure divisible by 4
+
+        with (
+            torch.autocast(device_type=str(self.device).split(':')[0], dtype=torch.bfloat16, enabled=True),
+            torch.no_grad()
+        ):
+            # Set up scheduler
+            sample_scheduler = FlowDPMSolverMultistepScheduler(
+                num_train_timesteps=1000,  # Standard for flow matching
+                shift=1,
+                use_dynamic_shifting=False
+            )
+            sampling_sigmas = get_sampling_sigmas(steps, shift)
+            timesteps, _ = retrieve_timesteps(
+                sample_scheduler,
+                device=self.device,
+                sigmas=sampling_sigmas
+            )
+
+            # Encode to latent space using VAE
+            pose_latents_no_ref = self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
+            pose_latents_no_ref = torch.stack(pose_latents_no_ref)
+            pose_latents = torch.cat([pose_latents_no_ref], dim=2)
+
+            ref_pixel_values = rearrange(ref_pixel_values, "t c h w -> 1 c t h w")
+            ref_latents = self.vae.encode(ref_pixel_values.to(torch.bfloat16))
+            ref_latents = torch.stack(ref_latents)
+
+            # Create mask and y tensors
+            mask_ref = self._get_i2v_mask(1, lat_h, lat_w, 1, device=self.device)
+            y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=self.device)
+
+            # CLIP encoding for reference image
+            img = ref_pixel_values[0, :, 0]
+            clip_context = self.clip.visual([img[:, None, :, :]]).to(dtype=torch.bfloat16, device=self.device)
+
+            # Prepare y_reft (temporal reference - simplified for first implementation)
+            if replace_flag and bg_images is not None:
+                bg_pixel_values = batch["bg_pixel_values"]
+                mask_pixel_values = 1 - batch["mask_pixel_values"]
+                mask_pixel_values = rearrange(mask_pixel_values, "b t c h w -> (b t) c h w")
+                mask_pixel_values = F.interpolate(mask_pixel_values, size=(H//8, W//8), mode='nearest')
+                mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
+                y_reft = self.vae.encode([bg_pixel_values[0]])[0]
+                msk_reft = self._get_i2v_mask(lat_t, lat_h, lat_w, 0, mask_pixel_values=mask_pixel_values, device=self.device)
+            else:
+                # For non-replace mode, use zeros
+                y_reft = self.vae.encode([torch.zeros(3, T, H, W).to(self.device)])[0]
+                msk_reft = self._get_i2v_mask(lat_t, lat_h, lat_w, 0, device=self.device)
+
+            y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=self.device)
+            y = torch.concat([y_ref, y_reft], dim=1)
+
+            # Prepare model arguments
+            arg_c = {
+                "context": context,
+                "seq_len": max_seq_len,
+                "clip_fea": clip_context.to(dtype=torch.bfloat16, device=self.device),
+                "y": [y],
+                "pose_latents": pose_latents,
+                "face_pixel_values": face_pixel_values,
+            }
+
+            if guide_scale > 1:
+                face_pixel_values_uncond = face_pixel_values * 0 - 1
+                arg_null = {
+                    "context": context_null,
+                    "seq_len": max_seq_len,
+                    "clip_fea": clip_context.to(dtype=torch.bfloat16, device=self.device),
+                    "y": [y],
+                    "pose_latents": pose_latents,
+                    "face_pixel_values": face_pixel_values_uncond,
+                }
+
+            # Denoising loop
+            latents = noise
+            from tqdm import tqdm
+            for i, t in enumerate(tqdm(timesteps, desc="Diffusion steps")):
+                latent_model_input = latents
+                timestep = torch.stack([t])
+
+                # Model forward pass
+                noise_pred_cond = TensorList(
+                    self.model(TensorList(latent_model_input), t=timestep, **arg_c)
+                )
+
+                if guide_scale > 1:
+                    noise_pred_uncond = TensorList(
+                        self.model(TensorList(latent_model_input), t=timestep, **arg_null)
+                    )
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
+                else:
+                    noise_pred = noise_pred_cond
+
+                # Scheduler step
+                temp_x0 = sample_scheduler.step(
+                    noise_pred[0].unsqueeze(0),
+                    t,
+                    latents[0].unsqueeze(0),
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                latents[0] = temp_x0.squeeze(0)
+
+            # Decode latents back to pixel space
+            x0 = latents
+            x0 = [x.to(dtype=torch.float32) for x in x0]
+            out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))  # Skip first frame (mask)
+
+        # Convert output to numpy for saving
+        # out_frames shape: [1, 3, T, H, W]
+        out_frames = out_frames[0].permute(1, 2, 3, 0).cpu().numpy()  # [T, H, W, 3]
+        out_frames = ((out_frames + 1) * 127.5).clip(0, 255).astype(np.uint8)
+
         frames = []
-        for i in range(len(cond_images)):
-            # Create dummy frame for testing
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
-            frames.append(frame)
+        for i in range(out_frames.shape[0]):
+            frames.append(out_frames[i])
+
         return frames
 
     def _get_valid_len(self, real_len, clip_len, overlap):
