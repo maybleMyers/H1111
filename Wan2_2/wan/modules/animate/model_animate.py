@@ -22,8 +22,10 @@ from ...distributed.sequence_parallel import (
 # Import block swapping utilities
 import sys
 import os
-# Add the parent directory to path to import from modules
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../..')))
+# Add the project root directory to path to import from modules
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 from modules.custom_offloading_utils import ModelOffloader, clean_memory_on_device
 
 
