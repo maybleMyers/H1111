@@ -1474,8 +1474,28 @@ class AnimateModelManager:
 
             logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
             self.model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
+
+            # Log memory before moving model
+            if torch.cuda.is_available():
+                logger.info(f"GPU memory before move_to_device: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                           f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+
             self.model.move_to_device_except_swap_blocks(self.device)
+
+            # Log memory after moving model but before prepare
+            if torch.cuda.is_available():
+                logger.info(f"GPU memory after move_to_device: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                           f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+
             self.model.prepare_block_swap_before_forward()
+
+            # Log memory after prepare
+            if torch.cuda.is_available():
+                logger.info(f"GPU memory after prepare_block_swap: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                           f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+                torch.cuda.empty_cache()
+                logger.info(f"GPU memory after empty_cache: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                           f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
         else:
             # Standard loading for non-swapping case - load directly to device
             self.model = WanAnimateModel.from_pretrained(
@@ -1703,6 +1723,14 @@ class AnimateModelManager:
             for i, t in enumerate(tqdm(timesteps, desc="Diffusion steps")):
                 latent_model_input = latents
                 timestep = torch.stack([t])
+
+                # Log memory before first forward pass
+                if i == 0 and torch.cuda.is_available():
+                    logger.info(f"GPU memory before first forward pass: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+                               f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+                    # Log sizes of inputs
+                    logger.info(f"Input sizes - latent: {latent_model_input[0].shape}, y: {arg_c['y'][0].shape}, "
+                               f"pose_latents: {arg_c['pose_latents'][0].shape}, face: {arg_c['face_pixel_values'].shape}")
 
                 # Model forward pass
                 noise_pred_cond = TensorList(
@@ -6355,6 +6383,14 @@ def main():
         else:
             logger.error("Animate configuration not available")
             return
+
+        # Debug: Check if config has param_dtype
+        logger.info(f"Config attributes: {list(cfg.keys())}")
+        if hasattr(cfg, 'param_dtype'):
+            logger.info(f"Config param_dtype: {cfg.param_dtype}")
+        else:
+            logger.warning("Config missing param_dtype, using bfloat16")
+            cfg.param_dtype = torch.bfloat16
 
         # Initialize model manager
         model_manager = AnimateModelManager(
