@@ -1267,35 +1267,12 @@ class AnimateModelManager:
             device=self.device
         )
 
-        # Load animate model
-        logger.info("Loading WanAnimateModel...")
-        # Load model on CPU first to avoid device issues with safetensors
-        self.model = WanAnimateModel.from_pretrained(
-            self.checkpoint_dir,
-            torch_dtype=self.config.param_dtype
-        )
+        # Store model loading parameters for deferred loading
+        self.use_relighting_lora = use_relighting_lora
+        self.blocks_to_swap = blocks_to_swap
+        self.model = None  # Will be loaded on demand
 
-        # Handle block swapping for memory management
-        if blocks_to_swap > 0:
-            logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {self.device}")
-            self.model.enable_block_swap(blocks_to_swap, self.device, supports_backward=False)
-            self.model.move_to_device_except_swap_blocks(self.device)
-            self.model.prepare_block_swap_before_forward()
-        else:
-            # Move entire model to target device
-            self.model = self.model.to(self.device)
-
-        # Apply LoRA if needed
-        if use_relighting_lora:
-            lora_path = os.path.join(self.checkpoint_dir, self.config.lora_checkpoint)
-            if os.path.exists(lora_path):
-                logger.info(f"Applying relighting LoRA from {lora_path}")
-                self._apply_lora(lora_path)
-            else:
-                logger.warning(f"LoRA file not found at {lora_path}")
-
-        self.model.eval()
-        logger.info("Animate model loaded successfully")
+        logger.info("Animate model components loaded (DIT model deferred)")
 
     def _apply_lora(self, lora_path):
         """Apply LoRA weights to the model
@@ -1430,6 +1407,40 @@ class AnimateModelManager:
         msk = msk.transpose(1, 2)[0]
         return msk
 
+    def _load_dit_model_if_needed(self):
+        """Load the DIT model if it hasn't been loaded yet"""
+        if self.model is not None:
+            return  # Already loaded
+
+        logger.info("Loading WanAnimateModel (deferred loading)...")
+        # Load model on CPU first to avoid device issues with safetensors
+        self.model = WanAnimateModel.from_pretrained(
+            self.checkpoint_dir,
+            torch_dtype=self.config.param_dtype
+        )
+
+        # Handle block swapping for memory management
+        if self.blocks_to_swap > 0:
+            logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
+            self.model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
+            self.model.move_to_device_except_swap_blocks(self.device)
+            self.model.prepare_block_swap_before_forward()
+        else:
+            # Move entire model to target device
+            self.model = self.model.to(self.device)
+
+        # Apply LoRA if needed
+        if self.use_relighting_lora:
+            lora_path = os.path.join(self.checkpoint_dir, self.config.lora_checkpoint)
+            if os.path.exists(lora_path):
+                logger.info(f"Applying relighting LoRA from {lora_path}")
+                self._apply_lora(lora_path)
+            else:
+                logger.warning(f"LoRA file not found at {lora_path}")
+
+        self.model.eval()
+        logger.info("WanAnimateModel loaded and ready")
+
     def _generate_clip(self, cond_images, face_images, refer_image,
                       bg_images, mask_images, replace_flag,
                       context, context_null, height, width,
@@ -1560,6 +1571,9 @@ class AnimateModelManager:
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=self.device)
             y = torch.concat([y_ref, y_reft], dim=1)
 
+            # Load DIT model after VAE encoding is complete
+            self._load_dit_model_if_needed()
+
             # Prepare model arguments
             arg_c = {
                 "context": context,
@@ -1653,22 +1667,59 @@ class AnimateModelManager:
         """Clean up models and free memory"""
         logger.info("Cleaning up AnimateModelManager")
         if self.model is not None:
+            # Handle block swapping cleanup if applicable
+            if hasattr(self.model, 'blocks_to_swap') and self.model.blocks_to_swap > 0:
+                if hasattr(self.model, 'offloader') and self.model.offloader is not None:
+                    # Wait for all blocks
+                    for idx in range(len(self.model.blocks)):
+                        try:
+                            self.model.offloader.wait_for_block(idx)
+                        except Exception as e:
+                            logger.warning(f"Error waiting for block {idx}: {e}")
+
+                    # Move all blocks to CPU
+                    for idx in range(len(self.model.blocks)):
+                        try:
+                            self.model.blocks[idx] = self.model.blocks[idx].cpu()
+                        except Exception as e:
+                            logger.warning(f"Error moving block {idx} to CPU: {e}")
+
+                    # Cleanup offloader
+                    try:
+                        if hasattr(self.model.offloader, 'thread_pool'):
+                            self.model.offloader.thread_pool.shutdown(wait=True)
+                        if hasattr(self.model.offloader, 'futures'):
+                            self.model.offloader.futures.clear()
+                        del self.model.offloader
+                        self.model.offloader = None
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up offloader: {e}")
+
             self.model.cpu()
             del self.model
+            self.model = None
+
         if self.vae is not None:
             # Wan2_1_VAE has the actual model in self.model attribute
             if hasattr(self.vae, 'model'):
                 self.vae.model.cpu()
             del self.vae
+            self.vae = None
+
         if self.text_encoder is not None:
             self.text_encoder.model.cpu()
             del self.text_encoder
+            self.text_encoder = None
+
         if self.clip is not None:
             # CLIPModel has the actual model in self.model attribute
             if hasattr(self.clip, 'model'):
                 self.clip.model.cpu()
             del self.clip
+            self.clip = None
+
         torch.cuda.empty_cache()
+        gc.collect()
 
 
 class AnimatePreprocessor:
