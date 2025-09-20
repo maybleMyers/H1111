@@ -1553,8 +1553,8 @@ class AnimateModelManager:
             y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=self.device)
 
             # CLIP encoding for reference image
-            img = ref_pixel_values[0, :, 0]
-            clip_context = self.clip.visual([img[:, None, :, :]]).to(dtype=torch.bfloat16, device=self.device)
+            img = ref_pixel_values[0]  # Shape: [3, H, W]
+            clip_context = self.clip.visual([img.unsqueeze(1)]).to(dtype=torch.bfloat16, device=self.device)
 
             # Prepare y_reft (temporal reference - simplified for first implementation)
             if replace_flag and bg_images is not None:
