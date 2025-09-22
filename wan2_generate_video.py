@@ -448,6 +448,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
+        "--use_pinned_memory",
+        action="store_true",
+        help="Use pinned memory for block swapping staging buffers (improves performance but uses more RAM)"
+    )
+    parser.add_argument(
         "--use-bouncing-linear",
         action="store_true",
         help="Enable CPU Bouncing Linear strategy for extreme VRAM savings (replaces --blocks-to-swap)."
@@ -1764,7 +1769,8 @@ def optimize_model(
 
     if args.blocks_to_swap > 0 and not args.use_bouncing_linear:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        logger.info(f"Using {'pinned' if args.use_pinned_memory else 'regular'} memory for staging buffers")
+        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:

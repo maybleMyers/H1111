@@ -439,6 +439,7 @@ def wan22_batch_handler(
     # Model Paths & Performance
     attn_mode: str,
     mixed_dtype: bool,
+    use_pinned_memory: bool,
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
@@ -524,6 +525,9 @@ def wan22_batch_handler(
             "--vae", os.path.join("wan", vae_path),
             "--t5", os.path.join("wan", t5_path),
         ]
+
+        if use_pinned_memory and block_swap > 0:
+            command.append("--use_pinned_memory")
 
         if negative_prompt:
             command.extend(["--negative_prompt", str(negative_prompt)])
@@ -8867,6 +8871,7 @@ with gr.Blocks(
             with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
                     wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                    wan22_use_pinned_memory = gr.Checkbox(label="Use Pinned Memory for Block Swap", value=False, info="Improves performance but uses more RAM")
                     wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
@@ -11992,6 +11997,7 @@ with gr.Blocks(
                     "outputs",  # save_path
                     params.get("attn_mode", "sdpa"),
                     params.get("mixed_dtype", False),
+                    params.get("use_pinned_memory", False),
                     params.get("block_swap", 30),
                     params.get("fp8", False),
                     params.get("fp8_scaled", False),
@@ -12025,7 +12031,7 @@ with gr.Blocks(
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
             wan22_flow_shift, wan22_sample_guide_scale, wan22_dual_dit_boundary, wan22_batch_size,
-            wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
+            wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_use_pinned_memory, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
             wan22_dit_low_noise_path, wan22_dit_high_noise_path, wan22_clip_path, wan22_dit_path,
             wan22_vae_path, wan22_t5_path, wan22_lora_folder,
             *wan22_lora_weights,           # Unpack all 8 weight dropdowns
@@ -13082,6 +13088,7 @@ with gr.Blocks(
             # Performance & Model Paths
             wan22_attn_mode,
             wan22_mixed_dtype,
+            wan22_use_pinned_memory,
             wan22_block_swap,
             wan22_fp8,
             wan22_fp8_scaled,
