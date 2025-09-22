@@ -509,9 +509,10 @@ class WanModel(nn.Module):
         eps=1e-6,
         attn_mode=None,
         split_attn=False,
-        add_ref_conv=False, 
+        add_ref_conv=False,
         in_dim_ref_conv=16,
         use_bouncing_linear=False,
+        bouncing_linear_alternate=False,
         device="cuda"
     ):
         super().__init__()
@@ -569,9 +570,11 @@ class WanModel(nn.Module):
                 WanAttentionBlock(
                     cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, attn_mode, split_attn,
                     # 10. Pass the new arguments down to the block constructor
-                    use_bouncing_linear=use_bouncing_linear, device=device
+                    # Apply bouncing linear to every other block if alternate pattern is requested
+                    use_bouncing_linear=use_bouncing_linear if not bouncing_linear_alternate else (use_bouncing_linear and (i % 2 == 0)),
+                    device=device
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -819,7 +822,8 @@ def load_wan_model(
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
-    use_bouncing_linear: bool = False, 
+    use_bouncing_linear: bool = False,
+    bouncing_linear_alternate: bool = False,
 ) -> WanModel:
     assert not fp8_scaled, "FP8 scaling is not compatible with this LoRA loader."
 
@@ -834,11 +838,12 @@ def load_wan_model(
             in_dim=config.in_dim, num_heads=config.num_heads, num_layers=config.num_layers,
             out_dim=config.out_dim, text_len=config.text_len, attn_mode=attn_mode,
             split_attn=split_attn, add_ref_conv=False, in_dim_ref_conv=16,
-            
+
             # 12. Pass the new arguments to the WanModel constructor
             use_bouncing_linear=use_bouncing_linear,
+            bouncing_linear_alternate=bouncing_linear_alternate,
             device=device,
-            
+
         )
 
     dit_path_list = dit_path if isinstance(dit_path, list) else [dit_path]

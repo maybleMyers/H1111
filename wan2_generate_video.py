@@ -453,6 +453,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable CPU Bouncing Linear strategy for extreme VRAM savings (replaces --blocks-to-swap)."
     )
     parser.add_argument(
+        "--bouncing-linear-alternate",
+        action="store_true",
+        help="Apply bouncing linear to every other layer (alternate pattern) for balanced memory/performance"
+    )
+    parser.add_argument(
         "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
@@ -721,10 +726,11 @@ class DynamicModelManager:
             
         # Load model with LoRA weights if available
         model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type], 
+            self.config, self.device, self.model_paths[model_type],
             self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
             lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
-            use_bouncing_linear=self.args.use_bouncing_linear
+            use_bouncing_linear=self.args.use_bouncing_linear,
+            bouncing_linear_alternate=self.args.bouncing_linear_alternate
         )
         
         # Optimize model
@@ -1531,10 +1537,11 @@ def load_dit_model(
         logger.info(f"DEBUG: Loading single DiT model with NO LoRA weights")
         
     model = load_wan_model(
-        config, device, dit_path, args.attn_mode, False, 
+        config, device, dit_path, args.attn_mode, False,
         loading_device, loading_weight_dtype, False,
         lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
-        use_bouncing_linear=args.use_bouncing_linear
+        use_bouncing_linear=args.use_bouncing_linear,
+        bouncing_linear_alternate=args.bouncing_linear_alternate
     )
     return model
 
@@ -2964,6 +2971,23 @@ def run_sampling(
     apply_slg_global = args.slg_layers is not None and args.slg_mode is not None
     slg_start_step = int(args.slg_start * num_timesteps)
     slg_end_step = int(args.slg_end * num_timesteps)
+
+    # Preload first model before loop (like source script musubi-tuner does)
+    if 'model_manager' in locals() and isinstance(model_manager, DynamicModelManager):
+        # Determine which model to load first based on timesteps
+        if args.dual_dit_boundary is not None:
+            boundary = args.dual_dit_boundary * 1000
+        else:
+            boundary = cfg.boundary * 1000
+
+        # Check first timestep to determine initial model
+        if len(timesteps) > 0:
+            if timesteps[0].item() >= boundary:
+                logger.info("Preloading high noise model before sampling loop...")
+                model = model_manager.get_model('high')
+            else:
+                logger.info("Preloading low noise model before sampling loop...")
+                model = model_manager.get_model('low')
 
     logger.info(f"Starting sampling loop for {num_timesteps} steps.")
     for i, t in enumerate(tqdm(timesteps)):

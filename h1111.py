@@ -466,6 +466,7 @@ def wan22_batch_handler(
     unload_text_encoders: bool,
     vae_fp32: bool,
     use_bouncing_linear: bool,
+    bouncing_linear_alternate: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
@@ -637,6 +638,8 @@ def wan22_batch_handler(
             command.extend(["--vae_dtype", "float32"])
         if use_bouncing_linear:
             command.append("--use-bouncing-linear")
+        if bouncing_linear_alternate:
+            command.append("--bouncing-linear-alternate")
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
@@ -8878,6 +8881,10 @@ with gr.Blocks(
                         value=False,
                         info="Extreme memory saving. Replaces Block Swap. Keeps linear layers on CPU."
                     )
+                    wan22_bouncing_linear_alternate = gr.Checkbox(
+                        label="Use Alternating Bouncing",
+                        value=False
+                    )
                     wan22_unload_text_encoders = gr.Checkbox(
                         label="Unload Text Encoders after use (T5/CLIP) to save RAM",
                         value=False, visible=False
@@ -13099,6 +13106,7 @@ with gr.Blocks(
             wan22_unload_text_encoders,
             wan22_vae_fp32,
             wan22_use_bouncing_linear,
+            wan22_bouncing_linear_alternate,
             # V2V arguments
             wan22_enable_v2v,
             wan22_input_video,
