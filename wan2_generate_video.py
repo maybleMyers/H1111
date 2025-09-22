@@ -735,7 +735,8 @@ class DynamicModelManager:
             self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
             lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
             use_bouncing_linear=self.args.use_bouncing_linear,
-            bouncing_linear_alternate=self.args.bouncing_linear_alternate
+            bouncing_linear_alternate=self.args.bouncing_linear_alternate,
+            use_pinned_memory=self.args.use_pinned_memory
         )
         
         # Optimize model
@@ -1546,7 +1547,8 @@ def load_dit_model(
         loading_device, loading_weight_dtype, False,
         lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
         use_bouncing_linear=args.use_bouncing_linear,
-        bouncing_linear_alternate=args.bouncing_linear_alternate
+        bouncing_linear_alternate=args.bouncing_linear_alternate,
+        use_pinned_memory=args.use_pinned_memory
     )
     return model
 

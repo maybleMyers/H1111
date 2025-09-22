@@ -175,7 +175,7 @@ class CPUBouncingLinear(nn.Module):
     - Inference scenarios with memory constraints
     """
 
-    def __init__(self, in_features, out_features, bias=True, device="cuda"):
+    def __init__(self, in_features, out_features, bias=True, device="cuda", use_pinned_memory=False):
         """
         Initialize CPU linear layer.
 
@@ -184,25 +184,32 @@ class CPUBouncingLinear(nn.Module):
             out_features (int): Output feature dimension
             bias (bool): Whether to include learnable bias term
             device (str): Target GPU device for computation
+            use_pinned_memory (bool): Whether to use pinned memory for faster transfers
 
         Note:
             Parameters are initialized on CPU with proper weight initialization.
-            share_memory_() and pin_memory() enable efficient sharing and faster transfers.
+            share_memory_() enables efficient sharing in multiprocessing contexts.
+            pin_memory() enables faster async transfers when use_pinned_memory=True.
         """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
+        self.use_pinned_memory = use_pinned_memory
 
-        # parameters live on CPU with pinned memory for faster transfers
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device="cpu").share_memory_().pin_memory()
-        )
-        self.bias = (
-            nn.Parameter(torch.empty(out_features, device="cpu").share_memory_().pin_memory())
-            if bias
-            else None
-        )
+        # parameters live on CPU, optionally with pinned memory for faster transfers
+        weight_tensor = torch.empty(out_features, in_features, device="cpu").share_memory_()
+        if use_pinned_memory:
+            weight_tensor = weight_tensor.pin_memory()
+        self.weight = nn.Parameter(weight_tensor)
+
+        if bias:
+            bias_tensor = torch.empty(out_features, device="cpu").share_memory_()
+            if use_pinned_memory:
+                bias_tensor = bias_tensor.pin_memory()
+            self.bias = nn.Parameter(bias_tensor)
+        else:
+            self.bias = None
 
         # init
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
@@ -214,9 +221,8 @@ class CPUBouncingLinear(nn.Module):
         # Register hook to ensure weights stay on CPU after state_dict loads
         self._register_load_state_dict_pre_hook(self._load_state_dict_pre_hook)
 
-    @staticmethod
-    def _load_state_dict_pre_hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """Ensure loaded weights are on CPU with shared memory and pinned"""
+    def _load_state_dict_pre_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Ensure loaded weights are on CPU with shared memory and optionally pinned"""
         weight_key = f"{prefix}weight"
         bias_key = f"{prefix}bias"
 
@@ -224,10 +230,11 @@ class CPUBouncingLinear(nn.Module):
             weight = state_dict[weight_key]
             if not weight.is_cpu:
                 state_dict[weight_key] = weight.cpu()
-            # Ensure shared memory and pinned after loading
+            # Ensure shared memory
             if not state_dict[weight_key].is_shared():
                 state_dict[weight_key].share_memory_()
-            if not state_dict[weight_key].is_pinned():
+            # Conditionally pin memory based on setting
+            if self.use_pinned_memory and not state_dict[weight_key].is_pinned():
                 state_dict[weight_key] = state_dict[weight_key].pin_memory()
 
         if bias_key in state_dict:
@@ -236,7 +243,7 @@ class CPUBouncingLinear(nn.Module):
                 state_dict[bias_key] = bias.cpu()
             if not state_dict[bias_key].is_shared():
                 state_dict[bias_key].share_memory_()
-            if not state_dict[bias_key].is_pinned():
+            if self.use_pinned_memory and not state_dict[bias_key].is_pinned():
                 state_dict[bias_key] = state_dict[bias_key].pin_memory()
 
     def _apply(self, fn):
@@ -244,13 +251,13 @@ class CPUBouncingLinear(nn.Module):
         # This prevents .to(device) calls from moving weights to GPU
         super()._apply(lambda t: t if t is self.weight or t is self.bias else fn(t))
 
-        # Ensure weights are on CPU with shared memory and pinned
+        # Ensure weights are on CPU with shared memory and optionally pinned
         if self.weight is not None:
             if not self.weight.is_cpu:
                 self.weight.data = self.weight.data.cpu()
             if not self.weight.is_shared():
                 self.weight.share_memory_()
-            if not self.weight.is_pinned():
+            if self.use_pinned_memory and not self.weight.is_pinned():
                 self.weight.data = self.weight.data.pin_memory()
 
         if self.bias is not None:
@@ -258,7 +265,7 @@ class CPUBouncingLinear(nn.Module):
                 self.bias.data = self.bias.data.cpu()
             if not self.bias.is_shared():
                 self.bias.share_memory_()
-            if not self.bias.is_pinned():
+            if self.use_pinned_memory and not self.bias.is_pinned():
                 self.bias.data = self.bias.data.pin_memory()
 
         return self

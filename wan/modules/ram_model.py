@@ -158,7 +158,7 @@ class WanLayerNorm(nn.LayerNorm):
 
 class WanSelfAttention(nn.Module):
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attn_mode="torch", split_attn=False, use_bouncing_linear=False, device="cuda"):
+    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attn_mode="torch", split_attn=False, use_bouncing_linear=False, device="cuda", use_pinned_memory=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -172,10 +172,10 @@ class WanSelfAttention(nn.Module):
 
         # 2. Conditionally create Linear or CPUBouncingLinear layers
         if use_bouncing_linear:
-            self.q = CPUBouncingLinear(dim, dim, device=device)
-            self.k = CPUBouncingLinear(dim, dim, device=device)
-            self.v = CPUBouncingLinear(dim, dim, device=device)
-            self.o = CPUBouncingLinear(dim, dim, device=device)
+            self.q = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
+            self.k = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
+            self.v = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
+            self.o = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
         else:
             self.q = nn.Linear(dim, dim)
             self.k = nn.Linear(dim, dim)
@@ -254,15 +254,15 @@ class WanT2VCrossAttention(WanSelfAttention):
 
 class WanI2VCrossAttention(WanSelfAttention):
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attn_mode="torch", split_attn=False, use_bouncing_linear=False, device="cuda"):
+    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attn_mode="torch", split_attn=False, use_bouncing_linear=False, device="cuda", use_pinned_memory=False):
 
         # 3. Pass new arguments to the super constructor
-        super().__init__(dim, num_heads, window_size, qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device)
+        super().__init__(dim, num_heads, window_size, qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device, use_pinned_memory)
 
         # 4. Conditionally create layers for this specific subclass
         if use_bouncing_linear:
-            self.k_img = CPUBouncingLinear(dim, dim, device=device)
-            self.v_img = CPUBouncingLinear(dim, dim, device=device)
+            self.k_img = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
+            self.v_img = CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
         else:
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
@@ -340,6 +340,7 @@ class WanAttentionBlock(nn.Module):
         split_attn=False,
         use_bouncing_linear=False,
         device="cuda",
+        use_pinned_memory=False,
     ):
         super().__init__()
         self.dim = dim
@@ -354,17 +355,17 @@ class WanAttentionBlock(nn.Module):
         self.norm1 = WanLayerNorm(dim, eps)
         
         # 5. Pass arguments down to sub-module constructors
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device)
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device, use_pinned_memory)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device)
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps, attn_mode, split_attn, use_bouncing_linear, device, use_pinned_memory)
         self.norm2 = WanLayerNorm(dim, eps)
 
         # 6. Conditionally create the FFN sequential block
         if use_bouncing_linear:
             self.ffn = nn.Sequential(
-                CPUBouncingLinear(dim, ffn_dim, device=device),
+                CPUBouncingLinear(dim, ffn_dim, device=device, use_pinned_memory=use_pinned_memory),
                 nn.GELU(approximate="tanh"),
-                CPUBouncingLinear(ffn_dim, dim, device=device)
+                CPUBouncingLinear(ffn_dim, dim, device=device, use_pinned_memory=use_pinned_memory)
             )
         else:
             self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
@@ -419,7 +420,7 @@ class WanAttentionBlock(nn.Module):
 
 class Head(nn.Module):
 
-    def __init__(self, dim, out_dim, patch_size, eps=1e-6, use_bouncing_linear=False, device="cuda"):
+    def __init__(self, dim, out_dim, patch_size, eps=1e-6, use_bouncing_linear=False, device="cuda", use_pinned_memory=False):
         super().__init__()
         self.dim = dim
         self.out_dim = out_dim
@@ -432,7 +433,7 @@ class Head(nn.Module):
         
         # 7. Conditionally create the head layer
         if use_bouncing_linear:
-            self.head = CPUBouncingLinear(dim, out_dim_calc, device=device)
+            self.head = CPUBouncingLinear(dim, out_dim_calc, device=device, use_pinned_memory=use_pinned_memory)
         else:
             self.head = nn.Linear(dim, out_dim_calc)
         
@@ -454,7 +455,7 @@ class Head(nn.Module):
 
 class MLPProj(torch.nn.Module):
 
-    def __init__(self, in_dim, out_dim, use_bouncing_linear=False, device="cuda"):
+    def __init__(self, in_dim, out_dim, use_bouncing_linear=False, device="cuda", use_pinned_memory=False):
         super().__init__()
 
         
@@ -462,9 +463,9 @@ class MLPProj(torch.nn.Module):
         if use_bouncing_linear:
             self.proj = torch.nn.Sequential(
                 torch.nn.LayerNorm(in_dim),
-                CPUBouncingLinear(in_dim, in_dim, device=device),
+                CPUBouncingLinear(in_dim, in_dim, device=device, use_pinned_memory=use_pinned_memory),
                 torch.nn.GELU(),
-                CPUBouncingLinear(in_dim, out_dim, device=device),
+                CPUBouncingLinear(in_dim, out_dim, device=device, use_pinned_memory=use_pinned_memory),
                 torch.nn.LayerNorm(out_dim),
             )
         else:
@@ -513,7 +514,8 @@ class WanModel(nn.Module):
         in_dim_ref_conv=16,
         use_bouncing_linear=False,
         bouncing_linear_alternate=False,
-        device="cuda"
+        device="cuda",
+        use_pinned_memory=False
     ):
         super().__init__()
 
@@ -544,18 +546,18 @@ class WanModel(nn.Module):
         # 9. Conditionally create all top-level Sequential blocks with Linear layers
         if use_bouncing_linear:
             self.text_embedding = nn.Sequential(
-                CPUBouncingLinear(text_dim, dim, device=device),
+                CPUBouncingLinear(text_dim, dim, device=device, use_pinned_memory=use_pinned_memory),
                 nn.GELU(approximate="tanh"),
-                CPUBouncingLinear(dim, dim, device=device)
+                CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
             )
             self.time_embedding = nn.Sequential(
-                CPUBouncingLinear(freq_dim, dim, device=device),
+                CPUBouncingLinear(freq_dim, dim, device=device, use_pinned_memory=use_pinned_memory),
                 nn.SiLU(),
-                CPUBouncingLinear(dim, dim, device=device)
+                CPUBouncingLinear(dim, dim, device=device, use_pinned_memory=use_pinned_memory)
             )
             self.time_projection = nn.Sequential(
                 nn.SiLU(),
-                CPUBouncingLinear(dim, dim * 6, device=device)
+                CPUBouncingLinear(dim, dim * 6, device=device, use_pinned_memory=use_pinned_memory)
             )
         else:
             self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
@@ -572,14 +574,15 @@ class WanModel(nn.Module):
                     # 10. Pass the new arguments down to the block constructor
                     # Apply bouncing linear to every other block if alternate pattern is requested
                     use_bouncing_linear=use_bouncing_linear if not bouncing_linear_alternate else (use_bouncing_linear and (i % 2 == 0)),
-                    device=device
+                    device=device,
+                    use_pinned_memory=use_pinned_memory
                 )
                 for i in range(num_layers)
             ]
         )
 
         # head
-        self.head = Head(dim, out_dim, patch_size, eps, use_bouncing_linear=use_bouncing_linear, device=device)
+        self.head = Head(dim, out_dim, patch_size, eps, use_bouncing_linear=use_bouncing_linear, device=device, use_pinned_memory=use_pinned_memory)
 
         # buffers
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
@@ -590,7 +593,7 @@ class WanModel(nn.Module):
         self.freqs_fhw = {}
 
         if model_type == "i2v":
-            self.img_emb = MLPProj(1280, dim, use_bouncing_linear=use_bouncing_linear, device=device)
+            self.img_emb = MLPProj(1280, dim, use_bouncing_linear=use_bouncing_linear, device=device, use_pinned_memory=use_pinned_memory)
 
         self.add_ref_conv = add_ref_conv
         if add_ref_conv:
@@ -824,6 +827,7 @@ def load_wan_model(
     use_scaled_mm: bool = False,
     use_bouncing_linear: bool = False,
     bouncing_linear_alternate: bool = False,
+    use_pinned_memory: bool = False,
 ) -> WanModel:
     assert not fp8_scaled, "FP8 scaling is not compatible with this LoRA loader."
 
@@ -843,6 +847,7 @@ def load_wan_model(
             use_bouncing_linear=use_bouncing_linear,
             bouncing_linear_alternate=bouncing_linear_alternate,
             device=device,
+            use_pinned_memory=use_pinned_memory,
 
         )
 
