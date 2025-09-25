@@ -261,8 +261,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
-    # Tiled VAE decode arguments
+    # Tiled VAE arguments
     parser.add_argument("--enable_tiled_vae_decode", action="store_true", help="Enable tiled VAE decoding for memory optimization")
+    parser.add_argument("--enable_tiled_vae_encode", action="store_true", help="Enable tiled VAE encoding for memory optimization")
     parser.add_argument("--vae_tile_sample_min_height", type=int, default=240, help="Minimum tile height in pixel space for VAE tiling")
     parser.add_argument("--vae_tile_sample_min_width", type=int, default=424, help="Minimum tile width in pixel space for VAE tiling")
     parser.add_argument("--vae_tile_overlap_factor_height", type=float, default=0.1666, help="Overlap factor for height dimension in VAE tiling (0.0-1.0)")
@@ -2473,15 +2474,15 @@ def load_video(video_path, start_frame=0, num_frames=None, bucket_reso=(256, 256
     return frames, actual_frames_loaded
 
 
-def encode_video_to_latents(video_tensor: torch.Tensor, vae: WanVAE, device: torch.device, vae_dtype: torch.dtype, args: argparse.Namespace) -> torch.Tensor: # Added args parameter
+def encode_video_to_latents(video_tensor: torch.Tensor, vae, device: torch.device, vae_dtype: torch.dtype, args: argparse.Namespace) -> torch.Tensor: # Added args parameter, made vae generic
     """Encode video tensor to latent space using VAE for V2V.
 
     Args:
         video_tensor (torch.Tensor): Video tensor with shape [B, C, F, H, W], values in [0, 1].
-        vae (WanVAE): VAE model instance.
+        vae: VAE model instance (WanVAE or Wan2_2_VAE).
         device (torch.device): Device to perform encoding on.
         vae_dtype (torch.dtype): Target dtype for the output latents.
-        args (argparse.Namespace): Command line arguments (needed for vae_cache_cpu). # Added args description
+        args (argparse.Namespace): Command line arguments (needed for vae_cache_cpu and tiled encoding). # Added args description
 
     Returns:
         torch.Tensor: Encoded latents with shape [B, C', F', H', W'].
@@ -2491,36 +2492,71 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae: WanVAE, device: tor
 
     logger.info(f"Encoding video tensor to latents: input shape {video_tensor.shape}")
 
-    # Ensure VAE is on the correct device
-    vae.to_device(device)
+    # Check if we should use tiled encoding
+    if should_use_tiled_encode(args, video_tensor.shape):
+        logger.info("Using tiled VAE encoding due to large video size or enabled setting")
 
-    # Prepare video tensor: move to device, ensure float32, scale to [-1, 1]
-    video_tensor = video_tensor.to(device=device, dtype=torch.float32)
-    video_tensor = video_tensor * 2.0 - 1.0 # Scale from [0, 1] to [-1, 1]
+        # Determine VAE type and use appropriate tiled function
+        if hasattr(vae, 'to_device'):  # WanVAE
+            return encode_video_to_latents_tiled_wan_vae(video_tensor, vae, device, vae_dtype, args)
+        else:  # Wan2_2_VAE
+            return encode_video_to_latents_tiled_wan2_2_vae(video_tensor, vae, device, vae_dtype, args)
 
-    # WanVAE expects input as a list of [C, F, H, W] tensors (no batch dim)
-    # Process each video in the batch if batch size > 1 (usually 1 here)
-    latents_list = []
-    batch_size = video_tensor.shape[0]
-    for i in range(batch_size):
-        video_single = video_tensor[i] # Shape [C, F, H, W]
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype): # Use VAE's internal dtype for autocast
-            # vae.encode expects a list containing the tensor
-            encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
-            latents_list.append(encoded_latent)
+    # Use regular encoding for smaller videos or when tiling is disabled
+    logger.info("Using regular VAE encoding")
 
-    # Stack results back into a batch
-    latents = torch.stack(latents_list, dim=0) # Shape [B, C', F', H', W']
+    # Handle WanVAE
+    if hasattr(vae, 'to_device'):
+        # Ensure VAE is on the correct device
+        vae.to_device(device)
 
-    # Move VAE back to CPU (or cache device)
-    # Use the passed args object here
-    vae_target_device = torch.device("cpu") if not args.vae_cache_cpu else torch.device("cpu") # Default to CPU, TODO: check if cache device needs specific name
-    if args.vae_cache_cpu:
-        # Determine the actual cache device if needed, for now, CPU is safe fallback
-        logger.info("Moving VAE to CPU for caching (as configured by --vae_cache_cpu).")
-    else:
-        logger.info("Moving VAE to CPU after encoding.")
-    vae.to_device(vae_target_device) # Use args to decide target device
+        # Prepare video tensor: move to device, ensure float32, scale to [-1, 1]
+        video_tensor = video_tensor.to(device=device, dtype=torch.float32)
+        video_tensor = video_tensor * 2.0 - 1.0 # Scale from [0, 1] to [-1, 1]
+
+        # WanVAE expects input as a list of [C, F, H, W] tensors (no batch dim)
+        # Process each video in the batch if batch size > 1 (usually 1 here)
+        latents_list = []
+        batch_size = video_tensor.shape[0]
+        for i in range(batch_size):
+            video_single = video_tensor[i] # Shape [C, F, H, W]
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype): # Use VAE's internal dtype for autocast
+                # vae.encode expects a list containing the tensor
+                encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
+                latents_list.append(encoded_latent)
+
+        # Stack results back into a batch
+        latents = torch.stack(latents_list, dim=0) # Shape [B, C', F', H', W']
+
+        # Move VAE back to CPU (or cache device)
+        vae_target_device = torch.device("cpu") if not args.vae_cache_cpu else torch.device("cpu") # Default to CPU
+        if args.vae_cache_cpu:
+            # Determine the actual cache device if needed, for now, CPU is safe fallback
+            logger.info("Moving VAE to CPU for caching (as configured by --vae_cache_cpu).")
+        else:
+            logger.info("Moving VAE to CPU after encoding.")
+        vae.to_device(vae_target_device) # Use args to decide target device
+
+    else:  # Handle Wan2_2_VAE
+        # Prepare video tensor: move to device, ensure float32, keep in [0, 1] range
+        video_tensor = video_tensor.to(device=device, dtype=torch.float32)
+        # Note: Wan2_2_VAE expects values in [0, 1], not [-1, 1] like WanVAE
+
+        # Wan2_2_VAE expects input as a list of [C, F, H, W] tensors (no batch dim)
+        # Process each video in the batch if batch size > 1 (usually 1 here)
+        latents_list = []
+        batch_size = video_tensor.shape[0]
+        for i in range(batch_size):
+            video_single = video_tensor[i] # Shape [C, F, H, W]
+            with torch.no_grad():
+                # vae.encode expects a list containing the tensor
+                encoded_latents = vae.encode([video_single]) # Returns list of tensors
+                encoded_latent = encoded_latents[0] # Get first tensor [C', F', H', W']
+                latents_list.append(encoded_latent)
+
+        # Stack results back into a batch
+        latents = torch.stack(latents_list, dim=0) # Shape [B, C', F', H', W']
+
     clean_memory_on_device(device) # Clean the GPU memory
 
     # Convert latents to the desired final dtype (e.g., bfloat16)
@@ -2528,6 +2564,309 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae: WanVAE, device: tor
     logger.info(f"Encoded video latents shape: {latents.shape}, dtype: {latents.dtype}")
 
     return latents
+
+
+def encode_video_to_latents_tiled_wan_vae(video_tensor: torch.Tensor, vae: WanVAE, device: torch.device, vae_dtype: torch.dtype, args: argparse.Namespace) -> torch.Tensor:
+    """Tiled VAE encoding for WanVAE (14B models) to reduce memory usage.
+
+    Args:
+        video_tensor (torch.Tensor): Video tensor with shape [B, C, F, H, W], values in [0, 1].
+        vae (WanVAE): VAE model instance.
+        device (torch.device): Device to perform encoding on.
+        vae_dtype (torch.dtype): Target dtype for the output latents.
+        args (argparse.Namespace): Command line arguments.
+
+    Returns:
+        torch.Tensor: Encoded latents with shape [B, C', F', H', W'].
+    """
+    if vae is None:
+        raise ValueError("VAE must be provided for video encoding.")
+
+    logger.info(f"Encoding video tensor to latents using tiled VAE (WanVAE): input shape {video_tensor.shape}")
+
+    # Ensure VAE is on the correct device
+    vae.to_device(device)
+
+    # Prepare video tensor: move to device, ensure float32, scale to [-1, 1]
+    video_tensor = video_tensor.to(device=device, dtype=torch.float32)
+    video_tensor = video_tensor * 2.0 - 1.0  # Scale from [0, 1] to [-1, 1]
+
+    # Calculate tile dimensions
+    B, C, F, H, W = video_tensor.shape
+
+    # Calculate tile sizes in pixel space
+    tile_height = args.vae_tile_sample_min_height
+    tile_width = args.vae_tile_sample_min_width
+
+    if args.vae_auto_tile_size:
+        # Auto-size based on memory constraints
+        tile_height = min(tile_height, H // 2)
+        tile_width = min(tile_width, W // 2)
+        # Ensure tiles are at least minimum size
+        tile_height = max(tile_height, 128)
+        tile_width = max(tile_width, 128)
+
+    # Calculate overlap
+    overlap_height = int(tile_height * args.vae_tile_overlap_factor_height)
+    overlap_width = int(tile_width * args.vae_tile_overlap_factor_width)
+
+    # Calculate stride (tile size - overlap)
+    stride_height = tile_height - overlap_height
+    stride_width = tile_width - overlap_width
+
+    logger.info(f"Tiled encoding - tile_size: ({tile_height}, {tile_width}), stride: ({stride_height}, {stride_width}), overlap: ({overlap_height}, {overlap_width})")
+
+    # Process each video in the batch
+    latents_list = []
+    for i in range(B):
+        video_single = video_tensor[i]  # Shape [C, F, H, W]
+
+        # Initialize output containers
+        # Estimate output dimensions (VAE typically downsamples by 8x spatially)
+        out_h = H // 8
+        out_w = W // 8
+        out_f = F  # Temporal dimension preserved in WanVAE
+        out_c = 16  # WanVAE latent channels
+
+        weight_map = torch.zeros((out_c, out_f, out_h, out_w), dtype=torch.float32, device=device)
+        latent_accumulator = torch.zeros((out_c, out_f, out_h, out_w), dtype=torch.float32, device=device)
+
+        # Generate tiles
+        tiles = []
+        for y in range(0, H, stride_height):
+            for x in range(0, W, stride_width):
+                y_end = min(y + tile_height, H)
+                x_end = min(x + tile_width, W)
+
+                # Skip if tile is too small
+                if y_end - y < 64 or x_end - x < 64:
+                    continue
+
+                tiles.append((y, y_end, x, x_end))
+
+        logger.info(f"Processing {len(tiles)} tiles for tiled encoding")
+
+        # Process tiles
+        for tile_idx, (y_start, y_end, x_start, x_end) in enumerate(tiles):
+            logger.info(f"Processing tile {tile_idx + 1}/{len(tiles)}: [{y_start}:{y_end}, {x_start}:{x_end}]")
+
+            # Extract tile
+            tile_video = video_single[:, :, y_start:y_end, x_start:x_end].unsqueeze(0)  # Add batch dim
+
+            # Encode tile
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+                encoded_tile = vae.encode([tile_video.squeeze(0)])[0]  # Remove batch dim for WanVAE, returns [C', F', H', W']
+
+            # Calculate tile position in output space
+            out_y_start = y_start // 8
+            out_y_end = out_y_start + encoded_tile.shape[2]
+            out_x_start = x_start // 8
+            out_x_end = out_x_start + encoded_tile.shape[3]
+
+            # Create blending mask for this tile
+            tile_h, tile_w = encoded_tile.shape[2], encoded_tile.shape[3]
+            mask = torch.ones((tile_h, tile_w), device=device, dtype=torch.float32)
+
+            # Apply feathering at edges if there's overlap
+            if overlap_height > 0:
+                fade_h = overlap_height // 8
+                if y_start > 0:  # Not first row
+                    mask[:fade_h, :] *= torch.linspace(0, 1, fade_h, device=device).unsqueeze(1)
+                if y_end < H:  # Not last row
+                    mask[-fade_h:, :] *= torch.linspace(1, 0, fade_h, device=device).unsqueeze(1)
+
+            if overlap_width > 0:
+                fade_w = overlap_width // 8
+                if x_start > 0:  # Not first column
+                    mask[:, :fade_w] *= torch.linspace(0, 1, fade_w, device=device).unsqueeze(0)
+                if x_end < W:  # Not last column
+                    mask[:, -fade_w:] *= torch.linspace(1, 0, fade_w, device=device).unsqueeze(0)
+
+            # Accumulate weighted results
+            mask = mask.unsqueeze(0).unsqueeze(0)  # Add channel and temporal dims
+            latent_accumulator[:, :, out_y_start:out_y_end, out_x_start:out_x_end] += encoded_tile * mask
+            weight_map[:, :, out_y_start:out_y_end, out_x_start:out_x_end] += mask
+
+        # Normalize by weights
+        latent_accumulator = latent_accumulator / (weight_map + 1e-8)
+        latents_list.append(latent_accumulator)
+
+        # Clear memory
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends.mps, 'empty_cache'):
+            torch.backends.mps.empty_cache()
+
+    # Stack results back into batch
+    latents = torch.stack(latents_list, dim=0)  # Shape [B, C', F', H', W']
+
+    # Move VAE back to CPU if cache_cpu is enabled
+    vae_target_device = torch.device("cpu") if not args.vae_cache_cpu else torch.device("cpu")
+    if args.vae_cache_cpu:
+        vae.to_device(vae_target_device)
+
+    logger.info(f"Tiled encoding complete: output shape {latents.shape}")
+    return latents
+
+
+def encode_video_to_latents_tiled_wan2_2_vae(video_tensor: torch.Tensor, vae, device: torch.device, vae_dtype: torch.dtype, args: argparse.Namespace) -> torch.Tensor:
+    """Tiled VAE encoding for Wan2_2_VAE (5B models) to reduce memory usage.
+
+    Args:
+        video_tensor (torch.Tensor): Video tensor with shape [B, C, F, H, W], values in [0, 1].
+        vae: Wan2_2_VAE model instance.
+        device (torch.device): Device to perform encoding on.
+        vae_dtype (torch.dtype): Target dtype for the output latents.
+        args (argparse.Namespace): Command line arguments.
+
+    Returns:
+        torch.Tensor: Encoded latents with shape [B, C', F', H', W'].
+    """
+    if vae is None:
+        raise ValueError("VAE must be provided for video encoding.")
+
+    logger.info(f"Encoding video tensor to latents using tiled VAE (Wan2_2_VAE): input shape {video_tensor.shape}")
+
+    # Prepare video tensor: move to device, ensure float32, scale to [0, 1] (Wan2_2_VAE expects [0,1])
+    video_tensor = video_tensor.to(device=device, dtype=torch.float32)
+    # Note: Wan2_2_VAE expects values in [0, 1], not [-1, 1] like WanVAE
+
+    # Calculate tile dimensions
+    B, C, F, H, W = video_tensor.shape
+
+    # Calculate tile sizes in pixel space
+    tile_height = args.vae_tile_sample_min_height
+    tile_width = args.vae_tile_sample_min_width
+
+    if args.vae_auto_tile_size:
+        # Auto-size based on memory constraints
+        tile_height = min(tile_height, H // 2)
+        tile_width = min(tile_width, W // 2)
+        # Ensure tiles are at least minimum size
+        tile_height = max(tile_height, 128)
+        tile_width = max(tile_width, 128)
+
+    # Calculate overlap
+    overlap_height = int(tile_height * args.vae_tile_overlap_factor_height)
+    overlap_width = int(tile_width * args.vae_tile_overlap_factor_width)
+
+    # Calculate stride (tile size - overlap)
+    stride_height = tile_height - overlap_height
+    stride_width = tile_width - overlap_width
+
+    logger.info(f"Tiled encoding - tile_size: ({tile_height}, {tile_width}), stride: ({stride_height}, {stride_width}), overlap: ({overlap_height}, {overlap_width})")
+
+    # Process each video in the batch
+    latents_list = []
+    for i in range(B):
+        video_single = video_tensor[i]  # Shape [C, F, H, W]
+
+        # Initialize output containers
+        # Estimate output dimensions (VAE typically downsamples by 8x spatially)
+        out_h = H // 8
+        out_w = W // 8
+        out_f = F  # Temporal dimension preserved
+        out_c = 16  # Wan2_2_VAE latent channels
+
+        weight_map = torch.zeros((out_c, out_f, out_h, out_w), dtype=torch.float32, device=device)
+        latent_accumulator = torch.zeros((out_c, out_f, out_h, out_w), dtype=torch.float32, device=device)
+
+        # Generate tiles
+        tiles = []
+        for y in range(0, H, stride_height):
+            for x in range(0, W, stride_width):
+                y_end = min(y + tile_height, H)
+                x_end = min(x + tile_width, W)
+
+                # Skip if tile is too small
+                if y_end - y < 64 or x_end - x < 64:
+                    continue
+
+                tiles.append((y, y_end, x, x_end))
+
+        logger.info(f"Processing {len(tiles)} tiles for tiled encoding")
+
+        # Process tiles
+        for tile_idx, (y_start, y_end, x_start, x_end) in enumerate(tiles):
+            logger.info(f"Processing tile {tile_idx + 1}/{len(tiles)}: [{y_start}:{y_end}, {x_start}:{x_end}]")
+
+            # Extract tile
+            tile_video = video_single[:, :, y_start:y_end, x_start:x_end]  # Shape [C, F, H, W]
+
+            # Encode tile - Wan2_2_VAE expects a list of tensors
+            with torch.no_grad():
+                encoded_tiles = vae.encode([tile_video])  # Returns list of tensors
+                encoded_tile = encoded_tiles[0]  # Get first tensor [C', F', H', W']
+
+            # Calculate tile position in output space
+            out_y_start = y_start // 8
+            out_y_end = out_y_start + encoded_tile.shape[2]
+            out_x_start = x_start // 8
+            out_x_end = out_x_start + encoded_tile.shape[3]
+
+            # Create blending mask for this tile
+            tile_h, tile_w = encoded_tile.shape[2], encoded_tile.shape[3]
+            mask = torch.ones((tile_h, tile_w), device=device, dtype=torch.float32)
+
+            # Apply feathering at edges if there's overlap
+            if overlap_height > 0:
+                fade_h = overlap_height // 8
+                if y_start > 0:  # Not first row
+                    mask[:fade_h, :] *= torch.linspace(0, 1, fade_h, device=device).unsqueeze(1)
+                if y_end < H:  # Not last row
+                    mask[-fade_h:, :] *= torch.linspace(1, 0, fade_h, device=device).unsqueeze(1)
+
+            if overlap_width > 0:
+                fade_w = overlap_width // 8
+                if x_start > 0:  # Not first column
+                    mask[:, :fade_w] *= torch.linspace(0, 1, fade_w, device=device).unsqueeze(0)
+                if x_end < W:  # Not last column
+                    mask[:, -fade_w:] *= torch.linspace(1, 0, fade_w, device=device).unsqueeze(0)
+
+            # Accumulate weighted results
+            mask = mask.unsqueeze(0).unsqueeze(0)  # Add channel and temporal dims
+            latent_accumulator[:, :, out_y_start:out_y_end, out_x_start:out_x_end] += encoded_tile * mask
+            weight_map[:, :, out_y_start:out_y_end, out_x_start:out_x_end] += mask
+
+        # Normalize by weights
+        latent_accumulator = latent_accumulator / (weight_map + 1e-8)
+        latents_list.append(latent_accumulator)
+
+        # Clear memory
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends.mps, 'empty_cache'):
+            torch.backends.mps.empty_cache()
+
+    # Stack results back into batch
+    latents = torch.stack(latents_list, dim=0)  # Shape [B, C', F', H', W']
+
+    logger.info(f"Tiled encoding complete: output shape {latents.shape}")
+    return latents
+
+
+def should_use_tiled_encode(args: argparse.Namespace, video_shape: tuple) -> bool:
+    """Determine if tiled encoding should be used based on video size and settings.
+
+    Args:
+        args: Command line arguments containing tiled encoding settings.
+        video_shape: Shape tuple of the video tensor (B, C, F, H, W).
+
+    Returns:
+        bool: True if tiled encoding should be used.
+    """
+    if not args.enable_tiled_vae_encode:
+        return False
+
+    B, C, F, H, W = video_shape
+
+    # Check size thresholds
+    if args.vae_auto_tile_size:
+        # Auto mode: use tiled encoding for any reasonably large video
+        return H > 256 or W > 424
+    else:
+        # Manual mode: use explicit thresholds
+        return H > args.vae_tile_sample_min_height or W > args.vae_tile_sample_min_width
 
 
 def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerator, device: torch.device, video_latents: torch.Tensor):

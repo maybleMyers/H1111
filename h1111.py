@@ -479,8 +479,8 @@ def wan22_batch_handler(
     pusa_cond_positions: str, pusa_cond_noise_multipliers: str,
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
     pusa_auto_join: bool,
-    # Tiled VAE Decode parameters
-    enable_tiled_vae_decode: bool, vae_auto_tile_size: bool, vae_frame_batch_size: int,
+    # Tiled VAE parameters
+    enable_tiled_vae_decode: bool, enable_tiled_vae_encode: bool, vae_auto_tile_size: bool, vae_frame_batch_size: int,
     vae_tile_sample_min_height: int, vae_tile_sample_min_width: int,
     vae_tile_overlap_factor_height: float, vae_tile_overlap_factor_width: float
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
@@ -649,9 +649,12 @@ def wan22_batch_handler(
         if bouncing_linear_alternate:
             command.append("--bouncing-linear-alternate")
 
-        # Add tiled VAE decode arguments
+        # Add tiled VAE arguments
         if enable_tiled_vae_decode:
             command.append("--enable_tiled_vae_decode")
+        if enable_tiled_vae_encode:
+            command.append("--enable_tiled_vae_encode")
+        if enable_tiled_vae_decode or enable_tiled_vae_encode:
             if vae_auto_tile_size:
                 command.append("--vae_auto_tile_size")
             command.extend(["--vae_frame_batch_size", str(vae_frame_batch_size)])
@@ -9024,6 +9027,15 @@ with gr.Blocks(
                                 info="Overlap ratio between tiles (width). Higher values = smoother transitions, more memory"
                             )
 
+                # Tiled VAE Encode Settings
+                with gr.Group():
+                    gr.HTML("<h4>🧩 Tiled VAE Encode (Memory Optimization)</h4>")
+                    wan22_enable_tiled_vae_encode = gr.Checkbox(
+                        label="Enable Tiled VAE Encode",
+                        value=False,
+                        info="Enable tiled VAE encoding to reduce memory usage for large videos (V2V mode)"
+                    )
+
         # Pusa-ext Tab (Extended Video Generation with DiffSynth backend) - Reorganized to match Wan2.2 layout
         with gr.Tab(id=15, label="Pusa-ext") as pusa_tab:
             # Top section: Prompts and batch controls (same as Wan2.2)
@@ -13225,8 +13237,9 @@ with gr.Blocks(
             wan22_pusa_v2v_positions,
             wan22_pusa_v2v_noise_multipliers,
             wan22_pusa_auto_join,
-            # Tiled VAE Decode arguments
+            # Tiled VAE arguments
             wan22_enable_tiled_vae_decode,
+            wan22_enable_tiled_vae_encode,
             wan22_vae_auto_tile_size,
             wan22_vae_frame_batch_size,
             wan22_vae_tile_sample_min_height,
