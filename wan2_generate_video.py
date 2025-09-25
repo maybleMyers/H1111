@@ -898,10 +898,10 @@ def create_funcontrol_conditioning_latent(
             img_tensor = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)
             img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
 
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
-                # vae.encode expects a list, returns a list. Take first element.
+            with torch.no_grad():
+                # Use tiled encoding if enabled
                 # Result shape [C', F', H', W'] - needs batch dim for processing here
-                start_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
+                start_latent = encode_single_video_with_tiling(img_tensor, vae, device, vae_dtype, args).unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
             # Calculate influence and falloff
             start_frames_influence = min(start_latent.shape[2], total_latent_frames) # Usually 1
@@ -951,10 +951,10 @@ def create_funcontrol_conditioning_latent(
             img_tensor = TF.to_tensor(img_resized_np).sub_(0.5).div_(0.5).to(device)
             img_tensor = img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
 
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
-                # vae.encode expects a list, returns a list. Take first element.
+            with torch.no_grad():
+                # Use tiled encoding if enabled
                 # Result shape [C', F', H', W'] - needs batch dim for processing here
-                end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
+                end_latent = encode_single_video_with_tiling(img_tensor, vae, device, vae_dtype, args).unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
             # Calculate end image influence transition (S-curve / cubic)
             end_influence_mask = torch.zeros([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
@@ -1051,9 +1051,9 @@ def create_funcontrol_conditioning_latent(
             control_tensor = control_tensor.unsqueeze(0).to(device) # B,C,F,H,W
 
             # Encode control video
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae_dtype):
-                # vae.encode expects list of [C, F, H, W], returns list of [C', F', H', W']
-                control_video_latent = vae.encode([control_tensor[0]])[0].unsqueeze(0).to(device).contiguous() # [1, 16, lat_f, lat_h, lat_w]
+            with torch.no_grad():
+                # Use tiled encoding if enabled
+                control_video_latent = encode_single_video_with_tiling(control_tensor[0], vae, device, vae_dtype, args).unsqueeze(0).to(device).contiguous() # [1, 16, lat_f, lat_h, lat_w]
 
             # Calculate weighted control mask (replicating base_nodes logic)
             control_frames_latent = control_video_latent.shape[2] # Should match total_latent_frames
@@ -2030,10 +2030,10 @@ def prepare_i2v_inputs(
                 ref_img_tensor = ref_img_tensor.unsqueeze(1) # Add frame dim: C,F,H,W
 
                 vae.to_device(device) # Ensure VAE is on device for encoding
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-                    # Encode the single reference frame
-                    # vae.encode returns list, take first element. Result shape [C', 1, H', W']
-                    fun_ref_latent = vae.encode([ref_img_tensor])[0]
+                with torch.no_grad():
+                    # Encode the single reference frame using tiled encoding if enabled
+                    # Result shape [C', 1, H', W']
+                    fun_ref_latent = encode_single_video_with_tiling(ref_img_tensor, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args)
                     # Squeeze the frame dimension for Conv2d in the model: [C', H', W']
                     fun_ref_latent = fun_ref_latent.squeeze(1)
                 logger.info(f"Encoded fun_ref latent. Shape: {fun_ref_latent.shape}")
@@ -2227,12 +2227,12 @@ def prepare_i2v_inputs(
                  # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
 
             # Encode the padded start image tensor. VAE output matches latent frame count.
-            # vae.encode expects [C, F, H, W]
-            y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
+            # Use tiled encoding if enabled
+            y_latent_base = encode_single_video_with_tiling(img_padded, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args) # Shape [C', lat_f_base, H, W]
 
             if has_end_image and end_img_resized is not None:
-                 # Encode the single end frame
-                 y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
+                 # Encode the single end frame with tiled encoding if enabled
+                 y_end = encode_single_video_with_tiling(end_img_resized, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args) # Shape [C', 1, H, W]
                  # Concatenate along frame dimension (dim=1)
                  y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
             else:
@@ -2322,25 +2322,12 @@ def prepare_ti2v_inputs(
         vae.to_device(device)
         
         # Encode image - handle different VAE types
-        if hasattr(vae, 'model') and hasattr(vae, 'scale'):
-            # Wan2_2_VAE type - expects list input with frame dimension [C, F, H, W]
-            # image_tensor is already [3, 1, H, W] from official format
-            encoded_latents = vae.encode([image_tensor])  # Returns list of encoded latents
-            image_latent = encoded_latents[0]  # Get the first (and only) latent [C, 1, H', W']
-            
-            # CRITICAL: Expand the single image frame to all temporal positions to match noise
-            # This matches the official implementation where z[0] has same temporal dims as noise
-            image_latent = image_latent.expand(-1, lat_f, -1, -1)  # [C, F, H', W'] - expand to all frames
-            
-        else:
-            # Original WanVAE type - expects tensor input
-            image_latent = vae.encode(image_tensor).latent_dist.sample()  # [1, C, H', W']
-            # Scale by VAE scaling factor
-            image_latent = image_latent * vae.config.scaling_factor
-            
-            # For TI2V, we need to expand the single image frame to all temporal positions
-            # This matches the official implementation where z[0] has full temporal dimensions
-            image_latent = image_latent.expand(-1, lat_f, -1, -1)  # [C, F, H', W'] - expand to all frames
+        # Use our unified tiled encoding helper for both VAE types
+        image_latent = encode_single_video_with_tiling(image_tensor, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args)  # [C, 1, H', W']
+
+        # CRITICAL: Expand the single image frame to all temporal positions to match noise
+        # This matches the official implementation where z[0] has same temporal dims as noise
+        image_latent = image_latent.expand(-1, lat_f, -1, -1)  # [C, F, H', W'] - expand to all frames
         
     logger.info(f"Image latent shape: {image_latent.shape}")
     
@@ -2846,27 +2833,40 @@ def encode_video_to_latents_tiled_wan2_2_vae(video_tensor: torch.Tensor, vae, de
 
 
 def should_use_tiled_encode(args: argparse.Namespace, video_shape: tuple) -> bool:
-    """Determine if tiled encoding should be used based on video size and settings.
+    """Determine if tiled encoding should be used based on explicit user setting only.
 
     Args:
         args: Command line arguments containing tiled encoding settings.
         video_shape: Shape tuple of the video tensor (B, C, F, H, W).
 
     Returns:
-        bool: True if tiled encoding should be used.
+        bool: True if tiled encoding should be used (only when explicitly enabled).
     """
-    if not args.enable_tiled_vae_encode:
-        return False
+    # Only use tiled encoding when explicitly requested by the user
+    return args.enable_tiled_vae_encode
 
-    B, C, F, H, W = video_shape
 
-    # Check size thresholds
-    if args.vae_auto_tile_size:
-        # Auto mode: use tiled encoding for any reasonably large video
-        return H > 256 or W > 424
-    else:
-        # Manual mode: use explicit thresholds
-        return H > args.vae_tile_sample_min_height or W > args.vae_tile_sample_min_width
+def encode_single_video_with_tiling(video_tensor: torch.Tensor, vae, device: torch.device, vae_dtype: torch.dtype, args: argparse.Namespace) -> torch.Tensor:
+    """Helper function to encode single video tensor with optional tiling support.
+
+    Args:
+        video_tensor (torch.Tensor): Video tensor with shape [C, F, H, W], values in [0, 1].
+        vae: VAE model instance (WanVAE or Wan2_2_VAE).
+        device (torch.device): Device to perform encoding on.
+        vae_dtype (torch.dtype): Target dtype for the output latents.
+        args (argparse.Namespace): Command line arguments.
+
+    Returns:
+        torch.Tensor: Encoded latents with shape [C', F', H', W'].
+    """
+    # Add batch dimension for processing
+    video_batch = video_tensor.unsqueeze(0)  # [1, C, F, H, W]
+
+    # Use our main encoding function which handles tiling based on args
+    latents_batch = encode_video_to_latents(video_batch, vae, device, vae_dtype, args)
+
+    # Remove batch dimension for return
+    return latents_batch.squeeze(0)  # [C', F', H', W']
 
 
 def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerator, device: torch.device, video_latents: torch.Tensor):
@@ -3985,8 +3985,8 @@ def prepare_video_extension_inputs(
     
     # Encode conditioning frames with VAE
     vae.to_device(device)
-    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-        y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+    with torch.no_grad():
+        y_latent = encode_single_video_with_tiling(padded_frames, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args)  # [C', lat_f, lat_h, lat_w]
     
     # Create mask for conditioning frames
     motion_frames_latent_num = (cond_f - 1) // config.vae_stride[0] + 1
@@ -4447,8 +4447,8 @@ def generate_extended_video(
         
         # Encode conditioning frames to latent
         vae.to_device(device)
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            cond_latent = vae.encode([cond_frames])[0]
+        with torch.no_grad():
+            cond_latent = encode_single_video_with_tiling(cond_frames, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args)
         
         # Prepare inputs for this chunk
         chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)
@@ -5362,9 +5362,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     # We'll treat each frame as a single-frame video
                     img_tensor_video = img_tensor.squeeze(0).unsqueeze(1)  # [3, 1, H, W] - remove batch, add frame dim
 
-                    # vae.encode expects a list, returns a list
-                    cond_latent_list = vae.encode([img_tensor_video])  # Returns list with [C', 1, H_lat, W_lat]
-                    cond_latent = cond_latent_list[0].to(device)  # Get first element from list
+                    # Use tiled encoding if enabled
+                    cond_latent = encode_single_video_with_tiling(img_tensor_video, vae, device, vae.dtype if hasattr(vae, 'dtype') else torch.float32, args).to(device)  # [C', 1, H_lat, W_lat]
 
                     # Remove the temporal dimension since we encoded a single frame
                     cond_latent = cond_latent.squeeze(1)  # [C', H_lat, W_lat]
