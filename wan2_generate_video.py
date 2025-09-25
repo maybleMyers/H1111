@@ -261,6 +261,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
+    # Tiled VAE decode arguments
+    parser.add_argument("--enable_tiled_vae_decode", action="store_true", help="Enable tiled VAE decoding for memory optimization")
+    parser.add_argument("--vae_tile_sample_min_height", type=int, default=240, help="Minimum tile height in pixel space for VAE tiling")
+    parser.add_argument("--vae_tile_sample_min_width", type=int, default=424, help="Minimum tile width in pixel space for VAE tiling")
+    parser.add_argument("--vae_tile_overlap_factor_height", type=float, default=0.1666, help="Overlap factor for height dimension in VAE tiling (0.0-1.0)")
+    parser.add_argument("--vae_tile_overlap_factor_width", type=float, default=0.2, help="Overlap factor for width dimension in VAE tiling (0.0-1.0)")
+    parser.add_argument("--vae_frame_batch_size", type=int, default=6, help="Frame batch size for temporal processing in VAE tiling")
+    parser.add_argument("--vae_auto_tile_size", action="store_true", help="Automatically determine VAE tile size based on latent dimensions")
     parser.add_argument("--t5", type=str, default=None, help="text encoder (T5) checkpoint path")
     parser.add_argument("--clip", type=str, default=None, help="text encoder (CLIP) checkpoint path")
     # LoRA
@@ -5187,6 +5195,285 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     return final_latent
 
+# ========================= TILED VAE DECODE FUNCTIONS =========================
+
+def blend_v(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    """Blend two tensors vertically (height dimension) for smooth tile transitions."""
+    blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+    for y in range(blend_extent):
+        blend_factor = y / blend_extent
+        b[..., y, :] = a[..., -blend_extent + y, :] * (1 - blend_factor) + b[..., y, :] * blend_factor
+    return b
+
+def blend_h(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    """Blend two tensors horizontally (width dimension) for smooth tile transitions."""
+    blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+    for x in range(blend_extent):
+        blend_factor = x / blend_extent
+        b[..., x] = a[..., -blend_extent + x] * (1 - blend_factor) + b[..., x] * blend_factor
+    return b
+
+@torch.inference_mode()
+def decode_latents_tiled_wan_vae(
+    vae,
+    z: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    """Tiled decoding for WanVAE (14B models) with spatial and temporal tiling.
+
+    Args:
+        vae: WanVAE instance
+        z: Input latents [B, C, T, H, W]
+        args: Command line arguments with tiling parameters
+        device: Device for computation
+
+    Returns:
+        torch.Tensor: Decoded video frames [B, 3, T', H', W']
+    """
+    logger.info("Using tiled VAE decode for WanVAE (14B models)")
+
+    B, C, T, H, W = z.shape
+
+    # Calculate tile parameters
+    if args.vae_auto_tile_size:
+        tile_sample_min_height = H // 2 * 8  # Auto-size based on latent dims
+        tile_sample_min_width = W // 2 * 8
+    else:
+        tile_sample_min_height = args.vae_tile_sample_min_height
+        tile_sample_min_width = args.vae_tile_sample_min_width
+
+    tile_latent_min_height = int(tile_sample_min_height / 8)  # VAE downscale factor
+    tile_latent_min_width = int(tile_sample_min_width / 8)
+
+    overlap_height = int(tile_latent_min_height * (1 - args.vae_tile_overlap_factor_height))
+    overlap_width = int(tile_latent_min_width * (1 - args.vae_tile_overlap_factor_width))
+    blend_extent_height = int(tile_sample_min_height * args.vae_tile_overlap_factor_height)
+    blend_extent_width = int(tile_sample_min_width * args.vae_tile_overlap_factor_width)
+    row_limit_height = tile_sample_min_height - blend_extent_height
+    row_limit_width = tile_sample_min_width - blend_extent_width
+
+    frame_batch_size = min(args.vae_frame_batch_size, T)
+
+    logger.info(f"Tile parameters: tile_size=({tile_sample_min_height}x{tile_sample_min_width}), "
+                f"overlap=({args.vae_tile_overlap_factor_height:.3f},{args.vae_tile_overlap_factor_width:.3f}), "
+                f"frame_batch_size={frame_batch_size}")
+
+    # Process each batch item separately
+    result_batch = []
+    for batch_idx in range(B):
+        z_single = z[batch_idx:batch_idx+1]  # Keep batch dim for processing
+
+        # Split into overlapping spatial tiles and temporal batches
+        rows = []
+        total_tiles = len(range(0, H, overlap_height)) * len(range(0, W, overlap_width)) * \
+                     len(range(0, T, frame_batch_size))
+
+        with tqdm(total=total_tiles, desc=f"Processing VAE tiles (batch {batch_idx+1}/{B})") as pbar:
+            for i in range(0, H, overlap_height):
+                row = []
+                for j in range(0, W, overlap_width):
+                    temporal = []
+                    for k in range(0, T, frame_batch_size):
+                        # Extract tile with temporal batching
+                        t_end = min(k + frame_batch_size, T)
+                        tile = z_single[
+                            :, :,
+                            k:t_end,
+                            i:i + tile_latent_min_height,
+                            j:j + tile_latent_min_width,
+                        ]
+
+                        # Decode tile - WanVAE expects list of [C, T, H, W] tensors
+                        tile_decoded = vae.decode([tile.squeeze(0)])[0]  # Returns [C, T, H, W]
+                        temporal.append(tile_decoded.unsqueeze(0))  # Add batch dim back
+                        pbar.update(1)
+
+                        # Clean memory after each tile
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        elif device.type == "mps":
+                            torch.mps.empty_cache()
+
+                    # Concatenate temporal batches
+                    row.append(torch.cat(temporal, dim=2))
+                rows.append(row)
+
+        # Blend tiles with overlap handling
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # Blend vertically with tile above
+                if i > 0:
+                    tile = blend_v(rows[i - 1][j], tile, blend_extent_height)
+                # Blend horizontally with tile to the left
+                if j > 0:
+                    tile = blend_h(row[j - 1], tile, blend_extent_width)
+
+                # Crop to non-overlapping region
+                result_row.append(tile[..., :row_limit_height, :row_limit_width])
+
+            result_rows.append(torch.cat(result_row, dim=-1))  # Concat horizontally
+
+        # Concatenate all rows vertically
+        decoded_batch_item = torch.cat(result_rows, dim=-2)
+        result_batch.append(decoded_batch_item)
+
+    # Stack batch results
+    final_result = torch.cat(result_batch, dim=0)
+    logger.info(f"Tiled VAE decode complete. Output shape: {final_result.shape}")
+
+    return final_result
+
+@torch.inference_mode()
+def decode_latents_tiled_wan2_2_vae(
+    vae,
+    z: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    """Tiled decoding for Wan2_2_VAE (5B model) with spatial and temporal tiling.
+
+    Args:
+        vae: Wan2_2_VAE instance
+        z: Input latents [B, C, T, H, W]
+        args: Command line arguments with tiling parameters
+        device: Device for computation
+
+    Returns:
+        torch.Tensor: Decoded video frames [B, 3, T', H', W']
+    """
+    logger.info("Using tiled VAE decode for Wan2_2_VAE (5B model)")
+
+    B, C, T, H, W = z.shape
+
+    # Calculate tile parameters
+    if args.vae_auto_tile_size:
+        tile_sample_min_height = H // 2 * 8  # Auto-size based on latent dims
+        tile_sample_min_width = W // 2 * 8
+    else:
+        tile_sample_min_height = args.vae_tile_sample_min_height
+        tile_sample_min_width = args.vae_tile_sample_min_width
+
+    tile_latent_min_height = int(tile_sample_min_height / 8)  # VAE downscale factor
+    tile_latent_min_width = int(tile_sample_min_width / 8)
+
+    overlap_height = int(tile_latent_min_height * (1 - args.vae_tile_overlap_factor_height))
+    overlap_width = int(tile_latent_min_width * (1 - args.vae_tile_overlap_factor_width))
+    blend_extent_height = int(tile_sample_min_height * args.vae_tile_overlap_factor_height)
+    blend_extent_width = int(tile_sample_min_width * args.vae_tile_overlap_factor_width)
+    row_limit_height = tile_sample_min_height - blend_extent_height
+    row_limit_width = tile_sample_min_width - blend_extent_width
+
+    frame_batch_size = min(args.vae_frame_batch_size, T)
+
+    logger.info(f"Tile parameters: tile_size=({tile_sample_min_height}x{tile_sample_min_width}), "
+                f"overlap=({args.vae_tile_overlap_factor_height:.3f},{args.vae_tile_overlap_factor_width:.3f}), "
+                f"frame_batch_size={frame_batch_size}")
+
+    # Process each batch item separately
+    result_batch = []
+    for batch_idx in range(B):
+        z_single = z[batch_idx]  # [C, T, H, W] - remove batch dim for Wan2_2_VAE
+
+        # Split into overlapping spatial tiles and temporal batches
+        rows = []
+        total_tiles = len(range(0, H, overlap_height)) * len(range(0, W, overlap_width)) * \
+                     len(range(0, T, frame_batch_size))
+
+        with tqdm(total=total_tiles, desc=f"Processing VAE tiles (batch {batch_idx+1}/{B})") as pbar:
+            for i in range(0, H, overlap_height):
+                row = []
+                for j in range(0, W, overlap_width):
+                    temporal = []
+                    for k in range(0, T, frame_batch_size):
+                        # Extract tile with temporal batching
+                        t_end = min(k + frame_batch_size, T)
+                        tile = z_single[
+                            :,
+                            k:t_end,
+                            i:i + tile_latent_min_height,
+                            j:j + tile_latent_min_width,
+                        ]
+
+                        # Decode tile - Wan2_2_VAE expects list of [C, T, H, W] tensors
+                        tile_decoded = vae.decode([tile])[0]  # Returns [C, T, H, W]
+                        temporal.append(tile_decoded)
+                        pbar.update(1)
+
+                        # Clean memory after each tile
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        elif device.type == "mps":
+                            torch.mps.empty_cache()
+
+                    # Concatenate temporal batches
+                    row.append(torch.cat(temporal, dim=1))  # Concat on time dim
+                rows.append(row)
+
+        # Blend tiles with overlap handling
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # Blend vertically with tile above
+                if i > 0:
+                    tile = blend_v(rows[i - 1][j], tile, blend_extent_height)
+                # Blend horizontally with tile to the left
+                if j > 0:
+                    tile = blend_h(row[j - 1], tile, blend_extent_width)
+
+                # Crop to non-overlapping region
+                result_row.append(tile[..., :row_limit_height, :row_limit_width])
+
+            result_rows.append(torch.cat(result_row, dim=-1))  # Concat horizontally
+
+        # Concatenate all rows vertically and add batch dimension
+        decoded_batch_item = torch.cat(result_rows, dim=-2).unsqueeze(0)  # Add batch dim
+        result_batch.append(decoded_batch_item)
+
+    # Stack batch results
+    final_result = torch.cat(result_batch, dim=0)
+    logger.info(f"Tiled VAE decode complete. Output shape: {final_result.shape}")
+
+    return final_result
+
+def should_use_tiled_decode(args: argparse.Namespace, latent_shape: tuple) -> bool:
+    """Determine if tiled decode should be used based on settings and tensor size."""
+    if not args.enable_tiled_vae_decode:
+        return False
+
+    # Validate tiling parameters
+    if args.vae_tile_overlap_factor_height < 0 or args.vae_tile_overlap_factor_height >= 1:
+        logger.warning(f"Invalid height overlap factor {args.vae_tile_overlap_factor_height}, using default 0.1666")
+        args.vae_tile_overlap_factor_height = 0.1666
+
+    if args.vae_tile_overlap_factor_width < 0 or args.vae_tile_overlap_factor_width >= 1:
+        logger.warning(f"Invalid width overlap factor {args.vae_tile_overlap_factor_width}, using default 0.2")
+        args.vae_tile_overlap_factor_width = 0.2
+
+    B, C, T, H, W = latent_shape
+
+    # Calculate pixel dimensions (assuming 8x downscale factor)
+    pixel_height = H * 8
+    pixel_width = W * 8
+
+    # Use tiling if dimensions exceed tile size or if explicitly enabled
+    height_threshold = args.vae_tile_sample_min_height if not args.vae_auto_tile_size else H * 4
+    width_threshold = args.vae_tile_sample_min_width if not args.vae_auto_tile_size else W * 4
+
+    will_tile = pixel_height > height_threshold or pixel_width > width_threshold
+
+    if will_tile:
+        logger.info(f"Tiling enabled: pixel size ({pixel_height}x{pixel_width}) > thresholds ({height_threshold}x{width_threshold})")
+    else:
+        logger.info(f"Tiling not needed: pixel size ({pixel_height}x{pixel_width}) <= thresholds ({height_threshold}x{width_threshold})")
+
+    return will_tile
+
+# ======================= END TILED VAE DECODE FUNCTIONS =======================
+
 def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.Tensor:
     """decode latent tensor to video frames
 
@@ -5227,26 +5514,41 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure latent is on the correct device and expected dtype for VAE
     latent_decode = latent.to(device=device, dtype=vae.dtype)
 
-    # Handle different VAE decode APIs
-    videos = None
-    with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+    # Check if tiled decode should be used
+    use_tiled = should_use_tiled_decode(args, latent_decode.shape)
+
+    if use_tiled:
+        logger.info(f"Using tiled VAE decode for latent shape {latent_decode.shape}")
+
+        # Route to appropriate tiled decode function based on VAE type
         if hasattr(vae, 'model') and hasattr(vae, 'scale'):
-            # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
-            # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
-            latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
-            decoded_list = vae.decode(latent_list)
-            if decoded_list and len(decoded_list) > 0:
-                # Stack list back into batch dimension: [1, C, F, H, W]
-                videos = torch.stack(decoded_list, dim=0)
-            else:
-                raise RuntimeError("VAE decoding failed or returned empty list.")
+            # Wan2_2_VAE type (5B model)
+            videos = decode_latents_tiled_wan2_2_vae(vae, latent_decode, args, device)
         else:
-            # Original WanVAE type - handles tensor input directly
-            decoded_list = vae.decode(latent_decode)
-            if decoded_list and len(decoded_list) > 0:
-                videos = torch.stack(decoded_list, dim=0)
+            # WanVAE type (14B models)
+            videos = decode_latents_tiled_wan_vae(vae, latent_decode, args, device)
+    else:
+        # Standard decode for smaller latents or when tiling is disabled
+        logger.info(f"Using standard VAE decode for latent shape {latent_decode.shape}")
+        videos = None
+        with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+            if hasattr(vae, 'model') and hasattr(vae, 'scale'):
+                # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
+                # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
+                latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
+                decoded_list = vae.decode(latent_list)
+                if decoded_list and len(decoded_list) > 0:
+                    # Stack list back into batch dimension: [1, C, F, H, W]
+                    videos = torch.stack(decoded_list, dim=0)
+                else:
+                    raise RuntimeError("VAE decoding failed or returned empty list.")
             else:
-                raise RuntimeError("VAE decoding failed or returned empty list.")
+                # Original WanVAE type - handles tensor input directly
+                decoded_list = vae.decode(latent_decode)
+                if decoded_list and len(decoded_list) > 0:
+                    videos = torch.stack(decoded_list, dim=0)
+                else:
+                    raise RuntimeError("VAE decoding failed or returned empty list.")
 
 
     # Move VAE back to CPU/cache

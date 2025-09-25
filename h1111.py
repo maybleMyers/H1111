@@ -475,10 +475,14 @@ def wan22_batch_handler(
     # Pusa Extension parameters
     pusa_noise_multipliers: float, pusa_noisy_steps: int,
     # New Pusa Multi-Frame parameters
-    pusa_mode: str, pusa_end_image: str, pusa_cond_images: List[str], 
+    pusa_mode: str, pusa_end_image: str, pusa_cond_images: List[str],
     pusa_cond_positions: str, pusa_cond_noise_multipliers: str,
     pusa_cond_video: str, pusa_v2v_positions: str, pusa_v2v_noise_multipliers: str,
-    pusa_auto_join: bool
+    pusa_auto_join: bool,
+    # Tiled VAE Decode parameters
+    enable_tiled_vae_decode: bool, vae_auto_tile_size: bool, vae_frame_batch_size: int,
+    vae_tile_sample_min_height: int, vae_tile_sample_min_width: int,
+    vae_tile_overlap_factor_height: float, vae_tile_overlap_factor_width: float
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -644,6 +648,17 @@ def wan22_batch_handler(
             command.append("--use-bouncing-linear")
         if bouncing_linear_alternate:
             command.append("--bouncing-linear-alternate")
+
+        # Add tiled VAE decode arguments
+        if enable_tiled_vae_decode:
+            command.append("--enable_tiled_vae_decode")
+            if vae_auto_tile_size:
+                command.append("--vae_auto_tile_size")
+            command.extend(["--vae_frame_batch_size", str(vae_frame_batch_size)])
+            command.extend(["--vae_tile_sample_min_height", str(vae_tile_sample_min_height)])
+            command.extend(["--vae_tile_sample_min_width", str(vae_tile_sample_min_width)])
+            command.extend(["--vae_tile_overlap_factor_height", str(vae_tile_overlap_factor_height)])
+            command.extend(["--vae_tile_overlap_factor_width", str(vae_tile_overlap_factor_width)])
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
             command.extend(["--preview_suffix", unique_preview_suffix])
@@ -8951,6 +8966,64 @@ with gr.Blocks(
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
 
+                # Tiled VAE Decode Settings
+                with gr.Group():
+                    gr.HTML("<h4>🧩 Tiled VAE Decode (Memory Optimization)</h4>")
+                    wan22_enable_tiled_vae_decode = gr.Checkbox(
+                        label="Enable Tiled VAE Decode",
+                        value=False,
+                        info="Enable tiled VAE decoding to reduce memory usage for large videos"
+                    )
+                    with gr.Group(visible=False) as wan22_tiled_vae_controls:
+                        with gr.Row():
+                            wan22_vae_auto_tile_size = gr.Checkbox(
+                                label="Auto Tile Size",
+                                value=False,
+                                info="Automatically determine tile size based on latent dimensions"
+                            )
+                            wan22_vae_frame_batch_size = gr.Number(
+                                label="Frame Batch Size",
+                                value=6,
+                                minimum=1,
+                                maximum=97,
+                                step=1,
+                                info="Number of frames to process together (lower = less memory)"
+                            )
+                        with gr.Row():
+                            wan22_vae_tile_sample_min_height = gr.Number(
+                                label="Tile Height (pixels)",
+                                value=240,
+                                minimum=64,
+                                maximum=1024,
+                                step=8,
+                                info="Minimum tile height in pixel space"
+                            )
+                            wan22_vae_tile_sample_min_width = gr.Number(
+                                label="Tile Width (pixels)",
+                                value=424,
+                                minimum=64,
+                                maximum=1024,
+                                step=8,
+                                info="Minimum tile width in pixel space"
+                            )
+                        with gr.Row():
+                            wan22_vae_tile_overlap_factor_height = gr.Slider(
+                                minimum=0.0,
+                                maximum=0.9,
+                                step=0.01,
+                                label="Height Overlap Factor",
+                                value=0.1666,
+                                info="Overlap ratio between tiles (height). Higher values = smoother transitions, more memory"
+                            )
+                            wan22_vae_tile_overlap_factor_width = gr.Slider(
+                                minimum=0.0,
+                                maximum=0.9,
+                                step=0.01,
+                                label="Width Overlap Factor",
+                                value=0.2,
+                                info="Overlap ratio between tiles (width). Higher values = smoother transitions, more memory"
+                            )
+
         # Pusa-ext Tab (Extended Video Generation with DiffSynth backend) - Reorganized to match Wan2.2 layout
         with gr.Tab(id=15, label="Pusa-ext") as pusa_tab:
             # Top section: Prompts and batch controls (same as Wan2.2)
@@ -12959,8 +13032,15 @@ with gr.Blocks(
         inputs=[wan22_enable_extension],
         outputs=[wan22_extension_controls]
     )
-    
-    
+
+    # Tiled VAE decode visibility toggle
+    wan22_enable_tiled_vae_decode.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_tiled_vae_decode],
+        outputs=[wan22_tiled_vae_controls]
+    )
+
+
     # Image input handling for wan22
     wan22_input_image.change(
         fn=update_wanx_image_dimensions,  # Reuse the same function
@@ -13145,6 +13225,14 @@ with gr.Blocks(
             wan22_pusa_v2v_positions,
             wan22_pusa_v2v_noise_multipliers,
             wan22_pusa_auto_join,
+            # Tiled VAE Decode arguments
+            wan22_enable_tiled_vae_decode,
+            wan22_vae_auto_tile_size,
+            wan22_vae_frame_batch_size,
+            wan22_vae_tile_sample_min_height,
+            wan22_vae_tile_sample_min_width,
+            wan22_vae_tile_overlap_factor_height,
+            wan22_vae_tile_overlap_factor_width,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
