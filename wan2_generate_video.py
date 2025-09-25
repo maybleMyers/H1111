@@ -2513,7 +2513,7 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae, device: torch.devic
         latents = torch.stack(latents_list, dim=0)  # Shape [B, C', F', H', W']
 
     elif args.task in ["i2v-A14B", "t2v-A14B"]:
-        # Wan2_1_VAE (14B models) - expects direct tensor input like in animate.py
+        # Wan2_1_VAE (14B models) - expects 5D tensor input like in animate.py
         video_tensor = video_tensor.to(device=device, dtype=vae_dtype)
         if video_tensor.max() < 0.5:  # Convert from [0, 1] to [-1, 1] if needed
             video_tensor = video_tensor * 2.0 - 1.0
@@ -2522,10 +2522,11 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae, device: torch.devic
         batch_size = video_tensor.shape[0]
         for i in range(batch_size):
             video_single = video_tensor[i]  # Shape [C, F, H, W]
+            # Add batch dimension for VAE input [B, C, F, H, W]
+            video_single_5d = video_single.unsqueeze(0)  # [1, C, F, H, W]
             with torch.no_grad():
-                encoded_latent = vae.encode(video_single)  # Direct call like animate.py
-                if isinstance(encoded_latent, list):
-                    encoded_latent = encoded_latent[0]  # [C', F', H', W']
+                encoded_latent_list = vae.encode(video_single_5d)  # Returns list like animate.py
+                encoded_latent = encoded_latent_list[0]  # Get first tensor [C', F', H', W']
                 latents_list.append(encoded_latent)
 
         latents = torch.stack(latents_list, dim=0)  # Shape [B, C', F', H', W']
@@ -2782,9 +2783,10 @@ def encode_video_to_latents_tiled_wan2_1_vae(video_tensor: torch.Tensor, vae, de
         test_tile = video_single[:, :, :test_tile_h, :test_tile_w]
 
         with torch.no_grad():
-            test_encoded = vae.encode(test_tile)  # Direct call for Wan2_1_VAE
-            if isinstance(test_encoded, list):
-                test_encoded = test_encoded[0]
+            # Wan2_1_VAE expects 5D tensor [B, C, F, H, W], so add batch dimension
+            test_tile_5d = test_tile.unsqueeze(0)  # [1, C, F, H, W]
+            test_encoded_list = vae.encode(test_tile_5d)  # Returns list
+            test_encoded = test_encoded_list[0]  # Get first tensor from list
 
         # Get actual output dimensions
         out_c, out_f, test_h, test_w = test_encoded.shape
@@ -2820,11 +2822,12 @@ def encode_video_to_latents_tiled_wan2_1_vae(video_tensor: torch.Tensor, vae, de
             # Extract tile
             tile_video = video_single[:, :, y_start:y_end, x_start:x_end]  # Shape [C, F, H, W]
 
-            # Encode tile - Wan2_1_VAE expects direct tensor input
+            # Encode tile - Wan2_1_VAE expects 5D tensor input
             with torch.no_grad():
-                encoded_tile = vae.encode(tile_video)  # Direct call like animate.py
-                if isinstance(encoded_tile, list):
-                    encoded_tile = encoded_tile[0]  # Get first tensor [C', F', H', W']
+                # Add batch dimension for VAE input [B, C, F, H, W]
+                tile_video_5d = tile_video.unsqueeze(0)  # [1, C, F, H, W]
+                encoded_tile_list = vae.encode(tile_video_5d)  # Returns list
+                encoded_tile = encoded_tile_list[0]  # Get first tensor [C', F', H', W']
 
             # Calculate tile position in output space using actual spatial scale
             out_y_start = int(y_start * spatial_scale_h)
@@ -3060,16 +3063,16 @@ def encode_single_video_with_tiling(video_tensor: torch.Tensor, vae, device: tor
             encoded_latents = vae.encode([video_input])
             return encoded_latents[0]  # [C', F', H', W']
         elif args.task in ["i2v-A14B", "t2v-A14B"]:
-            # Wan2_1_VAE (14B models) - expects direct tensor input like in animate.py
+            # Wan2_1_VAE (14B models) - expects 5D tensor input
             video_input = video_tensor.to(device=device, dtype=vae_dtype)
             if video_input.max() < 0.5:  # Convert from [0, 1] to [-1, 1] if needed
                 video_input = video_input * 2.0 - 1.0
+            # Add batch dimension for VAE input [B, C, F, H, W]
+            video_input_5d = video_input.unsqueeze(0)  # [1, C, F, H, W]
             with torch.no_grad():
-                encoded_latents = vae.encode(video_input)  # Direct call like animate.py
-            if isinstance(encoded_latents, list):
-                return encoded_latents[0]  # [C', F', H', W']
-            else:
-                return encoded_latents  # [C', F', H', W']
+                encoded_latents_list = vae.encode(video_input_5d)  # Returns list
+                encoded_latents = encoded_latents_list[0]  # Get first tensor [C', F', H', W']
+            return encoded_latents  # [C', F', H', W']
         else:
             # Legacy WanVAE - expects direct tensor input, values in [-1, 1]
             video_input = video_tensor.to(device=device, dtype=vae_dtype)
