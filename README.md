@@ -46,16 +46,5 @@
       <video src="https://github.com/user-attachments/assets/06453de7-862b-4ca1-a9bb-10969b1b2fd6" width="100%" controls loop></video>
     </td>
   </tr>
-  <tr>
-    <td>
-      <video src="https://github.com/user-attachments/assets/9c685dbc-5beb-4ae9-bf97-feaaf60371bc" width="100%" controls loop></video>
-    </td>
-    <td>
-      <video src="https://github.com/user-attachments/assets/1792f52c-e834-48bc-9509-3927cbf51c78" width="100%" controls loop></video>
-    </td>
-     <td>
-      <video src="https://github.com/user-attachments/assets/ac020241-4a36-4213-9284-4ff1a59138ac" width="100%" controls loop></video>
-    </td>
-  </tr>
 </table>
 </details>
