@@ -85,4 +85,4 @@ class EulerScheduler(FlowMatchEulerDiscreteScheduler):
         sigma_next = unsqueeze_to_ndim(self.sigmas[self.step_index + 1], sample.ndim).to(sample.device)
         x_t_next = sample + (sigma_next - sigma) * model_output
         self._step_index += 1
-        return x_t_next
+        return (x_t_next,)  # Return as tuple for compatibility with wan2_generate_video.py
