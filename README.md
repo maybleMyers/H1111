@@ -57,27 +57,5 @@
       <video src="https://github.com/user-attachments/assets/ac020241-4a36-4213-9284-4ff1a59138ac" width="100%" controls loop></video>
     </td>
   </tr>
-  <tr>
-    <td>
-      <video src="https://github.com/user-attachments/assets/acaa89e1-1e07-43fe-82e4-a8f2c2ed2333" width="100%" controls loop></video>
-    </td>
-    <td>
-      <video src="https://github.com/user-attachments/assets/7c5edffa-f698-4adf-820f-6a439e19c7be" width="100%" controls loop></video>
-    </td>
-     <td>
-      <video src="https://github.com/user-attachments/assets/51df9766-6f52-470c-a604-cdc0453390c2" width="100%" controls loop></video>
-    </td>
-  </tr>
-  <tr>
-    <td>
-      <video src="https://github.com/user-attachments/assets/dad7be55-b93d-4f4c-bc77-023d8776e6ad" width="100%" controls loop></video>
-    </td>
-    <td>
-      <video src="https://github.com/user-attachments/assets/e55cfbf0-cb5e-46b1-96b7-1ab9f880934b" width="100%" controls loop></video>
-    </td>
-     <td>
-      <video src="https://github.com/user-attachments/assets/6c1184ba-e3e2-4f97-b49a-ecead1fea01a" width="100%" controls loop></video>
-    </td>
-  </tr>
 </table>
 </details>
