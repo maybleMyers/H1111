@@ -3,7 +3,7 @@
 ## Sample Videos
 
 <details>
-<summary>🎬 Click to view sample videos (74 examples)</summary>
+<summary>🎬 Click to view sample videos - Part 1 (36 examples)</summary>
 <br>
 
 <table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
@@ -147,6 +147,14 @@
       <video src="https://github.com/user-attachments/assets/6cd95866-7740-4ed2-9ce9-5c560b046a7f" width="100%" controls loop></video>
     </td>
   </tr>
+</table>
+</details>
+
+<details>
+<summary>🎬 Click to view sample videos - Part 2 (36 examples)</summary>
+<br>
+
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
   <tr>
     <td>
       <video src="https://github.com/user-attachments/assets/d883e9d1-a897-40ee-ab5d-7a9d301fd6dd" width="100%" controls loop></video>
