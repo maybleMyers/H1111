@@ -115,13 +115,24 @@ def find_matching_patterns(model_keys, lora_keys):
 
     # Extract base names from model keys (removing .weight/.bias)
     model_bases = set()
+    model_weights = set()
+    model_biases = set()
+
     for key in model_keys:
-        if key.endswith('.weight') or key.endswith('.bias'):
+        if key.endswith('.weight'):
             base = key.rsplit('.', 1)[0]
             model_bases.add(base)
+            model_weights.add(key)
+        elif key.endswith('.bias'):
+            base = key.rsplit('.', 1)[0]
+            model_bases.add(base)
+            model_biases.add(key)
 
     print(f"Unique model base keys: {len(model_bases)}")
-    print("Sample model base keys (first 10):")
+    print(f"Model weight keys: {len(model_weights)}")
+    print(f"Model bias keys: {len(model_biases)}")
+
+    print("\nSample model base keys (first 10):")
     for base in sorted(model_bases)[:10]:
         print(f"  {base}")
 
@@ -131,58 +142,106 @@ def find_matching_patterns(model_keys, lora_keys):
     print("="*60)
 
     # Check diff keys
-    diff_keys = [k for k in lora_keys if 'diff' in k and 'diff_b' not in k]
+    diff_keys = [k for k in lora_keys if 'diff' in k and 'diff_b' not in k and 'diff_m' not in k]
     diff_b_keys = [k for k in lora_keys if 'diff_b' in k]
+
+    # Statistics
+    matched_diff = 0
+    unmatched_diff = []
+    matched_diff_b = 0
+    unmatched_diff_b = []
 
     if diff_keys:
         print(f"\n{len(diff_keys)} diff keys found")
         print("Checking mapping for diff keys:")
 
-        for diff_key in diff_keys[:5]:
-            print(f"\n  LoRA key: {diff_key}")
+        for diff_key in diff_keys:
+            found_match = False
 
             # Try to find corresponding model key
             # Pattern 1: diffusion_model.X.diff -> X.weight
             if diff_key.startswith('diffusion_model.') and diff_key.endswith('.diff'):
                 potential_model_key = diff_key[len('diffusion_model.'):-len('.diff')] + '.weight'
                 if potential_model_key in model_keys:
-                    print(f"    ✓ Matches model key: {potential_model_key}")
-                else:
-                    print(f"    ✗ Expected model key not found: {potential_model_key}")
+                    matched_diff += 1
+                    found_match = True
+                    if matched_diff <= 5:  # Show first 5 matches
+                        print(f"\n  LoRA key: {diff_key}")
+                        print(f"    ✓ Matches model key: {potential_model_key}")
 
-            # Pattern 2: lora_unet_X.diff -> X.weight (with underscores to dots)
-            elif diff_key.startswith('lora_unet_') and diff_key.endswith('.diff'):
-                base = diff_key[len('lora_unet_'):-len('.diff')]
-                potential_model_key = base.replace('_', '.') + '.weight'
-                if potential_model_key in model_keys:
-                    print(f"    ✓ Matches model key: {potential_model_key}")
+            # Pattern 2: lora_unet_X_diff -> X.weight (with underscores to dots)
+            elif 'lora_unet_' in diff_key and '_diff' in diff_key:
+                # Handle both .diff and _diff endings
+                if diff_key.endswith('.diff'):
+                    base = diff_key[len('lora_unet_'):-len('.diff')]
+                elif diff_key.endswith('_diff'):
+                    base = diff_key[len('lora_unet_'):-len('_diff')]
                 else:
-                    print(f"    ✗ Expected model key not found: {potential_model_key}")
+                    base = None
+
+                if base:
+                    potential_model_key = base.replace('_', '.') + '.weight'
+                    if potential_model_key in model_keys:
+                        matched_diff += 1
+                        found_match = True
+                        if matched_diff <= 5:  # Show first 5 matches
+                            print(f"\n  LoRA key: {diff_key}")
+                            print(f"    ✓ Matches model key: {potential_model_key}")
+
+            if not found_match:
+                unmatched_diff.append(diff_key)
+
+        print(f"\n  Summary: {matched_diff}/{len(diff_keys)} diff keys matched")
+        if unmatched_diff:
+            print(f"  First 5 unmatched diff keys:")
+            for key in unmatched_diff[:5]:
+                print(f"    - {key}")
 
     if diff_b_keys:
         print(f"\n{len(diff_b_keys)} diff_b keys found")
         print("Checking mapping for diff_b keys:")
 
-        for diff_b_key in diff_b_keys[:5]:
-            print(f"\n  LoRA key: {diff_b_key}")
+        for diff_b_key in diff_b_keys:
+            found_match = False
 
             # Try to find corresponding model key
             # Pattern 1: diffusion_model.X.diff_b -> X.bias
             if diff_b_key.startswith('diffusion_model.') and diff_b_key.endswith('.diff_b'):
                 potential_model_key = diff_b_key[len('diffusion_model.'):-len('.diff_b')] + '.bias'
                 if potential_model_key in model_keys:
-                    print(f"    ✓ Matches model key: {potential_model_key}")
-                else:
-                    print(f"    ✗ Expected model key not found: {potential_model_key}")
+                    matched_diff_b += 1
+                    found_match = True
+                    if matched_diff_b <= 5:  # Show first 5 matches
+                        print(f"\n  LoRA key: {diff_b_key}")
+                        print(f"    ✓ Matches model key: {potential_model_key}")
 
-            # Pattern 2: lora_unet_X.diff_b -> X.bias (with underscores to dots)
-            elif diff_b_key.startswith('lora_unet_') and diff_b_key.endswith('.diff_b'):
-                base = diff_b_key[len('lora_unet_'):-len('.diff_b')]
-                potential_model_key = base.replace('_', '.') + '.bias'
-                if potential_model_key in model_keys:
-                    print(f"    ✓ Matches model key: {potential_model_key}")
+            # Pattern 2: lora_unet_X_diff_b -> X.bias (with underscores to dots)
+            elif 'lora_unet_' in diff_b_key and 'diff_b' in diff_b_key:
+                # Handle both .diff_b and _diff_b endings
+                if diff_b_key.endswith('.diff_b'):
+                    base = diff_b_key[len('lora_unet_'):-len('.diff_b')]
+                elif diff_b_key.endswith('_diff_b'):
+                    base = diff_b_key[len('lora_unet_'):-len('_diff_b')]
                 else:
-                    print(f"    ✗ Expected model key not found: {potential_model_key}")
+                    base = None
+
+                if base:
+                    potential_model_key = base.replace('_', '.') + '.bias'
+                    if potential_model_key in model_keys:
+                        matched_diff_b += 1
+                        found_match = True
+                        if matched_diff_b <= 5:  # Show first 5 matches
+                            print(f"\n  LoRA key: {diff_b_key}")
+                            print(f"    ✓ Matches model key: {potential_model_key}")
+
+            if not found_match:
+                unmatched_diff_b.append(diff_b_key)
+
+        print(f"\n  Summary: {matched_diff_b}/{len(diff_b_keys)} diff_b keys matched")
+        if unmatched_diff_b:
+            print(f"  First 5 unmatched diff_b keys:")
+            for key in unmatched_diff_b[:5]:
+                print(f"    - {key}")
 
     # Check standard LoRA patterns
     lora_down_keys = [k for k in lora_keys if 'lora_down' in k]
@@ -227,6 +286,44 @@ def main():
     # Find matching patterns
     if model_keys and lora_keys:
         find_matching_patterns(model_keys, lora_keys)
+
+    # Special analysis for _img keys
+    print("\n" + "="*80)
+    print("Special Analysis: _img Keys")
+    print("="*80)
+
+    img_keys = [k for k in lora_keys if '_img' in k]
+    if img_keys:
+        print(f"\nFound {len(img_keys)} keys with '_img' suffix")
+        print("These are image-specific keys for I2V models.")
+        print("Sample _img keys:")
+        for key in img_keys[:5]:
+            print(f"  - {key}")
+
+        # Check if model has corresponding non-img keys
+        print("\nChecking if model has non-_img versions:")
+        for img_key in img_keys[:5]:
+            # Try to construct non-img version
+            if 'diffusion_model.' in img_key:
+                non_img_key = img_key.replace('_img', '')
+                non_img_model_key = non_img_key.replace('diffusion_model.', '')
+                if non_img_model_key in model_keys:
+                    print(f"  ✓ {img_key} -> {non_img_model_key}")
+                else:
+                    # Try as weight/bias
+                    if '.diff_b' in non_img_key:
+                        test_key = non_img_key.replace('diffusion_model.', '').replace('.diff_b', '.bias')
+                    elif '.diff' in non_img_key:
+                        test_key = non_img_key.replace('diffusion_model.', '').replace('.diff', '.weight')
+                    elif '.lora_down.weight' in non_img_key:
+                        test_key = non_img_key.replace('diffusion_model.', '').replace('.lora_down.weight', '.weight')
+                    else:
+                        test_key = None
+
+                    if test_key and test_key in model_keys:
+                        print(f"  ✓ {img_key} -> {test_key} (via non-img)")
+                    else:
+                        print(f"  ✗ {img_key} -> No match found")
 
     print("\n" + "="*80)
     print("Analysis complete!")
