@@ -149,24 +149,48 @@ def load_safetensors_with_lora_and_fp8(
 
         # Check each LoRA weight set
         for lora_weight_keys, lora_sd, multiplier in zip(list_of_lora_weight_keys, lora_weights_list, lora_multipliers):
-            # First try lightx2v format (diff/diff_b keys with diffusion_model prefix)
+            # First try lightx2v format (diff/diff_b keys)
             if is_weight:
-                # Check for diff key (direct weight adjustment)
-                diff_key = f"diffusion_model.{model_weight_key.replace('.weight', '.diff')}"
-                if diff_key in lora_weight_keys:
-                    diff_weight = lora_sd[diff_key].to(calc_device)
-                    model_weight = model_weight + multiplier * diff_weight
-                    lora_weight_keys.remove(diff_key)
-                    continue
+                # Get base key without .weight suffix
+                base_key = model_weight_key.rsplit(".", 1)[0]
+
+                # Try multiple formats for diff key
+                possible_diff_keys = [
+                    # Original lightx2v format with diffusion_model prefix
+                    f"diffusion_model.{base_key}.diff",
+                    # Converted MUSUBI format with lora_unet prefix
+                    f"lora_unet_{base_key.replace('.', '_')}.diff",
+                    # Also try without any prefix transformation
+                    f"{base_key}.diff"
+                ]
+
+                for diff_key in possible_diff_keys:
+                    if diff_key in lora_weight_keys:
+                        diff_weight = lora_sd[diff_key].to(calc_device)
+                        model_weight = model_weight + multiplier * diff_weight
+                        lora_weight_keys.remove(diff_key)
+                        break  # Found and applied, move to next LoRA set
 
             elif is_bias:
-                # Check for diff_b key (direct bias adjustment)
-                diff_b_key = f"diffusion_model.{model_weight_key.replace('.bias', '.diff_b')}"
-                if diff_b_key in lora_weight_keys:
-                    diff_b_weight = lora_sd[diff_b_key].to(calc_device)
-                    model_weight = model_weight + multiplier * diff_b_weight
-                    lora_weight_keys.remove(diff_b_key)
-                    continue
+                # Get base key without .bias suffix
+                base_key = model_weight_key.rsplit(".", 1)[0]
+
+                # Try multiple formats for diff_b key
+                possible_diff_b_keys = [
+                    # Original lightx2v format with diffusion_model prefix
+                    f"diffusion_model.{base_key}.diff_b",
+                    # Converted MUSUBI format with lora_unet prefix
+                    f"lora_unet_{base_key.replace('.', '_')}.diff_b",
+                    # Also try without any prefix transformation
+                    f"{base_key}.diff_b"
+                ]
+
+                for diff_b_key in possible_diff_b_keys:
+                    if diff_b_key in lora_weight_keys:
+                        diff_b_weight = lora_sd[diff_b_key].to(calc_device)
+                        model_weight = model_weight + multiplier * diff_b_weight
+                        lora_weight_keys.remove(diff_b_key)
+                        break  # Found and applied, move to next LoRA set
 
             # Then try standard LoRA format (lora_down/lora_up)
             if is_weight:
