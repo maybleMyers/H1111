@@ -279,7 +279,7 @@
           <video src="https://github.com/user-attachments/assets/9fe91ed4-a357-4811-847f-25e8263bf366" width="100%" controls loop></video>
       </td>
        <td>
-          <video src="" width="100%" controls loop style="display: none;"></video>
+          <video src="" width="100%" controls loop></video>
      </td>
   </tr>
 </table>
