@@ -7883,7 +7883,7 @@ with gr.Blocks(
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
                     wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
                     wan22_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
-                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         wan22_random_seed_btn = gr.Button("🎲")

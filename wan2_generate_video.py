@@ -38,6 +38,7 @@ from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wan.utils.fm_solvers_euler import EulerScheduler
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -238,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-A14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     parser.add_argument(
-        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla"], help="The solver used to sample."
+        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla", "euler"], help="The solver used to sample."
     )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
@@ -2754,6 +2755,14 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
 
 
         scheduler.step = step_wrapper
+    elif args.sample_solver == "euler":
+        scheduler = EulerScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            shift=args.flow_shift,
+            device=device
+        )
+        scheduler.set_timesteps(args.infer_steps, device=device)
+        timesteps = scheduler.timesteps[:-1].clone()  # CRITICAL: Remove last timestep for Lightning
     else:
         raise NotImplementedError(f"Unsupported solver: {args.sample_solver}")
 
