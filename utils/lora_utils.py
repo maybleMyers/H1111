@@ -135,8 +135,12 @@ def load_safetensors_with_lora_and_fp8(
     # Define the weight hook function for on-the-fly merging
     def weight_hook_func(model_weight_key, model_weight):
         """Hook function to merge LoRA weights as model weights are loaded"""
-        
-        if not model_weight_key.endswith(".weight"):
+
+        # Handle both .weight and .bias parameters
+        is_weight = model_weight_key.endswith(".weight")
+        is_bias = model_weight_key.endswith(".bias")
+
+        if not (is_weight or is_bias):
             return model_weight
 
         original_device = model_weight.device
@@ -145,67 +149,83 @@ def load_safetensors_with_lora_and_fp8(
 
         # Check each LoRA weight set
         for lora_weight_keys, lora_sd, multiplier in zip(list_of_lora_weight_keys, lora_weights_list, lora_multipliers):
-            # Convert model weight key to LoRA key format
-            # Model keys like "blocks.0.cross_attn.k.weight" become "lora_unet_blocks_0_cross_attn_k"
-            if not model_weight_key.endswith(".weight"):
-                continue
-                
-            # Remove .weight suffix and handle different prefixes
-            base_key = model_weight_key.rsplit(".", 1)[0]
-            
-            # Remove diffusion_model prefix if present (for 1.3B models)
-            if base_key.startswith("diffusion_model."):
-                base_key = base_key[len("diffusion_model."):]
-            
-            # Convert dots to underscores and add lora_unet prefix for LoRA key format
-            # "blocks.0.cross_attn.k" -> "lora_unet_blocks_0_cross_attn_k"
-            lora_base_key = "lora_unet_" + base_key.replace(".", "_")
-            
-            down_key = lora_base_key + ".lora_down.weight"
-            up_key = lora_base_key + ".lora_up.weight" 
-            alpha_key = lora_base_key + ".alpha"
-            
-            # Check if this weight has corresponding LoRA weights
-            if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
-                continue
+            # First try lightx2v format (diff/diff_b keys with diffusion_model prefix)
+            if is_weight:
+                # Check for diff key (direct weight adjustment)
+                diff_key = f"diffusion_model.{model_weight_key.replace('.weight', '.diff')}"
+                if diff_key in lora_weight_keys:
+                    diff_weight = lora_sd[diff_key].to(calc_device)
+                    model_weight = model_weight + multiplier * diff_weight
+                    lora_weight_keys.remove(diff_key)
+                    continue
 
-            # Get LoRA weights
-            down_weight = lora_sd[down_key]
-            up_weight = lora_sd[up_key]
+            elif is_bias:
+                # Check for diff_b key (direct bias adjustment)
+                diff_b_key = f"diffusion_model.{model_weight_key.replace('.bias', '.diff_b')}"
+                if diff_b_key in lora_weight_keys:
+                    diff_b_weight = lora_sd[diff_b_key].to(calc_device)
+                    model_weight = model_weight + multiplier * diff_b_weight
+                    lora_weight_keys.remove(diff_b_key)
+                    continue
 
-            dim = down_weight.size()[0]
-            alpha = lora_sd.get(alpha_key, dim)
-            scale = alpha / dim
+            # Then try standard LoRA format (lora_down/lora_up)
+            if is_weight:
+                # Remove .weight suffix and handle different prefixes
+                base_key = model_weight_key.rsplit(".", 1)[0]
 
-            # Move to calc device
-            down_weight = down_weight.to(calc_device)
-            up_weight = up_weight.to(calc_device)
+                # Remove diffusion_model prefix if present (for 1.3B models)
+                if base_key.startswith("diffusion_model."):
+                    base_key = base_key[len("diffusion_model."):]
 
-            # Merge LoRA weights: W <- W + U * D * scale * multiplier
-            if len(model_weight.size()) == 2:
-                # Linear layer
-                if len(up_weight.size()) == 4:  # Conv2d weights used as linear
-                    up_weight = up_weight.squeeze(3).squeeze(2)
-                    down_weight = down_weight.squeeze(3).squeeze(2)
-                model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
-            elif down_weight.size()[2:4] == (1, 1):
-                # Conv2d 1x1
-                model_weight = (
-                    model_weight
-                    + multiplier
-                    * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                    * scale
-                )
-            else:
-                # Conv2d 3x3
-                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                model_weight = model_weight + multiplier * conved * scale
+                # Convert dots to underscores and add lora_unet prefix for LoRA key format
+                # "blocks.0.cross_attn.k" -> "lora_unet_blocks_0_cross_attn_k"
+                lora_base_key = "lora_unet_" + base_key.replace(".", "_")
 
-            # Remove used LoRA keys from tracking set
-            lora_weight_keys.remove(down_key)
-            lora_weight_keys.remove(up_key)
-            if alpha_key in lora_weight_keys:
-                lora_weight_keys.remove(alpha_key)
+                down_key = lora_base_key + ".lora_down.weight"
+                up_key = lora_base_key + ".lora_up.weight"
+                alpha_key = lora_base_key + ".alpha"
+
+                # Check if this weight has corresponding LoRA weights
+                if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
+                    continue
+
+                # Get LoRA weights
+                down_weight = lora_sd[down_key]
+                up_weight = lora_sd[up_key]
+
+                dim = down_weight.size()[0]
+                alpha = lora_sd.get(alpha_key, dim)
+                scale = alpha / dim
+
+                # Move to calc device
+                down_weight = down_weight.to(calc_device)
+                up_weight = up_weight.to(calc_device)
+
+                # Merge LoRA weights: W <- W + U * D * scale * multiplier
+                if len(model_weight.size()) == 2:
+                    # Linear layer
+                    if len(up_weight.size()) == 4:  # Conv2d weights used as linear
+                        up_weight = up_weight.squeeze(3).squeeze(2)
+                        down_weight = down_weight.squeeze(3).squeeze(2)
+                    model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
+                elif down_weight.size()[2:4] == (1, 1):
+                    # Conv2d 1x1
+                    model_weight = (
+                        model_weight
+                        + multiplier
+                        * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        * scale
+                    )
+                else:
+                    # Conv2d 3x3
+                    conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                    model_weight = model_weight + multiplier * conved * scale
+
+                # Remove used LoRA keys from tracking set
+                lora_weight_keys.remove(down_key)
+                lora_weight_keys.remove(up_key)
+                if alpha_key in lora_weight_keys:
+                    lora_weight_keys.remove(alpha_key)
 
         # Move back to original device
         model_weight = model_weight.to(original_device)
