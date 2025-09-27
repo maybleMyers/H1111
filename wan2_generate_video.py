@@ -2862,6 +2862,12 @@ def run_sampling(
         # Apply CFG on all steps
         apply_cfg_array = [True] * num_timesteps
 
+    # Lightning optimization: Skip CFG entirely when guidance_scale is 1.0
+    # Lightning models are trained without CFG, so we should skip the unconditional pass
+    if abs(args.guidance_scale - 1.0) < 1e-6:
+        apply_cfg_array = [False] * num_timesteps
+        logger.info("Lightning mode: CFG disabled (guidance_scale=1.0), using conditional-only inference")
+
     # SLG (Skip Layer Guidance) setup
     apply_slg_global = args.slg_layers is not None and args.slg_mode is not None
     slg_start_step = int(args.slg_start * num_timesteps)
