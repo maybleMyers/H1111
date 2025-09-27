@@ -1,5 +1,303 @@
 ![GUI Screenshot](images/screenshot.png)
 
+## Sample Videos
+
+<details>
+<summary>🎬 Click to view sample videos - Part 1 (36 examples)</summary>
+<br>
+
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/004f101a-0319-4234-9d16-fd5c0635e158" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/b3fb01fa-aa2d-4646-b319-2cb7ab6d885b" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/5ec82b5f-fd60-4990-95f1-469b9cd63649" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/327b0a21-8a9c-4991-ab5f-1ec77012edeb" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/18eed83c-21d3-42ea-b9c7-d5943f9c8807" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/d1b07ff9-2a06-412a-93ac-8c9d424e204e" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/19ac729f-9e3d-4cb0-94dd-74e75fd2ea5c" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/b40e54be-36aa-46de-a19c-d8c56c3a3eca" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/32428538-4bd6-4f21-998d-0c1c07d97a3c" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/f384beda-9190-4933-9e74-de7c56f692ce" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/d98c893a-f04e-46e2-b72e-d59c3160f95c" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/b7a25267-06e3-4fb9-a11e-1a10ca7e3dae" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/711bd788-8672-4895-8afe-638d709912de" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/f2cc6cac-0fc5-4edd-8622-2289492845c6" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/70ee9b8d-229d-4430-8aa6-4ed3fc7df533" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/b42377d2-0618-4d05-a263-1b6f52aa2a3c" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/6834f962-d459-49a9-8871-b21c342848fc" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/8c706041-0ef6-4a89-97c0-d49d025191c5" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/9fea0c26-c60d-485b-a6ed-ec130116b6a9" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/20fdcdd0-f26d-428e-a465-44c8fc0e9c5b" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/864ba7a9-6398-4b70-b4b5-ffed075f9682" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/73503294-b1a1-4342-b888-b05070c51f80" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/04dd1909-aec3-42d4-86ee-e9952d9bd53b" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/cee2a5ef-06cf-4fae-9bac-08449936d11a" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/169329a6-5ed3-49d8-b7c3-ea32b394b3c9" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/14b940b0-4fde-4d3c-a3ba-f13ae391a848" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/81d8b1a8-1128-49a7-b879-20c17f378573" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/8d708084-2757-4380-b2c1-8a7b30a206e9" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/2147c36a-b814-4990-89eb-f7f2486eeadc" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/365dbf86-3ed9-412d-b0f4-8d49c0289df9" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/cc2ba2be-da59-4fd2-b932-c92c945c0b4c" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/a47aac75-55c5-4523-8c4f-a4c6234d2cd3" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/1ad4274a-0524-496b-983c-f5781b03ba63" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/5827f2eb-e010-4803-b3f8-43d39d942479" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/b10f0c30-6a75-4116-bddf-974e7c4c850a" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/6cd95866-7740-4ed2-9ce9-5c560b046a7f" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+</details>
+
+<details>
+<summary>🎬 Click to view sample videos - Part 2 (36 examples)</summary>
+<br>
+
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/d883e9d1-a897-40ee-ab5d-7a9d301fd6dd" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/b011d548-ebc9-4976-a753-166ab88536b6" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/dea488b0-b865-4d42-a2b8-15b7ab850bd7" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/fe52d385-c490-423c-a191-705cdb23bb5b" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/18f4d3a5-64ff-4ae7-9612-c54b69ad4041" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/652ab3ee-fa67-410b-b7a0-189162bb0d0b" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/7e5cf108-4eeb-4257-a361-8d123853be03" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/70a7f546-4e9d-46b1-a3fd-dd92f98341cb" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/a4a9517d-d438-45d6-b1ab-1cda7bd21c61" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/48fbab80-3c36-4118-b417-8ae895192185" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/7a39e07a-ac8a-423b-8d61-f7e67039f790" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/90e7c446-34a3-4a9d-ae74-dee16012ddf3" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/563b611b-1876-4231-93b6-5741540aad9c" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/a680b214-1ed8-416a-acf4-03bbf1ceaaba" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/669ef47a-e997-4507-a7a9-0312c289dd00" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/952f8ee0-93b7-4c0e-8874-4cc987125ca3" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/cd0fc3b7-ff6f-4228-8858-33a44aa25396" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/06453de7-862b-4ca1-a9bb-10969b1b2fd6" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/9c685dbc-5beb-4ae9-bf97-feaaf60371bc" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/1792f52c-e834-48bc-9509-3927cbf51c78" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/ac020241-4a36-4213-9284-4ff1a59138ac" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/acaa89e1-1e07-43fe-82e4-a8f2c2ed2333" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/7c5edffa-f698-4adf-820f-6a439e19c7be" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/51df9766-6f52-470c-a604-cdc0453390c2" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/dad7be55-b93d-4f4c-bc77-023d8776e6ad" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/e55cfbf0-cb5e-46b1-96b7-1ab9f880934b" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/6c1184ba-e3e2-4f97-b49a-ecead1fea01a" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/8998a889-7a17-4513-ae0e-dc51f1be74a3" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/345dc23b-6844-4686-92f4-a0fb56a76418" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/3e0a65a4-380e-4666-9e56-51a9f420cb3b" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px; table-layout: fixed;">
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/212c5e3b-2171-480f-82f4-565b4ecfd99c" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/d716ac7b-dfb6-45a9-a4e6-643c5219b7ae" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/3e6ff08c-774a-4b3f-9195-1df353761661" width="100%" controls loop></video>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <video src="https://github.com/user-attachments/assets/ca977bd0-b154-4b66-991b-17e5bfaa44f2" width="100%" controls loop></video>
+    </td>
+    <td>
+      <video src="https://github.com/user-attachments/assets/f43a8014-4f14-4228-a063-86ee618f6ac0" width="100%" controls loop></video>
+    </td>
+     <td>
+      <video src="https://github.com/user-attachments/assets/036b237a-5b80-408a-9ae4-410448af1319" width="100%" controls loop></video>
+    </td>
+  </tr>
+</table>
+</details>
+
 # Recent update
 9/19/2025  
     Added ram torch memory utilization to wan2.2 in the ramtorch branch. It drastically lowers VRAM use during inference and is faster than blockswapping in my experiments. Click Use Bouncing Linear (Max VRAM Savings) at the bottom of the page. Thanks to lord Lodestone https://github.com/lodestone-rock/RamTorch  
