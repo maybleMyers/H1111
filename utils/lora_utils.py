@@ -150,18 +150,19 @@ def load_safetensors_with_lora_and_fp8(
         # Check each LoRA weight set
         for lora_weight_keys, lora_sd, multiplier in zip(list_of_lora_weight_keys, lora_weights_list, lora_multipliers):
             # First try lightx2v format (diff/diff_b keys)
+            # Model keys are like: blocks.0.cross_attn.k.weight
+            # LoRA keys are like: diffusion_model.blocks.0.cross_attn.k.diff
+
             if is_weight:
                 # Get base key without .weight suffix
-                base_key = model_weight_key.rsplit(".", 1)[0]
+                base_key = model_weight_key.rsplit(".", 1)[0]  # e.g., "blocks.0.cross_attn.k"
 
                 # Try multiple formats for diff key
                 possible_diff_keys = [
-                    # Original lightx2v format with diffusion_model prefix
+                    # Original lightx2v format: add diffusion_model prefix to model key
                     f"diffusion_model.{base_key}.diff",
-                    # Converted MUSUBI format with lora_unet prefix
+                    # Converted MUSUBI format: lora_unet_ prefix with underscores
                     f"lora_unet_{base_key.replace('.', '_')}.diff",
-                    # Also try without any prefix transformation
-                    f"{base_key}.diff"
                 ]
 
                 for diff_key in possible_diff_keys:
@@ -173,16 +174,14 @@ def load_safetensors_with_lora_and_fp8(
 
             elif is_bias:
                 # Get base key without .bias suffix
-                base_key = model_weight_key.rsplit(".", 1)[0]
+                base_key = model_weight_key.rsplit(".", 1)[0]  # e.g., "blocks.0.cross_attn.k"
 
                 # Try multiple formats for diff_b key
                 possible_diff_b_keys = [
-                    # Original lightx2v format with diffusion_model prefix
+                    # Original lightx2v format: add diffusion_model prefix to model key
                     f"diffusion_model.{base_key}.diff_b",
-                    # Converted MUSUBI format with lora_unet prefix
+                    # Converted MUSUBI format: lora_unet_ prefix with underscores
                     f"lora_unet_{base_key.replace('.', '_')}.diff_b",
-                    # Also try without any prefix transformation
-                    f"{base_key}.diff_b"
                 ]
 
                 for diff_b_key in possible_diff_b_keys:
