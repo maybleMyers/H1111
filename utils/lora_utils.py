@@ -132,15 +132,77 @@ def load_safetensors_with_lora_and_fp8(
 
     logger.info(f"Merging LoRA weights into state dict. Multipliers: {lora_multipliers}")
 
+    # Helper function to convert LoRA key to model key format
+    def convert_lora_key_to_model_key(lora_key):
+        """
+        Convert LoRA key to model key format, handling _img suffix and MUSUBI format
+        Examples:
+        - lora_unet_blocks_0_cross_attn_k_diff_b → blocks.0.cross_attn.k.bias
+        - lora_unet_blocks_0_cross_attn_k_img_diff_b → blocks.0.cross_attn.k.bias
+        - diffusion_model.blocks.0.cross_attn.k.diff → blocks.0.cross_attn.k.weight
+        """
+        # Handle _img suffix by stripping it
+        original_key = lora_key
+        if '_img' in lora_key:
+            lora_key = lora_key.replace('_img', '')
+
+        # Handle MUSUBI format (lora_unet_ prefix)
+        if lora_key.startswith('lora_unet_'):
+            key = lora_key[len('lora_unet_'):]
+
+            # Parse blocks.N pattern specially
+            if key.startswith('blocks_'):
+                # Split only first two underscores for block number
+                parts = key.split('_', 2)  # ['blocks', '0', 'cross_attn_k_diff_b']
+                if len(parts) >= 3:
+                    block_part = f"blocks.{parts[1]}"
+                    rest = parts[2]
+
+                    # Determine parameter type
+                    if rest.endswith('_diff_b'):
+                        param = rest[:-7]  # Remove _diff_b
+                        return f"{block_part}.{param}.bias"
+                    elif rest.endswith('_diff_m'):
+                        param = rest[:-7]  # Remove _diff_m
+                        return f"{block_part}.{param}.modulation"
+                    elif rest.endswith('_diff'):
+                        param = rest[:-5]  # Remove _diff
+                        return f"{block_part}.{param}.weight"
+            else:
+                # Handle non-block keys (like embedding, time_in, etc.)
+                if key.endswith('_diff_b'):
+                    param = key[:-7]  # Remove _diff_b
+                    return f"{param}.bias"
+                elif key.endswith('_diff_m'):
+                    param = key[:-7]  # Remove _diff_m
+                    return f"{param}.modulation"
+                elif key.endswith('_diff'):
+                    param = key[:-5]  # Remove _diff
+                    return f"{param}.weight"
+
+        # Handle original lightx2v format (diffusion_model. prefix)
+        elif lora_key.startswith('diffusion_model.'):
+            key = lora_key[len('diffusion_model.'):]
+
+            if key.endswith('.diff_b'):
+                return key[:-7] + '.bias'
+            elif key.endswith('.diff_m'):
+                return key[:-7] + '.modulation'
+            elif key.endswith('.diff'):
+                return key[:-5] + '.weight'
+
+        return None
+
     # Define the weight hook function for on-the-fly merging
     def weight_hook_func(model_weight_key, model_weight):
         """Hook function to merge LoRA weights as model weights are loaded"""
 
-        # Handle both .weight and .bias parameters
+        # Handle .weight, .bias, and .modulation parameters
         is_weight = model_weight_key.endswith(".weight")
         is_bias = model_weight_key.endswith(".bias")
+        is_modulation = model_weight_key.endswith(".modulation")
 
-        if not (is_weight or is_bias):
+        if not (is_weight or is_bias or is_modulation):
             return model_weight
 
         original_device = model_weight.device
@@ -149,47 +211,24 @@ def load_safetensors_with_lora_and_fp8(
 
         # Check each LoRA weight set
         for lora_weight_keys, lora_sd, multiplier in zip(list_of_lora_weight_keys, lora_weights_list, lora_multipliers):
-            # First try lightx2v format (diff/diff_b keys)
-            # Model keys are like: blocks.0.cross_attn.k.weight
-            # LoRA keys are like: diffusion_model.blocks.0.cross_attn.k.diff
+            # Try lightx2v format (diff/diff_b keys)
+            # Go through all LoRA keys and see if any match this model key
+            keys_to_remove = []
+            for lora_key in lora_weight_keys:
+                if 'diff' in lora_key and 'lora_down' not in lora_key and 'lora_up' not in lora_key:
+                    # Try to convert this LoRA key to model key format
+                    converted_model_key = convert_lora_key_to_model_key(lora_key)
 
-            if is_weight:
-                # Get base key without .weight suffix
-                base_key = model_weight_key.rsplit(".", 1)[0]  # e.g., "blocks.0.cross_attn.k"
+                    # Check if it matches our current model key
+                    if converted_model_key == model_weight_key:
+                        # Apply this LoRA weight
+                        lora_weight = lora_sd[lora_key].to(calc_device)
+                        model_weight = model_weight + multiplier * lora_weight
+                        keys_to_remove.append(lora_key)
 
-                # Try multiple formats for diff key
-                possible_diff_keys = [
-                    # Original lightx2v format: add diffusion_model prefix to model key
-                    f"diffusion_model.{base_key}.diff",
-                    # Converted MUSUBI format: lora_unet_ prefix with underscores
-                    f"lora_unet_{base_key.replace('.', '_')}.diff",
-                ]
-
-                for diff_key in possible_diff_keys:
-                    if diff_key in lora_weight_keys:
-                        diff_weight = lora_sd[diff_key].to(calc_device)
-                        model_weight = model_weight + multiplier * diff_weight
-                        lora_weight_keys.remove(diff_key)
-                        break  # Found and applied, move to next LoRA set
-
-            elif is_bias:
-                # Get base key without .bias suffix
-                base_key = model_weight_key.rsplit(".", 1)[0]  # e.g., "blocks.0.cross_attn.k"
-
-                # Try multiple formats for diff_b key
-                possible_diff_b_keys = [
-                    # Original lightx2v format: add diffusion_model prefix to model key
-                    f"diffusion_model.{base_key}.diff_b",
-                    # Converted MUSUBI format: lora_unet_ prefix with underscores
-                    f"lora_unet_{base_key.replace('.', '_')}.diff_b",
-                ]
-
-                for diff_b_key in possible_diff_b_keys:
-                    if diff_b_key in lora_weight_keys:
-                        diff_b_weight = lora_sd[diff_b_key].to(calc_device)
-                        model_weight = model_weight + multiplier * diff_b_weight
-                        lora_weight_keys.remove(diff_b_key)
-                        break  # Found and applied, move to next LoRA set
+            # Remove used keys
+            for key in keys_to_remove:
+                lora_weight_keys.remove(key)
 
             # Then try standard LoRA format (lora_down/lora_up)
             if is_weight:
