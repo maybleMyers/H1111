@@ -6,7 +6,7 @@
 <summary>🎬 Click to view sample videos (74 examples)</summary>
 <br>
 
-<table>
+<table border="0" style="width: 100%; text-align: left; margin-top: 20px;">
   <tr>
       <td>
           <video src="https://github.com/user-attachments/assets/004f101a-0319-4234-9d16-fd5c0635e158" width="100%" controls loop></video>
