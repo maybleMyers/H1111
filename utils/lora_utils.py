@@ -259,8 +259,19 @@ def load_safetensors_with_lora_and_fp8(
                 up_key_img = lora_base_key + "_img_lora_up_weight"
                 alpha_key_img = down_key_img + ".alpha"
 
-                # Try standard format first (most common)
-                if down_key_dots in lora_weight_keys and up_key_dots in lora_weight_keys:
+                # Direct format: blocks.0.cross_attn.k.lora_down.weight (no prefix conversion)
+                down_key_direct = base_key + ".lora_down.weight"
+                up_key_direct = base_key + ".lora_up.weight"
+                alpha_key_direct = base_key + ".alpha"
+
+                # Try direct format first (for new MUSUBI LoRAs)
+                if down_key_direct in lora_weight_keys and up_key_direct in lora_weight_keys:
+                    # Use direct format
+                    down_key = down_key_direct
+                    up_key = up_key_direct
+                    alpha_key = alpha_key_direct
+                # Try standard format with lora_unet prefix
+                elif down_key_dots in lora_weight_keys and up_key_dots in lora_weight_keys:
                     # Use standard format with dots
                     down_key = down_key_dots
                     up_key = up_key_dots
