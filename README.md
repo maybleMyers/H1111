@@ -1,27 +1,27 @@
-This branch is in active development, so could break or change alot.  
-You can find all of the files needed for wan2.2 at https://huggingface.co/maybleMyers/wan_files_for_h1111/tree/main  
-so far all models work. you can use the t2v models by not using an input image in the wan2.2 tab.  
 
-This script is designed to allow inference with the same quality as the source https://github.com/Wan-Video/Wan2.2 .  
-Most of the changes are to provide better memory optimization. This repository is built for quality not speed. With a 4090 generating a 720p video will take around 1 hr.    
 
-Put all the models in the wan subfolder. To run the 14B-i2v model you need these:  
-wan/wan22_i2v_14B_low_noise_bf16.safetensors  
-wan/wan22_i2v_14B_high_noise_bf16.safetensors  
-wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth  
-wan/Wan2.1_VAE.pth  
-wan/models_t5_umt5-xxl-enc-bf16.pth  
+### Lightx2v Support
 
-You need to install some extra packages probably:
-pip install imageio librosa pyloudnorm soundfile xfuser
+This branch adds support for the lightx2v loras. https://huggingface.co/lightx2v/Wan2.2-Lightning is there repo, thanks to the lightx2v team.  
 
-v2v seems to be working well now with the t2v model.
-Most warnings are safe to ignore and will probably be removed later.
+Download normal wan2.2 models, ie:  
+https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/wan22_i2v_14B_low_noise_bf16.safetensors  
+https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/wan22_i2v_14B_high_noise_bf16.safetensors  
+https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/blob/main/Wan2.1_VAE.pth  
+https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/blob/main/models_t5_umt5-xxl-enc-bf16.pth  
+https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/blob/main/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth  
 
-A cool thing to try are the mixed weight models, I preserved all the weights that would not safely convert to fp16 in fp32 without increasing model size very much. Select preserve mixed weight dtype at the bottom of the page, download the models named like this: wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors.
+And put them in the wan subfolder.  
 
-If you want to use infinitetalk you need to follow the installation instructions on their github to get it to work and download the same models you use for multitalk. https://github.com/MeiGen-AI/InfiniteTalk . But in my tests multitalk is way better than infinitetalk.  
+I have verified that these loras work with the i2v models so far.
 
-## Changlog
-9/8/2025  
-    Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2, video extension for wan 2.2.  
+https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.2-T2V-A14B-4steps-lora-250928_high_noise_model_MUSUBI.safetensors  
+https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.2-T2V-A14B-4steps-lora-250928_low_noise_model_MUSUBI.safetensors  
+
+
+This is the old lora, use it for high and low noise.  
+
+https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64_MUSUBI.safetensors  
+
+Use them in the wan2.2 tab and set sampling steps to like 4-8, Guidance Scale to 1 and step_distill as the Sample Solver.  
+It seems like higher weights work better, 1.4-2 seems good.  
