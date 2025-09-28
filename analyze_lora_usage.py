@@ -241,6 +241,7 @@ def main():
     parser.add_argument('model_path', type=str, help='Path to model file')
     parser.add_argument('lora_path', type=str, help='Path to LoRA file')
     parser.add_argument('--verbose', action='store_true', help='Show detailed matching')
+    parser.add_argument('--test-keys', action='store_true', help='Test specific key conversions')
 
     args = parser.parse_args()
 
@@ -252,6 +253,85 @@ def main():
     print(f"\nLoading LoRA: {args.lora_path}")
     lora_keys = load_lora_keys(args.lora_path)
     print(f"  Found {len(lora_keys)} LoRA keys")
+
+    # Test specific keys if requested
+    if args.test_keys:
+        print("\n" + "="*80)
+        print("Testing Specific Key Conversions")
+        print("="*80)
+
+        # Test problem keys from the unmatched list
+        test_lora_keys = [
+            'lora_unet_blocks_21_cross_attn_o_diff_b',
+            'lora_unet_blocks_14_self_attn_q_diff_b',
+            'lora_unet_blocks_8_self_attn_norm_q_diff',
+            'lora_unet_blocks_7_cross_attn_norm_k_diff',
+        ]
+
+        print("\nTesting LoRA key conversions:")
+        for lora_key in test_lora_keys:
+            converted = convert_lora_key_to_model_key(lora_key)
+            exists = converted in model_keys if converted else False
+            print(f"\nLoRA: {lora_key}")
+            print(f"  → Model: {converted}")
+            print(f"  → Exists in model: {exists}")
+
+        # Check what similar keys DO exist in the model
+        print("\n" + "-"*40)
+        print("Checking what blocks.21.cross_attn keys exist in model:")
+        found_21 = False
+        for key in sorted(model_keys.keys()):
+            if 'blocks.21' in key and 'cross_attn' in key:
+                print(f"  {key}")
+                found_21 = True
+        if not found_21:
+            print("  NONE - Block 21 doesn't exist in model!")
+
+        print("\nChecking what blocks.8.self_attn keys exist in model:")
+        found_8 = False
+        for key in sorted(model_keys.keys()):
+            if 'blocks.8' in key and 'self_attn' in key:
+                print(f"  {key}")
+                found_8 = True
+        if not found_8:
+            print("  NONE - Block 8 doesn't exist in model!")
+
+        # Find the maximum block number in model
+        print("\n" + "-"*40)
+        print("Finding maximum block number in model:")
+        max_block = -1
+        for key in model_keys.keys():
+            if 'blocks.' in key:
+                # Extract block number
+                parts = key.split('.')
+                for i, part in enumerate(parts):
+                    if part == 'blocks' and i+1 < len(parts):
+                        try:
+                            block_num = int(parts[i+1])
+                            max_block = max(max_block, block_num)
+                        except ValueError:
+                            pass
+        print(f"  Maximum block number in model: {max_block}")
+
+        # Find block numbers in LoRA
+        print("\nFinding block numbers in LoRA:")
+        lora_blocks = set()
+        for key in lora_keys.keys():
+            if 'blocks_' in key:
+                # Extract block number from LoRA key
+                parts = key.split('_')
+                for i, part in enumerate(parts):
+                    if part == 'blocks' and i+1 < len(parts):
+                        try:
+                            block_num = int(parts[i+1])
+                            lora_blocks.add(block_num)
+                        except ValueError:
+                            pass
+        print(f"  LoRA has modifications for blocks: {sorted(lora_blocks)}")
+        print(f"  LoRA max block: {max(lora_blocks) if lora_blocks else -1}")
+        print(f"  LoRA blocks beyond model: {sorted([b for b in lora_blocks if b > max_block])}")
+
+        return  # Exit after test
 
     # Simulate matching
     matched, unmatched = simulate_lora_matching(model_keys, lora_keys)
