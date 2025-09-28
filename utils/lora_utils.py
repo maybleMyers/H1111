@@ -243,12 +243,25 @@ def load_safetensors_with_lora_and_fp8(
                 # "blocks.0.cross_attn.k" -> "lora_unet_blocks_0_cross_attn_k"
                 lora_base_key = "lora_unet_" + base_key.replace(".", "_")
 
-                down_key = lora_base_key + ".lora_down.weight"
-                up_key = lora_base_key + ".lora_up.weight"
-                alpha_key = lora_base_key + ".alpha"
+                # MUSUBI format uses underscores, not dots
+                down_key = lora_base_key + "_lora_down_weight"
+                up_key = lora_base_key + "_lora_up_weight"
 
-                # Check if this weight has corresponding LoRA weights
-                if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
+                # Also check _img variants
+                down_key_img = lora_base_key + "_img_lora_down_weight"
+                up_key_img = lora_base_key + "_img_lora_up_weight"
+
+                # Try regular keys first, then _img variants
+                if down_key in lora_weight_keys and up_key in lora_weight_keys:
+                    # Use regular keys
+                    alpha_key = down_key + ".alpha"
+                elif down_key_img in lora_weight_keys and up_key_img in lora_weight_keys:
+                    # Use _img variant keys
+                    down_key = down_key_img
+                    up_key = up_key_img
+                    alpha_key = down_key + ".alpha"
+                else:
+                    # No matching LoRA keys found
                     continue
 
                 # Get LoRA weights
