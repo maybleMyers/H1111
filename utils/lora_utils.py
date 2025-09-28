@@ -243,23 +243,38 @@ def load_safetensors_with_lora_and_fp8(
                 # "blocks.0.cross_attn.k" -> "lora_unet_blocks_0_cross_attn_k"
                 lora_base_key = "lora_unet_" + base_key.replace(".", "_")
 
-                # MUSUBI format uses underscores, not dots
-                down_key = lora_base_key + "_lora_down_weight"
-                up_key = lora_base_key + "_lora_up_weight"
+                # Try both standard (dots) and MUSUBI (underscores) formats
+                # Standard format: lora_unet_blocks_0_cross_attn_k.lora_down.weight
+                down_key_dots = lora_base_key + ".lora_down.weight"
+                up_key_dots = lora_base_key + ".lora_up.weight"
+                alpha_key_dots = lora_base_key + ".alpha"
 
-                # Also check _img variants
+                # MUSUBI format: lora_unet_blocks_0_cross_attn_k_lora_down_weight
+                down_key_underscores = lora_base_key + "_lora_down_weight"
+                up_key_underscores = lora_base_key + "_lora_up_weight"
+                alpha_key_underscores = down_key_underscores + ".alpha"
+
+                # Also check _img variants for MUSUBI format
                 down_key_img = lora_base_key + "_img_lora_down_weight"
                 up_key_img = lora_base_key + "_img_lora_up_weight"
+                alpha_key_img = down_key_img + ".alpha"
 
-                # Try regular keys first, then _img variants
-                if down_key in lora_weight_keys and up_key in lora_weight_keys:
-                    # Use regular keys
-                    alpha_key = down_key + ".alpha"
+                # Try standard format first (most common)
+                if down_key_dots in lora_weight_keys and up_key_dots in lora_weight_keys:
+                    # Use standard format with dots
+                    down_key = down_key_dots
+                    up_key = up_key_dots
+                    alpha_key = alpha_key_dots
+                elif down_key_underscores in lora_weight_keys and up_key_underscores in lora_weight_keys:
+                    # Use MUSUBI format with underscores
+                    down_key = down_key_underscores
+                    up_key = up_key_underscores
+                    alpha_key = alpha_key_underscores
                 elif down_key_img in lora_weight_keys and up_key_img in lora_weight_keys:
-                    # Use _img variant keys
+                    # Use _img variant keys (MUSUBI format)
                     down_key = down_key_img
                     up_key = up_key_img
-                    alpha_key = down_key + ".alpha"
+                    alpha_key = alpha_key_img
                 else:
                     # No matching LoRA keys found
                     continue
