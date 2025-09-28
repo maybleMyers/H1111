@@ -94,12 +94,16 @@ def convert_lora_key_to_model_key(lora_key):
             # Handle non-block keys (like embedding, time_in, etc.)
             if key.endswith('_diff_b'):
                 param = key[:-7]  # Remove _diff_b
+                # Replace underscores with dots for proper module hierarchy
+                param = param.replace('_', '.')
                 return f"{param}.bias"
             elif key.endswith('_diff_m'):
                 param = key[:-7]  # Remove _diff_m
+                param = param.replace('_', '.')
                 return f"{param}.modulation"
             elif key.endswith('_diff'):
                 param = key[:-5]  # Remove _diff
+                param = param.replace('_', '.')
                 return f"{param}.weight"
 
     # Handle original lightx2v format (diffusion_model. prefix)
