@@ -299,6 +299,8 @@
 </details>
 
 # Recent update
+9/28/2025  
+    Supports lightx2v 4 step loras via the lightx2v branch. Achieve good generations in as little as 4 steps with wan2.2 xD.  
 9/19/2025  
     Added ram torch memory utilization to wan2.2 in the ramtorch branch. It drastically lowers VRAM use during inference and is faster than blockswapping in my experiments. Click Use Bouncing Linear (Max VRAM Savings) at the bottom of the page. Thanks to lord Lodestone https://github.com/lodestone-rock/RamTorch  
 9/17/2025  
@@ -307,8 +309,6 @@
     Support Pusa video extension via the pusa2 branch. Seems to work best when you use more loras than just base pusa lora.   
 9/8/2025  
     Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2 long video generation, video extension for wan 2.2 to the wan2.2b branch.  
-7/31/2025  
-    I have added support for the wan 2.2 i2v 14b and 5b models on the wan2.2b branch. 24GB gpu needed as of now for vae things. Download the appropriate models from https://huggingface.co/maybleMyers/wan_files_for_h1111/  . Use the 2.1 vae for 14b and the 2.2 vae for 5b.  
 
 # H1111
 
@@ -496,10 +496,14 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+9/28/2025  
+    Supports lightx2v 4 step loras via the lightx2v branch. Achieve good generations in as little as 4 steps with wan2.2 xD.  
+9/19/2025  
+    Added ram torch memory utilization to wan2.2 in the ramtorch branch. It drastically lowers VRAM use during inference and is faster than blockswapping in my experiments. Click Use Bouncing Linear (Max VRAM Savings) at the bottom of the page. Thanks to lord Lodestone https://github.com/lodestone-rock/RamTorch  
 9/17/2025  
     Support Pusa 4 image to video via the pusa2 branch. Add lightx2v support for 4 step gen.  
 9/16/2025  
-    Support Pusa video extension via the pusa2 branch.  
+    Support Pusa video extension via the pusa2 branch. Seems to work best when you use more loras than just base pusa lora.   
 9/8/2025  
     Added support for video extension, wan one frame support, infinitetalk support, context windows for wan 2.2 long video generation, video extension for wan 2.2 to the wan2.2b branch.  
 7/31/2025  
