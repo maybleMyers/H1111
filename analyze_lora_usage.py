@@ -44,22 +44,52 @@ def convert_lora_key_to_model_key(lora_key):
 
         # Parse blocks.N pattern specially
         if key.startswith('blocks_'):
-            # Split only first two underscores for block number
-            parts = key.split('_', 2)  # ['blocks', '0', 'cross_attn_k_diff_b']
-            if len(parts) >= 3:
-                block_part = f"blocks.{parts[1]}"
-                rest = parts[2]
+            parts = key.split('_')
 
-                # Determine parameter type
-                if rest.endswith('_diff_b'):
-                    param = rest[:-7]  # Remove _diff_b
-                    return f"{block_part}.{param}.bias"
-                elif rest.endswith('_diff_m'):
-                    param = rest[:-7]  # Remove _diff_m
-                    return f"{block_part}.{param}.modulation"
-                elif rest.endswith('_diff'):
-                    param = rest[:-5]  # Remove _diff
-                    return f"{block_part}.{param}.weight"
+            if len(parts) >= 4:  # blocks, N, module, param, ...
+                block_num = parts[1]
+
+                # Find the suffix and extract the middle part
+                if '_diff_b' in key:
+                    suffix_start = key.rfind('_diff_b')
+                    # Get everything between blocks_N_ and _diff_b
+                    param_part = key[len(f'blocks_{block_num}_'):suffix_start]
+
+                    # Handle module boundaries (cross_attn, self_attn, ffn need dots after them)
+                    if 'cross_attn_' in param_part:
+                        param_part = param_part.replace('cross_attn_', 'cross_attn.')
+                    if 'self_attn_' in param_part:
+                        param_part = param_part.replace('self_attn_', 'self_attn.')
+                    if 'ffn_' in param_part:
+                        param_part = param_part.replace('ffn_', 'ffn.')
+
+                    return f"blocks.{block_num}.{param_part}.bias"
+
+                elif '_diff_m' in key:
+                    suffix_start = key.rfind('_diff_m')
+                    param_part = key[len(f'blocks_{block_num}_'):suffix_start]
+
+                    if 'cross_attn_' in param_part:
+                        param_part = param_part.replace('cross_attn_', 'cross_attn.')
+                    if 'self_attn_' in param_part:
+                        param_part = param_part.replace('self_attn_', 'self_attn.')
+                    if 'ffn_' in param_part:
+                        param_part = param_part.replace('ffn_', 'ffn.')
+
+                    return f"blocks.{block_num}.{param_part}.modulation"
+
+                elif '_diff' in key:
+                    suffix_start = key.rfind('_diff')
+                    param_part = key[len(f'blocks_{block_num}_'):suffix_start]
+
+                    if 'cross_attn_' in param_part:
+                        param_part = param_part.replace('cross_attn_', 'cross_attn.')
+                    if 'self_attn_' in param_part:
+                        param_part = param_part.replace('self_attn_', 'self_attn.')
+                    if 'ffn_' in param_part:
+                        param_part = param_part.replace('ffn_', 'ffn.')
+
+                    return f"blocks.{block_num}.{param_part}.weight"
         else:
             # Handle non-block keys (like embedding, time_in, etc.)
             if key.endswith('_diff_b'):
