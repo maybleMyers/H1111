@@ -2,7 +2,7 @@
 
 ### Lightx2v Support
 
-This branch adds support for the lightx2v loras. https://huggingface.co/lightx2v/Wan2.2-Lightning is there repo, thanks to the lightx2v team.  
+This branch adds support for the lightx2v loras. https://huggingface.co/lightx2v/Wan2.2-Lightning is their repo, thanks to the lightx2v team.  
 
 Download normal wan2.2 models, ie:  
 https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/wan22_i2v_14B_low_noise_bf16.safetensors  
@@ -17,7 +17,6 @@ I have verified that these loras work with the i2v models so far.
 
 https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.2-T2V-A14B-4steps-lora-250928_high_noise_model_MUSUBI.safetensors  
 https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan2.2-T2V-A14B-4steps-lora-250928_low_noise_model_MUSUBI.safetensors  
-
 
 This is the old lora, use it for high and low noise.  
 
