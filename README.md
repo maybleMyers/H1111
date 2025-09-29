@@ -23,5 +23,5 @@ This is the old lora, use it for high and low noise.
 https://huggingface.co/maybleMyers/wan_files_for_h1111/blob/main/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64_MUSUBI.safetensors  
 
 Use them in the wan2.2 tab and set sampling steps to like 4-8, Guidance Scale to 1 and use step_distill as the Sample Solver for old lora(single lora) or euler for the new lora(2 loras).  
-It seems like higher weights work better, 1.4-2 seems good.  
+It seems like higher weights work better, 1.4-2 seems good for the old lora, 1.4High 1.0Low seems good for new one.  
 put the loras in the lora subfolder.
