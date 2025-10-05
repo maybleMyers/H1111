@@ -441,9 +441,9 @@ def parse_args() -> argparse.Namespace:
                        help="Length of context window in frames (default: 81)")
     parser.add_argument("--context_overlap", type=int, default=30, 
                        help="Overlap between context windows in frames (default: 30)")
-    parser.add_argument("--context_schedule", type=str, default="standard_static",
-                       choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
-                       help="Context window scheduling method (default: standard_static)")
+    parser.add_argument("--context_schedule", type=str, default="sliding",
+                       choices=["sliding", "standard_static", "batched"],
+                       help="Context window scheduling method (default: sliding)")
     parser.add_argument("--context_stride", type=int, default=1,
                        help="Stride for uniform context schedules (default: 1)")
     parser.add_argument("--context_closed_loop", action="store_true",

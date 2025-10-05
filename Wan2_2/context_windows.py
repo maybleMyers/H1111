@@ -392,77 +392,11 @@ def get_shape_for_dim(x_in: torch.Tensor, dim: int) -> List[int]:
 
 class ContextSchedules:
     """Available context schedule types."""
-    UNIFORM_LOOPED = "looped_uniform"
-    UNIFORM_STANDARD = "standard_uniform"
     STATIC_STANDARD = "standard_static"
     BATCHED = "batched"
+    SLIDING = "sliding"
 
 
-def create_windows_uniform_looped(num_frames: int, handler: IndexListContextHandler,
-                                 model_options: Dict[str, Any]) -> List[List[int]]:
-    """Create uniform windows with looping for cyclic videos."""
-    windows = []
-    if num_frames < handler.context_length:
-        windows.append(list(range(num_frames)))
-        return windows
-    
-    context_stride = min(handler.context_stride, int(np.ceil(np.log2(num_frames / handler.context_length))) + 1)
-    
-    for context_step in 1 << np.arange(context_stride):
-        pad = int(round(num_frames * ordered_halving(handler._step)))
-        for j in range(
-            int(ordered_halving(handler._step) * context_step) + pad,
-            num_frames + pad + (0 if handler.closed_loop else -handler.context_overlap),
-            (handler.context_length * context_step - handler.context_overlap),
-        ):
-            windows.append([e % num_frames for e in range(j, j + handler.context_length * context_step, context_step)])
-    
-    return windows
-
-
-def create_windows_uniform_standard(num_frames: int, handler: IndexListContextHandler,
-                                   model_options: Dict[str, Any]) -> List[List[int]]:
-    """Create uniform windows without looping."""
-    windows = []
-    if num_frames <= handler.context_length:
-        windows.append(list(range(num_frames)))
-        return windows
-    
-    context_stride = min(handler.context_stride, int(np.ceil(np.log2(num_frames / handler.context_length))) + 1)
-    
-    # Create windows with uniform distribution
-    for context_step in 1 << np.arange(context_stride):
-        pad = int(round(num_frames * ordered_halving(handler._step)))
-        for j in range(
-            int(ordered_halving(handler._step) * context_step) + pad,
-            num_frames + pad + (-handler.context_overlap),
-            (handler.context_length * context_step - handler.context_overlap),
-        ):
-            windows.append([e % num_frames for e in range(j, j + handler.context_length * context_step, context_step)])
-    
-    # Shift windows that loop over and remove duplicates
-    delete_idxs = []
-    win_i = 0
-    while win_i < len(windows):
-        is_roll, roll_idx = does_window_roll_over(windows[win_i], num_frames)
-        if is_roll:
-            roll_val = windows[win_i][roll_idx]
-            shift_window_to_end(windows[win_i], num_frames=num_frames)
-            if roll_val not in windows[(win_i+1) % len(windows)]:
-                windows.insert(win_i+1, list(range(roll_val, roll_val + handler.context_length)))
-        
-        # Check for duplicates
-        for pre_i in range(0, win_i):
-            if windows[win_i] == windows[pre_i]:
-                delete_idxs.append(win_i)
-                break
-        win_i += 1
-    
-    # Remove duplicates
-    for i in reversed(delete_idxs):
-        windows.pop(i)
-    
-    return windows
 
 
 def create_windows_static_standard(num_frames: int, handler: IndexListContextHandler,
@@ -500,12 +434,49 @@ def create_windows_batched(num_frames: int, handler: IndexListContextHandler,
     return windows
 
 
+def create_windows_sliding(num_frames: int, handler: IndexListContextHandler,
+                           model_options: Dict[str, Any]) -> List[List[int]]:
+    """Create a simple, robust sliding window schedule."""
+    windows = []
+    if num_frames <= handler.context_length:
+        windows.append(list(range(num_frames)))
+        return windows
+
+    delta = handler.context_length - handler.context_overlap
+    if delta <= 0:
+        # Fallback to avoid infinite loop if overlap is too large
+        logger.warning(f"Overlap {handler.context_overlap} is not smaller than context length {handler.context_length}. "
+                       f"Falling back to simple batched windows.")
+        for start_idx in range(0, num_frames, handler.context_length):
+            windows.append(list(range(start_idx, min(start_idx + handler.context_length, num_frames))))
+        return windows
+
+    for start_idx in range(0, num_frames, delta):
+        end_idx = start_idx + handler.context_length
+        
+        # If the window extends past the end, shift it back to align with the end
+        if end_idx > num_frames:
+            start_idx = max(0, num_frames - handler.context_length)
+            end_idx = num_frames
+        
+        window = list(range(start_idx, end_idx))
+        
+        # Avoid adding duplicate windows if the last window was already added
+        if not windows or windows[-1] != window:
+            windows.append(window)
+        
+        # Stop if we've reached the end of the frames
+        if end_idx == num_frames:
+            break
+            
+    return windows
+
+
 # Mapping of schedule names to functions
 CONTEXT_MAPPING = {
-    ContextSchedules.UNIFORM_LOOPED: create_windows_uniform_looped,
-    ContextSchedules.UNIFORM_STANDARD: create_windows_uniform_standard,
     ContextSchedules.STATIC_STANDARD: create_windows_static_standard,
     ContextSchedules.BATCHED: create_windows_batched,
+    ContextSchedules.SLIDING: create_windows_sliding,
 }
 
 
@@ -586,39 +557,6 @@ def get_matching_fuse_method(fuse_method: str) -> ContextFuseMethod:
     return ContextFuseMethod(fuse_method, func)
 
 
-def ordered_halving(val: int) -> float:
-    """Returns fraction with denominator that is a power of 2."""
-    bin_str = f"{val:064b}"
-    bin_flip = bin_str[::-1]
-    as_int = int(bin_flip, 2)
-    return as_int / (1 << 64)
-
-
-def does_window_roll_over(window: List[int], num_frames: int) -> Tuple[bool, int]:
-    """Check if window rolls over the sequence boundary."""
-    prev_val = -1
-    for i, val in enumerate(window):
-        val = val % num_frames
-        if val < prev_val:
-            return True, i
-        prev_val = val
-    return False, -1
-
-
-def shift_window_to_start(window: List[int], num_frames: int):
-    """Shift window indices to start from 0."""
-    start_val = window[0]
-    for i in range(len(window)):
-        window[i] = ((window[i] - start_val) + num_frames) % num_frames
-
-
-def shift_window_to_end(window: List[int], num_frames: int):
-    """Shift window indices to end at num_frames-1."""
-    shift_window_to_start(window, num_frames)
-    end_val = window[-1]
-    end_delta = num_frames - end_val - 1
-    for i in range(len(window)):
-        window[i] = window[i] + end_delta
 
 
 class WanContextWindowsHandler:

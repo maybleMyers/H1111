@@ -7839,8 +7839,8 @@ with gr.Blocks(
                             with gr.Row():
                                 wan22_context_schedule = gr.Dropdown(
                                     label="Context Schedule",
-                                    choices=["standard_static", "standard_uniform", "looped_uniform", "batched"],
-                                    value="standard_static",
+                                    choices=["sliding", "standard_static", "standard_uniform", "looped_uniform", "batched"],
+                                    value="sliding",
                                     info="Context window scheduling method"
                                 )
                                 wan22_context_stride = gr.Number(
