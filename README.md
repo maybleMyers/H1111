@@ -327,7 +327,7 @@ SkyReels-i2v
 SkyReels-t2v  
 Multitalk  
 
-I have mostly been workiing on the framepack, multitalk and the WanX-i2v tab. WanX-i2v is used for skyreels v2 and the fun control models.    
+I have mostly been workiing on the wan2.2 lately. The wan2.2b branch is the most stable and the lightx2v branch has the most features. To switch branches just git pull then git switch wan2.2b for example.      
 
 This supports queuing multiple different jobs if you open 2+ browser tabs and use the same model.
 
