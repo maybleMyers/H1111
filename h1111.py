@@ -7790,12 +7790,12 @@ with gr.Blocks(
                         )
                         with gr.Row(visible=False) as wan22_extension_controls:
                             wan22_extend_frames = gr.Number(
-                                label="Total Frames to Generate", 
-                                value=200, 
-                                minimum=81, 
-                                maximum=500,
+                                label="Number of New Sections to Generate",
+                                value=1,
+                                minimum=1,
+                                maximum=11,
                                 step=1,
-                                info="Total number of frames in the extended video (81-500 frames)"
+                                info="Number of new video sections to generate and append. Each section's length is set by 'Frame Count'."
                             )
                             wan22_frames_to_check = gr.Number(
                                 label="Frames to Check from End",

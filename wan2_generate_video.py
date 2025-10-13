@@ -3600,110 +3600,112 @@ def blend_video_transition(video1: torch.Tensor, video2: torch.Tensor, blend_fra
 def generate_extended_video_i2v_based(
     args: argparse.Namespace,
     initial_video_path: str,
-    total_frames: int,
+    num_new_sections: int,
 ) -> torch.Tensor:
-    """Generate extended video using clean i2v approach with smooth blending"""
+    """
+    Generate extended video using a clean i2v approach by iteratively adding new sections.
+    Each new section is generated from the sharpest frame of the previously extended video.
+    """
     import tempfile
     import cv2
-    
-    device = torch.device(args.device)
-    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to {total_frames} frames")
-    
-    # Extract the best transition frame
-    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=args.frames_to_check)
-    
-    # Load initial video up to the best frame
-    if best_frame_idx > 0:
-        video_frames_np, initial_frames = load_video(
-            initial_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
-        )
-    else:
-        # Use entire video as fallback
-        video_frames_np, initial_frames = load_video(
-            initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
-        )
-    
-    # Convert initial video to tensor [1, C, F, H, W]
-    initial_video = torch.from_numpy(np.stack(video_frames_np, axis=0))
-    initial_video = initial_video.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
-    initial_video = initial_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
-    
-    logger.info(f"Initial video loaded: {initial_video.shape[2]} frames")
-    
-    if initial_frames >= total_frames:
-        logger.info("Video already has desired length")
-        return initial_video[:, :, :total_frames]
-    
-    # Store original arguments
+    import shutil
+    import time
+
+    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to add {num_new_sections} new section(s).")
+    logger.info(f"Each new section will have a length of {args.video_length} frames.")
+
+    current_video_path = initial_video_path
+    final_video_tensor = None
+
+    # Create a temporary directory for intermediate videos and frames
+    temp_dir = tempfile.mkdtemp()
+
+    # Store original arguments that will be modified during recursive calls
     original_image_path = args.image_path
     original_video_length = args.video_length
     original_extend_video = args.extend_video
-    
-    # Generate extension chunks using i2v
-    all_videos = [initial_video]
-    current_frames = initial_frames
-    chunk_size = 81  # Standard i2v length
-    
-    # Get the best transition frame as starting image
-    best_frame_tensor = initial_video[0, :, -1]  # [C, H, W] - last frame
-    best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
-    best_frame_np = best_frame_np.astype(np.uint8)
-    
+
     try:
-        while current_frames < total_frames:
-            remaining_frames = total_frames - current_frames
-            frames_to_generate = min(chunk_size, remaining_frames)
-            
-            logger.info(f"Generating chunk: {frames_to_generate} frames (progress: {current_frames}/{total_frames})")
-            
-            # Save the frame as temporary image
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
-                cv2.imwrite(tmp_file.name, cv2.cvtColor(best_frame_np, cv2.COLOR_RGB2BGR))
+        # Main loop to generate the requested number of new sections
+        for i in range(num_new_sections):
+            logger.info(f"--- Generating new section {i + 1}/{num_new_sections} ---")
+
+            # 1. Extract the best transition frame from the *current* video
+            best_frame_idx = extract_best_transition_frame(current_video_path, frames_to_check=args.frames_to_check)
+
+            # 2. Load the current video up to the best transition frame
+            if best_frame_idx > 0:
+                base_video_frames_np, _ = load_video(
+                    current_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
+                )
+            else:  # Fallback: use the whole video if frame extraction fails
+                logger.warning(f"Could not find a sharp frame for section {i+1}. Using the entire previous video as base.")
+                base_video_frames_np, _ = load_video(
+                    current_video_path, 0, None, bucket_reso=tuple(args.video_size)
+                )
+
+            if not base_video_frames_np:
+                raise ValueError(f"Failed to load base video frames from {current_video_path} for section {i+1}")
+
+            # Convert the base video (up to the sharpest frame) to a tensor
+            base_video_tensor = torch.from_numpy(np.stack(base_video_frames_np, axis=0))
+            base_video_tensor = base_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+            base_video_tensor = base_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+            logger.info(f"Section {i+1}: Base video loaded with {base_video_tensor.shape[2]} frames.")
+
+            # 3. Get the last frame of the base video to use as the start image for the new i2v generation
+            last_frame_np = (base_video_tensor[0, :, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+            # 4. Generate the new video chunk
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_file:
+                cv2.imwrite(tmp_file.name, cv2.cvtColor(last_frame_np, cv2.COLOR_RGB2BGR))
                 temp_image_path = tmp_file.name
-            
-            # Modify args for i2v generation
+
+            # Modify args for the recursive i2v generation call
             args.image_path = temp_image_path
-            args.video_length = frames_to_generate
-            args.extend_video = None  # Prevent recursive extension calls
-            
-            # Generate new chunk using the main generation function
-            new_chunk = generate(args)
-            
-            # Clean up temp file
+            args.video_length = original_video_length  # This is the length of one new section
+            args.extend_video = None  # Prevent infinite recursion
+
+            # Generate the new chunk as a latent tensor by calling the main generate function
+            new_chunk_latent = generate(args)
             os.unlink(temp_image_path)
-            
-            if new_chunk is not None:
-                logger.info(f"Generated chunk shape: {new_chunk.shape}")
-                # Decode the latent chunk to pixel space for blending
-                decoded_chunk = decode_latent(new_chunk, args, WAN_CONFIGS[args.task])
-                logger.info(f"Decoded chunk shape: {decoded_chunk.shape}")
-                all_videos.append(decoded_chunk)
-                current_frames += frames_to_generate
-                
-                # Use the last frame of the decoded chunk as the next starting frame
-                best_frame_tensor = decoded_chunk[0, :, -1]
-                best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
-                best_frame_np = best_frame_np.astype(np.uint8)
-            else:
-                logger.error("Failed to generate video chunk")
-                break
-        
-        # Blend all video segments smoothly
-        logger.info(f"Blending {len(all_videos)} video segments")
-        result = all_videos[0]
-        
-        for i in range(1, len(all_videos)):
-            result = blend_video_transition(result, all_videos[i], blend_frames=8)
-            logger.info(f"Blended segment {i+1}, current length: {result.shape[2]} frames")
-        
-        logger.info(f"Final extended video: {result.shape}")
-        return result
-        
+
+            if new_chunk_latent is None:
+                raise RuntimeError(f"Failed to generate latent for section {i+1}")
+
+            # 5. Decode the new chunk from latent to pixel space
+            decoded_chunk = decode_latent(new_chunk_latent, args, WAN_CONFIGS[args.task]) # Returns [B, C, F, H, W], range [0, 1]
+            logger.info(f"Section {i+1}: Decoded new chunk with shape: {decoded_chunk.shape}")
+
+            # 6. Concatenate the base video and the new chunk.
+            # Skip the first frame of the new chunk as it's a repeat of the start image.
+            final_video_tensor = torch.cat([base_video_tensor, decoded_chunk[:, :, 1:, :, :]], dim=2)
+
+            # 7. Update current_video_path for the next iteration by saving the new longer video
+            if i < num_new_sections - 1: # No need to save the very last intermediate video
+                temp_video_filename = f"intermediate_section_{i+1}.mp4"
+                current_video_path = os.path.join(temp_dir, temp_video_filename)
+
+                logger.info(f"Section {i+1}: Saving intermediate video of length {final_video_tensor.shape[2]} to {current_video_path}")
+                save_videos_grid(final_video_tensor, current_video_path, fps=args.fps, rescale=False)
+                time.sleep(1) # Give a moment for the file to be fully written to disk
+
     finally:
-        # Restore original arguments
+        # Restore original arguments to avoid side effects
         args.image_path = original_image_path
         args.video_length = original_video_length
         args.extend_video = original_extend_video
+
+        # Clean up the temporary directory and all its contents
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+    if final_video_tensor is None:
+        raise RuntimeError("Video extension process failed to produce a final video.")
+
+    logger.info(f"Final extended video generated with shape: {final_video_tensor.shape}")
+    return final_video_tensor
 
 def generate_extended_video(
     args: argparse.Namespace,
