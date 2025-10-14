@@ -7873,10 +7873,10 @@ with gr.Blocks(
                     )
                     # Width and height inputs
                     with gr.Row():
-                        wan22_width = gr.Number(label="Width", value=832, interactive=True)
+                        wan22_width = gr.Number(label="Width", value=832, step=32, interactive=True)
                         wan22_calc_height_btn = gr.Button("→")
                         wan22_calc_width_btn = gr.Button("←")
-                        wan22_height = gr.Number(label="Height", value=480, interactive=True)
+                        wan22_height = gr.Number(label="Height", value=480, step=32, interactive=True)
                     wan22_frame_num = gr.Slider(minimum=9, maximum=611, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
