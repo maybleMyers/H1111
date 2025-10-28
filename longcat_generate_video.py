@@ -4233,8 +4233,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
         )
 
     # Match LongCat pipeline: keep latents normalized before denoising
-    latents_mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
-    latents_std = 1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
+    latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
+    latents_std = (1.0 / vae.std).view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
     latents = (latents - latents_mean) * latents_std
 
     logger.info(f"Initial latent range (pre-denoising): [{latents.min().item():.4f}, {latents.max().item():.4f}]")
