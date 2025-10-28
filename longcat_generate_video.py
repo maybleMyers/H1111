@@ -4172,9 +4172,10 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
         )[0]
 
-    # Move embeddings to device
-    prompt_embeds = prompt_embeds.to(device)
-    negative_prompt_embeds = negative_prompt_embeds.to(device)
+    # Move embeddings to device and match DiT dtype
+    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds.dtype
+    prompt_embeds = prompt_embeds.to(device=device, dtype=embed_dtype)
+    negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=embed_dtype)
 
     # Cleanup text encoder
     del text_encoder, tokenizer
@@ -4194,47 +4195,37 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
 
     # Generate noise
+    latents_generator_device = "cpu" if args.cpu_noise else device
+    latents_generator = torch.Generator(device=latents_generator_device)
+    latents_generator.manual_seed(seed)
+
     if args.cpu_noise:
         latents = torch.randn(
             1, latent_c, latent_f, latent_h, latent_w,
-            generator=torch.Generator(device="cpu").manual_seed(seed),
-            dtype=dit_dtype
+            generator=latents_generator,
+            dtype=torch.float32
         ).to(device)
     else:
         latents = torch.randn(
             1, latent_c, latent_f, latent_h, latent_w,
-            generator=torch.Generator(device=device).manual_seed(seed),
-            dtype=dit_dtype,
+            generator=latents_generator,
+            dtype=torch.float32,
             device=device
         )
 
-    # CRITICAL: Normalize latents before denoising
-    # The diffusion model was trained on normalized latent distributions
-    # Without normalization, the model receives out-of-distribution inputs causing NaN
-    if hasattr(vae, 'mean') and hasattr(vae, 'std'):
-        logger.info("Normalizing initial latents using VAE statistics")
-        # Reshape for broadcasting: [C] -> [1, C, 1, 1, 1]
-        latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = vae.std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-
-        # Apply normalization: latents = (latents - mean) * (1 / std)
-        latents = (latents - latents_mean) * (1.0 / latents_std)
-        logger.info(f"Normalized initial latents - range: [{latents.min().item():.4f}, {latents.max().item():.4f}]")
-    else:
-        logger.warning("VAE missing mean/std - skipping normalization (will likely cause NaN!)")
+    logger.info(f"Initial latent range (pre-denoising): [{latents.min().item():.4f}, {latents.max().item():.4f}]")
 
     # --- Setup scheduler (use FlowMatchEulerDiscreteScheduler from LongCat) ---
     logger.info("Setting up scheduler...")
     num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
 
-    # Use FlowMatchEulerDiscreteScheduler with custom sigmas (matching LongCat source)
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=1000,
-        shift=1.0,
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.ckpt_dir,
+        subfolder="scheduler",
+        torch_dtype=torch.float32,
     )
 
-    # Generate custom sigma schedule (matching LongCat pipeline)
-    sigmas = torch.linspace(1, 0.001, num_inference_steps).to(torch.float32)
+    sigmas = torch.linspace(1, 0.001, num_inference_steps, device=device, dtype=torch.float32)
     scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
     timesteps = scheduler.timesteps
 
@@ -4255,60 +4246,74 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     prompt_embeds_list = [prompt_embeds[i] for i in range(prompt_embeds.shape[0])]
     negative_prompt_embeds_list = [negative_prompt_embeds[i] for i in range(negative_prompt_embeds.shape[0])]
 
-    arg_c = {"context": prompt_embeds_list, "seq_len": max_length}
-    arg_null = {"context": negative_prompt_embeds_list, "seq_len": max_length}
+    do_classifier_free_guidance = args.guidance_scale > 1.0
 
     for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-        # Convert latent to list format for WanModel
-        # latents shape: [1, C, F, H, W]
-        if latents.dim() == 5:
-            latent_model_input_list = [latents[j] for j in range(latents.shape[0])]
-        elif latents.dim() == 4:
-            latent_model_input_list = [latents]
+        if do_classifier_free_guidance:
+            latent_model_input = torch.cat([latents, latents], dim=0)
         else:
-            raise ValueError(f"Unexpected latent shape: {latents.shape}")
+            latent_model_input = latents
+
+        latent_input_dtype = dit_dtype if dit_dtype is not None else latent_model_input.dtype
+        latent_model_input = latent_model_input.to(device=device, dtype=latent_input_dtype)
+
+        if latent_model_input.dim() == 5:
+            latent_model_input_list = [latent_model_input[j] for j in range(latent_model_input.shape[0])]
+        elif latent_model_input.dim() == 4:
+            latent_model_input_list = [latent_model_input]
+        else:
+            raise ValueError(f"Unexpected latent shape: {latent_model_input.shape}")
+
+        timestep_batch = t.expand(len(latent_model_input_list)).to(device=device, dtype=torch.float32)
+        timestep_for_model = timestep_batch.to(dtype=latent_input_dtype)
+
+        if do_classifier_free_guidance:
+            context_list = negative_prompt_embeds_list + prompt_embeds_list
+        else:
+            context_list = prompt_embeds_list
+
+        if args.blocks_to_swap > 0:
+            model.prepare_block_swap_before_forward()
 
         with torch.no_grad():
-            # 1. Predict conditional noise
-            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
-            noise_pred_cond = model(latent_model_input_list, t=t, **model_arg_c)[0]
-
-            # 2. Apply CFG if needed
-            if args.guidance_scale > 1.0:
-                model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
-                noise_pred_uncond = model(latent_model_input_list, t=t, **model_arg_null)[0]
-                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                noise_pred = noise_pred_cond
-
-            # 3. Ensure noise_pred has batch dimension for scheduler
-            if noise_pred.dim() == 4:  # [C, F, H, W]
-                noise_pred = noise_pred.unsqueeze(0)  # [1, C, F, H, W]
-
-            # CRITICAL: Negate noise prediction for scheduler compatibility
-            # FlowMatchEulerDiscreteScheduler requires negated velocity predictions
-            # Without this, denoising goes in the wrong direction causing divergence
-            noise_pred = -noise_pred
-
-            # 4. Scheduler step
-            scheduler_output = scheduler.step(
-                noise_pred,
-                t,
-                latents,
-                return_dict=False,
-                generator=seed_g
+            model_outputs = model(
+                latent_model_input_list,
+                t=timestep_for_model,
+                context=context_list,
+                seq_len=max_length
             )
-            latents = scheduler_output[0]
 
-            # DIAGNOSTIC: Check for NaN at each step
-            if torch.isnan(latents).any():
-                nan_count = torch.isnan(latents).sum().item()
-                logger.error(f"NaN detected at step {i}/{num_inference_steps}! Count: {nan_count}/{latents.numel()}")
-                logger.error(f"Latent stats - min: {latents[~torch.isnan(latents)].min().item() if not torch.isnan(latents).all() else 'all NaN'}, "
-                            f"max: {latents[~torch.isnan(latents)].max().item() if not torch.isnan(latents).all() else 'all NaN'}")
-            elif i % 5 == 0 or i == 0:
-                # Log stats every 5 steps when no NaN
-                logger.info(f"Step {i}: latent range [{latents.min().item():.4f}, {latents.max().item():.4f}]")
+        noise_pred = torch.stack([output.to(torch.float32) for output in model_outputs], dim=0)
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+
+            B = noise_pred_cond.shape[0]
+            positive = noise_pred_cond.reshape(B, -1)
+            negative = noise_pred_uncond.reshape(B, -1)
+            st_star = torch.sum(positive * negative, dim=1, keepdim=True) / (torch.sum(negative ** 2, dim=1, keepdim=True) + 1e-8)
+            st_star = st_star.view(B, 1, 1, 1, 1)
+
+            noise_pred = noise_pred_uncond * st_star + args.guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
+
+        noise_pred = -noise_pred.to(latents.dtype)
+
+        latents = scheduler.step(
+            noise_pred,
+            t,
+            latents,
+            return_dict=False,
+            generator=seed_g
+        )[0]
+
+        # DIAGNOSTIC: Check for NaN at each step
+        if torch.isnan(latents).any():
+            nan_count = torch.isnan(latents).sum().item()
+            logger.error(f"NaN detected at step {i}/{num_inference_steps}! Count: {nan_count}/{latents.numel()}")
+            logger.error(f"Latent stats - min: {latents[~torch.isnan(latents)].min().item() if not torch.isnan(latents).all() else 'all NaN'}, "
+                        f"max: {latents[~torch.isnan(latents)].max().item() if not torch.isnan(latents).all() else 'all NaN'}")
+        elif i % 5 == 0 or i == 0:
+            logger.info(f"Step {i}: latent range [{latents.min().item():.4f}, {latents.max().item():.4f}]")
 
         # Periodic cleanup
         if i % 10 == 0:
