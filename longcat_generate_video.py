@@ -5181,6 +5181,20 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure latent is on the correct device and expected dtype for VAE
     latent_decode = latent.to(device=device, dtype=vae.dtype)
 
+    # CRITICAL: Denormalize latents before VAE decoding
+    # The diffusion process produces normalized latents (z-score normalized)
+    # but the VAE expects latents in the original unnormalized range
+    if hasattr(vae, 'config') and hasattr(vae.config, 'latents_mean') and hasattr(vae.config, 'latents_std'):
+        logger.info("Denormalizing latents using VAE config statistics")
+        latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+
+        # Apply inverse normalization: latents = latents / latents_std + latents_mean
+        latent_decode = latent_decode / latents_std + latents_mean
+        logger.info(f"Denormalized latents - range: [{latent_decode.min().item():.4f}, {latent_decode.max().item():.4f}]")
+    else:
+        logger.warning("VAE config missing latents_mean/latents_std - skipping denormalization (may cause black video!)")
+
     # Handle different VAE decode APIs
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
@@ -5228,6 +5242,23 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     clean_memory_on_device(device)
 
     logger.info(f"Decoded video shape: {videos.shape}")
+
+    # Validate decoded video for NaN/Inf values
+    if torch.isnan(videos).any():
+        nan_count = torch.isnan(videos).sum().item()
+        total_elements = videos.numel()
+        logger.error(f"CRITICAL: Decoded video contains {nan_count}/{total_elements} NaN values! This will cause black output.")
+        logger.error(f"Video stats - min: {videos[~torch.isnan(videos)].min().item() if not torch.isnan(videos).all() else 'all NaN'}, "
+                    f"max: {videos[~torch.isnan(videos)].max().item() if not torch.isnan(videos).all() else 'all NaN'}")
+        raise RuntimeError(f"VAE decoding produced NaN values ({nan_count}/{total_elements}). Check latent denormalization.")
+
+    if torch.isinf(videos).any():
+        inf_count = torch.isinf(videos).sum().item()
+        total_elements = videos.numel()
+        logger.warning(f"WARNING: Decoded video contains {inf_count}/{total_elements} Inf values!")
+
+    # Log value range for debugging
+    logger.info(f"Decoded video value range: [{videos.min().item():.4f}, {videos.max().item():.4f}]")
 
     # Post-processing: trim tail frames, convert to float32 CPU, scale to [0, 1]
     if args.trim_tail_frames > 0:
