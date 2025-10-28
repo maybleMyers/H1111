@@ -4194,6 +4194,11 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
 
     logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
 
+    # Sequence length after patch embedding (matches LongCat pipeline expectations)
+    patch_h, patch_w = cfg.patch_size[1], cfg.patch_size[2]
+    seq_len_tokens = (latent_f * latent_h * latent_w) // (patch_h * patch_w)
+    logger.info(f"Computed latent token sequence length: {seq_len_tokens}")
+
     # Generate noise
     latents_generator_device = "cpu" if args.cpu_noise else device
     latents_generator = torch.Generator(device=latents_generator_device)
@@ -4280,7 +4285,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
                 latent_model_input_list,
                 t=timestep_for_model,
                 context=context_list,
-                seq_len=max_length
+                seq_len=seq_len_tokens
             )
 
         noise_pred = torch.stack([output.to(torch.float32) for output in model_outputs], dim=0)
