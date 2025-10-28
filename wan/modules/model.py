@@ -213,6 +213,8 @@ class WanSelfAttention(nn.Module):
         # del x
         # query, key, value function
 
+        # Ensure x has the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)

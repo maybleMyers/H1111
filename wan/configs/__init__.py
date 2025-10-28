@@ -10,7 +10,6 @@ from .wan_i2v_14B import i2v_14B
 from .wan_t2v_1_3B import t2v_1_3B
 from .wan_t2v_14B import t2v_14B
 from .wan_multitalk_14B import multitalk_14B
-from .longcat_t2v import longcat_t2v
 # Import S2V base configs if they exist as separate files (like official repo)
 # For this integration, we define them directly here.
 
@@ -166,8 +165,6 @@ WAN_CONFIGS = {
     "i2v-14B-FC-1.1": i2v_14B_FC_1_1,
     'multitalk-14B': multitalk_14B,
     'infinitetalk-14B': multitalk_14B,  # InfiniteTalk uses the same config as MultiTalk
-    # LongCat models
-    "longcat-t2v": longcat_t2v,
 }
 
 SIZE_CONFIGS = {
@@ -210,5 +207,4 @@ SUPPORTED_SIZES = {
     "i2v-14B-FC-1.1": ("720*1280", "1280*720", "480*832", "832*480"),
     'multitalk-14B': ('multitalk-480', 'multitalk-720'),
     'infinitetalk-14B': ('infinitetalk-480', 'infinitetalk-720'),
-    "longcat-t2v": ("720*1280", "1280*720", "480*832", "832*480"),
 }
