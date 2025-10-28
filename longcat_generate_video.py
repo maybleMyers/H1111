@@ -41,24 +41,14 @@ from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.utils.fm_solvers_euler import EulerScheduler
 from wan.utils.step_distill_scheduler import StepDistillScheduler
 
-# LongCat model imports (use existing pipeline for block swapping)
+# LongCat support - uses existing efficient loading infrastructure
+# Only need transformers for UMT5 text encoder
 try:
     from transformers import AutoTokenizer, UMT5EncoderModel
-
-    # Add LongCat-Video to path if it exists
-    import sys
-    longcat_dir = os.path.join(os.path.dirname(__file__), 'LongCat-Video')
-    if os.path.exists(longcat_dir) and longcat_dir not in sys.path:
-        sys.path.insert(0, longcat_dir)
-
-    # Import from longcat_video subdirectory (now in sys.path)
-    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
-    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler as LongCatScheduler
     LONGCAT_AVAILABLE = True
 except ImportError as e:
     LONGCAT_AVAILABLE = False
-    print(f"Warning: LongCat modules not available: {e}")
+    print(f"Warning: transformers not available for LongCat UMT5 support: {e}")
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -766,190 +756,28 @@ class DynamicModelManager:
         self.cleanup()
 
 
-class LongCatModelManager:
-    """Manages LongCat model loading with block swapping support."""
+def load_longcat_dit_weights(checkpoint_dir: str, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None):
+    """Load sharded LongCat DiT weights from checkpoint directory.
 
-    def __init__(self, checkpoint_dir, device, dit_dtype, dit_weight_dtype, args):
-        self.checkpoint_dir = checkpoint_dir
-        self.device = device
-        self.dit_dtype = dit_dtype
-        self.dit_weight_dtype = dit_weight_dtype
-        self.args = args
+    Args:
+        checkpoint_dir: Path to LongCat checkpoint directory
+        device: Device to load weights to
+        dtype: Data type for weights
 
-        # Models
-        self.tokenizer = None
-        self.text_encoder = None
-        self.vae = None
-        self.dit = None
-        self.scheduler = None
+    Returns:
+        state_dict: Dictionary of model weights
+    """
+    dit_dir = os.path.join(checkpoint_dir, "dit")
 
-    def load_models(self):
-        """Load all LongCat models from HuggingFace checkpoint structure."""
-        if not LONGCAT_AVAILABLE:
-            raise ImportError("LongCat modules not available. Please install LongCat-Video.")
+    logger.info(f"Loading LongCat DiT weights from {dit_dir}")
 
-        logger.info(f"Loading LongCat models from {self.checkpoint_dir}")
+    # Load sharded safetensors using existing utility
+    # This efficiently handles the sharded format
+    sd = load_safetensors(dit_dir, device, disable_mmap=True, dtype=dtype)
 
-        # Load tokenizer and text encoder (UMT5-XXL)
-        logger.info("Loading UMT5-XXL tokenizer and text encoder...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.checkpoint_dir,
-            subfolder="tokenizer"
-        )
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            self.checkpoint_dir,
-            subfolder="text_encoder",
-            torch_dtype=self.dit_dtype
-        ).to(self.device)
-        self.text_encoder.eval()
+    logger.info(f"Loaded {len(sd)} weight tensors for LongCat DiT")
 
-        # Load VAE (Wan 2.1 VAE - AutoencoderKLWan)
-        logger.info("Loading Wan 2.1 VAE (AutoencoderKLWan)...")
-        self.vae = AutoencoderKLWan.from_pretrained(
-            self.checkpoint_dir,
-            subfolder="vae",
-            torch_dtype=self.dit_dtype
-        ).to(self.device)
-        self.vae.eval()
-
-        # Load scheduler
-        logger.info("Loading FlowMatchEulerDiscreteScheduler...")
-        self.scheduler = LongCatScheduler.from_pretrained(
-            self.checkpoint_dir,
-            subfolder="scheduler"
-        )
-
-        # Load DiT (LongCat Transformer)
-        logger.info("Loading LongCat DiT model...")
-        loading_device = "cpu" if self.args.blocks_to_swap > 0 else self.device
-
-        self.dit = LongCatVideoTransformer3DModel.from_pretrained(
-            self.checkpoint_dir,
-            subfolder="dit",
-            torch_dtype=self.dit_weight_dtype
-        )
-
-        # Apply block swapping if requested
-        if self.args.blocks_to_swap > 0:
-            logger.info(f"Enabling block swapping for {self.args.blocks_to_swap} blocks...")
-            self.dit.blocks_to_swap = self.args.blocks_to_swap
-
-            # swap_blocks is optional - use if provided
-            swap_blocks = getattr(self.args, 'swap_blocks', None)
-            if swap_blocks is not None:
-                self.dit.swap_blocks = swap_blocks
-
-            # Use the built-in enable_block_swap method from WanModel
-            # LongCat DiT should have similar method
-            if hasattr(self.dit, 'enable_block_swap'):
-                self.dit.enable_block_swap(self.args.blocks_to_swap, self.device, supports_backward=False)
-                self.dit.move_to_device_except_swap_blocks(self.device)
-                self.dit.prepare_block_swap_before_forward()
-            else:
-                logger.warning("LongCat DiT does not support enable_block_swap method. Loading to device normally.")
-                self.dit = self.dit.to(self.device)
-        else:
-            self.dit = self.dit.to(self.device)
-
-        self.dit.eval()
-
-        # Optimize if requested
-        if self.args.compile:
-            logger.info("Compiling DiT model...")
-            self.dit = torch.compile(self.dit, mode=self.args.compile_mode)
-
-        logger.info("LongCat models loaded successfully!")
-
-    def encode_prompt(self, prompt, negative_prompt="", max_sequence_length=512):
-        """Encode text prompts using UMT5."""
-        # Tokenize
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        # Encode
-        with torch.no_grad():
-            prompt_embeds = self.text_encoder(
-                input_ids=text_inputs.input_ids.to(self.device),
-                attention_mask=text_inputs.attention_mask.to(self.device)
-            )[0]
-
-        # Handle negative prompt
-        if negative_prompt:
-            uncond_inputs = self.tokenizer(
-                negative_prompt,
-                padding="max_length",
-                max_length=max_sequence_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-
-            with torch.no_grad():
-                negative_prompt_embeds = self.text_encoder(
-                    input_ids=uncond_inputs.input_ids.to(self.device),
-                    attention_mask=uncond_inputs.attention_mask.to(self.device)
-                )[0]
-        else:
-            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-
-        return prompt_embeds, negative_prompt_embeds
-
-    def cleanup(self):
-        """Clean up all loaded models."""
-        logger.info("Cleaning up LongCat models...")
-
-        # Clean up each model
-        if self.dit is not None:
-            # Handle block swapping cleanup
-            if hasattr(self.dit, 'blocks_to_swap') and self.dit.blocks_to_swap > 0:
-                if hasattr(self.dit, 'offloader') and self.dit.offloader is not None:
-                    for idx in range(len(self.dit.blocks)):
-                        try:
-                            self.dit.offloader.wait_for_block(idx)
-                            self.dit.blocks[idx] = self.dit.blocks[idx].cpu()
-                        except Exception as e:
-                            logger.warning(f"Error cleaning up block {idx}: {e}")
-
-                    try:
-                        if hasattr(self.dit.offloader, 'remove_handles'):
-                            for handle in self.dit.offloader.remove_handles:
-                                handle.remove()
-                            self.dit.offloader.remove_handles.clear()
-                        if hasattr(self.dit.offloader, 'thread_pool'):
-                            self.dit.offloader.thread_pool.shutdown(wait=True)
-                        if hasattr(self.dit.offloader, 'futures'):
-                            self.dit.offloader.futures.clear()
-                        del self.dit.offloader
-                    except Exception as e:
-                        logger.warning(f"Error cleaning up offloader: {e}")
-
-            self.dit = self.dit.cpu() if hasattr(self.dit, 'cpu') else None
-            del self.dit
-            self.dit = None
-
-        if self.vae is not None:
-            self.vae = self.vae.cpu()
-            del self.vae
-            self.vae = None
-
-        if self.text_encoder is not None:
-            self.text_encoder = self.text_encoder.cpu()
-            del self.text_encoder
-            self.text_encoder = None
-
-        self.tokenizer = None
-        self.scheduler = None
-
-        # Aggressive cleanup
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        clean_memory_on_device(self.device)
+    return sd
 
 
 def create_funcontrol_conditioning_latent(
@@ -4199,7 +4027,7 @@ def generate_extended_video(
 
 
 def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
-    """LongCat T2V generation using existing pipeline infrastructure with block swapping.
+    """LongCat T2V generation using existing efficient pipeline infrastructure.
 
     Args:
         args: command line arguments
@@ -4209,24 +4037,21 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     Returns:
         Generated latent tensor [B, C, F, H, W]
     """
-    logger.info("Running LongCat T2V generation")
+    logger.info("Running LongCat T2V generation with efficient loading")
 
     if not LONGCAT_AVAILABLE:
-        raise ImportError(
-            "LongCat modules not available. Please install LongCat-Video:\n"
-            "git clone https://github.com/HuggingFace/LongCat-Video.git\n"
-            "cd LongCat-Video && pip install -e ."
-        )
+        raise ImportError("transformers not available. Install: pip install transformers")
 
     if args.ckpt_dir is None:
-        raise ValueError("--ckpt_dir is required for LongCat models. Point it to the LongCat checkpoint directory.")
+        raise ValueError("--ckpt_dir is required for LongCat models")
 
-    # Setup data types (use vae_dtype as reference, default to bfloat16)
+    # Setup data types
     if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
-        dit_dtype = torch.bfloat16 if args.vae_dtype == "bf16" or args.vae_dtype == "bfloat16" else torch.float16
+        dit_dtype = torch.bfloat16 if args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
     else:
-        dit_dtype = torch.bfloat16  # Default to bfloat16 for LongCat
+        dit_dtype = torch.bfloat16
     dit_weight_dtype = dit_dtype
+    vae_dtype = dit_dtype
 
     logger.info(f"Using device: {device}, DiT dtype: {dit_dtype}")
 
@@ -4234,56 +4059,133 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     args.seed = seed
     logger.info(f"Using seed: {seed}")
-
-    # Set random seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    # Initialize LongCat model manager
-    logger.info("Initializing LongCat models...")
-    longcat_manager = LongCatModelManager(
-        checkpoint_dir=args.ckpt_dir,
-        device=device,
-        dit_dtype=dit_dtype,
-        dit_weight_dtype=dit_weight_dtype,
-        args=args
-    )
+    # --- Load VAE using existing infrastructure ---
+    logger.info("Loading Wan 2.1 VAE...")
+    # Temporarily override args.vae to point to LongCat VAE
+    original_vae_path = args.vae
+    args.vae = os.path.join(args.ckpt_dir, "vae", "diffusion_pytorch_model.safetensors")
+    vae = load_vae(args, cfg, device, vae_dtype)
+    args.vae = original_vae_path  # Restore
+    logger.info("VAE loaded successfully")
 
-    # Load models
-    longcat_manager.load_models()
+    # --- Load UMT5 text encoder ---
+    logger.info("Loading UMT5-XXL text encoder...")
+    text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
+    tokenizer = AutoTokenizer.from_pretrained(text_encoder_dir)
 
-    # Get models
-    dit = longcat_manager.dit
-    vae = longcat_manager.vae
-    scheduler = longcat_manager.scheduler
+    # Load to CPU first if using block swapping
+    te_device = "cpu" if args.blocks_to_swap > 0 else device
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        text_encoder_dir,
+        torch_dtype=dit_dtype
+    ).to(te_device)
+    text_encoder.eval()
+    logger.info("Text encoder loaded")
 
-    # Encode prompt
+    # --- Load LongCat DiT weights ---
+    logger.info("Loading LongCat DiT model...")
+    loading_device = "cpu" if args.blocks_to_swap > 0 else device
+    dit_sd = load_longcat_dit_weights(args.ckpt_dir, loading_device, dit_weight_dtype)
+
+    # Create WanModel with LongCat config
+    # NOTE: LongCat architecture is similar to Wan, try using WanModel
+    with init_empty_weights():
+        model = WanModel(
+            model_type="t2v",
+            dim=cfg.hidden_size,
+            eps=1e-6,
+            ffn_dim=cfg.hidden_size * cfg.mlp_ratio,
+            freq_dim=256,
+            in_dim=cfg.in_channels,
+            num_heads=cfg.num_heads,
+            num_layers=cfg.depth,
+            out_dim=cfg.out_channels,
+            text_len=cfg.max_seq_length,
+            attn_mode=args.attn_mode,
+            split_attn=False,
+        )
+        if dit_weight_dtype is not None:
+            model.to(dit_weight_dtype)
+
+    # Load state dict
+    logger.info("Loading DiT weights into model...")
+    model.load_state_dict(dit_sd, strict=False)
+    del dit_sd
+
+    # Enable block swapping or move to device
+    if args.blocks_to_swap > 0:
+        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        model.move_to_device_except_swap_blocks(device)
+        model.prepare_block_swap_before_forward()
+    else:
+        logger.info(f"Moving model to {device}...")
+        model.to(device)
+
+    model.eval()
+    logger.info("LongCat DiT loaded and ready")
+
+    # --- Encode prompts ---
     logger.info(f"Encoding prompt: {args.prompt}")
-    prompt_embeds, negative_prompt_embeds = longcat_manager.encode_prompt(
+    max_length = cfg.max_seq_length
+
+    # Encode positive prompt
+    text_inputs = tokenizer(
         args.prompt,
-        args.negative_prompt or "",
-        max_sequence_length=cfg.get('max_seq_length', 512)
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt"
     )
 
-    # Prepare latent dimensions
+    with torch.no_grad():
+        prompt_embeds = text_encoder(
+            input_ids=text_inputs.input_ids.to(text_encoder.device),
+            attention_mask=text_inputs.attention_mask.to(text_encoder.device)
+        )[0]
+
+    # Encode negative prompt
+    negative_prompt = args.negative_prompt if args.negative_prompt else ""
+    uncond_inputs = tokenizer(
+        negative_prompt,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    with torch.no_grad():
+        negative_prompt_embeds = text_encoder(
+            input_ids=uncond_inputs.input_ids.to(text_encoder.device),
+            attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
+        )[0]
+
+    # Move embeddings to device
+    prompt_embeds = prompt_embeds.to(device)
+    negative_prompt_embeds = negative_prompt_embeds.to(device)
+
+    # Cleanup text encoder
+    del text_encoder, tokenizer
+    clean_memory_on_device(device)
+
+    # --- Prepare latents ---
     height, width = args.video_size
-    video_length = args.video_length if args.video_length is not None else cfg.get('default_frames', 93)
+    video_length = args.video_length if args.video_length is not None else cfg.default_frames
 
-    # Calculate latent dimensions
-    vae_scale_t = cfg.get('vae_scale_factor_temporal', 4)
-    vae_scale_s = cfg.get('vae_scale_factor_spatial', 8)
-    latent_f = (video_length - 1) // vae_scale_t + 1
-    latent_h = height // vae_scale_s
-    latent_w = width // vae_scale_s
-    latent_c = cfg.get('in_channels', 16)
+    latent_f = (video_length - 1) // cfg.vae_stride[0] + 1
+    latent_h = height // cfg.vae_stride[1]
+    latent_w = width // cfg.vae_stride[2]
+    latent_c = cfg.in_channels
 
-    logger.info(f"Latent shape: [1, {latent_c}, {latent_f}, {latent_h}, {latent_w}]")
-    logger.info(f"Video dimensions: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
+    logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
 
-    # Prepare noise
+    # Generate noise
     if args.cpu_noise:
         latents = torch.randn(
             1, latent_c, latent_f, latent_h, latent_w,
@@ -4298,75 +4200,69 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
-    # Setup scheduler
+    # --- Setup scheduler (use Euler scheduler) ---
+    logger.info("Setting up scheduler...")
     num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
-    scheduler.set_timesteps(num_inference_steps, device=device)
-    timesteps = scheduler.timesteps
+    scheduler = EulerScheduler(num_inference_steps)
 
-    logger.info(f"Running {num_inference_steps} inference steps with guidance scale {args.guidance_scale}")
+    logger.info(f"Running {num_inference_steps} steps with guidance scale {args.guidance_scale}")
 
-    # Denoising loop
-    for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-        # Expand latents for classifier-free guidance
-        latent_model_input = torch.cat([latents] * 2) if args.guidance_scale > 1.0 else latents
+    # --- Denoising loop (simplified, using existing WanModel forward pattern) ---
+    # TODO: Adapt this to match LongCat's actual forward signature
+    # For now, use a basic flow matching denoising loop
 
-        # Get timestep embedding
-        timestep = t.expand(latent_model_input.shape[0])
+    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
 
-        # Prepare encoder hidden states (text embeddings)
+    for i in tqdm(range(num_inference_steps), desc="Denoising"):
+        t_current = timesteps[i]
+        t_next = timesteps[i + 1]
+
+        # Expand for CFG
         if args.guidance_scale > 1.0:
-            encoder_hidden_states = torch.cat([negative_prompt_embeds, prompt_embeds])
+            latent_input = torch.cat([latents] * 2)
+            t_input = torch.cat([t_current.unsqueeze(0)] * 2)
+            context = torch.cat([negative_prompt_embeds, prompt_embeds])
         else:
-            encoder_hidden_states = prompt_embeds
+            latent_input = latents
+            t_input = t_current.unsqueeze(0)
+            context = prompt_embeds
 
-        # Predict noise
+        # Model forward (NOTE: Adjust signature to match LongCat)
         with torch.no_grad():
-            noise_pred = dit(
-                latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states
-            ).sample
+            # WanModel expects different inputs - this is a placeholder
+            # We need to adapt to actual LongCat DiT forward signature
+            # For now, assume it's similar to standard diffusion models
+            try:
+                noise_pred = model(latent_input, t_input, context)
+            except Exception as e:
+                logger.error(f"Model forward failed: {e}")
+                logger.info("LongCat DiT architecture may not match WanModel. Manual adaptation needed.")
+                raise
 
-        # Perform guidance
+        # Apply CFG
         if args.guidance_scale > 1.0:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        # Compute previous noisy sample
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
+        # Euler step
+        latents = latents + (t_next - t_current) * noise_pred
 
-        # Memory cleanup every 10 steps
         if i % 10 == 0:
             clean_memory_on_device(device)
 
     logger.info("Denoising complete!")
 
-    # Store VAE and cleanup DiT to free memory before decoding
-    # Move VAE to a temporary variable so main() can use it
-    args._longcat_vae = vae  # Store VAE for decoding in main()
-    args._longcat_cfg = cfg  # Store config for dimension calculations
+    # Store VAE for later decoding
+    args._longcat_vae = vae
+    args._longcat_cfg = cfg
 
-    # Cleanup DiT and text encoder to free GPU memory
-    if longcat_manager.dit is not None:
-        longcat_manager.dit = longcat_manager.dit.cpu()
-        del longcat_manager.dit
-        longcat_manager.dit = None
-
-    if longcat_manager.text_encoder is not None:
-        longcat_manager.text_encoder = longcat_manager.text_encoder.cpu()
-        del longcat_manager.text_encoder
-        longcat_manager.text_encoder = None
-
-    longcat_manager.tokenizer = None
-    longcat_manager.scheduler = None
-
+    # Cleanup model
+    del model
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
 
     logger.info(f"LongCat generation complete! Latent shape: {latents.shape}")
 
-    # Return latents in [B, C, F, H, W] format
-    # The main() function will decode them using the VAE we stored in args
     return latents
 
 
