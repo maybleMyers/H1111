@@ -29,6 +29,9 @@ def sinusoidal_embedding_1d(dim, position):
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
+    # Ensure position is 1-D for torch.outer
+    if position.dim() == 0:
+        position = position.unsqueeze(0)
 
     # calculation
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
