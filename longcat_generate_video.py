@@ -5184,7 +5184,17 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # CRITICAL: Denormalize latents before VAE decoding
     # The diffusion process produces normalized latents (z-score normalized)
     # but the VAE expects latents in the original unnormalized range
-    if hasattr(vae, 'config') and hasattr(vae.config, 'latents_mean') and hasattr(vae.config, 'latents_std'):
+    if hasattr(vae, 'mean') and hasattr(vae, 'std'):
+        logger.info("Denormalizing latents using VAE statistics")
+        # WanVAE stores mean and std as tensors directly (not in config)
+        # Reshape for broadcasting: [C] -> [1, C, 1, 1, 1]
+        latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_std = vae.std.view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+
+        # Apply inverse normalization: latents = latents / latents_std + latents_mean
+        latent_decode = latent_decode / latents_std + latents_mean
+        logger.info(f"Denormalized latents - range: [{latent_decode.min().item():.4f}, {latent_decode.max().item():.4f}]")
+    elif hasattr(vae, 'config') and hasattr(vae.config, 'latents_mean') and hasattr(vae.config, 'latents_std'):
         logger.info("Denormalizing latents using VAE config statistics")
         latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
         latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
@@ -5193,7 +5203,7 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
         latent_decode = latent_decode / latents_std + latents_mean
         logger.info(f"Denormalized latents - range: [{latent_decode.min().item():.4f}, {latent_decode.max().item():.4f}]")
     else:
-        logger.warning("VAE config missing latents_mean/latents_std - skipping denormalization (may cause black video!)")
+        logger.warning("VAE missing mean/std attributes - skipping denormalization (may cause black video!)")
 
     # Handle different VAE decode APIs
     videos = None
