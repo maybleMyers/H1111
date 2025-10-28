@@ -5185,10 +5185,14 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
         if is_longcat:
-            # LongCat VAE (AutoencoderKLWan) - uses .decode(return_dict=False)[0]
-            logger.info("Decoding with LongCat VAE (AutoencoderKLWan)")
-            videos = vae.decode(latent_decode, return_dict=False)[0]
-            # LongCat VAE returns [B, C, F, H, W] directly, no need to stack
+            # LongCat uses WanVAE (same as Wan2.2/2.1) - expects list, returns list
+            logger.info("Decoding with LongCat VAE (WanVAE)")
+            latent_list = [latent_decode.squeeze(0)]  # Convert [1,C,F,H,W] -> list of [C,F,H,W]
+            decoded_list = vae.decode(latent_list)
+            if decoded_list and len(decoded_list) > 0:
+                videos = torch.stack(decoded_list, dim=0)  # Stack back to [1,C,F,H,W]
+            else:
+                raise RuntimeError("VAE decoding failed or returned empty list.")
         elif hasattr(vae, 'model') and hasattr(vae, 'scale'):
             # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
             # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
