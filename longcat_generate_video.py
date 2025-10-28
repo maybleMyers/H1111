@@ -44,10 +44,17 @@ from wan.utils.step_distill_scheduler import StepDistillScheduler
 # LongCat model imports (use existing pipeline for block swapping)
 try:
     from transformers import AutoTokenizer, UMT5EncoderModel
-    # Import from LongCat-Video subdirectory
-    from LongCat_Video.longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-    from LongCat_Video.longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
-    from LongCat_Video.longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler as LongCatScheduler
+
+    # Add LongCat-Video to path if it exists
+    import sys
+    longcat_dir = os.path.join(os.path.dirname(__file__), 'LongCat-Video')
+    if os.path.exists(longcat_dir) and longcat_dir not in sys.path:
+        sys.path.insert(0, longcat_dir)
+
+    # Import from longcat_video subdirectory (now in sys.path)
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler as LongCatScheduler
     LONGCAT_AVAILABLE = True
 except ImportError as e:
     LONGCAT_AVAILABLE = False
