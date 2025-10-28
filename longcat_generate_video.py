@@ -39,6 +39,7 @@ from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.utils.fm_solvers_euler import EulerScheduler
+from wan.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from wan.utils.step_distill_scheduler import StepDistillScheduler
 
 # LongCat support - uses existing efficient loading infrastructure
@@ -4222,18 +4223,22 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     else:
         logger.warning("VAE missing mean/std - skipping normalization (will likely cause NaN!)")
 
-    # --- Setup scheduler (use FlowUniPCMultistepScheduler like Wan2) ---
+    # --- Setup scheduler (use FlowMatchEulerDiscreteScheduler from LongCat) ---
     logger.info("Setting up scheduler...")
     num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
-    flow_shift = getattr(args, 'flow_shift', 7.0)  # Default flow shift
 
-    scheduler = FlowUniPCMultistepScheduler(
-        num_train_timesteps=cfg.num_train_timesteps,
-        shift=1,
-        use_dynamic_shifting=False
+    # Use FlowMatchEulerDiscreteScheduler with custom sigmas (matching LongCat source)
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
     )
-    scheduler.set_timesteps(num_inference_steps, device=device, shift=flow_shift)
+
+    # Generate custom sigma schedule (matching LongCat pipeline)
+    sigmas = torch.linspace(1, 0.001, num_inference_steps).to(torch.float32)
+    scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
     timesteps = scheduler.timesteps
+
+    logger.info(f"Using FlowMatchEulerDiscreteScheduler with {num_inference_steps} steps")
 
     logger.info(f"Running {num_inference_steps} steps with guidance scale {args.guidance_scale}")
 
