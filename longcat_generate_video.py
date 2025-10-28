@@ -4250,8 +4250,13 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     seed_g.manual_seed(seed)
 
     # Prepare model arguments
-    arg_c = {"context": prompt_embeds, "seq_len": max_length}
-    arg_null = {"context": negative_prompt_embeds, "seq_len": max_length}
+    # CRITICAL: WanModel expects context as List[Tensor] where each tensor is [L, C]
+    # Convert from [B, L, C] tensor to List of [L, C] tensors
+    prompt_embeds_list = [prompt_embeds[i] for i in range(prompt_embeds.shape[0])]
+    negative_prompt_embeds_list = [negative_prompt_embeds[i] for i in range(negative_prompt_embeds.shape[0])]
+
+    arg_c = {"context": prompt_embeds_list, "seq_len": max_length}
+    arg_null = {"context": negative_prompt_embeds_list, "seq_len": max_length}
 
     for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
         # Convert latent to list format for WanModel
