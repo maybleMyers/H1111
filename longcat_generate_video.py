@@ -4207,6 +4207,21 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
+    # CRITICAL: Normalize latents before denoising
+    # The diffusion model was trained on normalized latent distributions
+    # Without normalization, the model receives out-of-distribution inputs causing NaN
+    if hasattr(vae, 'mean') and hasattr(vae, 'std'):
+        logger.info("Normalizing initial latents using VAE statistics")
+        # Reshape for broadcasting: [C] -> [1, C, 1, 1, 1]
+        latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        latents_std = vae.std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+
+        # Apply normalization: latents = (latents - mean) * (1 / std)
+        latents = (latents - latents_mean) * (1.0 / latents_std)
+        logger.info(f"Normalized initial latents - range: [{latents.min().item():.4f}, {latents.max().item():.4f}]")
+    else:
+        logger.warning("VAE missing mean/std - skipping normalization (will likely cause NaN!)")
+
     # --- Setup scheduler (use FlowUniPCMultistepScheduler like Wan2) ---
     logger.info("Setting up scheduler...")
     num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
@@ -4260,6 +4275,11 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             if noise_pred.dim() == 4:  # [C, F, H, W]
                 noise_pred = noise_pred.unsqueeze(0)  # [1, C, F, H, W]
 
+            # CRITICAL: Negate noise prediction for scheduler compatibility
+            # FlowMatchEulerDiscreteScheduler requires negated velocity predictions
+            # Without this, denoising goes in the wrong direction causing divergence
+            noise_pred = -noise_pred
+
             # 4. Scheduler step
             scheduler_output = scheduler.step(
                 noise_pred,
@@ -4269,6 +4289,16 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
                 generator=seed_g
             )
             latents = scheduler_output[0]
+
+            # DIAGNOSTIC: Check for NaN at each step
+            if torch.isnan(latents).any():
+                nan_count = torch.isnan(latents).sum().item()
+                logger.error(f"NaN detected at step {i}/{num_inference_steps}! Count: {nan_count}/{latents.numel()}")
+                logger.error(f"Latent stats - min: {latents[~torch.isnan(latents)].min().item() if not torch.isnan(latents).all() else 'all NaN'}, "
+                            f"max: {latents[~torch.isnan(latents)].max().item() if not torch.isnan(latents).all() else 'all NaN'}")
+            elif i % 5 == 0 or i == 0:
+                # Log stats every 5 steps when no NaN
+                logger.info(f"Step {i}: latent range [{latents.min().item():.4f}, {latents.max().item():.4f}]")
 
         # Periodic cleanup
         if i % 10 == 0:
