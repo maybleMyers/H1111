@@ -5216,8 +5216,8 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     if not is_longcat:
         vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
     else:
-        # For LongCat VAE, just move to CPU
-        vae.cpu()
+        # For LongCat VAE, use the to_device method to move to CPU
+        vae.to_device("cpu")
         del args._longcat_vae
         args._longcat_vae = None
     
