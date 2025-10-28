@@ -12,26 +12,24 @@ from .wan_ti2v_5B import ti2v_5B
 
 # LongCat configuration (based on Wan 2.1)
 longcat_t2v_13_6B = EasyDict(__name__='Config: LongCat T2V 13.6B')
-longcat_t2v_13_6B.in_channels = 16
-longcat_t2v_13_6B.out_channels = 16
-longcat_t2v_13_6B.hidden_size = 4096
-longcat_t2v_13_6B.depth = 48
-longcat_t2v_13_6B.num_heads = 32
-longcat_t2v_13_6B.mlp_ratio = 4
-longcat_t2v_13_6B.patch_size = (1, 2, 2)
-longcat_t2v_13_6B.vae_type = 'wan2.1'  # Uses Wan 2.1 VAE (AutoencoderKLWan)
-longcat_t2v_13_6B.vae_stride = (4, 8, 8)  # Temporal, Height, Width strides
-longcat_t2v_13_6B.vae_checkpoint = 'vae'  # Subfolder name in checkpoint dir
-longcat_t2v_13_6B.text_encoder = 'umt5-xxl'  # UMT5-XXL instead of T5-XXL
-longcat_t2v_13_6B.max_seq_length = 512
-longcat_t2v_13_6B.vae_scale_factor_temporal = 4
-longcat_t2v_13_6B.vae_scale_factor_spatial = 8
-longcat_t2v_13_6B.default_frames = 93
-longcat_t2v_13_6B.fps = 15  # 15fps for 480p base generation
-longcat_t2v_13_6B.default_height = 480
-longcat_t2v_13_6B.default_width = 832
-longcat_t2v_13_6B.is_fun_control = False  # LongCat doesn't support FunControl
-longcat_t2v_13_6B.i2v = False  # This is T2V only for now
+
+# --- Parameters for WanModel initialization ---
+longcat_t2v_13_6B.dim = 4096                  # RENAMED from hidden_size
+longcat_t2v_13_6B.num_layers = 48             # RENAMED from depth
+longcat_t2v_13_6B.ffn_dim = 4096 * 4          # CALCULATED from hidden_size * mlp_ratio
+longcat_t2v_13_6B.in_dim = 16                 # RENAMED from in_channels
+longcat_t2v_13_6B.out_dim = 16                # RENAMED from out_channels
+longcat_t2v_13_6B.text_len = 512              # RENAMED from max_seq_length
+longcat_t2v_13_6B.freq_dim = 256              # ADDED missing parameter
+longcat_t2v_13_6B.eps = 1e-6                  # ADDED missing parameter
+longcat_t2v_13_6B.num_train_timesteps = 1000  # ADDED missing parameter for scheduler
+longcat_t2v_13_6B.num_heads = 32              # This one was correct
+longcat_t2v_13_6B.patch_size = (1, 2, 2)      # This one was correct
+
+# --- Other required config values ---
+longcat_t2v_13_6B.vae_stride = (4, 8, 8)
+longcat_t2v_13_6B.is_fun_control = False
+longcat_t2v_13_6B.i2v = False
 
 LONGCAT_CONFIG = {
     'longcat-t2v-13.6B': longcat_t2v_13_6B
