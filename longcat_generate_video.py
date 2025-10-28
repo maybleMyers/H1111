@@ -4080,8 +4080,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
 
     # --- Load UMT5 text encoder ---
     logger.info("Loading UMT5-XXL text encoder...")
-    text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
-    tokenizer = AutoTokenizer.from_pretrained(text_encoder_dir)
+    tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
 
     # Load to CPU first if using block swapping
     te_device = "cpu" if args.blocks_to_swap > 0 else device
