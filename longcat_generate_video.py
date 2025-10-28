@@ -4216,8 +4216,11 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     if args.ckpt_dir is None:
         raise ValueError("--ckpt_dir is required for LongCat models. Point it to the LongCat checkpoint directory.")
 
-    # Setup data types
-    dit_dtype = torch.bfloat16 if args.dit_dtype == "bf16" else torch.float16
+    # Setup data types (use vae_dtype as reference, default to bfloat16)
+    if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
+        dit_dtype = torch.bfloat16 if args.vae_dtype == "bf16" or args.vae_dtype == "bfloat16" else torch.float16
+    else:
+        dit_dtype = torch.bfloat16  # Default to bfloat16 for LongCat
     dit_weight_dtype = dit_dtype
 
     logger.info(f"Using device: {device}, DiT dtype: {dit_dtype}")
