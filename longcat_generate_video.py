@@ -4049,7 +4049,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
         dit_dtype = torch.bfloat16 if args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
     else:
-        dit_dtype = torch.bfloat16
+        dit_dtype = None  # No conversion - keep original Float32 dtype
     dit_weight_dtype = dit_dtype
     vae_dtype = dit_dtype
 
