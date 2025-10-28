@@ -4120,6 +4120,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     # Load state dict
     logger.info("Loading DiT weights into model...")
     model.load_state_dict(dit_sd, strict=False)
+    model.to('cpu')
     del dit_sd
 
     # Enable block swapping or move to device
