@@ -14,7 +14,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
 import accelerate
-from accelerate import Accelerator
+from accelerate import Accelerator, init_empty_weights
 from functools import partial
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
@@ -4071,16 +4071,11 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
 
     # Load to CPU first if using cache
     vae_device = "cpu" if args.vae_cache_cpu else device
-    logger.info(f"Loading VAE weights from {vae_path}")
-    vae_sd = load_safetensors(vae_path, vae_device, dtype=vae_dtype, disable_mmap=True)
-
-    # Create WanVAE without file loading (vae_path=None triggers manual mode)
     cache_device = torch.device("cpu") if args.vae_cache_cpu else None
-    vae = WanVAE(vae_path=None, device=vae_device, dtype=vae_dtype, cache_device=cache_device)
 
-    # Load the state dict manually
-    vae.load_state_dict(vae_sd, strict=False)
-    del vae_sd
+    # Load VAE using the proper path (WanVAE handles loading internally)
+    logger.info(f"Loading VAE weights from {vae_path}")
+    vae = WanVAE(vae_path=vae_path, device=vae_device, dtype=vae_dtype, cache_device=cache_device)
     logger.info("VAE loaded successfully")
 
     # --- Load UMT5 text encoder ---
@@ -4107,15 +4102,15 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     with init_empty_weights():
         model = WanModel(
             model_type="t2v",
-            dim=cfg.hidden_size,
-            eps=1e-6,
-            ffn_dim=cfg.hidden_size * cfg.mlp_ratio,
-            freq_dim=256,
-            in_dim=cfg.in_channels,
+            dim=cfg.dim,
+            eps=cfg.eps,
+            ffn_dim=cfg.ffn_dim,
+            freq_dim=cfg.freq_dim,
+            in_dim=cfg.in_dim,
             num_heads=cfg.num_heads,
-            num_layers=cfg.depth,
-            out_dim=cfg.out_channels,
-            text_len=cfg.max_seq_length,
+            num_layers=cfg.num_layers,
+            out_dim=cfg.out_dim,
+            text_len=cfg.text_len,
             attn_mode=args.attn_mode,
             split_attn=False,
         )
@@ -4142,7 +4137,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
 
     # --- Encode prompts ---
     logger.info(f"Encoding prompt: {args.prompt}")
-    max_length = cfg.max_seq_length
+    max_length = cfg.text_len
 
     # Encode positive prompt
     text_inputs = tokenizer(
@@ -4185,12 +4180,14 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
 
     # --- Prepare latents ---
     height, width = args.video_size
-    video_length = args.video_length if args.video_length is not None else cfg.default_frames
+    # LongCat default frame count (use 129 if not specified)
+    default_frames = getattr(cfg, 'default_frames', 129)
+    video_length = args.video_length if args.video_length is not None else default_frames
 
     latent_f = (video_length - 1) // cfg.vae_stride[0] + 1
     latent_h = height // cfg.vae_stride[1]
     latent_w = width // cfg.vae_stride[2]
-    latent_c = cfg.in_channels
+    latent_c = cfg.in_dim
 
     logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
 
@@ -4209,53 +4206,70 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
-    # --- Setup scheduler (use Euler scheduler) ---
+    # --- Setup scheduler (use FlowUniPCMultistepScheduler like Wan2) ---
     logger.info("Setting up scheduler...")
     num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
-    scheduler = EulerScheduler(num_inference_steps)
+    flow_shift = getattr(args, 'flow_shift', 7.0)  # Default flow shift
+
+    scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=cfg.num_train_timesteps,
+        shift=1,
+        use_dynamic_shifting=False
+    )
+    scheduler.set_timesteps(num_inference_steps, device=device, shift=flow_shift)
+    timesteps = scheduler.timesteps
 
     logger.info(f"Running {num_inference_steps} steps with guidance scale {args.guidance_scale}")
 
-    # --- Denoising loop (simplified, using existing WanModel forward pattern) ---
-    # TODO: Adapt this to match LongCat's actual forward signature
-    # For now, use a basic flow matching denoising loop
+    # --- Denoising loop (using Wan2 efficient pattern) ---
+    logger.info("Starting denoising loop...")
 
-    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+    # Setup seed generator for scheduler
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
 
-    for i in tqdm(range(num_inference_steps), desc="Denoising"):
-        t_current = timesteps[i]
-        t_next = timesteps[i + 1]
+    # Prepare model arguments
+    arg_c = {"context": prompt_embeds, "seq_len": max_length}
+    arg_null = {"context": negative_prompt_embeds, "seq_len": max_length}
 
-        # Expand for CFG
-        if args.guidance_scale > 1.0:
-            latent_input = torch.cat([latents] * 2)
-            t_input = torch.cat([t_current.unsqueeze(0)] * 2)
-            context = torch.cat([negative_prompt_embeds, prompt_embeds])
+    for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
+        # Convert latent to list format for WanModel
+        # latents shape: [1, C, F, H, W]
+        if latents.dim() == 5:
+            latent_model_input_list = [latents[j] for j in range(latents.shape[0])]
+        elif latents.dim() == 4:
+            latent_model_input_list = [latents]
         else:
-            latent_input = latents
-            t_input = t_current.unsqueeze(0)
-            context = prompt_embeds
+            raise ValueError(f"Unexpected latent shape: {latents.shape}")
 
-        # Model forward (NOTE: Adjust signature to match LongCat)
         with torch.no_grad():
-            # WanModel expects different inputs - this is a placeholder
-            # We need to adapt to actual LongCat DiT forward signature
-            # For now, assume it's similar to standard diffusion models
-            try:
-                noise_pred = model(latent_input, t_input, context)
-            except Exception as e:
-                logger.error(f"Model forward failed: {e}")
-                logger.info("LongCat DiT architecture may not match WanModel. Manual adaptation needed.")
-                raise
+            # 1. Predict conditional noise
+            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            noise_pred_cond = model(latent_model_input_list, t=t, **model_arg_c)[0]
 
-        # Apply CFG
-        if args.guidance_scale > 1.0:
-            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            # 2. Apply CFG if needed
+            if args.guidance_scale > 1.0:
+                model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
+                noise_pred_uncond = model(latent_model_input_list, t=t, **model_arg_null)[0]
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred = noise_pred_cond
 
-        # Euler step
-        latents = latents + (t_next - t_current) * noise_pred
+            # 3. Ensure noise_pred has batch dimension for scheduler
+            if noise_pred.dim() == 4:  # [C, F, H, W]
+                noise_pred = noise_pred.unsqueeze(0)  # [1, C, F, H, W]
 
+            # 4. Scheduler step
+            scheduler_output = scheduler.step(
+                noise_pred,
+                t,
+                latents,
+                return_dict=False,
+                generator=seed_g
+            )
+            latents = scheduler_output[0]
+
+        # Periodic cleanup
         if i % 10 == 0:
             clean_memory_on_device(device)
 
