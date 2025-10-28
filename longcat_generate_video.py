@@ -5185,9 +5185,9 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
         if is_longcat:
-            # LongCat VAE (AutoencoderKLWan) - uses .decode().sample
+            # LongCat VAE (AutoencoderKLWan) - uses .decode(return_dict=False)[0]
             logger.info("Decoding with LongCat VAE (AutoencoderKLWan)")
-            videos = vae.decode(latent_decode).sample
+            videos = vae.decode(latent_decode, return_dict=False)[0]
             # LongCat VAE returns [B, C, F, H, W] directly, no need to stack
         elif hasattr(vae, 'model') and hasattr(vae, 'scale'):
             # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
