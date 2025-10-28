@@ -4141,8 +4141,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     logger.info(f"Encoding prompt: {args.prompt}")
     max_length = cfg.text_len
 
-    # Encode positive prompt
-    text_inputs = tokenizer(
+    # Encode prompts using official layout
+    prompt_inputs = tokenizer(
         args.prompt,
         padding="max_length",
         max_length=max_length,
@@ -4151,12 +4151,13 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     )
 
     with torch.no_grad():
-        prompt_embeds = text_encoder(
-            input_ids=text_inputs.input_ids.to(text_encoder.device),
-            attention_mask=text_inputs.attention_mask.to(text_encoder.device)
+        prompt_embeds_raw = text_encoder(
+            input_ids=prompt_inputs.input_ids.to(text_encoder.device),
+            attention_mask=prompt_inputs.attention_mask.to(text_encoder.device)
         )[0]
 
-    # Encode negative prompt
+    prompt_attention_mask = prompt_inputs.attention_mask.to(text_encoder.device)
+
     negative_prompt = args.negative_prompt if args.negative_prompt else ""
     uncond_inputs = tokenizer(
         negative_prompt,
@@ -4167,15 +4168,28 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     )
 
     with torch.no_grad():
-        negative_prompt_embeds = text_encoder(
+        negative_prompt_embeds_raw = text_encoder(
             input_ids=uncond_inputs.input_ids.to(text_encoder.device),
             attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
         )[0]
 
-    # Move embeddings to device and match DiT dtype
+    negative_attention_mask = uncond_inputs.attention_mask.to(text_encoder.device)
+
+    # Reshape to match LongCat expectations: [B, 1, L, C]
+    def reshape_embeddings(embeds: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        embeds = embeds.unsqueeze(1)  # [B, 1, L, C]
+        mask = mask  # [B, L]
+        return embeds, mask
+
+    prompt_embeds, prompt_attention_mask = reshape_embeddings(prompt_embeds_raw, prompt_attention_mask)
+    negative_prompt_embeds, negative_attention_mask = reshape_embeddings(negative_prompt_embeds_raw, negative_attention_mask)
+
+    # Move to device with correct dtype
     embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds.dtype
     prompt_embeds = prompt_embeds.to(device=device, dtype=embed_dtype)
     negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=embed_dtype)
+    prompt_attention_mask = prompt_attention_mask.to(device=device, dtype=torch.int64)
+    negative_attention_mask = negative_attention_mask.to(device=device, dtype=torch.int64)
 
     # Cleanup text encoder
     del text_encoder, tokenizer
@@ -4218,6 +4232,11 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
+    # Match LongCat pipeline: keep latents normalized before denoising
+    latents_mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
+    latents_std = 1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
+    latents = (latents - latents_mean) * latents_std
+
     logger.info(f"Initial latent range (pre-denoising): [{latents.min().item():.4f}, {latents.max().item():.4f}]")
 
     # --- Setup scheduler (use FlowMatchEulerDiscreteScheduler from LongCat) ---
@@ -4245,12 +4264,6 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
 
-    # Prepare model arguments
-    # CRITICAL: WanModel expects context as List[Tensor] where each tensor is [L, C]
-    # Convert from [B, L, C] tensor to List of [L, C] tensors
-    prompt_embeds_list = [prompt_embeds[i] for i in range(prompt_embeds.shape[0])]
-    negative_prompt_embeds_list = [negative_prompt_embeds[i] for i in range(negative_prompt_embeds.shape[0])]
-
     do_classifier_free_guidance = args.guidance_scale > 1.0
 
     for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
@@ -4262,33 +4275,28 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
         latent_input_dtype = dit_dtype if dit_dtype is not None else latent_model_input.dtype
         latent_model_input = latent_model_input.to(device=device, dtype=latent_input_dtype)
 
-        if latent_model_input.dim() == 5:
-            latent_model_input_list = [latent_model_input[j] for j in range(latent_model_input.shape[0])]
-        elif latent_model_input.dim() == 4:
-            latent_model_input_list = [latent_model_input]
-        else:
-            raise ValueError(f"Unexpected latent shape: {latent_model_input.shape}")
-
-        timestep_batch = t.expand(len(latent_model_input_list)).to(device=device, dtype=torch.float32)
-        timestep_for_model = timestep_batch.to(dtype=latent_input_dtype)
-
-        if do_classifier_free_guidance:
-            context_list = negative_prompt_embeds_list + prompt_embeds_list
-        else:
-            context_list = prompt_embeds_list
+        timestep_for_model = t.expand(latent_model_input.shape[0]).to(device=device, dtype=latent_input_dtype)
 
         if args.blocks_to_swap > 0:
             model.prepare_block_swap_before_forward()
 
+        if do_classifier_free_guidance:
+            encoder_hidden_states = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            encoder_attention_mask = torch.cat([negative_attention_mask, prompt_attention_mask], dim=0)
+        else:
+            encoder_hidden_states = prompt_embeds
+            encoder_attention_mask = prompt_attention_mask
+
         with torch.no_grad():
             model_outputs = model(
-                latent_model_input_list,
-                t=timestep_for_model,
-                context=context_list,
+                hidden_states=latent_model_input,
+                timestep=timestep_for_model,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
                 seq_len=seq_len_tokens
             )
 
-        noise_pred = torch.stack([output.to(torch.float32) for output in model_outputs], dim=0)
+        noise_pred = model_outputs.to(torch.float32)
 
         if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
