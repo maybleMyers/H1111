@@ -833,16 +833,21 @@ class LongCatModelManager:
         if self.args.blocks_to_swap > 0:
             logger.info(f"Enabling block swapping for {self.args.blocks_to_swap} blocks...")
             self.dit.blocks_to_swap = self.args.blocks_to_swap
-            self.dit.swap_blocks = self.args.swap_blocks
 
-            # Import block swapping utilities
-            from utils.model_utils import enable_block_swapping
-            enable_block_swapping(
-                self.dit,
-                self.device,
-                self.args.blocks_to_swap,
-                self.args.swap_blocks if self.args.swap_blocks else None
-            )
+            # swap_blocks is optional - use if provided
+            swap_blocks = getattr(self.args, 'swap_blocks', None)
+            if swap_blocks is not None:
+                self.dit.swap_blocks = swap_blocks
+
+            # Use the built-in enable_block_swap method from WanModel
+            # LongCat DiT should have similar method
+            if hasattr(self.dit, 'enable_block_swap'):
+                self.dit.enable_block_swap(self.args.blocks_to_swap, self.device, supports_backward=False)
+                self.dit.move_to_device_except_swap_blocks(self.device)
+                self.dit.prepare_block_swap_before_forward()
+            else:
+                logger.warning("LongCat DiT does not support enable_block_swap method. Loading to device normally.")
+                self.dit = self.dit.to(self.device)
         else:
             self.dit = self.dit.to(self.device)
 
