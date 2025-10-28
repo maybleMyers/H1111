@@ -4225,7 +4225,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
         torch_dtype=torch.float32,
     )
 
-    sigmas = torch.linspace(1, 0.001, num_inference_steps, device=device, dtype=torch.float32)
+    sigmas = np.linspace(1.0, 0.001, num_inference_steps, dtype=np.float32)
     scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
     timesteps = scheduler.timesteps
 
