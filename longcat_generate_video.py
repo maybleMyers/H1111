@@ -44,13 +44,14 @@ from wan.utils.step_distill_scheduler import StepDistillScheduler
 # LongCat model imports (use existing pipeline for block swapping)
 try:
     from transformers import AutoTokenizer, UMT5EncoderModel
-    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
-    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler as LongCatScheduler
+    # Import from LongCat-Video subdirectory
+    from LongCat_Video.longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+    from LongCat_Video.longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+    from LongCat_Video.longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler as LongCatScheduler
     LONGCAT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     LONGCAT_AVAILABLE = False
-    print("Warning: LongCat modules not available. Install LongCat-Video to enable LongCat support.")
+    print(f"Warning: LongCat modules not available: {e}")
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
