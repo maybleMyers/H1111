@@ -4065,13 +4065,22 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    # --- Load VAE using existing infrastructure ---
-    logger.info("Loading Wan 2.1 VAE...")
-    # Temporarily override args.vae to point to LongCat VAE
-    original_vae_path = args.vae
-    args.vae = os.path.join(args.ckpt_dir, "vae", "diffusion_pytorch_model.safetensors")
-    vae = load_vae(args, cfg, device, vae_dtype)
-    args.vae = original_vae_path  # Restore
+    # --- Load VAE using manual loading (LongCat VAE is in HF safetensors format) ---
+    logger.info("Loading Wan 2.1 VAE from LongCat checkpoint...")
+    vae_path = os.path.join(args.ckpt_dir, "vae", "diffusion_pytorch_model.safetensors")
+
+    # Load to CPU first if using cache
+    vae_device = "cpu" if args.vae_cache_cpu else device
+    logger.info(f"Loading VAE weights from {vae_path}")
+    vae_sd = load_safetensors(vae_path, vae_device, dtype=vae_dtype, disable_mmap=True)
+
+    # Create WanVAE without file loading (vae_path=None triggers manual mode)
+    cache_device = torch.device("cpu") if args.vae_cache_cpu else None
+    vae = WanVAE(vae_path=None, device=vae_device, dtype=vae_dtype, cache_device=cache_device)
+
+    # Load the state dict manually
+    vae.load_state_dict(vae_sd, strict=False)
+    del vae_sd
     logger.info("VAE loaded successfully")
 
     # --- Load UMT5 text encoder ---
