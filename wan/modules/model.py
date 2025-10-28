@@ -4,6 +4,7 @@ from typing import Optional, Union, List, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from accelerate import init_empty_weights
 
@@ -168,7 +169,18 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Convert both input and parameters to float32 for LayerNorm computation
+        # to avoid dtype mismatch when weights are in BFloat16
+        if self.weight is not None:
+            return F.layer_norm(
+                x.float(),
+                self.normalized_shape,
+                self.weight.float(),
+                self.bias.float() if self.bias is not None else None,
+                self.eps
+            ).type_as(x)
+        else:
+            return super().forward(x.float()).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
