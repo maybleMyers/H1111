@@ -193,6 +193,10 @@ class LongCatVideoTransformer3DModel(
 
         self.lora_dict = {}
         self.active_loras = []
+
+        # Block swapping support for memory-efficient inference
+        self.blocks_to_swap = None
+        self.offloader = None
     
     def load_lora(self, lora_path, lora_key, multiplier=1.0, lora_network_dim=128, lora_network_alpha=64):
         lora_network_state_dict_loaded = load_file(lora_path, device="cpu")
@@ -275,7 +279,60 @@ class LongCatVideoTransformer3DModel(
     
     def disable_bsa(self,):
         for block in self.blocks:
-            block.attn.enable_bsa = False    
+            block.attn.enable_bsa = False
+
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool = False):
+        """
+        Enable block swapping to reduce GPU memory usage by moving transformer blocks
+        between CPU and GPU during forward pass.
+
+        Args:
+            blocks_to_swap: Number of blocks to keep on CPU and swap during inference
+            device: Target device (usually 'cuda')
+            supports_backward: Whether to support backward pass (training mode)
+        """
+        from .custom_offloading_utils import ModelOffloader
+
+        self.blocks_to_swap = blocks_to_swap
+        num_blocks = len(self.blocks)
+
+        if self.blocks_to_swap > num_blocks - 1:
+            raise ValueError(
+                f"blocks_to_swap ({blocks_to_swap}) must be less than total blocks ({num_blocks})"
+            )
+
+        print(f"LongCatModel: Block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks. "
+              f"Supports backward: {supports_backward}")
+
+        self.offloader = ModelOffloader(
+            "longcat_block",
+            self.blocks,
+            num_blocks,
+            self.blocks_to_swap,
+            supports_backward,
+            device,
+            debug=False
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        """Move model to device but keep swap blocks on CPU initially"""
+        if self.blocks_to_swap:
+            # Temporarily remove blocks to avoid moving them
+            save_blocks = self.blocks
+            self.blocks = None
+
+        # Move everything else to device
+        self.to(device)
+
+        if self.blocks_to_swap:
+            # Restore blocks
+            self.blocks = save_blocks
+
+    def prepare_block_swap_before_forward(self):
+        """Prepare block devices before forward pass - call this before each forward()"""
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
 
     def forward(
         self, 
@@ -331,9 +388,18 @@ class LongCatVideoTransformer3DModel(
             hidden_states = context_parallel_util.split_cp_2d(hidden_states, seq_dim_hw=(2, 3), split_hw=self.cp_split_hw)
             hidden_states = rearrange(hidden_states, "B T H W C -> B (T H W) C")
 
+        # Clean memory before block swapping (if enabled)
+        if self.blocks_to_swap:
+            from .custom_offloading_utils import clean_memory_on_device
+            device = hidden_states.device
+            clean_memory_on_device(device)
+
         # blocks
         kv_cache_dict_ret = {}
         for i, block in enumerate(self.blocks):
+            # Block swapping: wait for block to be ready on device
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(i)
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 block_outputs = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, t, y_seqlens,
@@ -353,6 +419,10 @@ class LongCatVideoTransformer3DModel(
                     kv_cache_dict_ret[i] = (kv_cache[0].contiguous(), kv_cache[1].contiguous())
             else:
                 hidden_states = block_outputs
+
+            # Block swapping: submit next block swap
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, i)
 
         hidden_states = self.final_layer(hidden_states, t, (N_t, N_h, N_w))  # [B, N, C=T_p*H_p*W_p*C_out]
 

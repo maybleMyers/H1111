@@ -42,6 +42,11 @@ from wan.utils.fm_solvers_euler import EulerScheduler
 from wan.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from wan.utils.step_distill_scheduler import StepDistillScheduler
 
+# LongCat official model with block swapping support
+import sys
+sys.path.insert(0, str(Path(__file__).parent / "LongCat-Video"))
+from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+
 # LongCat support - uses existing efficient loading infrastructure
 # Only need transformers for UMT5 text encoder
 try:
@@ -4093,40 +4098,23 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     text_encoder.eval()
     logger.info("Text encoder loaded")
 
-    # --- Load LongCat DiT weights ---
-    logger.info("Loading LongCat DiT model...")
-    loading_device = "cpu" if args.blocks_to_swap > 0 else device
-    dit_sd = load_longcat_dit_weights(args.ckpt_dir, loading_device, dit_weight_dtype)
+    # --- Load LongCat DiT Model (Official) ---
+    logger.info("Loading LongCat DiT model using official LongCatVideoTransformer3DModel...")
 
-    # Create WanModel with LongCat config
-    # NOTE: LongCat architecture is similar to Wan, try using WanModel
-    with init_empty_weights():
-        model = WanModel(
-            model_type="t2v",
-            dim=cfg.dim,
-            eps=cfg.eps,
-            ffn_dim=cfg.ffn_dim,
-            freq_dim=cfg.freq_dim,
-            in_dim=cfg.in_dim,
-            num_heads=cfg.num_heads,
-            num_layers=cfg.num_layers,
-            out_dim=cfg.out_dim,
-            text_len=cfg.text_len,
-            attn_mode=args.attn_mode,
-            split_attn=False,
-        )
-        if dit_weight_dtype is not None:
-            model.to(dit_weight_dtype)
+    # Use official LongCat model with proper loading
+    model = LongCatVideoTransformer3DModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="dit",
+        torch_dtype=dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
+    )
 
-    # Load state dict
-    logger.info("Loading DiT weights into model...")
-    model.load_state_dict(dit_sd, strict=False)
-    model.to_empty(device='cpu')
-    del dit_sd
+    logger.info(f"LongCat DiT loaded: {model.config.depth} blocks, {model.config.hidden_size} dim")
 
     # Enable block swapping or move to device
     if args.blocks_to_swap > 0:
         logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        # Move model to CPU first before enabling block swapping
+        model.to("cpu")
         model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
@@ -4231,11 +4219,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
-    # Match LongCat pipeline: keep latents normalized before denoising
-    latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
-    latents_std = (1.0 / vae.std).view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
-    latents = (latents - latents_mean) * latents_std
-
+    # NOTE: Do NOT normalize initial noise! VAE statistics are for encoded latents, not random noise.
+    # The official LongCat pipeline keeps initial noise as pure N(0,1) Gaussian.
     logger.info(f"Initial latent range (pre-denoising): [{latents.min().item():.4f}, {latents.max().item():.4f}]")
 
     # --- Setup scheduler (use FlowMatchEulerDiscreteScheduler from LongCat) ---
@@ -4279,25 +4264,34 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
         if latent_model_input.dim() != 5:
             raise ValueError(f"Unexpected latent shape for LongCat model: {latent_model_input.shape}")
 
-        latent_model_input_list = [latent_model_input[j] for j in range(latent_model_input.shape[0])]
-
+        # Prepare for block swapping
         if args.blocks_to_swap > 0:
             model.prepare_block_swap_before_forward()
 
+        # Prepare encoder hidden states and attention mask for LongCat API (tensor-based)
         if do_classifier_free_guidance:
-            context_list = negative_context_list + prompt_context_list
+            # Stack negative and positive embeddings
+            encoder_hidden_states = torch.cat([
+                negative_prompt_embeds_raw,  # [B, L, C]
+                prompt_embeds_raw  # [B, L, C]
+            ], dim=0).unsqueeze(1).to(device, dtype=embed_dtype)  # [2B, 1, L, C]
+
+            encoder_attention_mask = torch.cat([
+                negative_attention_mask,  # [B, L]
+                prompt_attention_mask  # [B, L]
+            ], dim=0).unsqueeze(1).unsqueeze(1).to(device)  # [2B, 1, 1, L]
         else:
-            context_list = prompt_context_list
+            encoder_hidden_states = prompt_embeds_raw.unsqueeze(1).to(device, dtype=embed_dtype)  # [B, 1, L, C]
+            encoder_attention_mask = prompt_attention_mask.unsqueeze(1).unsqueeze(1).to(device)  # [B, 1, 1, L]
 
+        # Forward pass using LongCat API (tensor-based)
         with torch.no_grad():
-            model_outputs = model(
-                latent_model_input_list,
-                t=timestep_for_model,
-                context=context_list,
-                seq_len=seq_len_tokens
-            )
-
-        noise_pred = torch.stack([output.to(torch.float32) for output in model_outputs], dim=0)
+            noise_pred = model(
+                hidden_states=latent_model_input,  # [B*2, C, T, H, W] or [B, C, T, H, W]
+                timestep=timestep_for_model,  # [B*2] or [B]
+                encoder_hidden_states=encoder_hidden_states,  # [B*2, 1, L, C] or [B, 1, L, C]
+                encoder_attention_mask=encoder_attention_mask,  # [B*2, 1, 1, L] or [B, 1, 1, L]
+            ).to(torch.float32)
 
         if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
