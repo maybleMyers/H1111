@@ -383,7 +383,7 @@ class LongCatVideoTransformer3DModel(
             y_seqlens = [encoder_hidden_states.shape[2]] * encoder_hidden_states.shape[0]
             encoder_hidden_states = encoder_hidden_states.squeeze(1).view(1, -1, hidden_states.shape[-1])
 
-        if self.cp_split_hw[0] * self.cp_split_hw[1] > 1:
+        if self.cp_split_hw is not None and self.cp_split_hw[0] * self.cp_split_hw[1] > 1:
             hidden_states = rearrange(hidden_states, "B (T H W) C -> B T H W C", T=N_t, H=N_h, W=N_w)
             hidden_states = context_parallel_util.split_cp_2d(hidden_states, seq_dim_hw=(2, 3), split_hw=self.cp_split_hw)
             hidden_states = rearrange(hidden_states, "B T H W C -> B (T H W) C")
@@ -426,7 +426,7 @@ class LongCatVideoTransformer3DModel(
 
         hidden_states = self.final_layer(hidden_states, t, (N_t, N_h, N_w))  # [B, N, C=T_p*H_p*W_p*C_out]
 
-        if self.cp_split_hw[0] * self.cp_split_hw[1] > 1:
+        if self.cp_split_hw is not None and self.cp_split_hw[0] * self.cp_split_hw[1] > 1:
             hidden_states = context_parallel_util.gather_cp_2d(hidden_states, shape=(N_t, N_h, N_w), split_hw=self.cp_split_hw)
 
         hidden_states = self.unpatchify(hidden_states, N_t, N_h, N_w)  # [B, C_out, H, W]
