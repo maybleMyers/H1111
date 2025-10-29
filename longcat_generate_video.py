@@ -4276,13 +4276,15 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
                 prompt_embeds_raw  # [B, L, C]
             ], dim=0).unsqueeze(1).to(device, dtype=embed_dtype)  # [2B, 1, L, C]
 
+            # Keep mask 2D - forward method reshapes it internally
             encoder_attention_mask = torch.cat([
                 negative_attention_mask,  # [B, L]
                 prompt_attention_mask  # [B, L]
-            ], dim=0).unsqueeze(1).unsqueeze(1).to(device)  # [2B, 1, 1, L]
+            ], dim=0).to(device)  # [2B, L] - STAY 2D!
         else:
             encoder_hidden_states = prompt_embeds_raw.unsqueeze(1).to(device, dtype=embed_dtype)  # [B, 1, L, C]
-            encoder_attention_mask = prompt_attention_mask.unsqueeze(1).unsqueeze(1).to(device)  # [B, 1, 1, L]
+            # Keep mask 2D - forward method reshapes it internally
+            encoder_attention_mask = prompt_attention_mask.to(device)  # [B, L] - STAY 2D!
 
         # Forward pass using LongCat API (tensor-based)
         with torch.no_grad():
