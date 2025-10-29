@@ -56,6 +56,14 @@ except ImportError as e:
     LONGCAT_AVAILABLE = False
     print(f"Warning: transformers not available for LongCat UMT5 support: {e}")
 
+# LongCat video continuation support
+try:
+    from diffusers.utils import load_video
+    DIFFUSERS_LOAD_VIDEO_AVAILABLE = True
+except ImportError as e:
+    DIFFUSERS_LOAD_VIDEO_AVAILABLE = False
+    print(f"Warning: diffusers.utils.load_video not available for video continuation: {e}")
+
 from blissful_tuner.latent_preview import LatentPreviewer
 
 try:
@@ -176,6 +184,136 @@ def hv_load_video(video_path, start_frame, end_frame, bucket_reso):
         video.append(frame)
     container.close()
     return video
+
+# Video continuation helper functions
+def get_fps(video_path: str) -> float:
+    """Extract FPS from video file using cv2."""
+    cap = cv2.VideoCapture(video_path)
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return original_fps
+
+def load_and_downsample_video(video_path: str, target_fps: float, height: int = None, width: int = None):
+    """
+    Load video and downsample to target FPS using diffusers.utils.load_video.
+
+    Args:
+        video_path: Path to input video
+        target_fps: Target FPS for downsampling
+        height: Optional target height for resizing
+        width: Optional target width for resizing
+
+    Returns:
+        List[PIL.Image]: Downsampled video frames
+    """
+    from diffusers.utils import load_video
+
+    # Get original FPS
+    current_fps = get_fps(video_path)
+
+    # Calculate stride for downsampling
+    stride = max(1, round(current_fps / target_fps))
+
+    # Load video
+    video = load_video(video_path)
+
+    # Downsample by stride
+    video = video[::stride]
+
+    # Resize if dimensions provided
+    if height is not None and width is not None:
+        video = [frame.resize((width, height), Image.BICUBIC) for frame in video]
+
+    return video
+
+def normalize_latents(latents: torch.Tensor, vae_config) -> torch.Tensor:
+    """
+    Normalize latents using VAE mean/std statistics.
+
+    Args:
+        latents: Latents to normalize [B, C, F, H, W]
+        vae_config: VAE config with latents_mean and latents_std
+
+    Returns:
+        Normalized latents
+    """
+    latents_mean = torch.tensor(vae_config.latents_mean).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    latents_std = 1.0 / torch.tensor(vae_config.latents_std).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    return (latents - latents_mean) * latents_std
+
+def denormalize_latents(latents: torch.Tensor, vae_config) -> torch.Tensor:
+    """
+    Denormalize latents using VAE mean/std statistics.
+
+    Args:
+        latents: Normalized latents [B, C, F, H, W]
+        vae_config: VAE config with latents_mean and latents_std
+
+    Returns:
+        Denormalized latents
+    """
+    latents_mean = torch.tensor(vae_config.latents_mean).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    latents_std = torch.tensor(vae_config.latents_std).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    return latents / latents_std + latents_mean
+
+# KV cache infrastructure for video continuation
+_kv_cache_dict = {}
+
+def _cache_clean_latents(
+    cond_latents: torch.Tensor,
+    model: LongCatVideoTransformer3DModel,
+    model_max_length: int,
+    device: torch.device,
+    dtype: torch.dtype
+) -> dict:
+    """
+    Pre-compute attention KV cache for conditioning frames.
+
+    Args:
+        cond_latents: Conditioning latents [B, C, F, H, W]
+        model: LongCat DiT model
+        model_max_length: Maximum text encoder sequence length
+        device: Device to run on
+        dtype: Data type
+
+    Returns:
+        KV cache dictionary
+    """
+    global _kv_cache_dict
+
+    # Create timestep=0 tensor (conditioning frames are "clean")
+    timestep = torch.zeros(cond_latents.shape[0], cond_latents.shape[2]).to(device=device, dtype=dtype)
+
+    # Create empty prompt embeddings for caching (skip cross-attention)
+    empty_embeds = torch.zeros(
+        [cond_latents.shape[0], 1, model_max_length, model.config.d_model],
+        device=device,
+        dtype=dtype
+    )
+
+    # Run forward pass with return_kv=True to cache keys/values
+    _, kv_cache_dict = model(
+        hidden_states=cond_latents,
+        timestep=timestep,
+        encoder_hidden_states=empty_embeds,
+        return_kv=True,  # Request KV cache return
+        skip_crs_attn=True,  # Skip cross-attention (not needed for caching)
+    )
+
+    # Store in global cache
+    _kv_cache_dict = kv_cache_dict
+
+    return kv_cache_dict
+
+def _get_kv_cache_dict() -> dict:
+    """Get the current KV cache dictionary."""
+    global _kv_cache_dict
+    return _kv_cache_dict
+
+def _clear_kv_cache():
+    """Clear the KV cache."""
+    global _kv_cache_dict
+    _kv_cache_dict = {}
 
 def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, fps=24):
     from einops import rearrange  # Local import to avoid scope issues
@@ -469,6 +607,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context_dim", type=int, default=2,
                        help="Dimension to apply context windows (2=temporal for video, default: 2)")
 
+    # Video Continuation Arguments (LongCat)
+    parser.add_argument("--mode", type=str, default="generation",
+                       choices=["generation", "continuation"],
+                       help="Generation mode: 'generation' for T2V/I2V/V2V, 'continuation' for video continuation (LongCat only)")
+    parser.add_argument("--input_video", type=str, default=None,
+                       help="Path to input video for continuation mode (required when --mode continuation)")
+    parser.add_argument("--num_cond_frames", type=int, default=None,
+                       help="Number of conditioning frames from input video (required when --mode continuation)")
+    parser.add_argument("--target_fps", type=float, default=None,
+                       help="Target FPS for downsampling input video in continuation mode (required when --mode continuation)")
+
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
@@ -497,7 +646,29 @@ def parse_args() -> argparse.Namespace:
     if args.mixed_dtype and args.lora_weight:
         logger.warning("--mixed_dtype with LoRA: LoRA weights will be merged at the model's original precision")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
-         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
+         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")
+
+    # Video continuation validation
+    if args.mode == "continuation":
+        if not args.task.startswith("longcat-"):
+            raise ValueError("Video continuation mode (--mode continuation) is only supported with LongCat models (--task longcat-*)")
+        if args.input_video is None:
+            raise ValueError("--input_video is required when --mode continuation is specified")
+        if args.num_cond_frames is None:
+            raise ValueError("--num_cond_frames is required when --mode continuation is specified")
+        if args.target_fps is None:
+            raise ValueError("--target_fps is required when --mode continuation is specified")
+        if not DIFFUSERS_LOAD_VIDEO_AVAILABLE:
+            raise ValueError("diffusers.utils.load_video is required for video continuation mode but is not available")
+        if not os.path.exists(args.input_video):
+            raise ValueError(f"Input video not found: {args.input_video}")
+        if args.num_cond_frames < 1:
+            raise ValueError("--num_cond_frames must be at least 1")
+        if args.target_fps <= 0:
+            raise ValueError("--target_fps must be positive")
+        if args.video_length is not None and args.num_cond_frames >= args.video_length:
+            raise ValueError("--num_cond_frames must be less than --video_length")
+
     return args
 
 class DynamicModelManager:
@@ -4350,6 +4521,361 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     return latents
 
 
+def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
+    """LongCat video continuation using KV cache optimization.
+
+    Args:
+        args: command line arguments
+        device: torch device
+        cfg: model configuration
+
+    Returns:
+        Generated latent tensor [B, C, F, H, W] (only new frames, not including conditioning)
+    """
+    logger.info("Running LongCat video continuation with KV cache optimization")
+
+    if not LONGCAT_AVAILABLE:
+        raise ImportError("transformers not available. Install: pip install transformers")
+
+    if args.ckpt_dir is None:
+        raise ValueError("--ckpt_dir is required for LongCat models")
+
+    # Setup data types
+    if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
+        dit_dtype = torch.bfloat16 if args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
+    else:
+        dit_dtype = None  # No conversion - keep original Float32 dtype
+    dit_weight_dtype = dit_dtype
+    vae_dtype = dit_dtype
+
+    logger.info(f"Using device: {device}, DiT dtype: {dit_dtype}")
+
+    # Setup seed
+    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    args.seed = seed
+    logger.info(f"Using seed: {seed}")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    # --- Load VAE using official LongCat AutoencoderKLWan ---
+    logger.info("Loading Wan 2.1 VAE from LongCat checkpoint...")
+
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+
+    vae_device = "cpu" if args.vae_cache_cpu else device
+
+    vae = AutoencoderKLWan.from_pretrained(
+        args.ckpt_dir,
+        subfolder="vae",
+        torch_dtype=vae_dtype
+    ).to(vae_device)
+    vae.eval()
+    logger.info("VAE loaded successfully")
+
+    # --- Load input video and downsample ---
+    logger.info(f"Loading input video: {args.input_video}")
+    height, width = args.video_size
+    video_frames = load_and_downsample_video(
+        args.input_video,
+        args.target_fps,
+        height=height,
+        width=width
+    )
+    logger.info(f"Loaded {len(video_frames)} frames at {args.target_fps} FPS")
+
+    # Check if we have enough frames
+    if len(video_frames) < args.num_cond_frames:
+        raise ValueError(f"Input video has {len(video_frames)} frames, but num_cond_frames={args.num_cond_frames}")
+
+    # Extract last num_cond_frames for conditioning
+    conditioning_frames = video_frames[-args.num_cond_frames:]
+    logger.info(f"Using last {args.num_cond_frames} frames for conditioning")
+
+    # Convert PIL images to tensor [B, C, F, H, W]
+    from torchvision import transforms
+    to_tensor = transforms.ToTensor()
+    video_tensor = torch.stack([to_tensor(frame) for frame in conditioning_frames], dim=0)  # [F, C, H, W]
+    video_tensor = video_tensor.unsqueeze(0)  # [1, F, C, H, W]
+    video_tensor = video_tensor.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
+    video_tensor = video_tensor.to(device=vae_device, dtype=vae.dtype)
+
+    # Normalize to [-1, 1]
+    video_tensor = video_tensor * 2.0 - 1.0
+
+    # --- Encode conditioning frames through VAE ---
+    logger.info("Encoding conditioning frames through VAE...")
+    with torch.no_grad():
+        cond_latents = vae.encode(video_tensor).latent_dist.sample()
+
+    # Normalize conditioning latents
+    cond_latents = normalize_latents(cond_latents, vae.config)
+    logger.info(f"Conditioning latents shape: {cond_latents.shape}, range: [{cond_latents.min().item():.4f}, {cond_latents.max().item():.4f}]")
+
+    # --- Load UMT5 text encoder ---
+    logger.info("Loading UMT5-XXL text encoder...")
+    tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
+    te_device = "cpu" if args.blocks_to_swap > 0 else device
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        text_encoder_dir,
+        torch_dtype=dit_dtype
+    ).to(te_device)
+    text_encoder.eval()
+    logger.info("Text encoder loaded")
+
+    # --- Load LongCat DiT Model ---
+    logger.info("Loading LongCat DiT model using official LongCatVideoTransformer3DModel...")
+
+    model = LongCatVideoTransformer3DModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="dit",
+        torch_dtype=dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
+    )
+
+    logger.info(f"LongCat DiT loaded: {model.config.depth} blocks, {model.config.hidden_size} dim")
+
+    # Enable block swapping or move to device
+    if args.blocks_to_swap > 0:
+        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        model.to("cpu")
+        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        model.move_to_device_except_swap_blocks(device)
+        model.prepare_block_swap_before_forward()
+    else:
+        logger.info(f"Moving model to {device}...")
+        model.to(device)
+
+    model.eval()
+    logger.info("LongCat DiT loaded and ready")
+
+    # --- Encode prompts ---
+    logger.info(f"Encoding prompt: {args.prompt}")
+    max_length = cfg.text_len
+
+    prompt_inputs = tokenizer(
+        args.prompt,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    with torch.no_grad():
+        prompt_embeds_raw = text_encoder(
+            input_ids=prompt_inputs.input_ids.to(text_encoder.device),
+            attention_mask=prompt_inputs.attention_mask.to(text_encoder.device)
+        )[0]
+
+    prompt_attention_mask = prompt_inputs.attention_mask
+
+    negative_prompt = args.negative_prompt if args.negative_prompt else ""
+    uncond_inputs = tokenizer(
+        negative_prompt,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    with torch.no_grad():
+        negative_prompt_embeds_raw = text_encoder(
+            input_ids=uncond_inputs.input_ids.to(text_encoder.device),
+            attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
+        )[0]
+
+    negative_attention_mask = uncond_inputs.attention_mask
+
+    # Cleanup text encoder
+    del text_encoder, tokenizer
+    clean_memory_on_device(device)
+
+    # --- Prepare mixed latents (conditioning + noise) ---
+    default_frames = getattr(cfg, 'default_frames', 129)
+    video_length = args.video_length if args.video_length is not None else default_frames
+
+    latent_f = (video_length - 1) // cfg.vae_stride[0] + 1
+    latent_h = height // cfg.vae_stride[1]
+    latent_w = width // cfg.vae_stride[2]
+    latent_c = cfg.in_dim
+
+    # Calculate num_cond_latents from num_cond_frames
+    num_cond_latents = 1 + (args.num_cond_frames - 1) // cfg.vae_stride[0]
+    logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
+    logger.info(f"Conditioning: {args.num_cond_frames} frames -> {num_cond_latents} latents")
+
+    # Initialize full latents with random noise
+    latents_generator_device = "cpu" if args.cpu_noise else device
+    latents_generator = torch.Generator(device=latents_generator_device)
+    latents_generator.manual_seed(seed)
+
+    if args.cpu_noise:
+        latents = torch.randn(
+            1, latent_c, latent_f, latent_h, latent_w,
+            generator=latents_generator,
+            dtype=torch.float32
+        ).to(device)
+    else:
+        latents = torch.randn(
+            1, latent_c, latent_f, latent_h, latent_w,
+            generator=latents_generator,
+            dtype=torch.float32,
+            device=device
+        )
+
+    # Replace first num_cond_latents with conditioning latents
+    latents[:, :, :num_cond_latents, :, :] = cond_latents[:, :, :num_cond_latents, :, :].to(latents.device, dtype=latents.dtype)
+    logger.info(f"Mixed latents prepared: {num_cond_latents} conditioning + {latent_f - num_cond_latents} noise")
+
+    # --- Setup KV cache ---
+    logger.info("Setting up KV cache for conditioning frames...")
+    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
+
+    # Extract conditioning latents for caching
+    cond_latents_for_cache = latents[:, :, :num_cond_latents, :, :].to(device, dtype=dit_dtype if dit_dtype else torch.float32)
+
+    # Pre-compute KV cache
+    _cache_clean_latents(
+        cond_latents_for_cache,
+        model,
+        max_length,
+        device,
+        dit_dtype if dit_dtype else torch.float32
+    )
+
+    kv_cache_dict = _get_kv_cache_dict()
+    logger.info(f"KV cache prepared with {len(kv_cache_dict)} entries")
+
+    # Slice latents to only noise frames for denoising
+    latents = latents[:, :, num_cond_latents:, :, :].contiguous()
+    logger.info(f"Denoising latents shape (noise frames only): {latents.shape}")
+
+    # --- Setup scheduler ---
+    logger.info("Setting up scheduler...")
+    num_inference_steps = args.infer_steps if args.infer_steps is not None else 50
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.ckpt_dir,
+        subfolder="scheduler",
+        torch_dtype=torch.float32,
+    )
+
+    sigmas = np.linspace(1.0, 0.001, num_inference_steps, dtype=np.float32)
+    scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device)
+    timesteps = scheduler.timesteps
+
+    logger.info(f"Using FlowMatchEulerDiscreteScheduler with {num_inference_steps} steps")
+    logger.info(f"Running {num_inference_steps} steps with guidance scale {args.guidance_scale}")
+
+    # --- Denoising loop with KV cache ---
+    logger.info("Starting denoising loop...")
+
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
+
+    do_classifier_free_guidance = args.guidance_scale > 1.0
+
+    for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
+        if do_classifier_free_guidance:
+            latent_model_input = torch.cat([latents, latents], dim=0)
+        else:
+            latent_model_input = latents
+
+        latent_input_dtype = dit_dtype if dit_dtype is not None else latent_model_input.dtype
+        latent_model_input = latent_model_input.to(device=device, dtype=latent_input_dtype)
+
+        timestep_for_model = t.expand(latent_model_input.shape[0]).to(device=device, dtype=latent_input_dtype)
+
+        # Prepare for block swapping
+        if args.blocks_to_swap > 0:
+            model.prepare_block_swap_before_forward()
+
+        # Prepare encoder hidden states and attention mask
+        if do_classifier_free_guidance:
+            encoder_hidden_states = torch.cat([
+                negative_prompt_embeds_raw,
+                prompt_embeds_raw
+            ], dim=0).unsqueeze(1).to(device, dtype=embed_dtype)
+
+            encoder_attention_mask = torch.cat([
+                negative_attention_mask,
+                prompt_attention_mask
+            ], dim=0).to(device)
+        else:
+            encoder_hidden_states = prompt_embeds_raw.unsqueeze(1).to(device, dtype=embed_dtype)
+            encoder_attention_mask = prompt_attention_mask.to(device)
+
+        # Forward pass with KV cache and num_cond_latents
+        with torch.no_grad():
+            noise_pred = model(
+                hidden_states=latent_model_input,
+                timestep=timestep_for_model,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                num_cond_latents=num_cond_latents,  # Tell model about conditioning
+                kv_cache_dict=kv_cache_dict  # Pass KV cache
+            ).to(torch.float32)
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+
+            B = noise_pred_cond.shape[0]
+            positive = noise_pred_cond.reshape(B, -1)
+            negative = noise_pred_uncond.reshape(B, -1)
+            st_star = torch.sum(positive * negative, dim=1, keepdim=True) / (torch.sum(negative ** 2, dim=1, keepdim=True) + 1e-8)
+            st_star = st_star.view(B, 1, 1, 1, 1)
+
+            noise_pred = noise_pred_uncond * st_star + args.guidance_scale * (noise_pred_cond - noise_pred_uncond * st_star)
+
+        noise_pred = -noise_pred.to(latents.dtype)
+
+        latents = scheduler.step(
+            noise_pred,
+            t,
+            latents,
+            return_dict=False,
+            generator=seed_g
+        )[0]
+
+        # Check for NaN
+        if torch.isnan(latents).any():
+            nan_count = torch.isnan(latents).sum().item()
+            logger.error(f"NaN detected at step {i}/{num_inference_steps}! Count: {nan_count}/{latents.numel()}")
+            logger.error(f"Latent stats - min: {latents[~torch.isnan(latents)].min().item() if not torch.isnan(latents).all() else 'all NaN'}, "
+                        f"max: {latents[~torch.isnan(latents)].max().item() if not torch.isnan(latents).all() else 'all NaN'}")
+        elif i % 5 == 0 or i == 0:
+            logger.info(f"Step {i}: latent range [{latents.min().item():.4f}, {latents.max().item():.4f}]")
+
+        # Periodic cleanup
+        if i % 10 == 0:
+            clean_memory_on_device(device)
+
+    logger.info("Denoising complete!")
+
+    # --- Reconstruct full latents ---
+    logger.info("Reconstructing full latent sequence...")
+    full_latents = torch.cat([cond_latents_for_cache, latents], dim=2)
+    logger.info(f"Full latents shape: {full_latents.shape}")
+
+    # Store VAE for later decoding
+    args._longcat_vae = vae
+    args._longcat_cfg = cfg
+    args._longcat_num_cond_frames = args.num_cond_frames  # Store for output processing
+
+    # Cleanup
+    del model
+    _clear_kv_cache()
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+
+    logger.info(f"LongCat video continuation complete! Full latent shape: {full_latents.shape}")
+
+    return full_latents
+
+
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     """main function for generation pipeline (T2V, I2V, V2V)
 
@@ -5489,7 +6015,9 @@ def main():
 
         # Determine specific mode string
         mode_str = "Unknown"
-        if args.video_path: mode_str = "V2V"
+        if args.mode == "continuation":
+            mode_str = "Video Continuation"
+        elif args.video_path: mode_str = "V2V"
         elif args.image_path and args.control_path: mode_str = "FunControl-I2V" # FunControl overrides if control_path is present
         elif args.control_path: mode_str = "FunControl-T2V"
         elif args.image_path: mode_str = "I2V"
@@ -5502,9 +6030,15 @@ def main():
         )
         if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
+        if mode_str == "Video Continuation": logger.info(f"Input Video: {args.input_video}, Conditioning Frames: {args.num_cond_frames}, Target FPS: {args.target_fps}")
 
-        # Core generation pipeline
-        generated_latent = generate(args) # Returns [B, C, F, H, W] or None
+        # Core generation pipeline - route to appropriate function
+        if args.mode == "continuation":
+            # Video continuation mode (LongCat only)
+            generated_latent = generate_longcat_vc(args, args.device, cfg)
+        else:
+            # Standard generation modes (T2V, I2V, V2V, Fun-Control)
+            generated_latent = generate(args) # Returns [B, C, F, H, W] or None
 
         if args.save_merged_model:
             logger.info("Exiting after saving merged model.")
