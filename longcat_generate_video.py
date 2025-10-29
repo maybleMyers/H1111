@@ -5244,7 +5244,7 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
         # WanVAE stores mean and std as tensors directly (not in config)
         # Reshape for broadcasting: [C] -> [1, C, 1, 1, 1]
         latents_mean = vae.mean.view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
-        latents_std = vae.std.view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_std = (1.0 / vae.std).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
 
         # Apply inverse normalization: latents = latents / latents_std + latents_mean
         latent_decode = latent_decode / latents_std + latents_mean
@@ -5252,7 +5252,7 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     elif hasattr(vae, 'config') and hasattr(vae.config, 'latents_mean') and hasattr(vae.config, 'latents_std'):
         logger.info("Denormalizing latents using VAE config statistics")
         latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
-        latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_std = (1.0 / torch.tensor(vae.config.latents_std)).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
 
         # Apply inverse normalization: latents = latents / latents_std + latents_mean
         latent_decode = latent_decode / latents_std + latents_mean
