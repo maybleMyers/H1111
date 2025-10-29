@@ -4071,17 +4071,22 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    # --- Load VAE using manual loading (LongCat VAE is in HF safetensors format) ---
+    # --- Load VAE using official LongCat AutoencoderKLWan ---
     logger.info("Loading Wan 2.1 VAE from LongCat checkpoint...")
-    vae_path = os.path.join(args.ckpt_dir, "vae", "diffusion_pytorch_model.safetensors")
+
+    # Import AutoencoderKLWan from LongCat modules
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
 
     # Load to CPU first if using cache
     vae_device = "cpu" if args.vae_cache_cpu else device
-    cache_device = torch.device("cpu") if args.vae_cache_cpu else None
 
-    # Load VAE using the proper path (WanVAE handles loading internally)
-    logger.info(f"Loading VAE weights from {vae_path}")
-    vae = WanVAE(vae_path=vae_path, device=vae_device, dtype=vae_dtype, cache_device=cache_device)
+    # Load VAE using official HuggingFace-style loading
+    vae = AutoencoderKLWan.from_pretrained(
+        args.ckpt_dir,
+        subfolder="vae",
+        torch_dtype=vae_dtype
+    ).to(vae_device)
+    vae.eval()
     logger.info("VAE loaded successfully")
 
     # --- Load UMT5 text encoder ---
@@ -5231,6 +5236,9 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure VAE is on device for decoding
     if not is_longcat:
         vae.to_device(device)
+    else:
+        # For LongCat VAE (AutoencoderKLWan), use standard .to() method
+        vae.to(device)
 
     logger.info(f"Decoding video from latents: shape {latent.shape}, dtype {latent.dtype}")
     # Ensure latent is on the correct device and expected dtype for VAE
@@ -5264,14 +5272,10 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
         if is_longcat:
-            # LongCat uses WanVAE (same as Wan2.2/2.1) - expects list, returns list
-            logger.info("Decoding with LongCat VAE (WanVAE)")
-            latent_list = [latent_decode.squeeze(0)]  # Convert [1,C,F,H,W] -> list of [C,F,H,W]
-            decoded_list = vae.decode(latent_list)
-            if decoded_list and len(decoded_list) > 0:
-                videos = torch.stack(decoded_list, dim=0)  # Stack back to [1,C,F,H,W]
-            else:
-                raise RuntimeError("VAE decoding failed or returned empty list.")
+            # LongCat uses AutoencoderKLWan - expects tensor, returns DecoderOutput or tuple
+            logger.info("Decoding with LongCat VAE (AutoencoderKLWan)")
+            decoded = vae.decode(latent_decode, return_dict=False)[0]  # [1, C, F, H, W]
+            videos = decoded
         elif hasattr(vae, 'model') and hasattr(vae, 'scale'):
             # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
             # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
@@ -5295,10 +5299,11 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     if not is_longcat:
         vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
     else:
-        # For LongCat VAE, use the to_device method to move to CPU
-        vae.to_device("cpu")
-        del args._longcat_vae
-        args._longcat_vae = None
+        # For LongCat VAE (AutoencoderKLWan), use standard .to() method
+        vae.to("cpu")
+        if hasattr(args, '_longcat_vae'):
+            del args._longcat_vae
+            args._longcat_vae = None
     
     # Explicit cleanup to prevent memory fragmentation
     del latent_decode
