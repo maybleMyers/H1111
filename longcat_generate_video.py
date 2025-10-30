@@ -266,7 +266,9 @@ def _cache_clean_latents(
     model: LongCatVideoTransformer3DModel,
     model_max_length: int,
     device: torch.device,
-    dtype: torch.dtype
+    dtype: torch.dtype,
+    offload_kv_cache: bool = False,
+    blocks_to_swap: int = 0
 ) -> dict:
     """
     Pre-compute attention KV cache for conditioning frames.
@@ -277,6 +279,8 @@ def _cache_clean_latents(
         model_max_length: Maximum text encoder sequence length
         device: Device to run on
         dtype: Data type
+        offload_kv_cache: Whether to offload KV cache to CPU (saves GPU memory)
+        blocks_to_swap: Number of blocks being swapped (for block swap preparation)
 
     Returns:
         KV cache dictionary
@@ -295,6 +299,10 @@ def _cache_clean_latents(
         dtype=dtype
     )
 
+    # Prepare block swapping if enabled
+    if blocks_to_swap > 0:
+        model.prepare_block_swap_before_forward()
+
     # Run forward pass with return_kv=True to cache keys/values
     _, kv_cache_dict = model(
         hidden_states=cond_latents,
@@ -302,6 +310,7 @@ def _cache_clean_latents(
         encoder_hidden_states=empty_embeds,
         return_kv=True,  # Request KV cache return
         skip_crs_attn=True,  # Skip cross-attention (not needed for caching)
+        offload_kv_cache=offload_kv_cache  # Offload to CPU to save GPU memory
     )
 
     # Store in global cache
@@ -4742,13 +4751,15 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     # Extract conditioning latents for caching
     cond_latents_for_cache = latents[:, :, :num_cond_latents, :, :].to(device, dtype=dit_dtype if dit_dtype else torch.float32)
 
-    # Pre-compute KV cache
+    # Pre-compute KV cache with CPU offloading to save GPU memory
     _cache_clean_latents(
         cond_latents_for_cache,
         model,
         max_length,
         device,
-        dit_dtype if dit_dtype else torch.float32
+        dit_dtype if dit_dtype else torch.float32,
+        offload_kv_cache=True,  # Offload to CPU to reduce peak GPU memory usage
+        blocks_to_swap=args.blocks_to_swap  # Pass block swap info for proper preparation
     )
 
     kv_cache_dict = _get_kv_cache_dict()
