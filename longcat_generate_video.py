@@ -4628,6 +4628,17 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     cond_latents = normalize_latents(cond_latents, vae.config)
     logger.info(f"Conditioning latents shape: {cond_latents.shape}, range: [{cond_latents.min().item():.4f}, {cond_latents.max().item():.4f}]")
 
+    # Move VAE to CPU to free GPU memory before loading DiT and computing KV cache
+    logger.info("Moving VAE to CPU to free GPU memory for KV cache computation...")
+    vae.to('cpu')
+    clean_memory_on_device(device)
+
+    # Delete video loading artifacts - no longer needed, free GPU memory
+    del video_tensor, video_frames, conditioning_frames
+    import gc
+    gc.collect()
+    logger.info("Cleaned up video loading artifacts")
+
     # --- Load UMT5 text encoder ---
     logger.info("Loading UMT5-XXL text encoder...")
     tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
@@ -4744,7 +4755,17 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     latents[:, :, :num_cond_latents, :, :] = cond_latents[:, :, :num_cond_latents, :, :].to(latents.device, dtype=latents.dtype)
     logger.info(f"Mixed latents prepared: {num_cond_latents} conditioning + {latent_f - num_cond_latents} noise")
 
+    # Delete original cond_latents - already copied into latents, free GPU memory
+    del cond_latents
+    clean_memory_on_device(device)
+    logger.info("Cleaned up original conditioning latents")
+
     # --- Setup KV cache ---
+    # Final cleanup before KV cache computation to maximize available GPU memory
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    logger.info("Memory cleaned before KV cache computation")
+
     logger.info("Setting up KV cache for conditioning frames...")
     embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
 
