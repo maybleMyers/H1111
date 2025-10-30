@@ -237,8 +237,9 @@ def normalize_latents(latents: torch.Tensor, vae_config) -> torch.Tensor:
     Returns:
         Normalized latents
     """
-    latents_mean = torch.tensor(vae_config.latents_mean).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
-    latents_std = 1.0 / torch.tensor(vae_config.latents_std).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    # Access config as dictionary since it might be a FrozenDict
+    latents_mean = torch.tensor(vae_config['latents_mean']).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    latents_std = 1.0 / torch.tensor(vae_config['latents_std']).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
     return (latents - latents_mean) * latents_std
 
 def denormalize_latents(latents: torch.Tensor, vae_config) -> torch.Tensor:
@@ -252,8 +253,9 @@ def denormalize_latents(latents: torch.Tensor, vae_config) -> torch.Tensor:
     Returns:
         Denormalized latents
     """
-    latents_mean = torch.tensor(vae_config.latents_mean).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
-    latents_std = torch.tensor(vae_config.latents_std).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    # Access config as dictionary since it might be a FrozenDict
+    latents_mean = torch.tensor(vae_config['latents_mean']).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
+    latents_std = torch.tensor(vae_config['latents_std']).view(1, 16, 1, 1, 1).to(latents.device, latents.dtype)
     return latents / latents_std + latents_mean
 
 # KV cache infrastructure for video continuation
@@ -285,8 +287,10 @@ def _cache_clean_latents(
     timestep = torch.zeros(cond_latents.shape[0], cond_latents.shape[2]).to(device=device, dtype=dtype)
 
     # Create empty prompt embeddings for caching (skip cross-attention)
+    # Access config as dictionary since it's a FrozenDict
+    d_model = model.config.get('d_model', model.config.get('hidden_size', 4096))
     empty_embeds = torch.zeros(
-        [cond_latents.shape[0], 1, model_max_length, model.config.d_model],
+        [cond_latents.shape[0], 1, model_max_length, d_model],
         device=device,
         dtype=dtype
     )
@@ -2456,8 +2460,9 @@ def prepare_ti2v_inputs(
         else:
             # Original WanVAE type - expects tensor input
             image_latent = vae.encode(image_tensor).latent_dist.sample()  # [1, C, H', W']
-            # Scale by VAE scaling factor
-            image_latent = image_latent * vae.config.scaling_factor
+            # Scale by VAE scaling factor (access as dict if FrozenDict)
+            scaling_factor = vae.config.get('scaling_factor', vae.config['scaling_factor']) if isinstance(vae.config, dict) else vae.config.scaling_factor
+            image_latent = image_latent * scaling_factor
             
             # For TI2V, we need to expand the single image frame to all temporal positions
             # This matches the official implementation where z[0] has full temporal dimensions
@@ -3680,9 +3685,9 @@ def run_extension_sampling(
         motion_add_noise = torch.randn_like(motion_latent).to(device)
         noised_motion = add_noise_for_extension(
             motion_latent,
-            motion_add_noise, 
+            motion_add_noise,
             timesteps[0],
-            scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000
+            scheduler.config.get('num_train_timesteps', 1000) if isinstance(scheduler.config, dict) else (scheduler.config.num_train_timesteps if hasattr(scheduler.config, 'num_train_timesteps') else 1000)
         )
         latent[:, :motion_frames_latent_num] = noised_motion[:, :motion_frames_latent_num]
         logger.info(f"Injected {motion_frames_latent_num} motion frames at timestep {timesteps[0]}")
@@ -4284,7 +4289,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
         torch_dtype=dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
     )
 
-    logger.info(f"LongCat DiT loaded: {model.config.depth} blocks, {model.config.hidden_size} dim")
+    logger.info(f"LongCat DiT loaded: {model.config['depth']} blocks, {model.config['hidden_size']} dim")
 
     # Enable block swapping or move to device
     if args.blocks_to_swap > 0:
@@ -4636,7 +4641,7 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
         torch_dtype=dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
     )
 
-    logger.info(f"LongCat DiT loaded: {model.config.depth} blocks, {model.config.hidden_size} dim")
+    logger.info(f"LongCat DiT loaded: {model.config['depth']} blocks, {model.config['hidden_size']} dim")
 
     # Enable block swapping or move to device
     if args.blocks_to_swap > 0:
@@ -5783,10 +5788,10 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
         # Apply inverse normalization: latents = latents / latents_std + latents_mean
         latent_decode = latent_decode / latents_std + latents_mean
         logger.info(f"Denormalized latents - range: [{latent_decode.min().item():.4f}, {latent_decode.max().item():.4f}]")
-    elif hasattr(vae, 'config') and hasattr(vae.config, 'latents_mean') and hasattr(vae.config, 'latents_std'):
+    elif hasattr(vae, 'config') and 'latents_mean' in vae.config and 'latents_std' in vae.config:
         logger.info("Denormalizing latents using VAE config statistics")
-        latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
-        latents_std = (1.0 / torch.tensor(vae.config.latents_std)).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_mean = torch.tensor(vae.config['latents_mean']).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
+        latents_std = (1.0 / torch.tensor(vae.config['latents_std'])).view(1, -1, 1, 1, 1).to(latent_decode.device, latent_decode.dtype)
 
         # Apply inverse normalization: latents = latents / latents_std + latents_mean
         latent_decode = latent_decode / latents_std + latents_mean
