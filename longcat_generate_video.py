@@ -4741,15 +4741,26 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("Setting up KV cache for conditioning frames...")
     embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
 
-    # Prepare ONLY conditioning latents for caching (keep full latents out of memory!)
-    cond_latents_for_cache = cond_latents[:, :, :num_cond_latents, :, :].to(
+    # CRITICAL FIX: Move cond_latents to CPU FIRST to avoid having both full and sliced tensors in GPU memory
+    # The problem: cond_latents is on GPU from VAE encoding, and creating a slice keeps both in GPU memory
+    logger.info("Moving cond_latents to CPU to free GPU memory before extracting conditioning slice...")
+    cond_latents_cpu = cond_latents.cpu()
+    del cond_latents  # Delete GPU version immediately
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    logger.info(f"Freed GPU memory. Now extracting {num_cond_latents} conditioning latents from CPU and moving to GPU...")
+
+    # NOW extract ONLY the conditioning slice and move to GPU (only this small slice will be in GPU memory)
+    cond_latents_for_cache = cond_latents_cpu[:, :, :num_cond_latents, :, :].to(
         device,
         dtype=dit_dtype if dit_dtype else torch.float32
     )
+    del cond_latents_cpu  # Clean up CPU version
+    logger.info(f"Conditioning latents for cache: {cond_latents_for_cache.shape}, ~{cond_latents_for_cache.numel() * 4 / 1024 / 1024:.1f} MB")
 
     # Pre-compute KV cache with CPU offloading to save GPU memory
     # At this point, we only have ~16MB for 4 conditioning latent frames in GPU memory
-    # instead of ~96MB for all 24 frames like before
+    # instead of having the full 24-frame tensor (~96MB) PLUS the 4-frame slice in GPU
     _cache_clean_latents(
         cond_latents_for_cache,
         model,
@@ -4762,12 +4773,8 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
 
     kv_cache_dict = _get_kv_cache_dict()
     logger.info(f"KV cache prepared with {len(kv_cache_dict)} entries")
-
-    # Keep conditioning latents for final concatenation, but delete the full cond_latents
-    # We'll need cond_latents_for_cache later to reconstruct the full video
-    del cond_latents
     clean_memory_on_device(device)
-    logger.info("Cleaned up original cond_latents after KV cache computation")
+    logger.info("KV cache computation complete")
 
     # --- Create noise latents (only the frames we'll denoise) ---
     # This is much more memory efficient than creating all 24 frames upfront
