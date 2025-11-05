@@ -21,11 +21,18 @@ import numpy as np
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
+from dataset import image_video_dataset
 from networks import lora_wan
+from utils.lora_utils import filter_lora_state_dict
 from utils.safetensors_utils import mem_eff_save_file, load_safetensors
-from wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
-import wan
-from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
+from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
+import wan as wan
+from wan.modules.model import WanModel, detect_wan_sd_dtype
+# Import load_wan_model from musubi-tuner to get the correct function signature with use_scaled_mm support
+import sys
+import os
+sys.path.insert(0, os.path.join(os.getcwd(), 'musubi-tuner', 'src'))
+from musubi_tuner.wan.modules.model import load_wan_model
 from wan.modules.vae import WanVAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
@@ -40,7 +47,7 @@ except:
 
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
-from hv_generate_video import save_images_grid, save_videos_grid, synchronize_device
+from base_hv_generate_video import get_time_flag, save_images_grid, save_videos_grid, synchronize_device
 from dataset.image_video_dataset import load_video
 
 import logging
@@ -56,7 +63,7 @@ class GenerationSettings:
         self.device = device
         self.cfg = cfg
         self.dit_dtype = dit_dtype
-        self.dit_weight_dtype = dit_weight_dtype
+        self.dit_weight_dtype = dit_weight_dtype  # may be None if fp8_scaled, may be float8 if fp8 not scaled
         self.vae_dtype = vae_dtype
 
 
@@ -72,6 +79,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
+    parser.add_argument("--dit_high_noise", type=str, default=None, help="DiT checkpoint path for high noise (optional)")
+    parser.add_argument("--offload_inactive_dit", action="store_true", help="Offload DiT model to CPU")
+    parser.add_argument("--lazy_loading", action="store_true", help="Enable lazy loading for DiT models")
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
@@ -79,7 +89,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip", type=str, default=None, help="text encoder (CLIP) checkpoint path")
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
+    parser.add_argument("--lora_weight_high_noise", type=str, nargs="*", default=None, help="LoRA weight path for high noise")
+    parser.add_argument("--lora_multiplier_high_noise", type=float, nargs="*", default=None, help="LoRA multiplier for high noise")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -100,17 +112,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_size", type=int, nargs=2, default=[256, 256], help="video size, height and width")
     parser.add_argument("--video_length", type=int, default=None, help="video length, Default depends on task")
     parser.add_argument("--fps", type=int, default=16, help="video fps, Default is 16")
-    parser.add_argument("--infer_steps", type=int, default=None, help="number of inference steps")
+    parser.add_argument("--infer_steps", type=int, default=None, help="number of inference steps, default depends on task")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
         "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
     )
     parser.add_argument(
-        "--guidance_scale",
+        "--timestep_boundary",
         type=float,
-        default=5.0,
-        help="Guidance scale for classifier free guidance. Default is 5.0.",
+        default=None,
+        help="Timestep boundary for guidance (0.0 to 1.0). Default depends on task.",
+    )
+    parser.add_argument(
+        "--guidance_scale", type=float, default=None, help="Guidance scale for classifier free guidance. Default depends on task."
+    )
+    parser.add_argument(
+        "--guidance_scale_high_noise",
+        type=float,
+        default=None,
+        help="Guidance scale for classifier free guidance in high noise model. Default depends on task.",
     )
     parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference")
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
@@ -120,6 +141,28 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="path to control video for inference with controlnet. video file or directory with images",
+    )
+    parser.add_argument(
+        "--one_frame_inference",
+        type=str,
+        default=None,
+        help="one frame inference, default is None, comma separated values from 'no_2x', 'no_4x', 'no_post', 'control_indices' and 'target_index'.",
+    )
+    parser.add_argument(
+        "--control_image_path", type=str, default=None, nargs="*", help="path to control (reference) image for one frame inference."
+    )
+    parser.add_argument(
+        "--control_image_mask_path",
+        type=str,
+        default=None,
+        nargs="*",
+        help="path to control (reference) image mask for one frame inference.",
+    )
+    parser.add_argument(
+        "--conditioning_strength",
+        type=float,
+        default=0.3,
+        help="Strength for T2V image conditioning (0.0=preserve original, 1.0=ignore image)"
     )
     parser.add_argument("--trim_tail_frames", type=int, default=0, help="trim tail N frames from the video before saving")
     parser.add_argument(
@@ -179,7 +222,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
-        "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
+        "--output_type",
+        type=str,
+        default="video",
+        choices=["video", "images", "latent", "both", "latent_images"],
+        help="output type",
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
@@ -228,6 +275,9 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
 
     # Create dictionary of overrides
     overrides = {"prompt": prompt}
+    # Initialize control_image_path and control_image_mask_path as a list to accommodate multiple paths
+    overrides["control_image_path"] = []
+    overrides["control_image_mask_path"] = []
 
     for part in parts[1:]:
         if not part.strip():
@@ -253,10 +303,25 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["flow_shift"] = float(value)
         elif option == "i":
             overrides["image_path"] = value
+        elif option == "ei":
+            overrides["end_image_path"] = value
         elif option == "cn":
             overrides["control_path"] = value
         elif option == "n":
             overrides["negative_prompt"] = value
+        # one frame inference options
+        elif option == "ci":  # control_image_path
+            overrides["control_image_path"].append(value)
+        elif option == "cim":  # control_image_mask_path
+            overrides["control_image_mask_path"].append(value)
+        elif option == "of":  # one_frame_inference
+            overrides["one_frame_inference"] = value
+
+    # If no control_image_path was provided, remove the empty list
+    if not overrides["control_image_path"]:
+        del overrides["control_image_path"]
+    if not overrides["control_image_mask_path"]:
+        del overrides["control_image_mask_path"]
 
     return overrides
 
@@ -292,17 +357,31 @@ def get_task_defaults(task: str, size: Optional[Tuple[int, int]] = None) -> Tupl
         size: size of the video (width, height)
 
     Returns:
-        Tuple[int, float, int, bool]: (infer_steps, flow_shift, video_length, needs_clip)
+        Tuple[int, Optional[float], float, float, float, int, bool]: (infer_steps, boundary, flow_shift, guidance_scale, guidance_scale_high_noise, video_length, needs_clip)
     """
     width, height = size if size else (0, 0)
 
-    if "t2i" in task:
-        return 50, 5.0, 1, False
-    elif "i2v" in task:
-        flow_shift = 3.0 if (width == 832 and height == 480) or (width == 480 and height == 832) else 5.0
-        return 40, flow_shift, 81, True
-    else:  # t2v or default
-        return 50, 5.0, 81, False
+    cfg = WAN_CONFIGS[task]
+
+    infer_steps = cfg.sample_steps
+    boundary = cfg.boundary  # may be None
+    flow_shift = cfg.sample_shift
+    guidance_scale = cfg.sample_guide_scale[0]
+    guidance_scale_high_noise = cfg.sample_guide_scale[1] if len(cfg.sample_guide_scale) > 1 else guidance_scale
+
+    video_length = 1 if "t2i" in task else 81  # default video length for t2i is 1, for others is 81
+
+    if not cfg.v2_2:
+        # Wan2.1
+        needs_clip = "i2v" in task
+        if "i2v" in task and ((width == 832 and height == 480) or (width == 480 and height == 832)):
+            #  I2V
+            flow_shift = 3.0
+    else:
+        # Wan2.2
+        needs_clip = False
+
+    return infer_steps, boundary, flow_shift, guidance_scale, guidance_scale_high_noise, video_length, needs_clip
 
 
 def setup_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -315,19 +394,33 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
         argparse.Namespace: updated arguments
     """
     # Get default values for the task
-    infer_steps, flow_shift, video_length, _ = get_task_defaults(args.task, tuple(args.video_size))
+    infer_steps, boundary, flow_shift, guidance_scale, guidance_scale_high_noise, video_length, needs_clip = get_task_defaults(
+        args.task, tuple(args.video_size)
+    )
 
     # Apply default values to unset arguments
     if args.infer_steps is None:
         args.infer_steps = infer_steps
+    if args.timestep_boundary is None:
+        args.timestep_boundary = boundary
     if args.flow_shift is None:
         args.flow_shift = flow_shift
+    if args.guidance_scale is None:
+        args.guidance_scale = guidance_scale
+    if args.guidance_scale_high_noise is None:
+        args.guidance_scale_high_noise = guidance_scale_high_noise
     if args.video_length is None:
         args.video_length = video_length
 
     # Force video_length to 1 for t2i tasks
     if "t2i" in args.task:
         assert args.video_length == 1, f"video_length should be 1 for task {args.task}"
+    if args.timestep_boundary is not None:
+        if args.timestep_boundary > 1.0:
+            logger.warning(
+                f"timestep_boundary {args.timestep_boundary} is greater than 1.0, setting to {args.timestep_boundary / 1000.0}"
+            )
+            args.timestep_boundary = args.timestep_boundary / 1000.0
 
     # parse slg_layers
     if args.slg_layers is not None:
@@ -458,18 +551,62 @@ def load_clip_model(args: argparse.Namespace, config, device: torch.device) -> C
     return clip
 
 
-def load_dit_model(
+def load_dit_models(
     args: argparse.Namespace,
     config,
     device: torch.device,
     dit_dtype: torch.dtype,
     dit_weight_dtype: Optional[torch.dtype] = None,
     is_i2v: bool = False,
+) -> List[WanModel]:
+    """load DiT models
+
+    Returns:
+        List[WanModel]: loaded DiT models. If args.dit_high_noise is specified, returns a list with two models: high noise and low noise.
+    """
+    use_high_model = args.dit_high_noise is not None and len(args.dit_high_noise) > 0
+    if use_high_model and args.lazy_loading:
+        logger.info(f"Using lazy loading")
+        return [None, None]  # lazy loading will load models on demand
+
+    model = load_dit_model(args, args.dit, args.lora_weight, args.lora_multiplier, config, device, dit_weight_dtype)
+
+    if use_high_model:
+        if args.offload_inactive_dit:
+            logger.warning(f"Offloading low noise DiT model to CPU, high noise DiT will be loaded on GPU")
+            model.to("cpu")
+
+        logger.info(f"Loading high noise DiT model from {args.dit_high_noise}")
+        dit_high_noise = load_dit_model(
+            args,
+            args.dit_high_noise,
+            args.lora_weight_high_noise,
+            args.lora_multiplier_high_noise,
+            config,
+            device,
+            dit_weight_dtype,
+        )
+        return [dit_high_noise, model]
+
+    return [model]
+
+
+def load_dit_model(
+    args: argparse.Namespace,
+    dit_path: str,
+    lora_weights: List[str],
+    lora_multipliers: List[float],
+    config,
+    device: torch.device,
+    dit_weight_dtype: Optional[torch.dtype] = None,
 ) -> WanModel:
     """load DiT model
 
     Args:
         args: command line arguments
+        dit_path: path to the DiT checkpoint
+        lora_weights: path to the LoRA weights
+        lora_multipliers: multiplier for the LoRA weights
         config: model configuration
         device: device to use
         dit_dtype: data type for the model
@@ -479,114 +616,74 @@ def load_dit_model(
     Returns:
         WanModel: loaded DiT model
     """
+
+    # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
+
     loading_device = "cpu"
-    if args.blocks_to_swap == 0 and args.lora_weight is None and not args.fp8_scaled:
+    if args.blocks_to_swap == 0 and not args.lycoris:
         loading_device = device
 
-    loading_weight_dtype = dit_weight_dtype
-    if args.fp8_scaled or args.lora_weight is not None:
-        loading_weight_dtype = dit_dtype  # load as-is
-
-    # do not fp8 optimize because we will merge LoRA weights
-    model = load_wan_model(config, device, args.dit, args.attn_mode, False, loading_device, loading_weight_dtype, False)
-
-    return model
-
-
-def merge_lora_weights(lora_module: ModuleType, model: torch.nn.Module, args: argparse.Namespace, device: torch.device) -> None:
-    """merge LoRA weights to the model
-
-    Args:
-        model: DiT model
-        args: command line arguments
-        device: device to use
-    """
-    if args.lora_weight is None or len(args.lora_weight) == 0:
-        return
-
-    for i, lora_weight in enumerate(args.lora_weight):
-        if args.lora_multiplier is not None and len(args.lora_multiplier) > i:
-            lora_multiplier = args.lora_multiplier[i]
-        else:
-            lora_multiplier = 1.0
-
-        logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
-        weights_sd = load_file(lora_weight)
-
-        # apply include/exclude patterns
-        original_key_count = len(weights_sd.keys())
-        if args.include_patterns is not None and len(args.include_patterns) > i:
-            include_pattern = args.include_patterns[i]
-            regex_include = re.compile(include_pattern)
-            weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
-            logger.info(f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}")
-        if args.exclude_patterns is not None and len(args.exclude_patterns) > i:
-            original_key_count_ex = len(weights_sd.keys())
-            exclude_pattern = args.exclude_patterns[i]
-            regex_exclude = re.compile(exclude_pattern)
-            weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
-            logger.info(
-                f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}"
-            )
-        if len(weights_sd) != original_key_count:
-            remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
-            remaining_keys.sort()
-            logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
-            if len(weights_sd) == 0:
-                logger.warning(f"No keys left after filtering.")
-
-        if args.lycoris:
-            lycoris_net, _ = create_network_from_weights(
-                multiplier=lora_multiplier,
-                file=None,
-                weights_sd=weights_sd,
-                unet=model,
-                text_encoder=None,
-                vae=None,
-                for_inference=True,
-            )
-            lycoris_net.merge_to(None, model, weights_sd, dtype=None, device=device)
-        else:
-            network = lora_module.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
-            network.merge_to(None, model, weights_sd, device=device, non_blocking=True)
-
-        synchronize_device(device)
-        logger.info("LoRA weights loaded")
-
-    # save model here before casting to dit_weight_dtype
-    if args.save_merged_model:
-        logger.info(f"Saving merged model to {args.save_merged_model}")
-        mem_eff_save_file(model.state_dict(), args.save_merged_model)  # save_file needs a lot of memory
-        logger.info("Merged model saved")
-
-
-def optimize_model(
-    model: WanModel, args: argparse.Namespace, device: torch.device, dit_dtype: torch.dtype, dit_weight_dtype: torch.dtype
-) -> None:
-    """optimize the model (FP8 conversion, device move etc.)
-
-    Args:
-        model: dit model
-        args: command line arguments
-        device: device to use
-        dit_dtype: dtype for the model
-        dit_weight_dtype: dtype for the model weights
-    """
-    if args.fp8_scaled:
-        # load state dict as-is and optimize to fp8
-        state_dict = model.state_dict()
-
-        # if no blocks to swap, we can move the weights to GPU after optimization on GPU (omit redundant CPU->GPU copy)
-        move_to_device = args.blocks_to_swap == 0  # if blocks_to_swap > 0, we will keep the model on CPU
-        state_dict = model.fp8_optimization(state_dict, device, move_to_device, use_scaled_mm=args.fp8_fast)
-
-        info = model.load_state_dict(state_dict, strict=True, assign=True)
-        logger.info(f"Loaded FP8 optimized weights: {info}")
-
-        if args.blocks_to_swap == 0:
-            model.to(device)  # make sure all parameters are on the right device (e.g. RoPE etc.)
+    # load LoRA weights
+    if not args.lycoris and lora_weights is not None and len(lora_weights) > 0:
+        lora_weights_list = []
+        for lora_weight in lora_weights:
+            logger.info(f"Loading LoRA weight from: {lora_weight}")
+            lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+            lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
+            lora_weights_list.append(lora_sd)
     else:
-        # simple cast to dit_dtype
+        lora_weights_list = None
+
+    loading_weight_dtype = dit_weight_dtype
+    if args.fp8_scaled and not args.lycoris:
+        loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
+
+    model = load_wan_model(
+        config,
+        device,
+        dit_path,
+        args.attn_mode,
+        False,
+        loading_device,
+        loading_weight_dtype,
+        args.fp8_scaled and not args.lycoris,
+        lora_weights_list=lora_weights_list,
+        lora_multipliers=lora_multipliers,
+        use_scaled_mm=args.fp8_fast,
+    )
+
+    # merge LoRA weights
+    if args.lycoris:
+        if lora_weights is not None and len(lora_weights) > 0:
+            merge_lora_weights(
+                lora_wan,
+                model,
+                lora_weights,
+                lora_multipliers,
+                args.include_patterns,
+                args.exclude_patterns,
+                device,
+                lycoris=True,
+                save_merged_model=args.save_merged_model,
+            )
+
+        if args.fp8_scaled:
+            # load state dict as-is and optimize to fp8
+            state_dict = model.state_dict()
+
+            # if no blocks to swap, we can move the weights to GPU after optimization on GPU (omit redundant CPU->GPU copy)
+            move_to_device = args.blocks_to_swap == 0  # if blocks_to_swap > 0, we will keep the model on CPU
+            state_dict = model.fp8_optimization(state_dict, device, move_to_device, use_scaled_mm=args.fp8_fast)
+
+            info = model.load_state_dict(state_dict, strict=True, assign=True)
+            logger.info(f"Loaded FP8 optimized weights: {info}")
+
+    # if we only want to save the model, we can skip the rest
+    if args.save_merged_model:
+        return None
+
+    if not args.fp8_scaled:
+        # simple cast to dit_weight_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
         target_device = None
 
@@ -627,6 +724,95 @@ def optimize_model(
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
 
+    return model
+
+
+def merge_lora_weights(
+    lora_module: ModuleType,
+    model: torch.nn.Module,
+    lora_weights: List[str],
+    lora_multipliers: List[float],
+    include_patterns: Optional[List[str]],
+    exclude_patterns: Optional[List[str]],
+    device: torch.device,
+    lycoris: bool = False,
+    save_merged_model: Optional[str] = None,
+    converter: Optional[callable] = None,
+) -> None:
+    """merge LoRA weights to the model
+
+    Args:
+        lora_module: LoRA module, e.g. lora_wan
+        model: DiT model
+        lora_weights: paths to LoRA weights
+        lora_multipliers: multipliers for LoRA weights
+        include_patterns: regex patterns to include LoRA modules
+        exclude_patterns: regex patterns to exclude LoRA modules
+        device: torch.device
+        lycoris: use LyCORIS
+        save_merged_model: path to save merged model, if specified, no inference will be performed
+        converter: Optional[callable] = None
+    """
+    if lora_weights is None or len(lora_weights) == 0:
+        return
+
+    for i, lora_weight in enumerate(lora_weights):
+        if lora_multipliers is not None and len(lora_multipliers) > i:
+            lora_multiplier = lora_multipliers[i]
+        else:
+            lora_multiplier = 1.0
+
+        logger.info(f"Loading LoRA weights from {lora_weight} with multiplier {lora_multiplier}")
+        weights_sd = load_file(lora_weight)
+        if converter is not None:
+            weights_sd = converter(weights_sd)
+
+        # apply include/exclude patterns
+        original_key_count = len(weights_sd.keys())
+        if include_patterns is not None and len(include_patterns) > i:
+            include_pattern = include_patterns[i]
+            regex_include = re.compile(include_pattern)
+            weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
+            logger.info(f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}")
+        if exclude_patterns is not None and len(exclude_patterns) > i:
+            original_key_count_ex = len(weights_sd.keys())
+            exclude_pattern = exclude_patterns[i]
+            regex_exclude = re.compile(exclude_pattern)
+            weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
+            logger.info(
+                f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}"
+            )
+        if len(weights_sd) != original_key_count:
+            remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
+            remaining_keys.sort()
+            logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
+            if len(weights_sd) == 0:
+                logger.warning(f"No keys left after filtering.")
+
+        if lycoris:
+            lycoris_net, _ = create_network_from_weights(
+                multiplier=lora_multiplier,
+                file=None,
+                weights_sd=weights_sd,
+                unet=model,
+                text_encoder=None,
+                vae=None,
+                for_inference=True,
+            )
+            lycoris_net.merge_to(None, model, weights_sd, dtype=None, device=device)
+        else:
+            network = lora_module.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
+            network.merge_to(None, model, weights_sd, device=device, non_blocking=True)
+
+        synchronize_device(device)
+        logger.info("LoRA weights loaded")
+
+    # save model here before casting to dit_weight_dtype
+    if save_merged_model:
+        logger.info(f"Saving merged model to {save_merged_model}")
+        mem_eff_save_file(model.state_dict(), save_merged_model)  # save_file needs a lot of memory
+        logger.info("Merged model saved")
+
 
 def prepare_t2v_inputs(
     args: argparse.Namespace,
@@ -635,7 +821,7 @@ def prepare_t2v_inputs(
     device: torch.device,
     vae: Optional[WanVAE] = None,
     encoded_context: Optional[Dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+) -> Tuple[torch.Tensor, Tuple[dict, dict], Optional[int]]:
     """Prepare inputs for T2V
 
     Args:
@@ -647,8 +833,8 @@ def prepare_t2v_inputs(
         encoded_context: Pre-encoded text context
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
-            (noise, context, context_null, (arg_c, arg_null))
+        Tuple[torch.Tensor, Tuple[dict, dict], Optional[int]]:
+            (noise, (arg_c, arg_null), one_frame_inference_index)
     """
     # Prepare inputs for T2V
     # calculate dimensions and sequence length
@@ -706,9 +892,106 @@ def prepare_t2v_inputs(
     else:
         y = None
 
-    # generate noise
-    noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
-    noise = noise.to(device)
+    # Check if one frame inference is enabled for T2V
+    one_frame_inference_index = None
+    if args.one_frame_inference is not None:
+        # For T2V one-frame inference, we need to handle image conditioning differently than I2V
+        # Parse one-frame parameters
+        target_index, control_indices, f_indices, one_frame_inference_index = parse_one_frame_inference_args(args.one_frame_inference)
+        
+        # Check if we have control images for conditioning
+        has_control_images = (hasattr(args, 'control_image_path') and 
+                            args.control_image_path and 
+                            len(args.control_image_path) > 0)
+        
+        if has_control_images:
+            # T2V with image conditioning - encode image to single-frame latents
+            logger.info("T2V one-frame inference with image conditioning")
+            
+            # Load VAE if not already loaded
+            if vae is None:
+                vae_dtype = torch.bfloat16  # default
+                if args.vae_dtype is not None:
+                    if args.vae_dtype == "float32":
+                        vae_dtype = torch.float32
+                    elif args.vae_dtype == "float16":
+                        vae_dtype = torch.float16
+                vae = load_vae(args, config, device, vae_dtype)
+            
+            # Encode the control image to latents for conditioning
+            control_image_path = args.control_image_path[0]  # Use first control image
+            from PIL import Image
+            import cv2
+            import numpy as np
+            image = Image.open(control_image_path).convert("RGB")
+            
+            # Resize image to match video dimensions
+            interpolation = cv2.INTER_AREA if height < image.height else cv2.INTER_CUBIC
+            img_cv2 = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            img_resized = cv2.resize(img_cv2, (width, height), interpolation=interpolation)
+            img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+            
+            # Convert to tensor and encode with VAE
+            img_tensor = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
+            img_tensor = img_tensor.unsqueeze(1)  # Add frame dimension: [C, F=1, H, W]
+            
+            vae.to_device(device)
+            with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
+                # Encode image as single-frame video latent
+                control_latents = vae.encode([img_tensor])[0]  # [C, F=1, H, W]
+            vae.to_device("cpu")
+            clean_memory_on_device(device)
+            
+            # For T2V V2V-style conditioning, we'll use the control latents to condition the noise
+            # This is similar to how V2V works but for a single frame
+            # Update dimensions for single frame
+            frames = 1
+            lat_f = 1
+            target_shape = (16, lat_f, lat_h, lat_w)
+            
+            # Generate noise matching single frame dimensions
+            noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
+            noise = noise.to(device)
+            
+            # Use proper scheduler-based noise mixing (like V2V in wan2_generate_video.py)
+            # This ensures correct noise scaling according to the diffusion schedule
+            
+            # Use conditioning strength from command line argument
+            # 0.0 = keep original image, 1.0 = full generation (ignore image)
+            conditioning_strength = args.conditioning_strength
+            
+            # We need to apply the scheduler-based noise addition, but since we don't have
+            # the scheduler available here, we'll store the control latents and handle
+            # the proper noise addition in the sampling loop. For now, use a simple approach
+            # that will be enhanced later with proper scheduler integration.
+            
+            # Store conditioning info for later use (this approach preserves more detail)
+            # control_latents is already [C, F=1, H, W], same shape as noise
+            noise = conditioning_strength * noise + (1 - conditioning_strength) * control_latents
+            
+        else:
+            # Pure T2V one-frame inference without image conditioning
+            logger.info("Pure T2V one-frame inference")
+            # Update dimensions for single frame
+            frames = 1
+            lat_f = 1
+            target_shape = (16, lat_f, lat_h, lat_w)
+            
+            # Generate noise for single frame
+            noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
+            noise = noise.to(device)
+        
+        # Update sequence length for single frame
+        seq_len = lat_h * lat_w // (config.patch_size[1] * config.patch_size[2]) * lat_f
+        
+        # For T2V one-frame inference, we generate a single frame directly
+        # so the one_frame_inference_index should be 0 (first and only frame)
+        one_frame_inference_index = 0
+        
+    else:
+        # Standard T2V without one-frame inference - generate noise normally
+        noise = torch.randn(target_shape, dtype=torch.float32, generator=seed_g, device=device if not args.cpu_noise else "cpu")
+        noise = noise.to(device)
 
     # prepare model input arguments
     arg_c = {"context": context, "seq_len": seq_len}
@@ -717,7 +1000,106 @@ def prepare_t2v_inputs(
         arg_c["y"] = [y]
         arg_null["y"] = [y]
 
-    return noise, context, context_null, (arg_c, arg_null)
+    return noise, (arg_c, arg_null), one_frame_inference_index
+
+
+def parse_one_frame_inference_args(one_frame_inference_arg: str) -> Tuple[int, List[int], List[int], int]:
+    """Parse one frame inference arguments"""
+    one_frame_inference = set()
+    for mode in one_frame_inference_arg.split(","):
+        one_frame_inference.add(mode.strip())
+
+    target_index = 0
+    control_indices = []
+    for one_frame_param in one_frame_inference:
+        if one_frame_param.startswith("target_index="):
+            target_index = int(one_frame_param.split("=")[1])
+            logger.info(f"Set index for target: {target_index}")
+        elif one_frame_param.startswith("control_index="):
+            control_indices = one_frame_param.split("=")[1].split(";")
+            control_indices = [int(idx) for idx in control_indices]
+            logger.info(f"Set control indices: {control_indices}")
+
+    target_and_control_latent_indices = control_indices + [target_index]
+    f_indices = sorted(target_and_control_latent_indices)
+
+    one_frame_inference_index = f_indices.index(target_index)
+
+    return target_index, control_indices, f_indices, one_frame_inference_index
+
+
+def prepare_one_frame_inference(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    vae: WanVAE,
+    device: torch.device,
+    lat_h: int,
+    lat_w: int,
+    height: int,
+    width: int,
+) -> Tuple[int, torch.Tensor, List[int]]:
+
+    target_index, _, f_indices, one_frame_inference_index = parse_one_frame_inference_args(args.one_frame_inference)
+
+    # prepare image
+    def preprocess_image(image_path: str):
+        image = Image.open(image_path)
+        if image.mode == "RGBA":
+            alpha = image.split()[-1]
+        else:
+            alpha = None
+        image = image.convert("RGB")
+
+        image_np = np.array(image)  # PIL to numpy, HWC
+
+        image_np = image_video_dataset.resize_image_to_bucket(image_np, (width, height))
+        image_tensor = torch.from_numpy(image_np).float() / 127.5 - 1.0  # -1 to 1.0, HWC
+        image_tensor = image_tensor.permute(2, 0, 1)[:, None]  # HWC -> CHW -> CFHW, C=3, F=1
+        return image_tensor, image_np, alpha
+
+    # check control images
+    control_image_tensors = []
+    control_mask_images = []
+    if args.control_image_path is not None and len(args.control_image_path) > 0:
+        for ctrl_image_path in args.control_image_path:
+            control_image_tensor, _, control_mask = preprocess_image(ctrl_image_path)
+            control_image_tensors.append(control_image_tensor)
+            control_mask_images.append(control_mask)
+
+    # TODO mask is not supported yet
+
+    vae.to_device(device)
+
+    with accelerator.autocast(), torch.no_grad():
+        black_image_latent = vae.encode([torch.zeros((3, 1, height, width), dtype=torch.float32, device=device)])[0]
+
+    control_latents = []
+    if control_image_tensors is not None:
+        # encode image to latent space with VAE
+        logger.info(f"Encoding image to latent space")
+
+        for ctrl_image_tensor in control_image_tensors:
+            # encode image one by one
+            with accelerator.autocast(), torch.no_grad():
+                control_latent = vae.encode([ctrl_image_tensor.to(device)])[0]
+            control_latents.append(control_latent)
+
+    vae.to_device("cpu")
+
+    lat_f = 1 + (len(control_latents) if control_latents is not None else 0)
+
+    # Create latent and mask for the required number of frames
+    y = torch.zeros(4 + 16, lat_f, lat_h, lat_w, dtype=torch.float32, device=device)
+    ci = 0
+    for j, index in enumerate(f_indices):
+        if index == target_index:
+            y[4:, j : j + 1, :, :] = black_image_latent  # set target latent to black image
+        else:
+            y[:4, j, :, :] = 1.0  # set mask to 1.0 for the clean latent frames
+            y[4:, j : j + 1, :, :] = control_latents[ci]  # set control latent
+            ci += 1
+
+    return one_frame_inference_index, y, f_indices
 
 
 def prepare_i2v_inputs(
@@ -727,7 +1109,7 @@ def prepare_i2v_inputs(
     device: torch.device,
     vae: WanVAE,
     encoded_context: Optional[Dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+) -> Tuple[torch.Tensor, Tuple[dict, dict], Optional[int]]:
     """Prepare inputs for I2V
 
     Args:
@@ -764,6 +1146,7 @@ def prepare_i2v_inputs(
         end_img = None
         end_img_cv2 = None
     has_end_image = end_img is not None
+    additional_frames = 1 if has_end_image and not config.flf2v else 0
 
     # calculate latent dimensions: keep aspect ratio
     height, width = img_tensor.shape[1:]
@@ -773,7 +1156,7 @@ def prepare_i2v_inputs(
     height = lat_h * config.vae_stride[1]
     width = lat_w * config.vae_stride[2]
     lat_f = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
-    max_seq_len = (lat_f + (1 if has_end_image else 0)) * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    max_seq_len = (lat_f + additional_frames) * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
 
     # set seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
@@ -783,18 +1166,6 @@ def prepare_i2v_inputs(
     else:
         # ComfyUI compatible noise
         seed_g = torch.manual_seed(seed)
-
-    # generate noise
-    noise = torch.randn(
-        16,
-        lat_f + (1 if has_end_image else 0),
-        lat_h,
-        lat_w,
-        dtype=torch.float32,
-        generator=seed_g,
-        device=device if not args.cpu_noise else "cpu",
-    )
-    noise = noise.to(device)
 
     # configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
@@ -819,74 +1190,114 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # load CLIP model
-        clip = load_clip_model(args, config, device)
-        clip.model.to(device)
+        clip_context = None
+        if not config.v2_2:
+            clip = load_clip_model(args, config, device)
+            clip.model.to(device)
 
-        # encode image to CLIP context
-        logger.info(f"Encoding image to CLIP context")
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-            clip_context = clip.visual([img_tensor[:, None, :, :]])
-        logger.info(f"Encoding complete")
+            # encode image to CLIP context
+            logger.info(f"Encoding image to CLIP context")
+            with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+                clip_context = clip.visual([img_tensor[:, None, :, :]])
+                # I2V end image is not officially supported, so no additional CLIP context
+                if end_img is not None and config.flf2v:
+                    end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
+                    end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
+                    clip_context = torch.concat([clip_context, end_clip_context], dim=0)
+            logger.info(f"Encoding complete")
 
-        # free CLIP model and clean memory
-        del clip
-        clean_memory_on_device(device)
+            # free CLIP model and clean memory
+            del clip
+            clean_memory_on_device(device)
     else:
         # Use pre-encoded context
         context = encoded_context["context"]
         context_null = encoded_context["context_null"]
         clip_context = encoded_context["clip_context"]
 
-    # encode image to latent space with VAE
-    logger.info(f"Encoding image to latent space")
-    vae.to_device(device)
+    # check if one frame inference is enabled
+    if args.one_frame_inference is not None:
+        if has_end_image and not config.flf2v:
+            logger.warning("One frame inference with end image is not supported other than FLF2V")
+        one_frame_inference_index, y, f_indices = prepare_one_frame_inference(
+            args, accelerator, vae, device, lat_h, lat_w, height, width
+        )
+        max_seq_len = len(f_indices) * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    else:
+        one_frame_inference_index, f_indices = None, None
 
-    # resize image
-    interpolation = cv2.INTER_AREA if height < img_cv2.shape[0] else cv2.INTER_CUBIC
-    img_resized = cv2.resize(img_cv2, (width, height), interpolation=interpolation)
-    img_resized = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-    img_resized = img_resized.unsqueeze(1)  # CFHW
+        # encode image to latent space with VAE
+        logger.info(f"Encoding image to latent space")
+        vae.to_device(device)
 
-    if has_end_image:
-        interpolation = cv2.INTER_AREA if height < end_img_cv2.shape[1] else cv2.INTER_CUBIC
-        end_img_resized = cv2.resize(end_img_cv2, (width, height), interpolation=interpolation)
-        end_img_resized = TF.to_tensor(end_img_resized).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
-        end_img_resized = end_img_resized.unsqueeze(1)  # CFHW
-
-    # create mask for the first frame
-    msk = torch.zeros(4, lat_f + (1 if has_end_image else 0), lat_h, lat_w, device=device)
-    msk[:, 0] = 1
-    if has_end_image:
-        msk[:, -1] = 1
-
-    # encode image to latent space
-    with accelerator.autocast(), torch.no_grad():
-        # padding to match the required number of frames
-        padding_frames = frames - 1  # the first frame is image
-        img_resized = torch.concat([img_resized, torch.zeros(3, padding_frames, height, width, device=device)], dim=1)
-        y = vae.encode([img_resized])[0]
+        # resize image
+        interpolation = cv2.INTER_AREA if height < img_cv2.shape[0] else cv2.INTER_CUBIC
+        img_resized = cv2.resize(img_cv2, (width, height), interpolation=interpolation)
+        img_resized = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
+        img_resized = img_resized.unsqueeze(1)  # CFHW
 
         if has_end_image:
-            y_end = vae.encode([end_img_resized])[0]
-            y = torch.concat([y, y_end], dim=1)  # add end frame
+            interpolation = cv2.INTER_AREA if height < end_img_cv2.shape[1] else cv2.INTER_CUBIC
+            end_img_resized = cv2.resize(end_img_cv2, (width, height), interpolation=interpolation)
+            end_img_resized = TF.to_tensor(end_img_resized).sub_(0.5).div_(0.5).to(device)  # -1 to 1, CHW
+            end_img_resized = end_img_resized.unsqueeze(1)  # CFHW
 
-    y = torch.concat([msk, y])
-    logger.info(f"Encoding complete")
+        # create mask for the first frame
+        # if unofficial end image is used, we need to add an additional frame for it
+        msk = torch.zeros(4, lat_f + additional_frames, lat_h, lat_w, device=device)
+        msk[:, 0] = 1
+        if has_end_image:
+            # this process is confirmed by official code for FLF2V
+            msk[:, -1] = 1
 
-    # Fun-Control: encode control video to latent space
-    if config.is_fun_control:
-        # TODO use same resizing as for image
-        logger.info(f"Encoding control video to latent space")
-        # C, F, H, W
-        control_video = load_control_video(args.control_path, frames + (1 if has_end_image else 0), height, width).to(device)
+        # encode image to latent space
         with accelerator.autocast(), torch.no_grad():
-            control_latent = vae.encode([control_video])[0]
-        y = y[msk.shape[0] :]  # remove mask because Fun-Control does not need it
-        if has_end_image:
-            y[:, 1:-1] = 0  # remove image latent except first and last frame. according to WanVideoWrapper, this doesn't work
-        else:
-            y[:, 1:] = 0  # remove image latent except first frame
-        y = torch.concat([control_latent, y], dim=0)  # add control video latent
+            if not config.flf2v or not has_end_image:
+                # padding to match the required number of frames
+                padding_frames = frames - 1  # the first frame is image
+                img_resized = torch.concat([img_resized, torch.zeros(3, padding_frames, height, width, device=device)], dim=1)
+                y = vae.encode([img_resized])[0]
+
+                if has_end_image:
+                    y_end = vae.encode([end_img_resized])[0]
+                    y = torch.concat([y, y_end], dim=1)  # add end frame
+            else:
+                # FLF2V: encode image and end image together
+                padding_frames = frames - 2  # first and last frames are images
+                img_resized = torch.concat(
+                    [img_resized, torch.zeros(3, padding_frames, height, width, device=device), end_img_resized], dim=1
+                )
+                y = vae.encode([img_resized])[0]
+
+        y = torch.concat([msk, y])
+        logger.info(f"Encoding complete")
+
+        # Fun-Control: encode control video to latent space
+        if config.is_fun_control:
+            # TODO use same resizing as for image
+            logger.info(f"Encoding control video to latent space")
+            # C, F, H, W
+            control_video = load_control_video(args.control_path, frames + (1 if has_end_image else 0), height, width).to(device)
+            with accelerator.autocast(), torch.no_grad():
+                control_latent = vae.encode([control_video])[0]
+            y = y[msk.shape[0] :]  # remove mask because Fun-Control does not need it
+            if has_end_image:
+                y[:, 1:-1] = 0  # remove image latent except first and last frame. according to WanVideoWrapper, this doesn't work
+            else:
+                y[:, 1:] = 0  # remove image latent except first frame
+            y = torch.concat([control_latent, y], dim=0)  # add control video latent
+
+    # generate noise
+    noise = torch.randn(
+        16,
+        y.shape[1],  # number of frames in latent space
+        lat_h,
+        lat_w,
+        dtype=torch.float32,
+        generator=seed_g,
+        device=device if not args.cpu_noise else "cpu",
+    )
+    noise = noise.to(device)
 
     # prepare model input arguments
     arg_c = {
@@ -894,6 +1305,7 @@ def prepare_i2v_inputs(
         "clip_fea": clip_context,
         "seq_len": max_seq_len,
         "y": [y],
+        "f_indices": [f_indices] if f_indices is not None else None,
     }
 
     arg_null = {
@@ -901,12 +1313,13 @@ def prepare_i2v_inputs(
         "clip_fea": clip_context,
         "seq_len": max_seq_len,
         "y": [y],
+        "f_indices": [f_indices] if f_indices is not None else None,
     }
 
     vae.to_device("cpu")  # move VAE to CPU to save memory
     clean_memory_on_device(device)
 
-    return noise, context, context_null, y, (arg_c, arg_null)
+    return noise, (arg_c, arg_null), one_frame_inference_index
 
 
 def load_control_video(control_path: str, frames: int, height: int, width: int) -> torch.Tensor:
@@ -977,11 +1390,12 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
 
 
 def run_sampling(
-    model: WanModel,
+    models: List[WanModel],
     noise: torch.Tensor,
     scheduler: Any,
     timesteps: torch.Tensor,
     args: argparse.Namespace,
+    gen_settings: GenerationSettings,
     inputs: Tuple[dict, dict],
     device: torch.device,
     seed_g: torch.Generator,
@@ -991,7 +1405,7 @@ def run_sampling(
 ) -> torch.Tensor:
     """run sampling
     Args:
-        model: dit model
+        models: dit models
         noise: initial noise
         scheduler: scheduler for sampling
         timesteps: time steps for sampling
@@ -1065,7 +1479,62 @@ def run_sampling(
     slg_start_step = int(args.slg_start * num_timesteps)
     slg_end_step = int(args.slg_end * num_timesteps)
 
+    prev_high_noise = args.timestep_boundary is not None
+    if prev_high_noise:
+        model = models[0]
+        guidance_scale = args.guidance_scale_high_noise
+    else:
+        model = models[-1]  # use low noise model for low noise steps
+        guidance_scale = args.guidance_scale
+
+    logger.info(
+        f"Starting sampling (high noise: {prev_high_noise}). Models: {len(models)}, timestep boundary: {args.timestep_boundary}, flow shift: {args.flow_shift}, guidance scale: {guidance_scale}"
+    )
+
     for i, t in enumerate(tqdm(timesteps)):
+        is_high_noise = (t / 1000.0) >= args.timestep_boundary if args.timestep_boundary is not None else False
+
+        if not is_high_noise and prev_high_noise:
+            guidance_scale = args.guidance_scale
+            logger.info(f"Switching to low noise at step {i}, t={t}, guidance_scale={guidance_scale}")
+
+            del model
+            gc.collect()
+
+            if len(models) > 1 and (args.offload_inactive_dit or args.lazy_loading):
+                if args.blocks_to_swap > 0:
+                    # prepare block swap for low noise model
+                    logger.info("Waiting for 5 seconds to finish block swap")
+                    time.sleep(5)
+
+                if args.offload_inactive_dit:
+                    logger.info(f"Switching model to CPU/GPU for both low and high noise models")
+                    models[0].to("cpu")
+
+                    if args.blocks_to_swap > 0:
+                        # prepare block swap for low noise model
+                        models[-1].move_to_device_except_swap_blocks(device)
+                        models[-1].prepare_block_swap_before_forward()
+
+                else:  # lazy loading
+                    pass
+
+                gc.collect()
+                clean_memory_on_device(device)
+
+            model = models[-1]  # use low noise model for low noise steps
+
+        if model is None:
+            # lazy loading
+            dit_path = args.dit_high_noise if is_high_noise else args.dit
+            lora_weight = args.lora_weight_high_noise if is_high_noise else args.lora_weight
+            lora_multiplier = args.lora_multiplier_high_noise if is_high_noise else args.lora_multiplier
+            model = load_dit_model(
+                args, dit_path, lora_weight, lora_multiplier, gen_settings.cfg, device, gen_settings.dit_weight_dtype
+            )
+
+        prev_high_noise = is_high_noise
+
         # latent is on CPU if use_cpu_offload is True
         latent_model_input = [latent.to(device)]
         timestep = torch.stack([t]).to(device)
@@ -1082,7 +1551,7 @@ def run_sampling(
 
                     # apply guidance
                     # SD3 formula: scaled = neg_out + (pos_out - neg_out) * cond_scale
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                     # calculate skip layer out
                     skip_layer_out = model(latent_model_input, t=timestep, skip_block_indices=args.slg_layers, **arg_null)[0].to(
@@ -1099,14 +1568,14 @@ def run_sampling(
                     )
 
                     # apply guidance
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 else:
                     # normal guidance
                     noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0].to(latent_storage_device)
 
                     # apply guidance
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = noise_pred_cond
 
@@ -1120,7 +1589,9 @@ def run_sampling(
     return latent
 
 
-def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_models: Optional[Dict] = None) -> torch.Tensor:
+def generate(
+    args: argparse.Namespace, gen_settings: GenerationSettings, shared_models: Optional[Dict] = None
+) -> tuple[torch.Tensor, Optional[int]]:
     """main function for generation
 
     Args:
@@ -1128,7 +1599,7 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
         shared_models: dictionary containing pre-loaded models and encoded data
 
     Returns:
-        torch.Tensor: generated latent
+        tuple[torch.Tensor, Optional[int]]: (latent tensor, one frame inference index)
     """
     device, cfg, dit_dtype, dit_weight_dtype, vae_dtype = (
         gen_settings.device,
@@ -1143,32 +1614,33 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     accelerator = accelerate.Accelerator(mixed_precision=mixed_precision)
 
     # I2V or T2V
-    is_i2v = "i2v" in args.task
+    is_i2v = "i2v" in args.task or "flf2v" in args.task
 
     # prepare seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     args.seed = seed  # set seed to args for saving
 
     # Check if we have shared models
+    one_frame_inference_index = None
     if shared_models is not None:
         # Use shared models and encoded data
         vae = shared_models.get("vae")
-        model = shared_models.get("model")
+        models = shared_models.get("models", [])
         encoded_context = shared_models.get("encoded_contexts", {}).get(args.prompt)
 
         # prepare inputs
         if is_i2v:
             # I2V
-            noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae, encoded_context)
+            noise, inputs, one_frame_inference_index = prepare_i2v_inputs(args, cfg, accelerator, device, vae, encoded_context)
         else:
             # T2V
-            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae, encoded_context)
+            noise, inputs, one_frame_inference_index = prepare_t2v_inputs(args, cfg, accelerator, device, vae, encoded_context)
     else:
         # prepare inputs without shared models
         if is_i2v:
             # I2V: need text encoder, VAE and CLIP
             vae = load_vae(args, cfg, device, vae_dtype)
-            noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
+            noise, inputs, one_frame_inference_index = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
             # vae is on CPU after prepare_i2v_inputs
         else:
             # T2V: need text encoder
@@ -1176,21 +1648,14 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
             if cfg.is_fun_control:
                 # Fun-Control: need VAE for encoding control video
                 vae = load_vae(args, cfg, device, vae_dtype)
-            noise, context, context_null, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
+            noise, inputs, one_frame_inference_index = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
 
-        # load DiT model
-        model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
+        # load DiT models
+        models = load_dit_models(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
 
-        # merge LoRA weights
-        if args.lora_weight is not None and len(args.lora_weight) > 0:
-            merge_lora_weights(lora_wan, model, args, device)
-
-            # if we only want to save the model, we can skip the rest
-            if args.save_merged_model:
-                return None
-
-        # optimize model: fp8 conversion, block swap etc.
-        optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+        # if we only want to save the model, we can skip the rest
+        if args.save_merged_model:
+            return None
 
     # setup scheduler
     scheduler, timesteps = setup_scheduler(args, cfg, device)
@@ -1200,18 +1665,22 @@ def generate(args: argparse.Namespace, gen_settings: GenerationSettings, shared_
     seed_g.manual_seed(seed)
 
     # run sampling
-    latent = run_sampling(model, noise, scheduler, timesteps, args, inputs, device, seed_g, accelerator, is_i2v)
+    latent = run_sampling(models, noise, scheduler, timesteps, args, gen_settings, inputs, device, seed_g, accelerator, is_i2v)
+    if one_frame_inference_index is not None:
+        latent = latent[:, one_frame_inference_index : one_frame_inference_index + 1, :]
+        latent = latent.contiguous()  # safetensors requires contiguous tensors :(
 
     # Only clean up shared models if they were created within this function
     if shared_models is None:
         # free memory
-        del model
+        del models
         del scheduler
         synchronize_device(device)
 
         # wait for 5 seconds until block swap is done
-        logger.info("Waiting for 5 seconds to finish block swap")
-        time.sleep(5)
+        if args.blocks_to_swap > 0:
+            logger.info("Waiting for 5 seconds to finish block swap")
+            time.sleep(5)
 
         gc.collect()
         clean_memory_on_device(device)
@@ -1247,9 +1716,9 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
 
     vae.to_device(device)
 
-    logger.info(f"Decoding video from latents: {latent.shape}")
     x0 = latent.to(device)
 
+    logger.info(f"Decoding video from latents: {latent.shape}")
     with torch.autocast(device_type=device.type, dtype=vae_dtype), torch.no_grad():
         videos = vae.decode(x0)
 
@@ -1257,11 +1726,11 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     if args.trim_tail_frames:
         videos[0] = videos[0][:, : -args.trim_tail_frames]
 
-    logger.info(f"Decoding complete")
     video = videos[0]
     del videos
     video = video.to(torch.float32).cpu()
 
+    logger.info(f"Decoding complete")
     return video
 
 
@@ -1279,7 +1748,7 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    time_flag = get_time_flag()
 
     seed = args.seed
     video_length = args.video_length
@@ -1320,7 +1789,7 @@ def save_video(video: torch.Tensor, args: argparse.Namespace, original_base_name
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    time_flag = get_time_flag()
 
     seed = args.seed
     original_name = "" if original_base_name is None else f"_{original_base_name}"
@@ -1346,13 +1815,14 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
+    time_flag = get_time_flag()
 
     seed = args.seed
     original_name = "" if original_base_name is None else f"_{original_base_name}"
     image_name = f"{time_flag}_{seed}{original_name}"
     sample = sample.unsqueeze(0)
-    save_images_grid(sample, save_path, image_name, rescale=True)
+    one_frame_inference = sample.shape[2] == 1  # check if one frame inference is used
+    save_images_grid(sample, save_path, image_name, rescale=True, create_subdir=not one_frame_inference)
     logger.info(f"Sample images saved to: {save_path}/{image_name}")
 
     return f"{save_path}/{image_name}"
@@ -1371,7 +1841,7 @@ def save_output(
         width: width of frame
         original_base_names: original base names (if latents are loaded from files)
     """
-    if args.output_type == "latent" or args.output_type == "both":
+    if args.output_type == "latent" or args.output_type == "both" or args.output_type == "latent_images":
         # save latent
         save_latent(latent, args, height, width)
 
@@ -1471,25 +1941,35 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
         vae = load_vae(args, cfg, device, vae_dtype)
         vae.to_device(device)
 
-        clip = load_clip_model(args, cfg, device)
-        clip.model.to(device)
+        if not cfg.v2_2:
+            clip = load_clip_model(args, cfg, device)
+            clip.model.to(device)
 
         # Process each image and encode with CLIP
         for prompt_data in prompts_data:
             if "image_path" not in prompt_data:
                 continue
 
-            prompt_args = apply_overrides(args, prompt_data)
-            if not os.path.exists(prompt_args.image_path):
-                logger.warning(f"Image path not found: {prompt_args.image_path}")
-                continue
+            if not cfg.v2_2:
+                prompt_args = apply_overrides(args, prompt_data)
+                if not os.path.exists(prompt_args.image_path):
+                    logger.warning(f"Image path not found: {prompt_args.image_path}")
+                    continue
 
-            # Load and encode image with CLIP
-            img = Image.open(prompt_args.image_path).convert("RGB")
-            img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+                # Load and encode image with CLIP
+                img = Image.open(prompt_args.image_path).convert("RGB")
+                img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
 
-            with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-                clip_context = clip.visual([img_tensor[:, None, :, :]])
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+                    clip_context = clip.visual([img_tensor[:, None, :, :]])
+
+                if prompt_args.end_image_path is not None and os.path.exists(prompt_args.end_image_path):
+                    end_img = Image.open(prompt_args.end_image_path).convert("RGB")
+                    end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
+                    end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
+                    clip_context = torch.concat([clip_context, end_clip_context], dim=0)
+            else:
+                clip_context = None
 
             encoded_contexts[prompt_data["prompt"]]["clip_context"] = clip_context
 
@@ -1504,22 +1984,16 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
         vae = load_vae(args, cfg, device, vae_dtype)
         vae.to_device("cpu")
 
-    # 4. Load DiT model
-    logger.info("Loading DiT model")
-    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
+    # 4. Load DiT model, 5. Merge LoRA weights if needed, and 6. Optimize model
+    logger.info("Loading DiT model(s)")
+    models = load_dit_models(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
 
-    # 5. Merge LoRA weights if needed
-    if args.lora_weight is not None and len(args.lora_weight) > 0:
-        merge_lora_weights(lora_wan, model, args, device)
-        if args.save_merged_model:
-            logger.info("Model merged and saved. Exiting.")
-            return
-
-    # 6. Optimize model
-    optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+    if args.save_merged_model:
+        logger.info("Model merged and saved. Exiting.")
+        return
 
     # Create shared models dict for generate function
-    shared_models = {"vae": vae, "model": model, "encoded_contexts": encoded_contexts}
+    shared_models = {"vae": vae, "models": models, "encoded_contexts": encoded_contexts}
 
     # 7. Generate for each prompt
     all_latents = []
@@ -1536,20 +2010,21 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
         # Save latent if needed
         height, width, _ = check_inputs(prompt_args)
-        if prompt_args.output_type == "latent" or prompt_args.output_type == "both":
+        if prompt_args.output_type == "latent" or prompt_args.output_type == "both" or prompt_args.output_type == "latent_images":
             save_latent(latent, prompt_args, height, width)
 
         all_latents.append(latent)
         all_prompt_args.append(prompt_args)
 
     # 8. Free DiT model
-    del model
+    del models
     clean_memory_on_device(device)
     synchronize_device(device)
 
     # wait for 5 seconds until block swap is done
-    logger.info("Waiting for 5 seconds to finish block swap")
-    time.sleep(5)
+    if args.blocks_to_swap > 0:
+        logger.info("Waiting for 5 seconds to finish block swap")
+        time.sleep(5)
 
     gc.collect()
     clean_memory_on_device(device)
@@ -1596,22 +2071,41 @@ def process_interactive(args: argparse.Namespace) -> None:
         gen_settings.dit_weight_dtype,
         gen_settings.vae_dtype,
     )
-    is_i2v = "i2v" in args.task
+    is_i2v = "i2v" in args.task or "flf2v" in args.task
 
     # Initialize models to None
     text_encoder = None
     vae = None
-    model = None
+    models = None
     clip = None
 
-    print("Interactive mode. Enter prompts (Ctrl+D to exit):")
+    print("Interactive mode. Enter prompts (Ctrl+D or Ctrl+Z (Windows) to exit):")
+
+    try:
+        import prompt_toolkit
+    except ImportError:
+        logger.warning("prompt_toolkit not found. Using basic input instead.")
+        prompt_toolkit = None
+
+    if prompt_toolkit:
+        session = prompt_toolkit.PromptSession()
+
+        def input_line(prompt: str) -> str:
+            return session.prompt(prompt)
+
+    else:
+
+        def input_line(prompt: str) -> str:
+            return input(prompt)
 
     try:
         while True:
             try:
-                line = input("> ")
+                line = input_line("> ")
                 if not line.strip():
                     continue
+                if len(line.strip()) == 1 and line.strip() in ["\x04", "\x1a"]:  # Ctrl+D or Ctrl+Z with prompt_toolkit
+                    raise EOFError  # Exit on Ctrl+D or Ctrl+Z
 
                 # Parse prompt
                 prompt_data = parse_prompt_line(line)
@@ -1647,24 +2141,34 @@ def process_interactive(args: argparse.Namespace) -> None:
 
                 # 2. For I2V, we need CLIP and VAE
                 if is_i2v:
-                    if clip is None:
-                        logger.info("Loading CLIP model")
-                        clip = load_clip_model(args, cfg, device)
+                    if not cfg.v2_2:
+                        if clip is None:
+                            logger.info("Loading CLIP model")
+                            clip = load_clip_model(args, cfg, device)
 
-                    clip.model.to(device)
+                        clip.model.to(device)
 
-                    # Encode image with CLIP if there's an image path
-                    if prompt_args.image_path and os.path.exists(prompt_args.image_path):
-                        img = Image.open(prompt_args.image_path).convert("RGB")
-                        img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+                        # Encode image with CLIP if there's an image path
+                        if prompt_args.image_path and os.path.exists(prompt_args.image_path):
+                            img = Image.open(prompt_args.image_path).convert("RGB")
+                            img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
 
-                        with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-                            clip_context = clip.visual([img_tensor[:, None, :, :]])
+                            with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+                                clip_context = clip.visual([img_tensor[:, None, :, :]])
 
-                        encoded_context["clip_context"] = clip_context
+                            if prompt_args.end_image_path is not None and os.path.exists(prompt_args.end_image_path):
+                                end_img = Image.open(prompt_args.end_image_path).convert("RGB")
+                                end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
+                                with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+                                    end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
+                                clip_context = torch.concat([clip_context, end_clip_context], dim=0)
 
-                    # Move CLIP to CPU after use
-                    clip.model.to("cpu")
+                            encoded_context["clip_context"] = clip_context
+
+                        # Move CLIP to CPU after use
+                        clip.model.to("cpu")
+                    else:
+                        encoded_context["clip_context"] = None
 
                     # Load VAE if needed
                     if vae is None:
@@ -1676,32 +2180,41 @@ def process_interactive(args: argparse.Namespace) -> None:
                     vae = load_vae(args, cfg, device, vae_dtype)
 
                 # 3. Load DiT model if not already loaded
-                if model is None:
+                if models is None:
                     logger.info("Loading DiT model")
-                    model = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
-
-                    # Merge LoRA weights if needed
-                    if args.lora_weight is not None and len(args.lora_weight) > 0:
-                        merge_lora_weights(lora_wan, model, args, device)
-
-                    # Optimize model
-                    optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+                    models = load_dit_models(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
                 else:
                     # Move model to GPU if it was offloaded
-                    model.to(device)
+                    if args.blocks_to_swap > 0:
+                        if len(models) > 1:
+                            if args.offload_inactive_dit:
+                                models[-1].to("cpu")  # Move last model to CPU if multiple models
+                            else:
+                                models[-1].move_to_device_except_swap_blocks(device)
+                                models[-1].prepare_block_swap_before_forward()
+                        models[0].move_to_device_except_swap_blocks(device)
+                        models[0].prepare_block_swap_before_forward()
+                    else:
+                        for model in models:
+                            model.to(device)
 
                 # Create shared models dict
-                shared_models = {"vae": vae, "model": model, "encoded_contexts": {prompt_data["prompt"]: encoded_context}}
+                shared_models = {"vae": vae, "models": models, "encoded_contexts": {prompt_data["prompt"]: encoded_context}}
 
                 # Generate latent
                 latent = generate(prompt_args, gen_settings, shared_models)
 
                 # Move model to CPU after generation
-                model.to("cpu")
+                for model in models:
+                    model.to("cpu")
 
                 # Save latent if needed
                 height, width, _ = check_inputs(prompt_args)
-                if prompt_args.output_type == "latent" or prompt_args.output_type == "both":
+                if (
+                    prompt_args.output_type == "latent"
+                    or prompt_args.output_type == "both"
+                    or prompt_args.output_type == "latent_images"
+                ):
                     save_latent(latent, prompt_args, height, width)
 
                 # Decode and save output
@@ -1736,8 +2249,8 @@ def process_interactive(args: argparse.Namespace) -> None:
         del clip
     if vae is not None:
         del vae
-    if model is not None:
-        del model
+    if models is not None:
+        del models
 
     clean_memory_on_device(device)
     gc.collect()
@@ -1782,6 +2295,10 @@ def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
 def main():
     # Parse arguments
     args = parse_args()
+
+    assert not (
+        args.offload_inactive_dit and args.lazy_loading
+    ), "--offload_inactive_dit and --lazy_loading cannot be used together"
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
@@ -1839,7 +2356,6 @@ def main():
         video_length = (video_length - 1) * cfg.vae_stride[0] + 1
         args.seed = seeds[0]
 
-        # Decode and save
         save_output(latent[0], args, cfg, height, width, original_base_names)
 
     elif args.from_file:

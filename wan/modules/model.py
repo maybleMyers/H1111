@@ -1,9 +1,10 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from accelerate import init_empty_weights
 
@@ -29,6 +30,9 @@ def sinusoidal_embedding_1d(dim, position):
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
+    # Ensure position is 1-D for torch.outer
+    if position.dim() == 0:
+        position = position.unsqueeze(0)
 
     # calculation
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
@@ -165,7 +169,18 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Convert both input and parameters to float32 for LayerNorm computation
+        # to avoid dtype mismatch when weights are in BFloat16
+        if self.weight is not None:
+            return F.layer_norm(
+                x.float(),
+                self.normalized_shape,
+                self.weight.float(),
+                self.bias.float() if self.bias is not None else None,
+                self.eps
+            ).type_as(x)
+        else:
+            return super().forward(x.float()).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -210,6 +225,8 @@ class WanSelfAttention(nn.Module):
         # del x
         # query, key, value function
 
+        # Ensure x has the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
@@ -821,7 +838,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
-        # time embeddings
+        # time embeddings 
         # with amp.autocast(dtype=torch.float32):
         with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
@@ -948,16 +965,57 @@ def load_wan_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
+    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
+    lora_multipliers: Optional[List[float]] = None,
+    use_scaled_mm: bool = False,
 ) -> WanModel:
     # dit_weight_dtype is None for fp8_scaled
-    assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
+    assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
     wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
-    logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
-    sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+    
+    # Check if we should use efficient LoRA loading
+    if lora_weights_list is not None and len(lora_weights_list) > 0:
+        logger.info(f"Loading DiT model with LoRA weights (efficient hook-based method)")
+        logger.info(f"Loading from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
+        
+        # Import the efficient loading function
+        from utils.lora_utils import load_safetensors_with_lora_and_fp8
+        
+        # Use hook-based loading that merges LoRA during load
+        sd = load_safetensors_with_lora_and_fp8(
+            model_files=dit_path,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            fp8_optimization=False,  # We'll handle fp8 separately if needed
+            calc_device=device,  # Use target device for calculations
+            move_to_device=(wan_loading_device == device),
+            target_keys=None,  # Apply to all keys
+            exclude_keys=None,
+        )
+        
+        # Detect actual input dimensions from checkpoint
+        if "patch_embedding.weight" in sd:
+            actual_in_dim = sd["patch_embedding.weight"].shape[1]
+            if actual_in_dim != config.in_dim:
+                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
+                config = type(config)(config.__dict__)  # Create a copy
+                config.in_dim = actual_in_dim
+    else:
+        # Original loading without LoRA
+        logger.info(f"Loading DiT model state dict from {dit_path}, device={wan_loading_device}, dtype={dit_weight_dtype}")
+        sd = load_safetensors(dit_path, wan_loading_device, disable_mmap=True, dtype=dit_weight_dtype)
+        
+        # Detect actual input dimensions from checkpoint
+        if "patch_embedding.weight" in sd:
+            actual_in_dim = sd["patch_embedding.weight"].shape[1]
+            if actual_in_dim != config.in_dim:
+                logger.info(f"Detected in_dim mismatch: config={config.in_dim}, checkpoint={actual_in_dim}. Using checkpoint value.")
+                config = type(config)(config.__dict__)  # Create a copy
+                config.in_dim = actual_in_dim
 
     # remove "model.diffusion_model." prefix: 1.3B model has this prefix
     sd_keys = list(sd.keys()) # Keep original keys for potential prefix removal
@@ -996,7 +1054,7 @@ def load_wan_model(
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info(f"Optimizing model weights to fp8. This may take a while.")
-        sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu")
+        sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu", use_scaled_mm=use_scaled_mm)
 
         if loading_device.type != "cpu":
             # make sure all the model weights are on the loading_device

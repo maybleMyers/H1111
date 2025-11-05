@@ -485,11 +485,21 @@ class T5EncoderModel:
             sd = {k.replace("encoder.", ""): v for k, v in sd.items()}
             model.load_state_dict(sd, strict=True, assign=True)
 
-        logger.info(f"moving model to {device} and casting to {self.dtype}")
-        model = model.to(device, dtype=self.dtype)
+        final_dtype = self.dtype
+        if "fp32" in weight_path and self.dtype == torch.bfloat16:
+            logger.warning(f"Checkpoint '{os.path.basename(weight_path)}' appears to be float32, but requested dtype is bfloat16. Forcing float32 to prevent precision loss.")
+            final_dtype = torch.float32
+        
+        # Override for fp8 if requested
+        if fp8:
+            final_dtype = torch.float8_e4m3fn
+
+        logger.info(f"moving model to {device} and casting to {final_dtype}")
+        model = model.to(device, dtype=final_dtype)
 
         if fp8:
             logger.info("preparing model for fp8")
+            model.prepare_fp8(final_dtype)
             model.prepare_fp8(dtype)
 
         self.model = model
