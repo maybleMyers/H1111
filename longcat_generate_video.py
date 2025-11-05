@@ -4718,7 +4718,7 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     del text_encoder, tokenizer
     clean_memory_on_device(device)
 
-    # --- Prepare mixed latents (conditioning + noise) ---
+    # --- Prepare latents dimensions (but don't create full tensor yet!) ---
     default_frames = getattr(cfg, 'default_frames', 129)
     video_length = args.video_length if args.video_length is not None else default_frames
 
@@ -4732,36 +4732,8 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info(f"Video: {height}x{width}@{video_length} -> Latent: {latent_h}x{latent_w}@{latent_f}")
     logger.info(f"Conditioning: {args.num_cond_frames} frames -> {num_cond_latents} latents")
 
-    # Initialize full latents with random noise
-    latents_generator_device = "cpu" if args.cpu_noise else device
-    latents_generator = torch.Generator(device=latents_generator_device)
-    latents_generator.manual_seed(seed)
-
-    if args.cpu_noise:
-        latents = torch.randn(
-            1, latent_c, latent_f, latent_h, latent_w,
-            generator=latents_generator,
-            dtype=torch.float32
-        ).to(device)
-    else:
-        latents = torch.randn(
-            1, latent_c, latent_f, latent_h, latent_w,
-            generator=latents_generator,
-            dtype=torch.float32,
-            device=device
-        )
-
-    # Replace first num_cond_latents with conditioning latents
-    latents[:, :, :num_cond_latents, :, :] = cond_latents[:, :, :num_cond_latents, :, :].to(latents.device, dtype=latents.dtype)
-    logger.info(f"Mixed latents prepared: {num_cond_latents} conditioning + {latent_f - num_cond_latents} noise")
-
-    # Delete original cond_latents - already copied into latents, free GPU memory
-    del cond_latents
-    clean_memory_on_device(device)
-    logger.info("Cleaned up original conditioning latents")
-
-    # --- Setup KV cache ---
-    # Final cleanup before KV cache computation to maximize available GPU memory
+    # --- Setup KV cache FIRST (with only conditioning latents in memory) ---
+    # This matches the official pipeline and dramatically reduces peak memory usage
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
     logger.info("Memory cleaned before KV cache computation")
@@ -4769,10 +4741,15 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("Setting up KV cache for conditioning frames...")
     embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
 
-    # Extract conditioning latents for caching
-    cond_latents_for_cache = latents[:, :, :num_cond_latents, :, :].to(device, dtype=dit_dtype if dit_dtype else torch.float32)
+    # Prepare ONLY conditioning latents for caching (keep full latents out of memory!)
+    cond_latents_for_cache = cond_latents[:, :, :num_cond_latents, :, :].to(
+        device,
+        dtype=dit_dtype if dit_dtype else torch.float32
+    )
 
     # Pre-compute KV cache with CPU offloading to save GPU memory
+    # At this point, we only have ~16MB for 4 conditioning latent frames in GPU memory
+    # instead of ~96MB for all 24 frames like before
     _cache_clean_latents(
         cond_latents_for_cache,
         model,
@@ -4786,9 +4763,36 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     kv_cache_dict = _get_kv_cache_dict()
     logger.info(f"KV cache prepared with {len(kv_cache_dict)} entries")
 
-    # Slice latents to only noise frames for denoising
-    latents = latents[:, :, num_cond_latents:, :, :].contiguous()
-    logger.info(f"Denoising latents shape (noise frames only): {latents.shape}")
+    # Keep conditioning latents for final concatenation, but delete the full cond_latents
+    # We'll need cond_latents_for_cache later to reconstruct the full video
+    del cond_latents
+    clean_memory_on_device(device)
+    logger.info("Cleaned up original cond_latents after KV cache computation")
+
+    # --- Create noise latents (only the frames we'll denoise) ---
+    # This is much more memory efficient than creating all 24 frames upfront
+    noise_frames = latent_f - num_cond_latents  # e.g., 24 - 4 = 20 frames
+    logger.info(f"Creating noise latents for {noise_frames} frames to denoise")
+
+    latents_generator_device = "cpu" if args.cpu_noise else device
+    latents_generator = torch.Generator(device=latents_generator_device)
+    latents_generator.manual_seed(seed)
+
+    if args.cpu_noise:
+        latents = torch.randn(
+            1, latent_c, noise_frames, latent_h, latent_w,
+            generator=latents_generator,
+            dtype=torch.float32
+        ).to(device)
+    else:
+        latents = torch.randn(
+            1, latent_c, noise_frames, latent_h, latent_w,
+            generator=latents_generator,
+            dtype=torch.float32,
+            device=device
+        )
+
+    logger.info(f"Noise latents shape (frames to denoise): {latents.shape}")
 
     # --- Setup scheduler ---
     logger.info("Setting up scheduler...")
