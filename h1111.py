@@ -9218,7 +9218,8 @@ with gr.Blocks(
     #Event handlers etc
     
     # Wan One Frame event handlers
-    wan_of_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # wan_of_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     wan_of_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan_of_seed])
     
     wan_of_generate_btn.click(
@@ -9382,7 +9383,8 @@ with gr.Blocks(
     )
 
     # LongCat event handlers
-    longcat_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # longcat_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     longcat_generate_btn.click(
         fn=longcat_batch_handler,
         inputs=[
@@ -9410,7 +9412,8 @@ with gr.Blocks(
     )
 
     #multitalk event handlers
-    multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
     multitalk_cond_image.change(
         fn=lambda data: (data, data), # Pass the data through to both outputs
@@ -9507,7 +9510,8 @@ with gr.Blocks(
         queue=True
     )
     
-    infinitetalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # infinitetalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     
     infinitetalk_random_seed_btn.click(
         fn=set_random_seed,
@@ -9594,7 +9598,8 @@ with gr.Blocks(
         queue=True
     )
 
-    fpe_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # fpe_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     
     def handle_fpe_gallery_select(evt: gr.SelectData) -> int:
         return evt.index
@@ -10014,7 +10019,8 @@ with gr.Blocks(
         outputs=[framepack_seed] 
     )
     # Connect FramePack Stop button
-    framepack_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # framepack_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     # Connect FramePack Gallery selection
     def handle_framepack_gallery_select(evt: gr.SelectData) -> int:
@@ -10106,7 +10112,8 @@ with gr.Blocks(
     wanx_v2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_v2v_prompt, outputs=wanx_v2v_token_counter)
 
     # Stop button handler
-    wanx_v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # wanx_v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     # Video input handling
     wanx_v2v_input.change(
@@ -10990,7 +10997,8 @@ with gr.Blocks(
 
     # Add event handlers for the SKYREELS tab
     skyreels_prompt.change(fn=count_prompt_tokens, inputs=skyreels_prompt, outputs=skyreels_token_counter)
-    skyreels_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # skyreels_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     # Image input handling
     skyreels_input.change(
@@ -11342,10 +11350,13 @@ with gr.Blocks(
         outputs=merge_refresh_outputs
     )
     # Event handlers
-    prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
+    # prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
+    # Removed - old Hunyuan-t2v tab
     v2v_prompt.change(fn=count_prompt_tokens, inputs=v2v_prompt, outputs=v2v_token_counter)
-    stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-    v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
+    # v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     #Image_to_Video
     def image_to_video(image_path, output_path, width, height, frames=240):  # Add width, height parameters
@@ -11448,7 +11459,8 @@ with gr.Blocks(
 
     # Add event handlers
     i2v_prompt.change(fn=count_prompt_tokens, inputs=i2v_prompt, outputs=i2v_token_counter)
-    i2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # i2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     def handle_i2v_gallery_select(evt: gr.SelectData) -> int:
         """Track selected index when I2V gallery item is clicked"""
@@ -11573,7 +11585,8 @@ with gr.Blocks(
 
     # Wan2.2 Tab Event Handlers
     wan22_prompt.change(fn=count_prompt_tokens, inputs=wan22_prompt, outputs=wan22_token_counter)
-    wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # wan22_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     wan22_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[wan22_seed])
     
     # V2V visibility toggle
@@ -12194,7 +12207,8 @@ with gr.Blocks(
 
     # WanX-i2v tab connections
     wanx_prompt.change(fn=count_prompt_tokens, inputs=wanx_prompt, outputs=wanx_token_counter)
-    wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
     
     # Image input handling for WanX-i2v
     wanx_input.change(
@@ -12397,7 +12411,8 @@ with gr.Blocks(
     wanx_t2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_t2v_prompt, outputs=wanx_t2v_token_counter)
 
     # Stop button handler
-    wanx_t2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # wanx_t2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     # Flow shift recommendation button
     wanx_t2v_recommend_flow_btn.click(
@@ -12538,7 +12553,8 @@ with gr.Blocks(
     )
     # Phantom Tab Event Handlers
     phantom_prompt.change(fn=count_prompt_tokens, inputs=phantom_prompt, outputs=phantom_token_counter)
-    phantom_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # phantom_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    # Removed - old Hunyuan-t2v tab
 
     phantom_recommend_flow_btn.click(
         fn=recommend_wanx_flow_shift, # Reusing WanX logic as it's dimension-based
