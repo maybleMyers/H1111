@@ -4718,6 +4718,24 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     del text_encoder, tokenizer
     clean_memory_on_device(device)
 
+    # CRITICAL: Move text embeddings to CPU to free GPU memory before KV cache computation
+    # UMT5-XXL embeddings can be quite large and we don't need them during KV cache computation
+    logger.info("Moving text embeddings to CPU to free GPU memory before KV cache computation...")
+
+    # Save dtype before moving to CPU
+    prompt_embeds_dtype = prompt_embeds_raw.dtype
+
+    prompt_embeds_cpu = prompt_embeds_raw.cpu()
+    negative_prompt_embeds_cpu = negative_prompt_embeds_raw.cpu()
+    prompt_attention_mask_cpu = prompt_attention_mask.cpu()
+    negative_attention_mask_cpu = negative_attention_mask.cpu()
+
+    # Delete GPU versions
+    del prompt_embeds_raw, negative_prompt_embeds_raw, prompt_attention_mask, negative_attention_mask
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    logger.info("Text embeddings moved to CPU, GPU memory freed")
+
     # --- Prepare latents dimensions (but don't create full tensor yet!) ---
     default_frames = getattr(cfg, 'default_frames', 129)
     video_length = args.video_length if args.video_length is not None else default_frames
@@ -4739,7 +4757,7 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("Memory cleaned before KV cache computation")
 
     logger.info("Setting up KV cache for conditioning frames...")
-    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
+    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_dtype
 
     # CRITICAL FIX: Move cond_latents to CPU FIRST to avoid having both full and sliced tensors in GPU memory
     # The problem: cond_latents is on GPU from VAE encoding, and creating a slice keeps both in GPU memory
@@ -4842,19 +4860,20 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
             model.prepare_block_swap_before_forward()
 
         # Prepare encoder hidden states and attention mask
+        # Move embeddings from CPU to GPU only when needed for this denoising step
         if do_classifier_free_guidance:
             encoder_hidden_states = torch.cat([
-                negative_prompt_embeds_raw,
-                prompt_embeds_raw
+                negative_prompt_embeds_cpu,
+                prompt_embeds_cpu
             ], dim=0).unsqueeze(1).to(device, dtype=embed_dtype)
 
             encoder_attention_mask = torch.cat([
-                negative_attention_mask,
-                prompt_attention_mask
+                negative_attention_mask_cpu,
+                prompt_attention_mask_cpu
             ], dim=0).to(device)
         else:
-            encoder_hidden_states = prompt_embeds_raw.unsqueeze(1).to(device, dtype=embed_dtype)
-            encoder_attention_mask = prompt_attention_mask.to(device)
+            encoder_hidden_states = prompt_embeds_cpu.unsqueeze(1).to(device, dtype=embed_dtype)
+            encoder_attention_mask = prompt_attention_mask_cpu.to(device)
 
         # Forward pass with KV cache and num_cond_latents
         with torch.no_grad():
