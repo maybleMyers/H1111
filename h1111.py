@@ -11897,66 +11897,71 @@ with gr.Blocks(
         outputs=[metadata_output, status]
     )
 
-    send_to_t2v_btn.click(
-        fn=lambda m: send_parameters_to_tab(m, "t2v"),
-        inputs=metadata_output,
-        outputs=[status, params_state]
-    ).then(
-        fn=change_to_tab_one, inputs=None, outputs=[tabs]
-    ).then(
-        lambda params: [
-            params.get("prompt", ""),
-            params.get("width", 544),              # Parameter mapping is fine here
-            params.get("height", 544),             # Parameter mapping is fine here
-            params.get("batch_size", 1),
-            params.get("video_length", 25),
-            params.get("fps", 24),
-            params.get("infer_steps", 30),
-            params.get("seed", -1),
-            params.get("model", "hunyuan/mp_rank_00_model_states.pt"),
-            params.get("vae", "hunyuan/pytorch_model.pt"),
-            params.get("te1", "hunyuan/llava_llama3_fp16.safetensors"),
-            params.get("te2", "hunyuan/clip_l.safetensors"),
-            params.get("save_path", "outputs"),
-            params.get("flow_shift", 11.0),
-            params.get("cfg_scale", 7.0),
-            params.get("output_type", "video"),
-            params.get("attn_mode", "sdpa"),
-            params.get("block_swap", "0"),
-            *[params.get(f"lora{i+1}", "") for i in range(4)],
-            *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
-        ] if params else [gr.update()]*26, # This lambda returns values based on param keys
-        inputs=params_state,
-        outputs=[prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps, seed, # <<< CORRECTED HERE: use t2v_width, t2v_height
-                 model, vae, te1, te2, save_path, flow_shift, cfg_scale,
-                 output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
-    )
-    # Text to Video generation
-    generate_btn.click(
-        fn=process_batch,
-        inputs=[
-            prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
-            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
-            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-            lora_folder, *lora_weights, *lora_multipliers, gr.Textbox(visible=False), gr.Number(visible=False), use_fp8
-        ],
-        outputs=[video_output, batch_progress, progress_text],
-        queue=True
-    ).then(
-        fn=lambda batch_size: 0 if batch_size == 1 else None,
-        inputs=[batch_size],
-        outputs=selected_index
-    )    
+    # NOTE: The following event handlers reference the old Hunyuan-t2v tab variables
+    # (prompt, generate_btn, video_output, send_t2v_to_v2v_btn, etc.) which no longer exist.
+    # These sections have been commented out since the tab was replaced with LongCat.
 
-    # Update gallery selection handling
-    def handle_gallery_select(evt: gr.SelectData) -> int:
-        return evt.index
+    # send_to_t2v_btn.click(
+    #     fn=lambda m: send_parameters_to_tab(m, "t2v"),
+    #     inputs=metadata_output,
+    #     outputs=[status, params_state]
+    # ).then(
+    #     fn=change_to_tab_one, inputs=None, outputs=[tabs]
+    # ).then(
+    #     lambda params: [
+    #         params.get("prompt", ""),
+    #         params.get("width", 544),
+    #         params.get("height", 544),
+    #         params.get("batch_size", 1),
+    #         params.get("video_length", 25),
+    #         params.get("fps", 24),
+    #         params.get("infer_steps", 30),
+    #         params.get("seed", -1),
+    #         params.get("model", "hunyuan/mp_rank_00_model_states.pt"),
+    #         params.get("vae", "hunyuan/pytorch_model.pt"),
+    #         params.get("te1", "hunyuan/llava_llama3_fp16.safetensors"),
+    #         params.get("te2", "hunyuan/clip_l.safetensors"),
+    #         params.get("save_path", "outputs"),
+    #         params.get("flow_shift", 11.0),
+    #         params.get("cfg_scale", 7.0),
+    #         params.get("output_type", "video"),
+    #         params.get("attn_mode", "sdpa"),
+    #         params.get("block_swap", "0"),
+    #         *[params.get(f"lora{i+1}", "") for i in range(4)],
+    #         *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
+    #     ] if params else [gr.update()]*26,
+    #     inputs=params_state,
+    #     outputs=[prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps, seed,
+    #              model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+    #              output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
+    # )
 
-    # Track selected index when gallery item is clicked
-    video_output.select(
-        fn=handle_gallery_select,
-        outputs=selected_index
-    )
+    # # Text to Video generation
+    # generate_btn.click(
+    #     fn=process_batch,
+    #     inputs=[
+    #         prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
+    #         seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+    #         output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+    #         lora_folder, *lora_weights, *lora_multipliers, gr.Textbox(visible=False), gr.Number(visible=False), use_fp8
+    #     ],
+    #     outputs=[video_output, batch_progress, progress_text],
+    #     queue=True
+    # ).then(
+    #     fn=lambda batch_size: 0 if batch_size == 1 else None,
+    #     inputs=[batch_size],
+    #     outputs=selected_index
+    # )
+
+    # # Update gallery selection handling
+    # def handle_gallery_select(evt: gr.SelectData) -> int:
+    #     return evt.index
+    #
+    # # Track selected index when gallery item is clicked
+    # video_output.select(
+    #     fn=handle_gallery_select,
+    #     outputs=selected_index
+    # )
 
     # Track selected index when Video2Video gallery item is clicked
     def handle_v2v_gallery_select(evt: gr.SelectData) -> int:
@@ -12039,30 +12044,30 @@ with gr.Blocks(
             lora4_multiplier,
             ""  # Add empty string for negative_prompt
         )
-    
-    send_t2v_to_v2v_btn.click(
-        fn=handle_send_button,
-        inputs=[
-            video_output, prompt, selected_index,
-            t2v_width, t2v_height, batch_size, video_length,
-            fps, infer_steps, seed, flow_shift, cfg_scale
-        ] + lora_weights + lora_multipliers,  # Remove the string here
-        outputs=[
-            v2v_input, 
-            v2v_prompt,
-            v2v_width,
-            v2v_height,
-            v2v_batch_size,
-            v2v_video_length,
-            v2v_fps,
-            v2v_infer_steps,
-            v2v_seed,
-            v2v_flow_shift,
-            v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
-    ).then(
-        fn=change_to_tab_two, inputs=None, outputs=[tabs]
-    )
+
+    # send_t2v_to_v2v_btn.click(
+    #     fn=handle_send_button,
+    #     inputs=[
+    #         video_output, prompt, selected_index,
+    #         t2v_width, t2v_height, batch_size, video_length,
+    #         fps, infer_steps, seed, flow_shift, cfg_scale
+    #     ] + lora_weights + lora_multipliers,
+    #     outputs=[
+    #         v2v_input,
+    #         v2v_prompt,
+    #         v2v_width,
+    #         v2v_height,
+    #         v2v_batch_size,
+    #         v2v_video_length,
+    #         v2v_fps,
+    #         v2v_infer_steps,
+    #         v2v_seed,
+    #         v2v_flow_shift,
+    #         v2v_cfg_scale
+    #     ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
+    # ).then(
+    #     fn=change_to_tab_two, inputs=None, outputs=[tabs]
+    # )
 
     def handle_send_to_v2v(metadata: dict, video_path: str) -> Tuple[str, dict, str]:
         """Handle both parameters and video transfer"""
@@ -12174,15 +12179,15 @@ with gr.Blocks(
         inputs=[v2v_batch_size],
         outputs=v2v_selected_index
     )
-    refresh_outputs = [model]  # Add model dropdown to outputs
-    for i in range(4):
-        refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
-    
-    refresh_btn.click(
-        fn=update_dit_and_lora_dropdowns,
-        inputs=[dit_folder, lora_folder, model] + lora_weights + lora_multipliers,
-        outputs=refresh_outputs
-    )
+    # refresh_outputs = [model]  # Add model dropdown to outputs
+    # for i in range(4):
+    #     refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
+    #
+    # refresh_btn.click(
+    #     fn=update_dit_and_lora_dropdowns,
+    #     inputs=[dit_folder, lora_folder, model] + lora_weights + lora_multipliers,
+    #     outputs=refresh_outputs
+    # )
     # Image2Video refresh
     i2v_refresh_outputs = [i2v_model]  # Add model dropdown to outputs
     for i in range(4):
