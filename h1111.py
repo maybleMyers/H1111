@@ -5246,6 +5246,210 @@ def wanx_batch_handler(
                 preview_steps=preview_steps
             )
 
+def longcat_generate_video(
+    prompt: str,
+    negative_prompt: str,
+    video_width: int,
+    video_height: int,
+    video_length: int,
+    target_fps: int,
+    infer_steps: int,
+    guidance_scale: float,
+    seed: int,
+    task: str,
+    ckpt_dir: str,
+    save_path: str,
+    blocks_to_swap: int,
+    mode: str,
+    input_video: Optional[str],
+    num_cond_frames: int,
+    output_type: str,
+    attn_mode: str,
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate video using longcat_generate_video.py subprocess"""
+    global stop_event
+
+    if stop_event.is_set():
+        yield [], "Generation stopped.", ""
+        return
+
+    # Create output directory
+    os.makedirs(save_path, exist_ok=True)
+
+    # Set seed
+    if seed == -1:
+        seed = random.randint(0, 2**32 - 1)
+
+    # Build command
+    cmd = [
+        sys.executable,
+        "longcat_generate_video.py",
+        "--task", task,
+        "--ckpt_dir", ckpt_dir,
+        "--prompt", prompt,
+        "--video_size", str(video_height), str(video_width),
+        "--video_length", str(video_length),
+        "--infer_steps", str(infer_steps),
+        "--guidance_scale", str(guidance_scale),
+        "--seed", str(seed),
+        "--save_path", save_path,
+        "--blocks_to_swap", str(blocks_to_swap),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--mode", mode,
+    ]
+
+    if negative_prompt:
+        cmd.extend(["--negative_prompt", negative_prompt])
+
+    if mode == "continuation" and input_video:
+        cmd.extend([
+            "--input_video", input_video,
+            "--num_cond_frames", str(num_cond_frames),
+            "--target_fps", str(target_fps)
+        ])
+
+    # Set up environment
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print(f"Running LongCat command: {' '.join(cmd)}")
+
+    # Start subprocess
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    # Parse output
+    output_video_path = None
+    for line in iter(process.stdout.readline, ''):
+        if stop_event.is_set():
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            yield [], "Generation stopped by user.", ""
+            return
+
+        line = line.strip()
+        if not line:
+            continue
+
+        print(f"LONGCAT: {line}")
+
+        # Look for output video path
+        if "saved" in line.lower() and ".mp4" in line:
+            # Try to extract the video path
+            match = re.search(r'([^\s]+\.mp4)', line)
+            if match:
+                output_video_path = match.group(1)
+
+        # Yield progress updates
+        progress_text = line
+        yield [], f"Generating... (Seed: {seed})", progress_text
+
+    # Wait for process to complete
+    return_code = process.wait()
+
+    if return_code != 0:
+        yield [], f"Error: Process exited with code {return_code}", "Generation failed"
+        return
+
+    # Find output video
+    if not output_video_path or not os.path.exists(output_video_path):
+        # Try to find the most recent video in save_path
+        video_files = sorted(
+            glob.glob(os.path.join(save_path, "*.mp4")),
+            key=os.path.getmtime,
+            reverse=True
+        )
+        if video_files:
+            output_video_path = video_files[0]
+
+    if output_video_path and os.path.exists(output_video_path):
+        yield [(output_video_path, f"Seed: {seed}")], f"Completed (seed: {seed})", ""
+    else:
+        yield [], "Error: Output video not found", "Generation may have failed"
+
+
+def longcat_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    video_width: int,
+    video_height: int,
+    video_length: int,
+    target_fps: int,
+    infer_steps: int,
+    guidance_scale: float,
+    seed: int,
+    batch_count: int,
+    task: str,
+    ckpt_dir: str,
+    save_path: str,
+    blocks_to_swap: int,
+    mode: str,
+    input_video: Optional[str],
+    num_cond_frames: int,
+    output_type: str,
+    attn_mode: str,
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Handle batch generation for LongCat"""
+    global stop_event
+    stop_event.clear()
+
+    all_videos = []
+
+    # Validate inputs for continuation mode
+    if mode == "continuation":
+        if not input_video or not os.path.exists(input_video):
+            yield [], "Error: Input video required for continuation mode", ""
+            return
+
+    for i in range(int(batch_count)):
+        if stop_event.is_set():
+            yield all_videos, "Batch stopped by user.", ""
+            return
+
+        # Calculate seed for this batch item
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing {i+1}/{batch_count} (Seed: {current_seed})"
+        yield all_videos, status_text, "Starting..."
+
+        # Generate single video
+        for videos, status, progress in longcat_generate_video(
+            prompt, negative_prompt, video_width, video_height,
+            video_length, target_fps, infer_steps, guidance_scale,
+            current_seed, task, ckpt_dir, save_path, blocks_to_swap,
+            mode, input_video, num_cond_frames, output_type, attn_mode
+        ):
+            if videos:
+                # Add new video to collection
+                if videos[0] not in all_videos:
+                    all_videos.extend(videos)
+            yield all_videos, f"Item {i+1}/{batch_count}: {status}", progress
+
+        # Brief pause between batch items
+        time.sleep(0.2)
+
+    yield all_videos, "Batch complete.", ""
+
+
 def process_single_video(
     prompt: str,
     width: int,
@@ -7327,92 +7531,78 @@ with gr.Blocks(
                 infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")
 
         # Text to Video Tab
-        with gr.Tab(id=1, label="Hunyuan-t2v"):
+        # LongCat Video Generation Tab
+        with gr.Tab(id=1, label="LongCat"):
             with gr.Row():
                 with gr.Column(scale=4):
-                    prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+                    longcat_prompt = gr.Textbox(scale=3, label="Enter your prompt",
+                                               value="an insanely long cat walking through a vibrant, futuristic cyberpunk city at night, neon lights reflecting on its fur",
+                                               lines=5)
 
                 with gr.Column(scale=1):
-                    token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    longcat_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
 
                 with gr.Column(scale=2):
-                    batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    longcat_batch_progress = gr.Textbox(label="", visible=True, elem_id="longcat_batch_progress")
+                    longcat_progress_text = gr.Textbox(label="", visible=True, elem_id="longcat_progress_text")
 
             with gr.Row():
-                generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                stop_btn = gr.Button("Stop Generation", variant="stop")
+                longcat_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                longcat_stop_btn = gr.Button("Stop Generation", variant="stop")
 
             with gr.Row():
                 with gr.Column():
-                    
-                    t2v_width = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Width")
-                    t2v_height = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Height")
-                    video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25, elem_id="my_special_slider")
-                    fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24, elem_id="my_special_slider")
-                    infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30, elem_id="my_special_slider")
-                    flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0, elem_id="my_special_slider")
-                    cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0, elem_id="my_special_slider")
-            
-                with gr.Column():
+                    longcat_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=3
+                    )
 
+                    longcat_width = gr.Slider(minimum=64, maximum=1536, step=16, value=832, label="Video Width")
+                    longcat_height = gr.Slider(minimum=64, maximum=1536, step=16, value=480, label="Video Height")
+                    longcat_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=93, elem_id="longcat_video_length")
+                    longcat_target_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Target FPS", value=15, elem_id="longcat_target_fps")
+                    longcat_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=50, elem_id="longcat_infer_steps")
+                    longcat_guidance_scale = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0, elem_id="longcat_guidance_scale")
+
+                with gr.Column():
                     with gr.Row():
-                        video_output = gr.Gallery(
+                        longcat_video_output = gr.Gallery(
                             label="Generated Videos (Click to select)",
                             columns=[2],
                             rows=[2],
                             object_fit="contain",
                             height="auto",
                             show_label=True,
-                            elem_id="gallery",
+                            elem_id="longcat_gallery",
                             allow_preview=True,
                             preview=True
                         )
-                    with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
-            
+
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    lora_weights = []
-                    lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
-                            ))
-                            lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))            
+                longcat_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                longcat_blocks_to_swap = gr.Slider(minimum=0, maximum=50, step=1, label="Blocks to Swap (VRAM Optimization)", value=26)
+                longcat_save_path = gr.Textbox(label="Save Path", value="outputs")
+
             with gr.Row():
-                exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
-                model = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("hunyuan"),
-                    value="mp_rank_00_model_states.pt",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
-                te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
-                te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
-                save_path = gr.Textbox(label="Save Path", value="outputs")
-            with gr.Row():
-                lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
-                use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
-                attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+                longcat_task = gr.Textbox(label="Task/Model", value="longcat-t2v-13.6B")
+                longcat_ckpt_dir = gr.Textbox(label="Checkpoint Directory", value="/home/mayble/diffusion/LongCat-Video")
+                longcat_output_type = gr.Radio(choices=["video", "images", "both"], label="Output Type", value="video")
+                longcat_attn_mode = gr.Radio(choices=["sdpa", "flash", "flash2", "flash3", "sageattn", "xformers", "torch"],
+                                            label="Attention Mode", value="sdpa")
+
+            # Continuation mode section
+            with gr.Accordion("Video Continuation Mode", open=False):
+                with gr.Row():
+                    longcat_mode = gr.Radio(
+                        choices=["generation", "continuation"],
+                        label="Mode",
+                        value="generation"
+                    )
+                with gr.Row():
+                    longcat_input_video = gr.Video(label="Input Video (for continuation)", value=None)
+                    longcat_num_cond_frames = gr.Slider(minimum=1, maximum=50, step=1,
+                                                       label="Number of Conditioning Frames", value=13)
 
         #Image to Video Tab
         with gr.Tab(label="Hunyuan-i2v", visible=False) as i2v_tab:
@@ -9191,7 +9381,35 @@ with gr.Blocks(
         outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_conditioning_strength]
     )
 
-#multitalk event handlers
+    # LongCat event handlers
+    longcat_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    longcat_generate_btn.click(
+        fn=longcat_batch_handler,
+        inputs=[
+            longcat_prompt,
+            longcat_negative_prompt,
+            longcat_width,
+            longcat_height,
+            longcat_video_length,
+            longcat_target_fps,
+            longcat_infer_steps,
+            longcat_guidance_scale,
+            longcat_seed,
+            longcat_batch_size,
+            longcat_task,
+            longcat_ckpt_dir,
+            longcat_save_path,
+            longcat_blocks_to_swap,
+            longcat_mode,
+            longcat_input_video,
+            longcat_num_cond_frames,
+            longcat_output_type,
+            longcat_attn_mode
+        ],
+        outputs=[longcat_video_output, longcat_batch_progress, longcat_progress_text]
+    )
+
+    #multitalk event handlers
     multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
     multitalk_cond_image.change(
