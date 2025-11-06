@@ -4616,6 +4616,11 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     conditioning_frames = video_frames[-args.num_cond_frames:]
     logger.info(f"Using last {args.num_cond_frames} frames for conditioning")
 
+    # Store original input video frames for later concatenation (matching official implementation)
+    # This ensures the output video uses original high-quality frames, not re-encoded ones
+    args._longcat_input_video_frames = video_frames
+    logger.info(f"Stored {len(video_frames)} original input video frames for output concatenation")
+
     # Convert PIL images to tensor [B, C, F, H, W]
     from torchvision import transforms
     to_tensor = transforms.ToTensor()
@@ -4943,15 +4948,11 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
 
     logger.info("Denoising complete!")
 
-    # --- Reconstruct full latents ---
-    logger.info("Reconstructing full latent sequence...")
-    full_latents = torch.cat([cond_latents_for_cache, latents], dim=2)
-    logger.info(f"Full latents shape: {full_latents.shape}")
-
     # Store VAE for later decoding
     args._longcat_vae = vae
     args._longcat_cfg = cfg
     args._longcat_num_cond_frames = args.num_cond_frames  # Store for output processing
+    args._longcat_continuation_mode = True  # Flag to indicate special handling needed
 
     # Cleanup
     del model
@@ -4959,9 +4960,12 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
 
-    logger.info(f"LongCat video continuation complete! Full latent shape: {full_latents.shape}")
+    # Return ONLY the newly generated latents (not conditioning latents)
+    # The conditioning frames will be added from the original input video during output processing
+    # This matches the official implementation: output = video[::stride] + output[num_cond_frames:]
+    logger.info(f"LongCat video continuation complete! Generated {latents.shape[2]} new latent frames (excluding {args.num_cond_frames} conditioning frames)")
 
-    return full_latents
+    return latents
 
 
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
@@ -6297,6 +6301,35 @@ def main():
             decoded_video = generated_latent  # Already decoded pixels
         else:
             decoded_video = decode_latent(generated_latent, args, cfg)
+
+        # --- Video Continuation Mode: Concatenate original input frames with generated frames ---
+        # This matches the official LongCat implementation:
+        # output = video[::stride] + output[num_cond_frames:]
+        if hasattr(args, '_longcat_continuation_mode') and args._longcat_continuation_mode:
+            if hasattr(args, '_longcat_input_video_frames') and args._longcat_input_video_frames is not None:
+                logger.info("Concatenating original input video with generated frames (continuation mode)")
+
+                # Convert original PIL frames to tensor [B, C, F, H, W]
+                from torchvision import transforms
+                to_tensor = transforms.ToTensor()
+                original_frames = [to_tensor(frame) for frame in args._longcat_input_video_frames]
+                original_video_tensor = torch.stack(original_frames, dim=0)  # [F, C, H, W]
+                original_video_tensor = original_video_tensor.unsqueeze(0)  # [1, F, C, H, W]
+                original_video_tensor = original_video_tensor.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
+
+                # Concatenate: original_video + generated_video
+                # decoded_video already excludes conditioning frames (we only decoded new latents)
+                decoded_video = torch.cat([original_video_tensor, decoded_video], dim=2)
+
+                logger.info(f"Concatenated video: {len(args._longcat_input_video_frames)} input frames + {generated_latent.shape[2]} generated frames = {decoded_video.shape[2]} total frames")
+
+                # Clean up stored frames
+                del args._longcat_input_video_frames
+            else:
+                logger.warning("Continuation mode active but original input frames not found - using decoded conditioning frames")
+
+            # Clean up continuation mode flag
+            del args._longcat_continuation_mode
 
         # Save the output (latent and/or video/images)
         # Don't save "latents" for extension mode since generated_latent contains pixels
