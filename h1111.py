@@ -9568,8 +9568,14 @@ with gr.Blocks(
             longcat_output_type,
             longcat_attn_mode,
             longcat_lora_folder,
-            *longcat_lora_weights,
-            *longcat_lora_multipliers
+            longcat_lora_weights[0], longcat_lora_multipliers[0],
+            longcat_lora_weights[1], longcat_lora_multipliers[1],
+            longcat_lora_weights[2], longcat_lora_multipliers[2],
+            longcat_lora_weights[3], longcat_lora_multipliers[3],
+            longcat_lora_weights[4], longcat_lora_multipliers[4],
+            longcat_lora_weights[5], longcat_lora_multipliers[5],
+            longcat_lora_weights[6], longcat_lora_multipliers[6],
+            longcat_lora_weights[7], longcat_lora_multipliers[7]
         ],
         outputs=[longcat_video_output, longcat_batch_progress, longcat_progress_text],
         queue=True
