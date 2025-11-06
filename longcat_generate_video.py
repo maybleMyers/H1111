@@ -4780,17 +4780,25 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     del cond_latents_cpu  # Clean up CPU version
     logger.info(f"Conditioning latents for cache: {cond_latents_for_cache.shape}, ~{cond_latents_for_cache.numel() * 4 / 1024 / 1024:.1f} MB")
 
-    # Pre-compute KV cache with CPU offloading to save GPU memory
-    # At this point, we only have ~16MB for 4 conditioning latent frames in GPU memory
-    # instead of having the full 24-frame tensor (~96MB) PLUS the 4-frame slice in GPU
+    # Pre-compute KV cache
+    # Use maximum block swapping and CPU offloading to minimize GPU memory during cache computation
+    logger.info("Computing KV cache with maximum memory optimization...")
+
+    # Log GPU memory before KV cache computation
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        logger.info(f"GPU memory BEFORE KV cache: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
     _cache_clean_latents(
         cond_latents_for_cache,
         model,
         max_length,
         device,
         dit_dtype if dit_dtype else torch.float32,
-        offload_kv_cache=True,  # Offload to CPU to reduce peak GPU memory usage
-        blocks_to_swap=args.blocks_to_swap  # Pass block swap info for proper preparation
+        offload_kv_cache=True,  # Offload KV cache to CPU
+        blocks_to_swap=args.blocks_to_swap
     )
 
     kv_cache_dict = _get_kv_cache_dict()
