@@ -5325,7 +5325,7 @@ def longcat_generate_video(
             if not os.path.isabs(lora_path):
                 lora_path = os.path.join(lora_folder, lora_path)
             if os.path.exists(lora_path):
-                cmd.extend(["--lora_path", lora_path, "--lora_multiplier", str(multiplier)])
+                cmd.extend(["--lora_weight", lora_path, "--lora_multiplier", str(multiplier)])
 
     # Set up environment
     env = os.environ.copy()

@@ -637,14 +637,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_segments", type=int, default=1,
                        help="Number of segments for long video generation (1 segment ≈ 5.3s @ 15fps, 11 segments ≈ 1 minute)")
 
-    # LoRA Arguments
-    parser.add_argument("--lora_path", type=str, action="append", default=[],
-                       help="Path to LoRA model file (can specify multiple)")
-    parser.add_argument("--lora_multiplier", type=float, action="append", default=[],
-                       help="LoRA multiplier/strength (must match number of --lora_path)")
-    parser.add_argument("--lora_key", type=str, action="append", default=[],
-                       help="LoRA key/name for identification (optional, auto-generated if not provided)")
-
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
@@ -4333,13 +4325,12 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     logger.info("LongCat DiT loaded and ready")
 
     # --- Load LoRAs if specified ---
-    if args.lora_path:
-        logger.info(f"Loading {len(args.lora_path)} LoRAs onto DiT model...")
+    if args.lora_weight:
+        logger.info(f"Loading {len(args.lora_weight)} LoRAs onto DiT model...")
         load_loras_on_model(
             model=model,
-            lora_paths=args.lora_path,
+            lora_paths=args.lora_weight,
             lora_multipliers=args.lora_multiplier,
-            lora_keys=args.lora_key,
             device=device
         )
 
@@ -4714,13 +4705,12 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("LongCat DiT loaded and ready")
 
     # --- Load LoRAs if specified ---
-    if args.lora_path:
-        logger.info(f"Loading {len(args.lora_path)} LoRAs onto DiT model...")
+    if args.lora_weight:
+        logger.info(f"Loading {len(args.lora_weight)} LoRAs onto DiT model...")
         load_loras_on_model(
             model=model,
-            lora_paths=args.lora_path,
+            lora_paths=args.lora_weight,
             lora_multipliers=args.lora_multiplier,
-            lora_keys=args.lora_key,
             device=device
         )
 
@@ -5012,9 +5002,9 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
 def load_loras_on_model(
     model,  # LongCatVideoTransformer3DModel
     lora_paths: List[str],
-    lora_multipliers: List[float],
-    lora_keys: List[str],
-    device: torch.device
+    lora_multipliers: Union[List[float], float],
+    lora_keys: Optional[List[str]] = None,
+    device: torch.device = None
 ) -> None:
     """
     Load and enable multiple LoRAs on the DiT model.
@@ -5022,12 +5012,16 @@ def load_loras_on_model(
     Args:
         model: LongCat DiT model with LoRA support
         lora_paths: List of paths to LoRA files
-        lora_multipliers: List of LoRA multipliers/strengths
-        lora_keys: List of LoRA keys for identification
-        device: Device to load LoRAs on
+        lora_multipliers: List of LoRA multipliers/strengths (or single float for all)
+        lora_keys: List of LoRA keys for identification (optional)
+        device: Device to load LoRAs on (optional)
     """
     if not lora_paths:
         return
+
+    # Convert single multiplier to list
+    if isinstance(lora_multipliers, (int, float)):
+        lora_multipliers = [lora_multipliers] * len(lora_paths)
 
     enabled_keys = []
 
@@ -5041,7 +5035,7 @@ def load_loras_on_model(
             logger.info(f"Skipping LoRA {i+1} (multiplier is 0)")
             continue
 
-        key = lora_keys[i] if i < len(lora_keys) else f"lora_{i+1}"
+        key = (lora_keys[i] if lora_keys and i < len(lora_keys) else f"lora_{i+1}")
 
         try:
             logger.info(f"Loading LoRA {i+1}: {key} from {lora_path} (multiplier: {multiplier})")
@@ -6406,10 +6400,10 @@ def main():
         if mode_str == "Video Continuation": logger.info(f"Input Video: {args.input_video}, Conditioning Frames: {args.num_cond_frames}, Target FPS: {args.target_fps}")
 
         # Log LoRA info if specified
-        if args.lora_path:
-            logger.info(f"LoRAs specified: {len(args.lora_path)} models")
-            for i, lora_path in enumerate(args.lora_path):
-                multiplier = args.lora_multiplier[i] if i < len(args.lora_multiplier) else 1.0
+        if args.lora_weight:
+            logger.info(f"LoRAs specified: {len(args.lora_weight)} models")
+            for i, lora_path in enumerate(args.lora_weight):
+                multiplier = args.lora_multiplier[i] if isinstance(args.lora_multiplier, list) and i < len(args.lora_multiplier) else args.lora_multiplier
                 logger.info(f"  LoRA {i+1}: {lora_path} (multiplier: {multiplier})")
 
         # Core generation pipeline - route to appropriate function
