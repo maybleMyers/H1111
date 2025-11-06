@@ -4236,11 +4236,13 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     if args.ckpt_dir is None:
         raise ValueError("--ckpt_dir is required for LongCat models")
 
-    # Setup data types
+    # Setup data types - DEFAULT TO BFLOAT16 to match official scripts
+    # Official LongCat scripts use bfloat16 for all components (text_encoder, dit, vae, scheduler)
+    # This reduces memory usage by ~50% compared to float32
     if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
         dit_dtype = torch.bfloat16 if args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
     else:
-        dit_dtype = None  # No conversion - keep original Float32 dtype
+        dit_dtype = torch.bfloat16  # Default to bfloat16 like official scripts (was None/fp32)
     dit_weight_dtype = dit_dtype
     vae_dtype = dit_dtype
 
@@ -4554,11 +4556,13 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     if args.ckpt_dir is None:
         raise ValueError("--ckpt_dir is required for LongCat models")
 
-    # Setup data types
+    # Setup data types - DEFAULT TO BFLOAT16 to match official scripts
+    # Official LongCat scripts use bfloat16 for all components (text_encoder, dit, vae, scheduler)
+    # This reduces memory usage by ~50% compared to float32
     if hasattr(args, 'vae_dtype') and args.vae_dtype is not None:
         dit_dtype = torch.bfloat16 if args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
     else:
-        dit_dtype = None  # No conversion - keep original Float32 dtype
+        dit_dtype = torch.bfloat16  # Default to bfloat16 like official scripts (was None/fp32)
     dit_weight_dtype = dit_dtype
     vae_dtype = dit_dtype
 
