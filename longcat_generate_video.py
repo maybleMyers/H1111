@@ -4948,6 +4948,14 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
 
     logger.info("Denoising complete!")
 
+    # --- Reconstruct full latent sequence (matching official pipeline) ---
+    # The official pipeline concatenates conditioning latents with denoised latents
+    # before decoding. This ensures the decoded video has the correct number of frames.
+    # Then the demo script extracts: video[::stride] + decoded_output[num_cond_frames:]
+    logger.info("Reconstructing full latent sequence...")
+    full_latents = torch.cat([cond_latents_for_cache, latents], dim=2)
+    logger.info(f"Full latents shape: {full_latents.shape} (will decode to {video_length} frames)")
+
     # Store VAE for later decoding
     args._longcat_vae = vae
     args._longcat_cfg = cfg
@@ -4960,12 +4968,11 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
 
-    # Return ONLY the newly generated latents (not conditioning latents)
-    # The conditioning frames will be added from the original input video during output processing
-    # This matches the official implementation: output = video[::stride] + output[num_cond_frames:]
-    logger.info(f"LongCat video continuation complete! Generated {latents.shape[2]} new latent frames (excluding {args.num_cond_frames} conditioning frames)")
+    # Return full latent sequence (conditioning + generated)
+    # The output processing will extract: original_video + decoded_latents[num_cond_frames:]
+    logger.info(f"LongCat video continuation complete! Returning full latent sequence: {full_latents.shape}")
 
-    return latents
+    return full_latents
 
 
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
@@ -6317,11 +6324,20 @@ def main():
                 original_video_tensor = original_video_tensor.unsqueeze(0)  # [1, F, C, H, W]
                 original_video_tensor = original_video_tensor.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
 
-                # Concatenate: original_video + generated_video
-                # decoded_video already excludes conditioning frames (we only decoded new latents)
-                decoded_video = torch.cat([original_video_tensor, decoded_video], dim=2)
+                # Extract only the newly generated frames from decoded_video
+                # decoded_video contains full video (conditioning + generated frames)
+                # We need: output[num_cond_frames:] to get only new frames
+                num_cond_frames = args._longcat_num_cond_frames
+                num_decoded_frames = decoded_video.shape[2]
+                new_frames = decoded_video[:, :, num_cond_frames:]
+                num_new_frames = new_frames.shape[2]
 
-                logger.info(f"Concatenated video: {len(args._longcat_input_video_frames)} input frames + {generated_latent.shape[2]} generated frames = {decoded_video.shape[2]} total frames")
+                logger.info(f"Decoded full video: {num_decoded_frames} frames, extracting {num_new_frames} new frames (skipping {num_cond_frames} conditioning frames)")
+
+                # Concatenate: original_video + new_frames (matching official implementation)
+                decoded_video = torch.cat([original_video_tensor, new_frames], dim=2)
+
+                logger.info(f"Concatenated video: {len(args._longcat_input_video_frames)} input frames + {num_new_frames} new frames = {decoded_video.shape[2]} total frames")
 
                 # Clean up stored frames
                 del args._longcat_input_video_frames
