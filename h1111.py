@@ -7664,7 +7664,7 @@ with gr.Blocks(
                 with gr.Row():
                     longcat_num_segments = gr.Slider(
                         minimum=1, maximum=50, step=1,
-                        label="Number of Segments (1 segment ≈ 5.3s @ 15fps, 11 segments ≈ 1 minute)",
+                        label="Continuation Segments (1 T2V + N continuations, 11 cont. ≈ 1 minute @ 15fps)",
                         value=11, visible=False
                     )
                     longcat_num_cond_frames = gr.Slider(

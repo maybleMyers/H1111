@@ -4999,6 +4999,343 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     return full_latents
 
 
+def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
+    """LongCat Image-to-Video generation (wrapper around generate_longcat).
+
+    This is essentially the same as T2V but allows specifying an image for consistency.
+    The LongCat model uses text prompts for I2V, not image conditioning like Wan I2V models.
+
+    Args:
+        args: command line arguments
+        device: torch device
+        cfg: model configuration
+
+    Returns:
+        Generated latent tensor [B, C, F, H, W]
+    """
+    logger.info("LongCat I2V: Using T2V generation (LongCat uses text-based I2V)")
+
+    # For LongCat, I2V is text-based, so route to T2V generation
+    # The image_path can be used for reference but doesn't affect generation
+    if args.image_path:
+        logger.info(f"Reference image: {args.image_path} (not used for generation)")
+
+    return generate_longcat(args, device, cfg)
+
+
+def generate_longcat_long_video(
+    args: argparse.Namespace,
+    device: torch.device,
+    cfg
+) -> Optional[torch.Tensor]:
+    """Generate long video with multiple segments using iterative continuation.
+
+    Implements the official LongCat long video algorithm from run_demo_long_video.py:
+
+    Phase 1: Multi-segment generation (480p @ 15fps)
+    ────────────────────────────────────────────────
+    1. Generate first segment with T2V (93 frames)
+    2. For each continuation segment (N iterations):
+       - Use last segment as conditioning video
+       - Generate 93 frames with 13 conditioning frames using KV cache
+       - Append only NEW frames (93-13=80 frames) to output
+       - Update current_video for next iteration
+       - Save checkpoint after each segment
+
+    Result: 93 + 80*N total frames (N+1 total segments)
+    Example: num_segments=11 → 1 T2V + 11 continuations = 93 + 880 = 973 frames ≈ 64.9s @ 15fps
+
+    Phase 2: Refinement (optional, 720p @ 30fps)
+    ──────────────────────────────────────────────
+    1. Load refinement LoRA and enable BSA
+    2. For each segment (N+1 iterations):
+       - Extract 93 frames from stage1 output
+       - Use previous refined segment as conditioning (26 frames)
+       - Generate refined 720p frames
+       - Append new frames
+       - Save checkpoint
+
+    Args:
+        args: command line arguments with:
+            - num_segments: number of segments to generate (default: 1)
+            - enable_refinement: whether to run refinement phase
+            - refinement_lora: path to refinement LoRA (optional)
+        device: torch device
+        cfg: model configuration
+
+    Returns:
+        Final latent tensor [B, C, F, H, W] (from refinement if enabled, else generation)
+    """
+    logger.info("=" * 80)
+    logger.info("LongCat Long Video Generation")
+    logger.info("=" * 80)
+
+    num_segments = args.num_segments if args.num_segments > 0 else 1
+    num_frames = args.video_length if args.video_length else 93
+    num_cond_frames = args.num_cond_frames if args.num_cond_frames else 13
+    target_fps = args.target_fps if args.target_fps else 15.0
+
+    # Validate
+    if num_cond_frames >= num_frames:
+        raise ValueError(f"num_cond_frames ({num_cond_frames}) must be less than num_frames ({num_frames})")
+
+    new_frames_per_segment = num_frames - num_cond_frames
+    # NOTE: Reference implementation generates 1 T2V + N continuations = N+1 total segments
+    # So total frames = initial_frames + (new_frames * num_continuation_segments)
+    total_frames = num_frames + new_frames_per_segment * num_segments
+    duration_seconds = total_frames / target_fps
+
+    logger.info(f"Configuration:")
+    logger.info(f"  Segments: {num_segments + 1} (1 T2V + {num_segments} continuations)")
+    logger.info(f"  Frames per segment: {num_frames} (cond: {num_cond_frames}, new: {new_frames_per_segment})")
+    logger.info(f"  Total frames: {total_frames} ≈ {duration_seconds:.1f}s @ {target_fps}fps")
+    logger.info("")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 1: Multi-Segment Generation (480p @ 15fps)
+    # ═══════════════════════════════════════════════════════════
+
+    logger.info("Phase 1: Multi-Segment Generation")
+    logger.info("-" * 80)
+
+    # Step 1: Generate first segment with T2V
+    logger.info(f"Segment 1/{num_segments}: Generating initial segment with T2V...")
+    first_segment_latents = generate_longcat(args, device, cfg)
+
+    # Decode first segment to video frames
+    logger.info("Decoding first segment latents to video frames...")
+    first_segment_video = decode_latent(first_segment_latents, args, cfg)  # [1, C, F, H, W], range [0,1]
+
+    # Convert to PIL Images for consistency with reference implementation
+    # Shape: [1, C, F, H, W] -> [F, H, W, C]
+    first_segment_video_np = first_segment_video[0].permute(1, 2, 3, 0).cpu().numpy()  # [F, H, W, C]
+    first_segment_video_np = (first_segment_video_np * 255).clip(0, 255).astype(np.uint8)
+
+    all_generated_frames = [Image.fromarray(frame) for frame in first_segment_video_np]
+    current_video = all_generated_frames.copy()
+
+    target_size = all_generated_frames[0].size  # (W, H)
+
+    logger.info(f"  Generated {len(all_generated_frames)} frames")
+    logger.info(f"  Target size: {target_size[0]}x{target_size[1]} (WxH)")
+
+    # Save checkpoint for first segment
+    checkpoint_path = os.path.join(args.save_path, f"longcat_long_video_segment_1.mp4")
+    os.makedirs(args.save_path, exist_ok=True)
+
+    # Convert PIL images to tensor and save
+    checkpoint_frames = torch.from_numpy(np.array([np.array(frame) for frame in all_generated_frames]))  # [F, H, W, C]
+    from torchvision.io import write_video
+    write_video(checkpoint_path, checkpoint_frames, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+    logger.info(f"  Saved checkpoint: {checkpoint_path}")
+    logger.info("")
+
+    # Step 2: Generate additional segments with continuation
+    # NOTE: Reference implementation does range(num_segments) AFTER initial T2V
+    # So for num_segments=11, it generates 1 T2V + 11 continuations = 12 total segments
+    # We match this by doing range(num_segments) which gives us num_segments continuation iterations
+    if num_segments > 0:
+        for segment_idx in range(num_segments):
+            logger.info(f"Segment {segment_idx + 2}/{num_segments + 1}: Generating continuation...")
+
+            # Save current video as temporary file for continuation
+            import tempfile
+            temp_video_fd, temp_video_path = tempfile.mkstemp(suffix=".mp4", dir=args.save_path)
+            os.close(temp_video_fd)
+
+            # Save current_video (last segment) as mp4
+            current_frames_tensor = torch.from_numpy(np.array([np.array(frame) for frame in current_video]))
+            write_video(temp_video_path, current_frames_tensor, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+            logger.info(f"  Saved conditioning video: {temp_video_path}")
+
+            # Setup args for continuation
+            continuation_args = argparse.Namespace(**vars(args))
+            continuation_args.mode = "continuation"
+            continuation_args.input_video = temp_video_path
+            continuation_args.num_cond_frames = num_cond_frames
+            continuation_args.target_fps = target_fps
+            continuation_args.video_length = num_frames
+
+            # Generate next segment
+            try:
+                new_segment_latents = generate_longcat_vc(continuation_args, device, cfg)
+
+                # Decode new segment
+                logger.info("  Decoding new segment latents...")
+                new_segment_video = decode_latent(new_segment_latents, args, cfg)  # [1, C, F, H, W]
+
+                # Convert to PIL Images
+                new_segment_video_np = new_segment_video[0].permute(1, 2, 3, 0).cpu().numpy()
+                new_segment_video_np = (new_segment_video_np * 255).clip(0, 255).astype(np.uint8)
+                new_video = [Image.fromarray(frame) for frame in new_segment_video_np]
+
+                # Resize to match target size (in case of resolution drift)
+                new_video = [frame.resize(target_size, Image.BICUBIC) for frame in new_video]
+
+                # Append only NEW frames (skip conditioning frames that overlap)
+                # Reference implementation: all_generated_frames.extend(new_video[num_cond_frames:])
+                all_generated_frames.extend(new_video[num_cond_frames:])
+                logger.info(f"  Appended {len(new_video[num_cond_frames:])} new frames (total: {len(all_generated_frames)})")
+
+                # Update current_video for next iteration
+                current_video = new_video
+
+                # Save checkpoint
+                checkpoint_path = os.path.join(args.save_path, f"longcat_long_video_segment_{segment_idx + 2}.mp4")
+                checkpoint_frames = torch.from_numpy(np.array([np.array(frame) for frame in all_generated_frames]))
+                write_video(checkpoint_path, checkpoint_frames, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+                logger.info(f"  Saved checkpoint: {checkpoint_path}")
+                logger.info("")
+
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+
+                # Memory cleanup
+                clean_memory_on_device(device)
+                gc.collect()
+
+    logger.info("Phase 1 complete!")
+    logger.info(f"Generated {len(all_generated_frames)} total frames across {num_segments + 1} segments")
+    logger.info("")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 2: Refinement (Optional, 720p @ 30fps)
+    # ═══════════════════════════════════════════════════════════
+
+    enable_refinement = getattr(args, 'enable_refinement', False)
+
+    if enable_refinement:
+        logger.info("Phase 2: Long Video Refinement (720p @ 30fps)")
+        logger.info("-" * 80)
+        logger.info("⚠️  Refinement is currently NOT IMPLEMENTED")
+        logger.info("    The refinement phase requires:")
+        logger.info("    1. Refinement LoRA weights (refinement_lora.safetensors)")
+        logger.info("    2. Block Sparse Attention (BSA) support in LongCat DiT")
+        logger.info("    3. generate_refine() method in LongCat pipeline")
+        logger.info("")
+        logger.info("Skipping refinement phase. Returning generation phase output.")
+        logger.info("")
+
+        # TODO: Implement refinement when LoRA and BSA are available
+        # See reference implementation in run_demo_long_video.py lines 136-175
+
+    # ═══════════════════════════════════════════════════════════
+    # Convert final output back to latent tensor
+    # ═══════════════════════════════════════════════════════════
+
+    logger.info("Converting final video frames to latent tensor...")
+
+    # Convert PIL images to tensor [F, H, W, C]
+    final_frames_np = np.array([np.array(frame) for frame in all_generated_frames])
+    final_frames_tensor = torch.from_numpy(final_frames_np).float() / 255.0  # [F, H, W, C], range [0, 1]
+
+    # Rearrange to [1, C, F, H, W]
+    final_frames_tensor = final_frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+
+    # Encode to latents using VAE
+    logger.info(f"Encoding {final_frames_tensor.shape[2]} frames to latents...")
+
+    # Get VAE
+    vae = getattr(args, '_longcat_vae', None) or getattr(args, '_vae', None)
+    if vae is None:
+        logger.info("Loading VAE for final encoding...")
+        from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+        vae_device = "cpu" if args.vae_cache_cpu else device
+        vae = AutoencoderKLWan.from_pretrained(
+            args.ckpt_dir,
+            subfolder="vae",
+            torch_dtype=torch.bfloat16 if hasattr(args, 'vae_dtype') and args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
+        ).to(vae_device)
+        vae.eval()
+        args._longcat_vae = vae
+
+    # Encode frames in chunks to avoid OOM (process 32 frames at a time)
+    chunk_size = 32
+    latent_chunks = []
+
+    for i in range(0, final_frames_tensor.shape[2], chunk_size):
+        chunk_end = min(i + chunk_size, final_frames_tensor.shape[2])
+        chunk = final_frames_tensor[:, :, i:chunk_end, :, :]
+
+        chunk = chunk.to(device=vae.device if hasattr(vae, 'device') else device, dtype=vae.dtype)
+        chunk = chunk * 2.0 - 1.0  # [0,1] -> [-1,1]
+
+        with torch.no_grad():
+            latent_chunk = vae.encode(chunk).latent_dist.sample()
+
+        # Normalize
+        latent_chunk = normalize_latents(latent_chunk, vae.config)
+        latent_chunks.append(latent_chunk.cpu())
+
+        # Memory cleanup
+        del chunk, latent_chunk
+        clean_memory_on_device(device)
+
+    # Concatenate chunks
+    final_latents = torch.cat(latent_chunks, dim=2)  # [1, C, F_latent, H_latent, W_latent]
+
+    logger.info(f"Final latent shape: {final_latents.shape}")
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("LongCat Long Video Generation Complete!")
+    logger.info(f"Output: {len(all_generated_frames)} frames ≈ {len(all_generated_frames) / target_fps:.1f}s @ {target_fps}fps")
+    logger.info("=" * 80)
+
+    return final_latents
+
+
+def generate_longcat_refine(
+    args: argparse.Namespace,
+    device: torch.device,
+    cfg,
+    model: "LongCatVideoTransformer3DModel",
+    conditioning_video: Optional[List[Image.Image]],
+    stage1_video: List[Image.Image],
+    num_cond_frames: int
+) -> torch.Tensor:
+    """Generate refined video segment (720p upscaling with refinement LoRA).
+
+    This function implements the refinement pass from the LongCat long video demo.
+    It takes low-resolution video from the generation phase and upscales to 720p
+    using a refinement LoRA and Block Sparse Attention (BSA).
+
+    Algorithm from run_demo_long_video.py:
+    1. Use previous refined segment as conditioning (if not first iteration)
+    2. Take corresponding segment from stage1 (generation phase) output
+    3. Run refinement generation with LoRA + BSA enabled
+    4. Return refined frames
+
+    Args:
+        args: command line arguments
+        device: torch device
+        cfg: model configuration
+        model: LongCat DiT model with refinement LoRA loaded
+        conditioning_video: previous refined segment (None for first iteration)
+        stage1_video: corresponding segment from generation phase (93 frames)
+        num_cond_frames: number of conditioning frames (0 first iteration, 26 after)
+
+    Returns:
+        Refined latent tensor [B, C, F, H, W]
+
+    Note:
+        This function is NOT YET IMPLEMENTED. It requires:
+        1. Refinement LoRA weights
+        2. BSA (Block Sparse Attention) support
+        3. pipe.generate_refine() method in LongCat pipeline
+    """
+    raise NotImplementedError(
+        "LongCat refinement is not yet implemented.\n"
+        "This requires:\n"
+        "  1. Refinement LoRA weights (refinement_lora.safetensors)\n"
+        "  2. Block Sparse Attention (BSA) in LongCat DiT\n"
+        "  3. generate_refine() method in LongCat pipeline\n"
+        "\n"
+        "See reference: LongCat-Video/run_demo_long_video.py lines 136-175"
+    )
+
+
 def load_loras_on_model(
     model,  # LongCatVideoTransformer3DModel
     lora_paths: List[str],
