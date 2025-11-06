@@ -287,36 +287,38 @@ def _cache_clean_latents(
     """
     global _kv_cache_dict
 
-    # Create timestep=0 tensor (conditioning frames are "clean")
-    timestep = torch.zeros(cond_latents.shape[0], cond_latents.shape[2]).to(device=device, dtype=dtype)
+    # CRITICAL: Disable gradient tracking to prevent OOM from activation caching
+    with torch.no_grad():
+        # Create timestep=0 tensor (conditioning frames are "clean")
+        timestep = torch.zeros(cond_latents.shape[0], cond_latents.shape[2]).to(device=device, dtype=dtype)
 
-    # Create empty prompt embeddings for caching (skip cross-attention)
-    # Access config as dictionary since it's a FrozenDict
-    d_model = model.config.get('d_model', model.config.get('hidden_size', 4096))
-    empty_embeds = torch.zeros(
-        [cond_latents.shape[0], 1, model_max_length, d_model],
-        device=device,
-        dtype=dtype
-    )
+        # Create empty prompt embeddings for caching (skip cross-attention)
+        # Access config as dictionary since it's a FrozenDict
+        d_model = model.config.get('d_model', model.config.get('hidden_size', 4096))
+        empty_embeds = torch.zeros(
+            [cond_latents.shape[0], 1, model_max_length, d_model],
+            device=device,
+            dtype=dtype
+        )
 
-    # Prepare block swapping if enabled
-    if blocks_to_swap > 0:
-        model.prepare_block_swap_before_forward()
+        # Prepare block swapping if enabled
+        if blocks_to_swap > 0:
+            model.prepare_block_swap_before_forward()
 
-    # Run forward pass with return_kv=True to cache keys/values
-    _, kv_cache_dict = model(
-        hidden_states=cond_latents,
-        timestep=timestep,
-        encoder_hidden_states=empty_embeds,
-        return_kv=True,  # Request KV cache return
-        skip_crs_attn=True,  # Skip cross-attention (not needed for caching)
-        offload_kv_cache=offload_kv_cache  # Offload to CPU to save GPU memory
-    )
+        # Run forward pass with return_kv=True to cache keys/values
+        _, kv_cache_dict = model(
+            hidden_states=cond_latents,
+            timestep=timestep,
+            encoder_hidden_states=empty_embeds,
+            return_kv=True,  # Request KV cache return
+            skip_crs_attn=True,  # Skip cross-attention (not needed for caching)
+            offload_kv_cache=offload_kv_cache  # Offload to CPU to save GPU memory
+        )
 
-    # Store in global cache
-    _kv_cache_dict = kv_cache_dict
+        # Store in global cache
+        _kv_cache_dict = kv_cache_dict
 
-    return kv_cache_dict
+        return kv_cache_dict
 
 def _get_kv_cache_dict() -> dict:
     """Get the current KV cache dictionary."""
@@ -4217,6 +4219,7 @@ def generate_extended_video(
     return final_video
 
 
+@torch.no_grad()
 def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
     """LongCat T2V generation using existing efficient pipeline infrastructure.
 
@@ -4537,6 +4540,7 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     return latents
 
 
+@torch.no_grad()
 def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
     """LongCat video continuation using KV cache optimization.
 
@@ -4784,9 +4788,14 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     # Use maximum block swapping and CPU offloading to minimize GPU memory during cache computation
     logger.info("Computing KV cache with maximum memory optimization...")
 
+    # CRITICAL: Aggressive memory cleanup before KV cache computation
+    # This is essential to prevent OOM during the forward pass
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     # Log GPU memory before KV cache computation
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
         allocated = torch.cuda.memory_allocated(device) / 1024**3
         reserved = torch.cuda.memory_reserved(device) / 1024**3
         logger.info(f"GPU memory BEFORE KV cache: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
