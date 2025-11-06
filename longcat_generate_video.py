@@ -633,10 +633,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_fps", type=float, default=None,
                        help="Target FPS for downsampling input video in continuation mode")
 
-    # Image-to-Video Arguments (LongCat)
-    parser.add_argument("--image_path", type=str, default=None,
-                       help="Path to input image for i2v mode")
-
     # Long Video Arguments (LongCat)
     parser.add_argument("--num_segments", type=int, default=1,
                        help="Number of segments for long video generation (1 segment ≈ 5.3s @ 15fps, 11 segments ≈ 1 minute)")
