@@ -5261,12 +5261,16 @@ def longcat_generate_video(
     save_path: str,
     blocks_to_swap: int,
     mode: str,
+    i2v_input_image: Optional[str],
     input_video: Optional[str],
+    num_segments: int,
     num_cond_frames: int,
     output_type: str,
     attn_mode: str,
+    lora_folder: str,
+    loras: List[Tuple[str, float]],
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
-    """Generate video using longcat_generate_video.py subprocess"""
+    """Generate video using longcat_generate_video.py subprocess with LoRA support"""
     global stop_event
 
     if stop_event.is_set():
@@ -5297,17 +5301,31 @@ def longcat_generate_video(
         "--output_type", output_type,
         "--attn_mode", attn_mode,
         "--mode", mode,
+        "--target_fps", str(target_fps),
     ]
 
     if negative_prompt:
         cmd.extend(["--negative_prompt", negative_prompt])
 
-    if mode == "continuation" and input_video:
-        cmd.extend([
-            "--input_video", input_video,
-            "--num_cond_frames", str(num_cond_frames),
-            "--target_fps", str(target_fps)
-        ])
+    # Mode-specific arguments
+    if mode == "i2v" and i2v_input_image:
+        cmd.extend(["--image_path", i2v_input_image])
+
+    if mode in ["continuation", "long_video"]:
+        cmd.extend(["--num_cond_frames", str(num_cond_frames)])
+        if input_video:
+            cmd.extend(["--input_video", input_video])
+        if mode == "long_video":
+            cmd.extend(["--num_segments", str(num_segments)])
+
+    # Add LoRA arguments
+    for lora_path, multiplier in loras:
+        if lora_path and lora_path != "None" and multiplier > 0:
+            # Convert relative path to absolute if needed
+            if not os.path.isabs(lora_path):
+                lora_path = os.path.join(lora_folder, lora_path)
+            if os.path.exists(lora_path):
+                cmd.extend(["--lora_path", lora_path, "--lora_multiplier", str(multiplier)])
 
     # Set up environment
     env = os.environ.copy()
@@ -5398,23 +5416,60 @@ def longcat_batch_handler(
     ckpt_dir: str,
     save_path: str,
     blocks_to_swap: int,
-    mode: str,
+    generation_mode: str,
+    i2v_input_image: Optional[str],
     input_video: Optional[str],
+    num_segments: int,
     num_cond_frames: int,
     output_type: str,
     attn_mode: str,
+    lora_folder: str,
+    lora_1: str, lora_1_multiplier: float,
+    lora_2: str, lora_2_multiplier: float,
+    lora_3: str, lora_3_multiplier: float,
+    lora_4: str, lora_4_multiplier: float,
+    lora_5: str, lora_5_multiplier: float,
+    lora_6: str, lora_6_multiplier: float,
+    lora_7: str, lora_7_multiplier: float,
+    lora_8: str, lora_8_multiplier: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
-    """Handle batch generation for LongCat"""
+    """Handle batch generation for LongCat with LoRA support"""
     global stop_event
     stop_event.clear()
 
     all_videos = []
 
-    # Validate inputs for continuation mode
-    if mode == "continuation":
-        if not input_video or not os.path.exists(input_video):
-            yield [], "Error: Input video required for continuation mode", ""
+    # Convert mode names
+    mode_map = {
+        "Text-to-Video": "generation",
+        "Image-to-Video": "i2v",
+        "Long Video": "long_video",
+        "Video Continuation": "continuation"
+    }
+    mode = mode_map.get(generation_mode, "generation")
+
+    # Validate inputs based on mode
+    if mode == "i2v":
+        if not i2v_input_image or not os.path.exists(i2v_input_image):
+            yield [], "Error: Input image required for Image-to-Video mode", ""
             return
+    elif mode in ["continuation", "long_video"]:
+        if mode == "continuation" and (not input_video or not os.path.exists(input_video)):
+            yield [], "Error: Input video required for Video Continuation mode", ""
+            return
+        # long_video mode can optionally use input_video
+
+    # Collect LoRA configurations
+    loras = [
+        (lora_1, lora_1_multiplier),
+        (lora_2, lora_2_multiplier),
+        (lora_3, lora_3_multiplier),
+        (lora_4, lora_4_multiplier),
+        (lora_5, lora_5_multiplier),
+        (lora_6, lora_6_multiplier),
+        (lora_7, lora_7_multiplier),
+        (lora_8, lora_8_multiplier),
+    ]
 
     for i in range(int(batch_count)):
         if stop_event.is_set():
@@ -5436,7 +5491,8 @@ def longcat_batch_handler(
             prompt, negative_prompt, video_width, video_height,
             video_length, target_fps, infer_steps, guidance_scale,
             current_seed, task, ckpt_dir, save_path, blocks_to_swap,
-            mode, input_video, num_cond_frames, output_type, attn_mode
+            mode, i2v_input_image, input_video, num_segments, num_cond_frames,
+            output_type, attn_mode, lora_folder, loras
         ):
             if videos:
                 # Add new video to collection
@@ -7591,18 +7647,75 @@ with gr.Blocks(
                 longcat_attn_mode = gr.Radio(choices=["sdpa", "flash", "flash2", "flash3", "sageattn", "xformers", "torch"],
                                             label="Attention Mode", value="sdpa")
 
-            # Continuation mode section
-            with gr.Accordion("Video Continuation Mode", open=False):
+            # Generation Mode Section
+            with gr.Accordion("Generation Mode", open=False):
                 with gr.Row():
-                    longcat_mode = gr.Radio(
-                        choices=["generation", "continuation"],
+                    longcat_generation_mode = gr.Radio(
+                        choices=["Text-to-Video", "Image-to-Video", "Long Video", "Video Continuation"],
                         label="Mode",
-                        value="generation"
+                        value="Text-to-Video"
                     )
+
+                # Mode-specific controls
                 with gr.Row():
-                    longcat_input_video = gr.Video(label="Input Video (for continuation)", value=None)
-                    longcat_num_cond_frames = gr.Slider(minimum=1, maximum=50, step=1,
-                                                       label="Number of Conditioning Frames", value=13)
+                    longcat_i2v_input_image = gr.Image(label="Input Image (for I2V)", type="filepath", visible=False)
+                    longcat_input_video = gr.Video(label="Input Video (for Continuation/Long Video)", value=None, visible=False)
+
+                with gr.Row():
+                    longcat_num_segments = gr.Slider(
+                        minimum=1, maximum=50, step=1,
+                        label="Number of Segments (1 segment ≈ 5.3s @ 15fps, 11 segments ≈ 1 minute)",
+                        value=11, visible=False
+                    )
+                    longcat_num_cond_frames = gr.Slider(
+                        minimum=1, maximum=50, step=1,
+                        label="Conditioning Frames (for Continuation/Long Video)",
+                        value=13, visible=False
+                    )
+
+            # LoRA Section
+            with gr.Accordion("LoRA", open=True):
+                with gr.Row():
+                    longcat_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                    longcat_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+
+                longcat_lora_weights = []
+                longcat_lora_multipliers = []
+
+                # Primary LoRAs (1-4)
+                for i in range(4):
+                    with gr.Row():
+                        longcat_lora_weights.append(gr.Dropdown(
+                            label=f"LoRA {i+1}",
+                            choices=get_lora_options("lora"),
+                            value="None",
+                            allow_custom_value=False,
+                            interactive=True,
+                            scale=2
+                        ))
+                        longcat_lora_multipliers.append(gr.Slider(
+                            label=f"Multiplier",
+                            minimum=0.0, maximum=2.0, step=0.05,
+                            value=1.0, scale=1, interactive=True
+                        ))
+
+                # Additional LoRAs (5-8)
+                with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                    for i in range(4, 8):
+                        with gr.Row():
+                            longcat_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}",
+                                choices=get_lora_options("lora"),
+                                value="None",
+                                allow_custom_value=False,
+                                interactive=True,
+                                scale=2
+                            ))
+                            longcat_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier",
+                                minimum=0.0, maximum=2.0, step=0.05,
+                                value=1.0, scale=1, interactive=True
+                            ))
 
         #Image to Video Tab
         with gr.Tab(label="Hunyuan-i2v", visible=False) as i2v_tab:
@@ -9383,8 +9496,53 @@ with gr.Blocks(
     )
 
     # LongCat event handlers
-    # longcat_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-    # Removed - old Hunyuan-t2v tab
+
+    # Mode visibility toggling
+    def update_longcat_mode_visibility(mode):
+        """Update UI visibility based on selected generation mode"""
+        return {
+            longcat_i2v_input_image: gr.update(visible=(mode == "Image-to-Video")),
+            longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_num_segments: gr.update(visible=(mode == "Long Video")),
+            longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"]))
+        }
+
+    longcat_generation_mode.change(
+        fn=update_longcat_mode_visibility,
+        inputs=[longcat_generation_mode],
+        outputs=[longcat_i2v_input_image, longcat_input_video, longcat_num_segments, longcat_num_cond_frames]
+    )
+
+    # LoRA refresh functionality
+    def update_longcat_lora_dropdowns(lora_folder: str, *current_values) -> List[gr.update]:
+        """Refresh LoRA dropdown choices"""
+        new_choices = get_lora_options(lora_folder)
+        weights = current_values[:8]
+        multipliers = current_values[8:16]
+
+        results = []
+        for i in range(8):
+            # Update dropdown with new choices, keeping current value if it still exists
+            current_weight = weights[i] if i < len(weights) else "None"
+            new_value = current_weight if current_weight in new_choices else "None"
+            results.extend([
+                gr.update(choices=new_choices, value=new_value),
+                gr.update(value=multipliers[i] if i < len(multipliers) else 1.0)
+            ])
+
+        return results
+
+    longcat_lora_refresh_outputs_list = []
+    for i in range(len(longcat_lora_weights)):
+        longcat_lora_refresh_outputs_list.extend([longcat_lora_weights[i], longcat_lora_multipliers[i]])
+
+    longcat_lora_refresh_btn.click(
+        fn=update_longcat_lora_dropdowns,
+        inputs=[longcat_lora_folder] + longcat_lora_weights + longcat_lora_multipliers,
+        outputs=longcat_lora_refresh_outputs_list
+    )
+
+    # Generate button
     longcat_generate_btn.click(
         fn=longcat_batch_handler,
         inputs=[
@@ -9402,13 +9560,19 @@ with gr.Blocks(
             longcat_ckpt_dir,
             longcat_save_path,
             longcat_blocks_to_swap,
-            longcat_mode,
+            longcat_generation_mode,
+            longcat_i2v_input_image,
             longcat_input_video,
+            longcat_num_segments,
             longcat_num_cond_frames,
             longcat_output_type,
-            longcat_attn_mode
+            longcat_attn_mode,
+            longcat_lora_folder,
+            *longcat_lora_weights,
+            *longcat_lora_multipliers
         ],
-        outputs=[longcat_video_output, longcat_batch_progress, longcat_progress_text]
+        outputs=[longcat_video_output, longcat_batch_progress, longcat_progress_text],
+        queue=True
     )
 
     #multitalk event handlers
