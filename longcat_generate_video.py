@@ -5485,7 +5485,16 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
         scheduler=scheduler,
         dit=dit,
     )
-    pipe.to(device)
+
+    # Only call pipe.to(device) if block swapping is NOT enabled
+    # When block swapping is enabled, DiT is already correctly positioned (some blocks on CPU, some on GPU)
+    # Calling pipe.to(device) would try to move ALL DiT blocks to GPU, defeating block swapping and causing OOM
+    if args.blocks_to_swap == 0:
+        pipe.to(device)
+    else:
+        # DiT already configured with block swapping, VAE and text_encoder already on device
+        # Just set the pipeline's device attribute without moving components
+        pipe.device = device
 
     # Setup generator
     generator = torch.Generator(device=device)
