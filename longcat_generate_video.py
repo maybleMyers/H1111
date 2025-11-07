@@ -5160,9 +5160,9 @@ def generate_longcat_long_video(
             try:
                 new_segment_latents = generate_longcat_vc(continuation_args, device, cfg)
 
-                # Decode new segment
+                # Decode new segment using continuation_args (has the VAE instance)
                 logger.info("  Decoding new segment latents...")
-                new_segment_video = decode_latent(new_segment_latents, args, cfg)  # [1, C, F, H, W]
+                new_segment_video = decode_latent(new_segment_latents, continuation_args, cfg)  # [1, C, F, H, W]
 
                 # Convert to PIL Images
                 new_segment_video_np = new_segment_video[0].permute(1, 2, 3, 0).cpu().numpy()
