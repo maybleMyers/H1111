@@ -6942,6 +6942,152 @@ def main():
             # Clean up continuation mode flag
             del args._longcat_continuation_mode
 
+        # --- Apply Refinement if requested (720p upscaling) ---
+        if hasattr(args, 'enable_refinement') and args.enable_refinement:
+            logger.info("=" * 80)
+            logger.info("Applying video refinement (480p -> 720p upscaling)")
+            logger.info("=" * 80)
+
+            # Check if refinement LoRA exists
+            if not hasattr(args, 'refinement_lora_path') or not os.path.exists(args.refinement_lora_path):
+                logger.warning(f"Refinement LoRA not found at: {getattr(args, 'refinement_lora_path', 'not specified')}")
+                logger.warning("Skipping refinement step")
+            else:
+                try:
+                    # Reload DiT model for refinement
+                    logger.info("Loading LongCat DiT model for refinement...")
+                    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+
+                    dit_dtype = torch.bfloat16
+                    refinement_dit = LongCatVideoTransformer3DModel.from_pretrained(
+                        args.ckpt_dir,
+                        subfolder="dit",
+                        torch_dtype=dit_dtype
+                    )
+
+                    # Load refinement LoRA
+                    logger.info(f"Loading refinement LoRA from: {args.refinement_lora_path}")
+                    load_loras_on_model(
+                        model=refinement_dit,
+                        lora_paths=[args.refinement_lora_path],
+                        lora_multipliers=[1.0],
+                        device=device
+                    )
+
+                    # Move model to device
+                    if args.blocks_to_swap > 0:
+                        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+                        refinement_dit.to("cpu")
+                        refinement_dit.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+                        refinement_dit.move_to_device_except_swap_blocks(device)
+                        refinement_dit.prepare_block_swap_before_forward()
+                    else:
+                        refinement_dit.to(device)
+
+                    refinement_dit.eval()
+
+                    # Reload text encoder
+                    logger.info("Loading text encoder for refinement...")
+                    from transformers import AutoTokenizer, UMT5EncoderModel
+                    tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+                    text_encoder = UMT5EncoderModel.from_pretrained(
+                        args.ckpt_dir,
+                        subfolder="text_encoder",
+                        torch_dtype=dit_dtype
+                    ).to(device)
+                    text_encoder.eval()
+
+                    # Reload VAE
+                    logger.info("Loading VAE for refinement...")
+                    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+                    refinement_vae = AutoencoderKLWan.from_pretrained(
+                        args.ckpt_dir,
+                        subfolder="vae"
+                    ).to(device)
+                    refinement_vae.eval()
+
+                    # Load scheduler
+                    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+                    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                        args.ckpt_dir,
+                        subfolder="scheduler",
+                        torch_dtype=dit_dtype
+                    )
+
+                    # Create refinement pipeline
+                    from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
+                    refinement_pipe = LongCatVideoPipeline(
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        vae=refinement_vae,
+                        scheduler=scheduler,
+                        dit=refinement_dit,
+                    )
+
+                    # Skip pipe.to(device) if block swapping is enabled (same fix as I2V)
+                    if args.blocks_to_swap == 0:
+                        refinement_pipe.to(device)
+                    else:
+                        refinement_pipe.device = device
+
+                    # Convert decoded_video tensor to PIL images for refinement pipeline
+                    # decoded_video shape: [1, C, F, H, W]
+                    logger.info(f"Converting video to PIL format: {decoded_video.shape}")
+                    from PIL import Image
+                    import numpy as np
+
+                    # Denormalize from [-1, 1] to [0, 255]
+                    video_frames = ((decoded_video[0].permute(1, 2, 3, 0).cpu().numpy() + 1.0) * 127.5).astype(np.uint8)
+                    stage1_pil_frames = [Image.fromarray(frame) for frame in video_frames]
+
+                    logger.info(f"Refining {len(stage1_pil_frames)} frames to 720p...")
+
+                    # Setup generator
+                    generator = torch.Generator(device=device)
+                    if args.seed:
+                        generator.manual_seed(args.seed)
+
+                    # Call refinement
+                    refined_output = refinement_pipe.generate_refine(
+                        prompt=args.prompt,
+                        stage1_video=stage1_pil_frames,
+                        num_cond_frames=0,  # No conditioning for single-pass refinement
+                        num_inference_steps=args.infer_steps if args.infer_steps else 30,
+                        generator=generator,
+                        output_type="np"
+                    )[0]
+
+                    logger.info(f"Refinement complete! Output shape: {refined_output.shape}")
+
+                    # Convert refined output back to tensor format [1, C, F, H, W]
+                    # refined_output is numpy array [F, H, W, C] in range [0, 1]
+                    refined_tensor = torch.from_numpy(refined_output).permute(0, 3, 1, 2).unsqueeze(0)  # [1, F, C, H, W]
+                    refined_tensor = refined_tensor.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
+                    refined_tensor = refined_tensor * 2.0 - 1.0  # Normalize to [-1, 1]
+
+                    # Replace decoded_video with refined output
+                    decoded_video = refined_tensor
+
+                    # Update video dimensions
+                    height = refined_tensor.shape[3]
+                    width = refined_tensor.shape[4]
+
+                    logger.info(f"Refined video dimensions: {height}x{width}")
+
+                    # Cleanup refinement models
+                    del refinement_dit, refinement_vae, text_encoder, tokenizer, refinement_pipe
+                    clean_memory_on_device(device)
+                    torch.cuda.empty_cache()
+
+                    logger.info("Refinement complete and models cleaned up")
+                    logger.info("=" * 80)
+
+                except Exception as e:
+                    logger.error(f"Refinement failed with error: {e}")
+                    logger.error("Continuing with non-refined video")
+                    import traceback
+                    traceback.print_exc()
+
         # Save the output (latent and/or video/images)
         # Don't save "latents" for extension mode since generated_latent contains pixels
         latent_to_save = None
