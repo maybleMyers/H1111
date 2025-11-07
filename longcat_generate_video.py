@@ -5367,9 +5367,11 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     # Load DiT model
     logger.info("Loading LongCat DiT model...")
     from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+    # For single GPU mode, use cp_split_hw=[1, 1] (context parallel size = 1)
     dit = LongCatVideoTransformer3DModel.from_pretrained(
         args.ckpt_dir,
         subfolder="dit",
+        cp_split_hw=[1, 1],  # Required for context parallelism even in single GPU mode
         torch_dtype=dit_dtype
     )
 
@@ -7178,9 +7180,11 @@ def main():
                     from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
 
                     dit_dtype = torch.bfloat16
+                    # For single GPU mode, use cp_split_hw=[1, 1] (context parallel size = 1)
                     refinement_dit = LongCatVideoTransformer3DModel.from_pretrained(
                         args.ckpt_dir,
                         subfolder="dit",
+                        cp_split_hw=[1, 1],  # Required for context parallelism even in single GPU mode
                         torch_dtype=dit_dtype
                     )
 
