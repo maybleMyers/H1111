@@ -5222,68 +5222,38 @@ def generate_longcat_long_video(
         # See reference implementation in run_demo_long_video.py lines 136-175
 
     # ═══════════════════════════════════════════════════════════
-    # Convert final output back to latent tensor
+    # Save final video directly from PIL images (no re-encoding!)
     # ═══════════════════════════════════════════════════════════
 
-    logger.info("Converting final video frames to latent tensor...")
+    # NOTE: The reference implementation (run_demo_long_video.py) saves video
+    # directly from PIL images without re-encoding through VAE.
+    # Re-encoding would cause quality degradation at segment boundaries.
+
+    logger.info("Saving final long video from accumulated frames...")
 
     # Convert PIL images to tensor [F, H, W, C]
     final_frames_np = np.array([np.array(frame) for frame in all_generated_frames])
-    final_frames_tensor = torch.from_numpy(final_frames_np).float() / 255.0  # [F, H, W, C], range [0, 1]
+    final_frames_tensor = torch.from_numpy(final_frames_np)  # [F, H, W, C], range [0, 255], uint8
 
-    # Rearrange to [1, C, F, H, W]
-    final_frames_tensor = final_frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+    # Generate output filename with timestamp and seed
+    import time
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    seed = args.seed if args.seed else 0
+    output_filename = f"{timestamp}_{seed}.mp4"
+    output_path = os.path.join(args.save_path, output_filename)
 
-    # Encode to latents using VAE
-    logger.info(f"Encoding {final_frames_tensor.shape[2]} frames to latents...")
+    # Save video
+    write_video(output_path, final_frames_tensor, fps=int(target_fps), video_codec="libx264", options={"crf": "18"})
 
-    # Get VAE
-    vae = getattr(args, '_longcat_vae', None) or getattr(args, '_vae', None)
-    if vae is None:
-        logger.info("Loading VAE for final encoding...")
-        from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
-        vae_device = "cpu" if args.vae_cache_cpu else device
-        vae = AutoencoderKLWan.from_pretrained(
-            args.ckpt_dir,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16 if hasattr(args, 'vae_dtype') and args.vae_dtype in ["bf16", "bfloat16"] else torch.float16
-        ).to(vae_device)
-        vae.eval()
-        args._longcat_vae = vae
-
-    # Encode frames in chunks to avoid OOM (process 32 frames at a time)
-    chunk_size = 32
-    latent_chunks = []
-
-    for i in range(0, final_frames_tensor.shape[2], chunk_size):
-        chunk_end = min(i + chunk_size, final_frames_tensor.shape[2])
-        chunk = final_frames_tensor[:, :, i:chunk_end, :, :]
-
-        chunk = chunk.to(device=vae.device if hasattr(vae, 'device') else device, dtype=vae.dtype)
-        chunk = chunk * 2.0 - 1.0  # [0,1] -> [-1,1]
-
-        with torch.no_grad():
-            latent_chunk = vae.encode(chunk).latent_dist.sample()
-
-        # Normalize
-        latent_chunk = normalize_latents(latent_chunk, vae.config)
-        latent_chunks.append(latent_chunk.cpu())
-
-        # Memory cleanup
-        del chunk, latent_chunk
-        clean_memory_on_device(device)
-
-    # Concatenate chunks
-    final_latents = torch.cat(latent_chunks, dim=2)  # [1, C, F_latent, H_latent, W_latent]
-
-    logger.info(f"Final latent shape: {final_latents.shape}")
     logger.info("")
     logger.info("=" * 80)
     logger.info("LongCat Long Video Generation Complete!")
     logger.info(f"Output: {len(all_generated_frames)} frames ≈ {len(all_generated_frames) / target_fps:.1f}s @ {target_fps}fps")
+    logger.info(f"Video saved to: {output_path}")
     logger.info("=" * 80)
 
-    return final_latents
+    # Return None to signal that video was already saved (no need for decode step in main)
+    return None
 
 
 def generate_longcat_refine(
@@ -6683,9 +6653,14 @@ def main():
             logger.info("Exiting after saving merged model.")
             return # Exit if only saving model
 
+        # For long_video mode, generated_latent is None because video was already saved
         if generated_latent is None:
-             logger.error("Generation failed or was skipped, exiting.")
-             return
+            if args.mode == "long_video":
+                logger.info("Done!")
+                return
+            else:
+                logger.error("Generation failed or was skipped, exiting.")
+                return
 
         # Update dimensions based on the *actual* generated latent
         # Latent shape might differ slightly from input request depending on VAE/model strides
