@@ -5373,10 +5373,13 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
         torch_dtype=dit_dtype
     )
 
-    # Load refinement LoRA (but don't enable yet - wait until model is on device)
+    # Load and enable refinement LoRA and BSA BEFORE block swapping (matching run_demo_video_continuation.py lines 154-156)
     dit.load_lora(refinement_lora_path, 'refinement_lora')
+    dit.enable_loras(['refinement_lora'])
+    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
+    dit.enable_bsa()
 
-    # Move model to device FIRST
+    # Now move model to device (with block swapping if enabled)
     if args.blocks_to_swap > 0:
         logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
         dit.to("cpu")
@@ -5385,11 +5388,6 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
         dit.prepare_block_swap_before_forward()
     else:
         dit.to(device)
-
-    # Now enable LoRA and BSA AFTER model is on device (matching run_demo_video_continuation.py lines 154-156)
-    dit.enable_loras(['refinement_lora'])
-    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
-    dit.enable_bsa()
 
     dit.eval()
     logger.info("DiT loaded with refinement LoRA and BSA enabled")
@@ -7186,11 +7184,16 @@ def main():
                         torch_dtype=dit_dtype
                     )
 
-                    # Load refinement LoRA (but don't enable yet - wait until model is on device)
+                    # Load and enable refinement LoRA and BSA BEFORE block swapping (matching run_demo_video_continuation.py lines 154-156)
                     logger.info(f"Loading refinement LoRA from: {refinement_lora_path}")
                     refinement_dit.load_lora(refinement_lora_path, 'refinement_lora')
+                    refinement_dit.enable_loras(['refinement_lora'])
+                    # CRITICAL: Enable BSA (Block Sparse Attention) for refinement
+                    # This is required for refinement to work properly (line 140 in run_demo_long_video.py)
+                    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
+                    refinement_dit.enable_bsa()
 
-                    # Move model to device FIRST
+                    # Now move model to device (with block swapping if enabled)
                     if args.blocks_to_swap > 0:
                         logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
                         refinement_dit.to("cpu")
@@ -7199,13 +7202,6 @@ def main():
                         refinement_dit.prepare_block_swap_before_forward()
                     else:
                         refinement_dit.to(device)
-
-                    # Now enable LoRA and BSA AFTER model is on device (matching run_demo_video_continuation.py lines 154-156)
-                    refinement_dit.enable_loras(['refinement_lora'])
-                    # CRITICAL: Enable BSA (Block Sparse Attention) for refinement
-                    # This is required for refinement to work properly (line 140 in run_demo_long_video.py)
-                    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
-                    refinement_dit.enable_bsa()
 
                     refinement_dit.eval()
 
