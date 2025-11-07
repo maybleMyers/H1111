@@ -5126,7 +5126,7 @@ def generate_longcat_long_video(
     # Convert PIL images to tensor and save
     checkpoint_frames = torch.from_numpy(np.array([np.array(frame) for frame in all_generated_frames]))  # [F, H, W, C]
     from torchvision.io import write_video
-    write_video(checkpoint_path, checkpoint_frames, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+    write_video(checkpoint_path, checkpoint_frames, fps=int(target_fps), video_codec="libx264", options={"crf": "18"})
     logger.info(f"  Saved checkpoint: {checkpoint_path}")
     logger.info("")
 
@@ -5145,7 +5145,7 @@ def generate_longcat_long_video(
 
             # Save current_video (last segment) as mp4
             current_frames_tensor = torch.from_numpy(np.array([np.array(frame) for frame in current_video]))
-            write_video(temp_video_path, current_frames_tensor, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+            write_video(temp_video_path, current_frames_tensor, fps=int(target_fps), video_codec="libx264", options={"crf": "18"})
             logger.info(f"  Saved conditioning video: {temp_video_path}")
 
             # Setup args for continuation
@@ -5183,7 +5183,7 @@ def generate_longcat_long_video(
                 # Save checkpoint
                 checkpoint_path = os.path.join(args.save_path, f"longcat_long_video_segment_{segment_idx + 2}.mp4")
                 checkpoint_frames = torch.from_numpy(np.array([np.array(frame) for frame in all_generated_frames]))
-                write_video(checkpoint_path, checkpoint_frames, fps=target_fps, video_codec="libx264", options={"crf": "18"})
+                write_video(checkpoint_path, checkpoint_frames, fps=int(target_fps), video_codec="libx264", options={"crf": "18"})
                 logger.info(f"  Saved checkpoint: {checkpoint_path}")
                 logger.info("")
 
