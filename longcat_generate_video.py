@@ -637,6 +637,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_segments", type=int, default=1,
                        help="Number of segments for long video generation (1 segment ≈ 5.3s @ 15fps, 11 segments ≈ 1 minute)")
 
+    # Refinement Arguments (LongCat VC)
+    parser.add_argument("--enable_refinement", action="store_true",
+                       help="Enable refinement pass for video continuation (upscales 480p@15fps to 720p@30fps)")
+    parser.add_argument("--refinement_lora_path", type=str, default="lora/refinement_lora.safetensors",
+                       help="Path to refinement LoRA file (relative to checkpoint dir)")
+
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (

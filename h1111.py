@@ -5265,6 +5265,8 @@ def longcat_generate_video(
     input_video: Optional[str],
     num_segments: int,
     num_cond_frames: int,
+    enable_refinement: bool,
+    refinement_lora_path: str,
     output_type: str,
     attn_mode: str,
     lora_folder: str,
@@ -5317,6 +5319,11 @@ def longcat_generate_video(
             cmd.extend(["--input_video", input_video])
         if mode == "long_video":
             cmd.extend(["--num_segments", str(num_segments)])
+        # Refinement support for continuation mode
+        if mode == "continuation" and enable_refinement:
+            cmd.extend(["--enable_refinement"])
+            if refinement_lora_path:
+                cmd.extend(["--refinement_lora_path", refinement_lora_path])
 
     # Add LoRA arguments
     for lora_path, multiplier in loras:
@@ -5421,6 +5428,8 @@ def longcat_batch_handler(
     input_video: Optional[str],
     num_segments: int,
     num_cond_frames: int,
+    enable_refinement: bool,
+    refinement_lora_path: str,
     output_type: str,
     attn_mode: str,
     lora_folder: str,
@@ -5492,6 +5501,7 @@ def longcat_batch_handler(
             video_length, target_fps, infer_steps, guidance_scale,
             current_seed, task, ckpt_dir, save_path, blocks_to_swap,
             mode, i2v_input_image, input_video, num_segments, num_cond_frames,
+            enable_refinement, refinement_lora_path,
             output_type, attn_mode, lora_folder, loras
         ):
             if videos:
@@ -7673,6 +7683,21 @@ with gr.Blocks(
                         value=13, visible=False
                     )
 
+                    # Refinement options for continuation
+                    longcat_enable_refinement = gr.Checkbox(
+                        label="Enable Refinement (720p @ 30fps upscaling)",
+                        value=False,
+                        visible=False,
+                        info="Requires refinement LoRA. Upscales 480p@15fps to 720p@30fps"
+                    )
+
+                    longcat_refinement_lora_path = gr.Textbox(
+                        label="Refinement LoRA Path (relative to checkpoint dir)",
+                        value="lora/refinement_lora.safetensors",
+                        placeholder="Path to refinement LoRA file",
+                        visible=False
+                    )
+
             # LoRA Section
             with gr.Accordion("LoRA", open=True):
                 with gr.Row():
@@ -9504,13 +9529,22 @@ with gr.Blocks(
             longcat_i2v_input_image: gr.update(visible=(mode == "Image-to-Video")),
             longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
             longcat_num_segments: gr.update(visible=(mode == "Long Video")),
-            longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"]))
+            longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_enable_refinement: gr.update(visible=(mode == "Video Continuation")),
+            longcat_refinement_lora_path: gr.update(visible=(mode == "Video Continuation"))
         }
 
     longcat_generation_mode.change(
         fn=update_longcat_mode_visibility,
         inputs=[longcat_generation_mode],
-        outputs=[longcat_i2v_input_image, longcat_input_video, longcat_num_segments, longcat_num_cond_frames]
+        outputs=[
+            longcat_i2v_input_image,
+            longcat_input_video,
+            longcat_num_segments,
+            longcat_num_cond_frames,
+            longcat_enable_refinement,
+            longcat_refinement_lora_path
+        ]
     )
 
     # LoRA refresh functionality
@@ -9565,6 +9599,8 @@ with gr.Blocks(
             longcat_input_video,
             longcat_num_segments,
             longcat_num_cond_frames,
+            longcat_enable_refinement,
+            longcat_refinement_lora_path,
             longcat_output_type,
             longcat_attn_mode,
             longcat_lora_folder,
