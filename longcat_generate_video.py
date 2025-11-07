@@ -5023,6 +5023,188 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     return full_latents
 
 
+def _get_refinement_lora_path(args: argparse.Namespace) -> str:
+    """Resolve refinement LoRA path from args.
+
+    Args:
+        args: command line arguments
+
+    Returns:
+        Absolute path to refinement LoRA file
+    """
+    if hasattr(args, 'refinement_lora_path') and args.refinement_lora_path:
+        if os.path.isabs(args.refinement_lora_path):
+            return args.refinement_lora_path
+        return os.path.join(args.ckpt_dir, args.refinement_lora_path)
+    return os.path.join(args.ckpt_dir, 'lora/refinement_lora.safetensors')
+
+
+def _load_dit_for_refinement(
+    args: argparse.Namespace,
+    device: torch.device,
+    dit_dtype: torch.dtype = torch.bfloat16
+):
+    """Load LongCat DiT model for refinement with block swapping support.
+
+    Args:
+        args: command line arguments
+        device: torch device
+        dit_dtype: data type for DiT
+
+    Returns:
+        Loaded DiT model with refinement LoRA and BSA enabled
+    """
+    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+
+    logger.info("Loading LongCat DiT model for refinement...")
+
+    # Load DiT (without cp_split_hw for single GPU)
+    dit = LongCatVideoTransformer3DModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="dit",
+        cp_split_hw=[1, 1],  # Required for context parallelism even in single GPU mode
+        torch_dtype=dit_dtype
+    )
+
+    # Get refinement LoRA path
+    refinement_lora_path = _get_refinement_lora_path(args)
+
+    if not os.path.exists(refinement_lora_path):
+        raise ValueError(f"Refinement LoRA not found at: {refinement_lora_path}")
+
+    logger.info(f"Loading refinement LoRA from: {refinement_lora_path}")
+
+    # Load and enable refinement LoRA and BSA BEFORE block swapping
+    dit.load_lora(refinement_lora_path, 'refinement_lora')
+    dit.enable_loras(['refinement_lora'])
+    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
+    dit.enable_bsa()
+
+    # Enable block swapping or move to device
+    if args.blocks_to_swap > 0:
+        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        dit.to("cpu")
+        dit.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        dit.move_to_device_except_swap_blocks(device)
+        dit.prepare_block_swap_before_forward()
+    else:
+        dit.to(device)
+
+    dit.eval()
+    logger.info("DiT loaded with refinement LoRA and BSA enabled")
+
+    return dit
+
+
+def _create_refinement_pipeline(
+    args: argparse.Namespace,
+    device: torch.device,
+    dit,
+    dit_dtype: torch.dtype = torch.bfloat16
+):
+    """Create LongCat pipeline for refinement.
+
+    Args:
+        args: command line arguments
+        device: torch device
+        dit: DiT model with refinement LoRA loaded
+        dit_dtype: data type
+
+    Returns:
+        LongCatVideoPipeline configured for refinement
+    """
+    from transformers import AutoTokenizer, UMT5EncoderModel
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
+
+    logger.info("Creating refinement pipeline...")
+
+    # Load text encoder
+    logger.info("Loading text encoder...")
+    tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="text_encoder",
+        torch_dtype=dit_dtype
+    ).to(device)
+    text_encoder.eval()
+
+    # Load VAE
+    logger.info("Loading VAE...")
+    vae = AutoencoderKLWan.from_pretrained(
+        args.ckpt_dir,
+        subfolder="vae",
+        torch_dtype=dit_dtype
+    ).to(device)
+    vae.eval()
+
+    # Load scheduler
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.ckpt_dir,
+        subfolder="scheduler",
+        torch_dtype=dit_dtype
+    )
+
+    # Create pipeline
+    pipe = LongCatVideoPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=scheduler,
+        dit=dit,
+    )
+
+    # Skip pipe.to(device) if block swapping is enabled
+    if args.blocks_to_swap == 0:
+        pipe.to(device)
+    else:
+        pipe.device = device
+
+    logger.info("Refinement pipeline created")
+
+    return pipe
+
+
+def _convert_numpy_to_pil(video_np: np.ndarray) -> List[Image.Image]:
+    """Convert numpy video array to list of PIL Images.
+
+    Args:
+        video_np: numpy array of shape [F, H, W, C], range [0, 1]
+
+    Returns:
+        List of PIL Images
+    """
+    video_uint8 = (video_np * 255).clip(0, 255).astype(np.uint8)
+    return [Image.fromarray(frame) for frame in video_uint8]
+
+
+def _save_refinement_checkpoint(
+    frames: List[Image.Image],
+    segment_idx: int,
+    args: argparse.Namespace,
+    fps: int = 30
+):
+    """Save refinement checkpoint video.
+
+    Args:
+        frames: list of PIL Images
+        segment_idx: current segment index
+        args: command line arguments
+        fps: frames per second
+    """
+    from torchvision.io import write_video
+
+    checkpoint_path = os.path.join(args.save_path, f"longcat_longvideo_refine_{segment_idx}.mp4")
+    os.makedirs(args.save_path, exist_ok=True)
+
+    # Convert PIL to tensor
+    frames_np = np.array([np.array(frame) for frame in frames])
+    frames_tensor = torch.from_numpy(frames_np)
+
+    write_video(checkpoint_path, frames_tensor, fps=fps, video_codec="libx264", options={"crf": "10"})
+    logger.info(f"  Saved checkpoint: {checkpoint_path}")
+
 
 def generate_longcat_long_video(
     args: argparse.Namespace,
@@ -5200,17 +5382,134 @@ def generate_longcat_long_video(
     if enable_refinement:
         logger.info("Phase 2: Long Video Refinement (720p @ 30fps)")
         logger.info("-" * 80)
-        logger.info("⚠️  Refinement is currently NOT IMPLEMENTED")
-        logger.info("    The refinement phase requires:")
-        logger.info("    1. Refinement LoRA weights (refinement_lora.safetensors)")
-        logger.info("    2. Block Sparse Attention (BSA) support in LongCat DiT")
-        logger.info("    3. generate_refine() method in LongCat pipeline")
-        logger.info("")
-        logger.info("Skipping refinement phase. Returning generation phase output.")
-        logger.info("")
 
-        # TODO: Implement refinement when LoRA and BSA are available
-        # See reference implementation in run_demo_long_video.py lines 136-175
+        try:
+            # Step 1: Validate refinement LoRA exists
+            refinement_lora_path = _get_refinement_lora_path(args)
+            if not os.path.exists(refinement_lora_path):
+                logger.error(f"Refinement LoRA not found at: {refinement_lora_path}")
+                logger.error("Skipping refinement phase. Returning generation phase output.")
+                logger.info("")
+            else:
+                # Step 2: Load DiT with refinement LoRA and BSA
+                logger.info("Loading DiT model with refinement LoRA and BSA...")
+                dit_dtype = torch.bfloat16
+
+                dit_refine = _load_dit_for_refinement(args, device, dit_dtype)
+
+                # Step 3: Create refinement pipeline
+                pipe_refine = _create_refinement_pipeline(args, device, dit_refine, dit_dtype)
+
+                # Step 4: Setup generator
+                seed = args.seed if args.seed else 42
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+
+                # Step 5: Setup refinement loop variables
+                # Matches run_demo_long_video.py:146-149
+                cur_condition_video = None      # Previous refined segment
+                cur_num_cond_frames = 0         # 0 for first, 26 for subsequent
+                start_id = 0                    # Starting frame index in stage1
+                all_refine_frames = []          # Accumulated refined frames
+
+                num_refine_segments = num_segments + 1  # N+1 total segments
+                logger.info(f"Refining {num_refine_segments} segments...")
+                logger.info(f"Input: {len(all_generated_frames)} frames @ 480p 15fps")
+                logger.info(f"Output: ~{len(all_generated_frames) * 2} frames @ 720p 30fps (temporal upsampling)")
+                logger.info("")
+
+                # Step 6: Iterate through segments for refinement
+                for segment_idx in range(num_refine_segments):
+                    logger.info(f"Refining segment {segment_idx + 1}/{num_refine_segments}...")
+
+                    # Extract 93-frame window from stage1 output
+                    # Matches run_demo_long_video.py:158
+                    end_id = min(start_id + num_frames, len(all_generated_frames))
+                    stage1_segment = all_generated_frames[start_id:end_id]
+                    logger.info(f"  Stage1 segment: frames [{start_id}:{end_id}] ({len(stage1_segment)} frames)")
+
+                    # Generate refined segment
+                    # Matches run_demo_long_video.py:155-162
+                    output_refine = pipe_refine.generate_refine(
+                        video=cur_condition_video,
+                        prompt='',  # Empty prompt as per source (run_demo_long_video.py:157)
+                        stage1_video=stage1_segment,
+                        num_cond_frames=cur_num_cond_frames,
+                        num_inference_steps=args.infer_steps if args.infer_steps else 50,
+                        generator=generator,
+                    )[0]
+
+                    # Convert to PIL Images
+                    # Matches run_demo_long_video.py:164-166
+                    new_video = _convert_numpy_to_pil(output_refine)
+                    logger.info(f"  Refined {len(new_video)} frames @ 720p")
+
+                    # Append only NEW frames (skip conditioning overlap)
+                    # Matches run_demo_long_video.py:168
+                    new_frames = new_video[cur_num_cond_frames:]
+                    all_refine_frames.extend(new_frames)
+
+                    logger.info(f"  Added {len(new_frames)} new frames (total: {len(all_refine_frames)} frames)")
+
+                    # Update for next iteration
+                    # Matches run_demo_long_video.py:169-171
+                    cur_condition_video = new_video
+                    cur_num_cond_frames = num_cond_frames * 2  # 13*2 = 26
+                    start_id = start_id + num_frames - num_cond_frames  # Advance by 80
+
+                    # Save checkpoint
+                    # Matches run_demo_long_video.py:173-175
+                    _save_refinement_checkpoint(all_refine_frames, segment_idx, args, fps=30)
+
+                    # Memory cleanup
+                    del output_refine, new_video, new_frames
+                    clean_memory_on_device(device)
+                    gc.collect()
+
+                    logger.info("")
+
+                logger.info("Phase 2 complete!")
+                logger.info(f"Refined {len(all_refine_frames)} frames @ 30fps (720p)")
+                logger.info("")
+
+                # Save final refined video
+                logger.info("Saving final refined long video...")
+
+                # Convert PIL images to tensor [F, H, W, C]
+                final_refine_frames_np = np.array([np.array(frame) for frame in all_refine_frames])
+                final_refine_frames_tensor = torch.from_numpy(final_refine_frames_np)
+
+                # Generate output filename with timestamp and seed
+                import time
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                output_filename = f"{timestamp}_{seed}_refined.mp4"
+                output_path_refined = os.path.join(args.save_path, output_filename)
+
+                # Save refined video at 30fps with high quality (CRF=10)
+                from torchvision.io import write_video
+                write_video(output_path_refined, final_refine_frames_tensor, fps=30, video_codec="libx264", options={"crf": "10"})
+
+                logger.info("")
+                logger.info("=" * 80)
+                logger.info("LongCat Long Video Refinement Complete!")
+                logger.info(f"Output: {len(all_refine_frames)} frames ≈ {len(all_refine_frames) / 30.0:.1f}s @ 30fps (720p)")
+                logger.info(f"Refined video saved to: {output_path_refined}")
+                logger.info("=" * 80)
+
+                # Clean up refinement models
+                del dit_refine, pipe_refine
+                clean_memory_on_device(device)
+                gc.collect()
+
+                # Return None since video was already saved
+                return None
+
+        except Exception as e:
+            logger.error(f"Refinement failed with error: {e}")
+            logger.error("Skipping refinement phase. Saving generation phase output only.")
+            logger.info("")
+            import traceback
+            traceback.print_exc()
 
     # ═══════════════════════════════════════════════════════════
     # Save final video directly from PIL images (no re-encoding!)
