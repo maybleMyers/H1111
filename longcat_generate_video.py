@@ -6723,6 +6723,9 @@ def main():
         elif args.mode == "continuation":
             # Video continuation mode (LongCat only)
             logger.info("Routing to LongCat Video Continuation")
+            if hasattr(args, 'enable_refinement') and args.enable_refinement:
+                logger.info(f"Refinement is ENABLED - will upscale to 720p@30fps after generation")
+                logger.info(f"Refinement LoRA path: {getattr(args, 'refinement_lora_path', 'not set')}")
             generated_latent = generate_longcat_vc(args, args.device, cfg)
         else:
             # Standard generation modes (T2V, I2V, V2V, Fun-Control)
