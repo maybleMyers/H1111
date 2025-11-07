@@ -4612,13 +4612,15 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("VAE loaded successfully")
 
     # --- Load input video and downsample ---
+    # Get dimensions from args
+    height, width = args.video_size
+
     # Check if frames were provided directly (for long_video mode to avoid encode-decode cycle)
     if hasattr(args, '_input_frames') and args._input_frames is not None:
         logger.info(f"Using {len(args._input_frames)} frames provided directly (avoiding mp4 encode-decode)")
         video_frames = args._input_frames
     else:
         logger.info(f"Loading input video: {args.input_video}")
-        height, width = args.video_size
         video_frames = load_and_downsample_video(
             args.input_video,
             args.target_fps,
