@@ -5313,6 +5313,13 @@ def longcat_generate_video(
     if mode == "i2v" and i2v_input_image:
         cmd.extend(["--image_path", i2v_input_image])
 
+    if mode == "refine":
+        # Refinement-only mode
+        if input_video:
+            cmd.extend(["--input_video", input_video])
+        if refinement_lora_path:
+            cmd.extend(["--refinement_lora_path", refinement_lora_path])
+
     if mode in ["continuation", "long_video"]:
         cmd.extend(["--num_cond_frames", str(num_cond_frames)])
         if input_video:
