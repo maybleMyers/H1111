@@ -5267,6 +5267,7 @@ def longcat_generate_video(
     num_cond_frames: int,
     enable_refinement: bool,
     refinement_lora_path: str,
+    refine_segment_size: int,
     output_type: str,
     attn_mode: str,
     lora_folder: str,
@@ -5319,6 +5320,8 @@ def longcat_generate_video(
             cmd.extend(["--input_video", input_video])
         if refinement_lora_path:
             cmd.extend(["--refinement_lora_path", refinement_lora_path])
+        if refine_segment_size and refine_segment_size != 93:
+            cmd.extend(["--refine_segment_size", str(refine_segment_size)])
 
     if mode in ["continuation", "long_video"]:
         cmd.extend(["--num_cond_frames", str(num_cond_frames)])
@@ -5326,8 +5329,15 @@ def longcat_generate_video(
             cmd.extend(["--input_video", input_video])
         if mode == "long_video":
             cmd.extend(["--num_segments", str(num_segments)])
+            # Refinement support for long_video mode
+            if enable_refinement:
+                cmd.extend(["--enable_refinement"])
+                if refinement_lora_path:
+                    cmd.extend(["--refinement_lora_path", refinement_lora_path])
+                if refine_segment_size and refine_segment_size != 93:
+                    cmd.extend(["--refine_segment_size", str(refine_segment_size)])
         # Refinement support for continuation mode
-        if mode == "continuation" and enable_refinement:
+        elif mode == "continuation" and enable_refinement:
             cmd.extend(["--enable_refinement"])
             if refinement_lora_path:
                 cmd.extend(["--refinement_lora_path", refinement_lora_path])
@@ -5437,6 +5447,7 @@ def longcat_batch_handler(
     num_cond_frames: int,
     enable_refinement: bool,
     refinement_lora_path: str,
+    refine_segment_size: int,
     output_type: str,
     attn_mode: str,
     lora_folder: str,
@@ -5513,7 +5524,7 @@ def longcat_batch_handler(
             video_length, target_fps, infer_steps, guidance_scale,
             current_seed, task, ckpt_dir, save_path, blocks_to_swap,
             mode, i2v_input_image, input_video, num_segments, num_cond_frames,
-            enable_refinement, refinement_lora_path,
+            enable_refinement, refinement_lora_path, refine_segment_size,
             output_type, attn_mode, lora_folder, loras
         ):
             if videos:
@@ -7710,6 +7721,14 @@ with gr.Blocks(
                         visible=False
                     )
 
+                    longcat_refine_segment_size = gr.Slider(
+                        minimum=30, maximum=150, step=1,
+                        label="Refine Segment Size (frames per segment, lower = less VRAM)",
+                        value=93,
+                        visible=False,
+                        info="Reduce if OOM. Each segment is processed separately with overlapping frames."
+                    )
+
             # LoRA Section
             with gr.Accordion("LoRA", open=True):
                 with gr.Row():
@@ -9541,8 +9560,9 @@ with gr.Blocks(
             longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video", "Refinement Only"])),
             longcat_num_segments: gr.update(visible=(mode == "Long Video")),
             longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
-            longcat_enable_refinement: gr.update(visible=(mode == "Video Continuation")),
-            longcat_refinement_lora_path: gr.update(visible=(mode in ["Video Continuation", "Refinement Only"]))
+            longcat_enable_refinement: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_refinement_lora_path: gr.update(visible=(mode in ["Video Continuation", "Long Video", "Refinement Only"])),
+            longcat_refine_segment_size: gr.update(visible=(mode in ["Long Video", "Refinement Only"]))
         }
 
     longcat_generation_mode.change(
@@ -9554,7 +9574,8 @@ with gr.Blocks(
             longcat_num_segments,
             longcat_num_cond_frames,
             longcat_enable_refinement,
-            longcat_refinement_lora_path
+            longcat_refinement_lora_path,
+            longcat_refine_segment_size
         ]
     )
 
@@ -9615,6 +9636,7 @@ with gr.Blocks(
             longcat_num_cond_frames,
             longcat_enable_refinement,
             longcat_refinement_lora_path,
+            longcat_refine_segment_size,
             longcat_output_type,
             longcat_attn_mode,
             longcat_lora_folder,
