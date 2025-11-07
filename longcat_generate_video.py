@@ -5345,13 +5345,10 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     from PIL import Image
     from diffusers.utils import load_video
 
-    # Load video frames
-    video_frames = load_video(args.input_video)
-    num_frames = len(video_frames)
+    # Load video frames (already returns PIL Images)
+    stage1_pil_frames = load_video(args.input_video)
+    num_frames = len(stage1_pil_frames)
     logger.info(f"Loaded {num_frames} frames from input video")
-
-    # Convert to PIL images
-    stage1_pil_frames = [Image.fromarray(frame) for frame in video_frames]
 
     # Build refinement LoRA path
     if hasattr(args, 'refinement_lora_path') and args.refinement_lora_path:
