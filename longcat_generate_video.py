@@ -642,6 +642,8 @@ def parse_args() -> argparse.Namespace:
                        help="Enable refinement pass for video continuation (upscales 480p@15fps to 720p@30fps)")
     parser.add_argument("--refinement_lora_path", type=str, default="lora/refinement_lora.safetensors",
                        help="Path to refinement LoRA file (relative to checkpoint dir)")
+    parser.add_argument("--refine_segment_size", type=int, default=93,
+                       help="Number of frames per segment for refinement (default: 93). Lower values use less VRAM but may have more segment boundaries.")
 
     args = parser.parse_args()
 
@@ -5744,24 +5746,107 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
-    # Run refinement (matching run_demo_long_video.py line 155-162)
-    logger.info(f"Refining {num_frames} frames to 720p@30fps...")
+    # Run segmented refinement (matching run_demo_long_video.py lines 146-175)
+    logger.info(f"Refining {num_frames} frames to 720p@30fps using segmented approach...")
     logger.info("Using empty prompt (refinement only needs stage1 video)")
 
-    refined_output = pipe.generate_refine(
-        prompt='',  # Empty prompt as per source (run_demo_long_video.py:157)
-        stage1_video=stage1_pil_frames,
-        num_cond_frames=0,  # No conditioning for single-pass refinement
-        num_inference_steps=args.infer_steps if args.infer_steps else 50,
-        generator=generator,
-        output_type="np"
-    )[0]
+    # Get segment size and conditioning frames from args or use defaults
+    segment_size = getattr(args, 'refine_segment_size', 93)
+    num_cond_frames = 13  # LongCat standard conditioning frames
 
-    logger.info(f"Refinement complete! Output shape: {refined_output.shape}")
-    logger.info(f"Refined video: {refined_output.shape[0]} frames @ 720p")
+    # Calculate number of segments needed
+    # First segment uses full segment_size frames, subsequent segments overlap by num_cond_frames
+    if num_frames <= segment_size:
+        # Single segment - no need for segmentation
+        num_segments = 1
+        logger.info(f"Video is {num_frames} frames - processing in single segment")
+    else:
+        # Multiple segments needed
+        # After first segment (segment_size frames), we need to cover (num_frames - segment_size) frames
+        # Each subsequent segment adds (segment_size - num_cond_frames) new frames
+        remaining_frames = num_frames - segment_size
+        new_frames_per_segment = segment_size - num_cond_frames
+        num_segments = 1 + math.ceil(remaining_frames / new_frames_per_segment)
+        logger.info(f"Video is {num_frames} frames - processing in {num_segments} segments")
+        logger.info(f"Segment size: {segment_size} frames, conditioning: {num_cond_frames} frames")
+        logger.info(f"Each segment adds {new_frames_per_segment} new frames")
+
+    logger.info("")
+
+    # Setup segmented refinement loop variables (matching run_demo_long_video.py:146-149)
+    cur_condition_video = None      # Previous refined segment
+    cur_num_cond_frames = 0         # 0 for first, 26 for subsequent (13*2)
+    start_id = 0                    # Starting frame index in stage1
+    all_refine_frames = []          # Accumulated refined frames
+
+    # Iterate through segments
+    for segment_idx in range(num_segments):
+        logger.info(f"Refining segment {segment_idx + 1}/{num_segments}...")
+
+        # Extract segment from stage1 output
+        end_id = min(start_id + segment_size, num_frames)
+        stage1_segment = stage1_pil_frames[start_id:end_id]
+        logger.info(f"  Stage1 segment: frames [{start_id}:{end_id}] ({len(stage1_segment)} frames)")
+
+        # Generate refined segment
+        # Matches run_demo_long_video.py:155-162
+        try:
+            output_refine = pipe.generate_refine(
+                video=cur_condition_video,
+                prompt='',  # Empty prompt as per source (run_demo_long_video.py:157)
+                stage1_video=stage1_segment,
+                num_cond_frames=cur_num_cond_frames,
+                num_inference_steps=args.infer_steps if args.infer_steps else 50,
+                generator=generator,
+                output_type="np"
+            )[0]
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error(f"OOM error during segment {segment_idx + 1}. Try reducing --refine_segment_size (current: {segment_size})")
+                logger.error(f"Or increase --blocks_to_swap (current: {args.blocks_to_swap})")
+                raise
+            else:
+                raise
+
+        # Convert to PIL Images
+        # Matches run_demo_long_video.py:164-166
+        new_video = _convert_numpy_to_pil(output_refine)
+        logger.info(f"  Refined {len(new_video)} frames @ 720p")
+
+        # Append only NEW frames (skip conditioning overlap)
+        # Matches run_demo_long_video.py:168
+        new_frames = new_video[cur_num_cond_frames:]
+        all_refine_frames.extend(new_frames)
+
+        logger.info(f"  Added {len(new_frames)} new frames (total: {len(all_refine_frames)} frames)")
+
+        # Update for next iteration
+        # Matches run_demo_long_video.py:169-171
+        cur_condition_video = new_video
+        cur_num_cond_frames = num_cond_frames * 2  # 13*2 = 26
+        start_id = start_id + segment_size - num_cond_frames  # Advance by (segment_size - 13)
+
+        # Save checkpoint after each segment
+        if num_segments > 1:
+            checkpoint_path = os.path.join(args.save_path, f"refine_checkpoint_segment_{segment_idx}.mp4")
+            os.makedirs(args.save_path, exist_ok=True)
+            checkpoint_frames_np = np.array([np.array(frame) for frame in all_refine_frames])
+            checkpoint_frames_tensor = torch.from_numpy(checkpoint_frames_np)
+            from torchvision.io import write_video
+            write_video(checkpoint_path, checkpoint_frames_tensor, fps=30, video_codec="libx264", options={"crf": "10"})
+            logger.info(f"  Saved checkpoint: {checkpoint_path}")
+
+        # Memory cleanup
+        del output_refine, new_video, new_frames
+        clean_memory_on_device(device)
+        gc.collect()
+
+        logger.info("")
+
+    logger.info(f"Refinement complete! Refined {len(all_refine_frames)} frames @ 720p")
     logger.info("Note: Temporal resolution doubled (15fps -> 30fps)")
 
-    # Save refined video
+    # Save final refined video
     import time
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     output_filename = f"{timestamp}_{seed}_refined.mp4"
@@ -5769,7 +5854,8 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     os.makedirs(args.save_path, exist_ok=True)
 
     # Convert to tensor for saving
-    output_tensor = torch.from_numpy((refined_output * 255).astype(np.uint8))
+    final_frames_np = np.array([np.array(frame) for frame in all_refine_frames])
+    output_tensor = torch.from_numpy(final_frames_np)
     from torchvision.io import write_video
     write_video(output_path, output_tensor, fps=30, video_codec="libx264", options={"crf": "10"})
 
