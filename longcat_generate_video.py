@@ -4350,6 +4350,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             model=model,
             lora_paths=args.lora_weight,
             lora_multipliers=args.lora_multiplier,
+            include_patterns=args.include_patterns,
+            exclude_patterns=args.exclude_patterns,
             device=device
         )
 
@@ -4737,6 +4739,8 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
             model=model,
             lora_paths=args.lora_weight,
             lora_multipliers=args.lora_multiplier,
+            include_patterns=args.include_patterns,
+            exclude_patterns=args.exclude_patterns,
             device=device
         )
 
@@ -5872,6 +5876,8 @@ def load_loras_on_model(
     lora_paths: List[str],
     lora_multipliers: Union[List[float], float],
     lora_keys: Optional[List[str]] = None,
+    include_patterns: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
     device: torch.device = None
 ) -> None:
     """
@@ -5882,6 +5888,8 @@ def load_loras_on_model(
         lora_paths: List of paths to LoRA files
         lora_multipliers: List of LoRA multipliers/strengths (or single float for all)
         lora_keys: List of LoRA keys for identification (optional)
+        include_patterns: List of include patterns for filtering LoRA keys (optional)
+        exclude_patterns: List of exclude patterns for filtering LoRA keys (optional)
         device: Device to load LoRAs on (optional)
     """
     if not lora_paths:
@@ -5905,10 +5913,46 @@ def load_loras_on_model(
 
         key = (lora_keys[i] if lora_keys and i < len(lora_keys) else f"lora_{i+1}")
 
+        # Get include/exclude patterns for this LoRA
+        include_pattern = include_patterns[i] if include_patterns and i < len(include_patterns) else None
+        exclude_pattern = exclude_patterns[i] if exclude_patterns and i < len(exclude_patterns) else None
+
         try:
-            logger.info(f"Loading LoRA {i+1}: {key} from {lora_path} (multiplier: {multiplier})")
-            model.load_lora(lora_path, key, multiplier=multiplier)
-            enabled_keys.append(key)
+            # Load LoRA state dict for filtering if patterns are specified
+            if include_pattern or exclude_pattern:
+                logger.info(f"Loading LoRA {i+1}: {key} from {lora_path} (multiplier: {multiplier}, include: {include_pattern}, exclude: {exclude_pattern})")
+                from safetensors.torch import load_file
+                lora_sd = load_file(lora_path, device="cpu")
+
+                # Filter keys using the same function as wan2_generate_video
+                original_keys = len(lora_sd)
+                lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
+                filtered_keys = len(lora_sd)
+
+                if filtered_keys == 0:
+                    logger.warning(f"LoRA {i+1} has no keys after filtering (include: {include_pattern}, exclude: {exclude_pattern}). Skipping.")
+                    continue
+
+                logger.info(f"Filtered LoRA {i+1} keys: {original_keys} -> {filtered_keys}")
+
+                # Save filtered LoRA to temp file and load it
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+                    temp_path = tmp.name
+                    from safetensors.torch import save_file
+                    save_file(lora_sd, temp_path)
+
+                try:
+                    model.load_lora(temp_path, key, multiplier=multiplier)
+                    enabled_keys.append(key)
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+            else:
+                logger.info(f"Loading LoRA {i+1}: {key} from {lora_path} (multiplier: {multiplier})")
+                model.load_lora(lora_path, key, multiplier=multiplier)
+                enabled_keys.append(key)
         except Exception as e:
             logger.error(f"Failed to load LoRA {i+1} from {lora_path}: {e}")
 
@@ -6056,6 +6100,18 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
 
     dit.eval()
     logger.info("LongCat DiT loaded and ready")
+
+    # --- Load LoRAs if specified ---
+    if args.lora_weight:
+        logger.info(f"Loading {len(args.lora_weight)} LoRAs onto DiT model...")
+        load_loras_on_model(
+            model=dit,
+            lora_paths=args.lora_weight,
+            lora_multipliers=args.lora_multiplier,
+            include_patterns=args.include_patterns,
+            exclude_patterns=args.exclude_patterns,
+            device=device
+        )
 
     # Create pipeline
     from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
