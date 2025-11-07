@@ -638,6 +638,8 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     # load checkpoint
     logging.info(f"loading {pretrained_path}")
     if os.path.splitext(pretrained_path)[-1] == ".safetensors":
+        # For safetensors, first materialize meta tensors to target device
+        model = model.to_empty(device=device)
         sd = load_file(pretrained_path)
         model.load_state_dict(sd, strict=False, assign=True)
     else:
@@ -744,9 +746,9 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        # with amp.autocast(dtype=self.dtype):
-        return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
 
     def decode(self, zs):
-        # with amp.autocast(dtype=self.dtype):
-        return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]

@@ -173,6 +173,20 @@ class MemoryEfficientSafeOpen:
 def load_safetensors(
     path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
 ) -> dict[str, torch.Tensor]:
+    # Handle sharded models stored in a directory
+    if os.path.isdir(path):
+        import glob
+        shard_files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+        if not shard_files:
+            raise FileNotFoundError(f"No .safetensors files found in directory: {path}")
+
+        total_state_dict = {}
+        for shard_file in shard_files:
+            # Recursively call this function to load each shard (which is a single file)
+            shard_state_dict = load_safetensors(shard_file, device, disable_mmap, dtype)
+            total_state_dict.update(shard_state_dict)
+        return total_state_dict
+
     if disable_mmap:
         # return safetensors.torch.load(open(path, "rb").read())
         # use experimental loader

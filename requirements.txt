@@ -99,3 +99,4 @@ zipp==3.21.0
 imageio-ffmpeg
 decord
 gradio_image_annotation
+color-matcher>=0.3.0

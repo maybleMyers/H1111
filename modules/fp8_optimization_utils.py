@@ -78,7 +78,7 @@ def quantize_tensor_to_fp8(tensor, scale, exp_bits=4, mantissa_bits=3, sign_bits
     # Calculate log scales (only for non-zero elements)
     log_scales = torch.zeros_like(clamped_tensor)
     if nonzero_mask.any():
-        log_scales[nonzero_mask] = torch.floor(torch.log2(abs_values[nonzero_mask]) + bias).detach()
+        log_scales[nonzero_mask] = torch.floor(torch.log2(abs_values[nonzero_mask]) + bias).to(clamped_tensor.dtype).detach()
 
     # Limit log scales and calculate quantization factor
     log_scales = torch.clamp(log_scales, min=1.0)

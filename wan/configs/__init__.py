@@ -164,6 +164,7 @@ WAN_CONFIGS = {
     "i2v-14B-FC": i2v_14B_FC,
     "i2v-14B-FC-1.1": i2v_14B_FC_1_1,
     'multitalk-14B': multitalk_14B,
+    'infinitetalk-14B': multitalk_14B,  # InfiniteTalk uses the same config as MultiTalk
 }
 
 SIZE_CONFIGS = {
@@ -176,7 +177,9 @@ SIZE_CONFIGS = {
     "672*352": (672, 352),
     "352*672": (352, 672),
     'multitalk-480': (640, 640),
-    'multitalk-720': (960, 960),    
+    'multitalk-720': (960, 960),
+    'infinitetalk-480': (640, 640),
+    'infinitetalk-720': (960, 960),    
 }
 
 MAX_AREA_CONFIGS = {
@@ -203,4 +206,5 @@ SUPPORTED_SIZES = {
     "i2v-14B-FC": ("720*1280", "1280*720", "480*832", "832*480"),
     "i2v-14B-FC-1.1": ("720*1280", "1280*720", "480*832", "832*480"),
     'multitalk-14B': ('multitalk-480', 'multitalk-720'),
+    'infinitetalk-14B': ('infinitetalk-480', 'infinitetalk-720'),
 }
