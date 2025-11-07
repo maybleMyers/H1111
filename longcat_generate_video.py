@@ -6942,15 +6942,28 @@ def main():
             # Clean up continuation mode flag
             del args._longcat_continuation_mode
 
-        # --- Apply Refinement if requested (720p upscaling) ---
+        # --- Apply Refinement if requested (480p@15fps -> 720p@30fps upscaling) ---
+        # Implementation follows LongCat-Video/run_demo_long_video.py lines 136-176
         if hasattr(args, 'enable_refinement') and args.enable_refinement:
             logger.info("=" * 80)
-            logger.info("Applying video refinement (480p -> 720p upscaling)")
+            logger.info("Applying video refinement (480p@15fps -> 720p@30fps upscaling)")
+            logger.info("Using strategy from run_demo_long_video.py")
             logger.info("=" * 80)
 
+            # Build refinement LoRA path
+            if hasattr(args, 'refinement_lora_path') and args.refinement_lora_path:
+                # If path is relative, make it relative to checkpoint dir
+                if not os.path.isabs(args.refinement_lora_path):
+                    refinement_lora_path = os.path.join(args.ckpt_dir, args.refinement_lora_path)
+                else:
+                    refinement_lora_path = args.refinement_lora_path
+            else:
+                # Default path from source repo
+                refinement_lora_path = os.path.join(args.ckpt_dir, 'lora/refinement_lora.safetensors')
+
             # Check if refinement LoRA exists
-            if not hasattr(args, 'refinement_lora_path') or not os.path.exists(args.refinement_lora_path):
-                logger.warning(f"Refinement LoRA not found at: {getattr(args, 'refinement_lora_path', 'not specified')}")
+            if not os.path.exists(refinement_lora_path):
+                logger.warning(f"Refinement LoRA not found at: {refinement_lora_path}")
                 logger.warning("Skipping refinement step")
             else:
                 try:
@@ -6965,14 +6978,15 @@ def main():
                         torch_dtype=dit_dtype
                     )
 
-                    # Load refinement LoRA
-                    logger.info(f"Loading refinement LoRA from: {args.refinement_lora_path}")
-                    load_loras_on_model(
-                        model=refinement_dit,
-                        lora_paths=[args.refinement_lora_path],
-                        lora_multipliers=[1.0],
-                        device=device
-                    )
+                    # Load refinement LoRA (matching run_demo_long_video.py lines 137-139)
+                    logger.info(f"Loading refinement LoRA from: {refinement_lora_path}")
+                    refinement_dit.load_lora(refinement_lora_path, 'refinement_lora')
+                    refinement_dit.enable_loras(['refinement_lora'])
+
+                    # CRITICAL: Enable BSA (Block Sparse Attention) for refinement
+                    # This is required for refinement to work properly (line 140 in run_demo_long_video.py)
+                    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
+                    refinement_dit.enable_bsa()
 
                     # Move model to device
                     if args.blocks_to_swap > 0:
@@ -7002,7 +7016,8 @@ def main():
                     from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
                     refinement_vae = AutoencoderKLWan.from_pretrained(
                         args.ckpt_dir,
-                        subfolder="vae"
+                        subfolder="vae",
+                        torch_dtype=dit_dtype
                     ).to(device)
                     refinement_vae.eval()
 
@@ -7040,19 +7055,27 @@ def main():
                     video_frames = ((decoded_video[0].permute(1, 2, 3, 0).cpu().numpy() + 1.0) * 127.5).astype(np.uint8)
                     stage1_pil_frames = [Image.fromarray(frame) for frame in video_frames]
 
-                    logger.info(f"Refining {len(stage1_pil_frames)} frames to 720p...")
+                    total_frames = len(stage1_pil_frames)
+                    logger.info(f"Refining {total_frames} frames to 720p@30fps...")
+
+                    # Refinement parameters from source
+                    num_frames = 93  # Segment size
+                    num_cond_frames = args.num_cond_frames if hasattr(args, 'num_cond_frames') and args.num_cond_frames else 13
 
                     # Setup generator
                     generator = torch.Generator(device=device)
                     if args.seed:
                         generator.manual_seed(args.seed)
 
-                    # Call refinement
+                    # CRITICAL: Use empty prompt for refinement (line 157 in run_demo_long_video.py)
+                    # The refinement model doesn't need text guidance, only the stage1 video as input
+                    logger.info("Running refinement with empty prompt (as per source implementation)...")
+
                     refined_output = refinement_pipe.generate_refine(
-                        prompt=args.prompt,
+                        prompt='',  # Empty prompt as per source (run_demo_long_video.py:157)
                         stage1_video=stage1_pil_frames,
-                        num_cond_frames=0,  # No conditioning for single-pass refinement
-                        num_inference_steps=args.infer_steps if args.infer_steps else 30,
+                        num_cond_frames=0,  # No conditioning for single-segment refinement
+                        num_inference_steps=args.infer_steps if args.infer_steps else 50,
                         generator=generator,
                         output_type="np"
                     )[0]
@@ -7072,7 +7095,8 @@ def main():
                     height = refined_tensor.shape[3]
                     width = refined_tensor.shape[4]
 
-                    logger.info(f"Refined video dimensions: {height}x{width}")
+                    logger.info(f"Refined video dimensions: {height}x{width}@{refined_output.shape[0]} frames")
+                    logger.info(f"Note: Refinement doubles temporal resolution (15fps -> 30fps)")
 
                     # Cleanup refinement models
                     del refinement_dit, refinement_vae, text_encoder, tokenizer, refinement_pipe
