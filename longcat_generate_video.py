@@ -4612,15 +4612,20 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     logger.info("VAE loaded successfully")
 
     # --- Load input video and downsample ---
-    logger.info(f"Loading input video: {args.input_video}")
-    height, width = args.video_size
-    video_frames = load_and_downsample_video(
-        args.input_video,
-        args.target_fps,
-        height=height,
-        width=width
-    )
-    logger.info(f"Loaded {len(video_frames)} frames at {args.target_fps} FPS")
+    # Check if frames were provided directly (for long_video mode to avoid encode-decode cycle)
+    if hasattr(args, '_input_frames') and args._input_frames is not None:
+        logger.info(f"Using {len(args._input_frames)} frames provided directly (avoiding mp4 encode-decode)")
+        video_frames = args._input_frames
+    else:
+        logger.info(f"Loading input video: {args.input_video}")
+        height, width = args.video_size
+        video_frames = load_and_downsample_video(
+            args.input_video,
+            args.target_fps,
+            height=height,
+            width=width
+        )
+        logger.info(f"Loaded {len(video_frames)} frames at {args.target_fps} FPS")
 
     # Check if we have enough frames
     if len(video_frames) < args.num_cond_frames:
@@ -5138,23 +5143,17 @@ def generate_longcat_long_video(
         for segment_idx in range(num_segments):
             logger.info(f"Segment {segment_idx + 2}/{num_segments + 1}: Generating continuation...")
 
-            # Save current video as temporary file for continuation
-            import tempfile
-            temp_video_fd, temp_video_path = tempfile.mkstemp(suffix=".mp4", dir=args.save_path)
-            os.close(temp_video_fd)
-
-            # Save current_video (last segment) as mp4
-            current_frames_tensor = torch.from_numpy(np.array([np.array(frame) for frame in current_video]))
-            write_video(temp_video_path, current_frames_tensor, fps=int(target_fps), video_codec="libx264", options={"crf": "18"})
-            logger.info(f"  Saved conditioning video: {temp_video_path}")
-
             # Setup args for continuation
             continuation_args = argparse.Namespace(**vars(args))
             continuation_args.mode = "continuation"
-            continuation_args.input_video = temp_video_path
             continuation_args.num_cond_frames = num_cond_frames
             continuation_args.target_fps = target_fps
             continuation_args.video_length = num_frames
+
+            # Pass PIL frames directly to avoid mp4 encode-decode cycle
+            # (Reference implementation does the same: pipe.generate_vc(video=current_video, ...))
+            continuation_args._input_frames = current_video
+            logger.info(f"  Passing {len(current_video)} frames directly to continuation (avoiding encode-decode)")
 
             # Generate next segment
             try:
@@ -5188,10 +5187,6 @@ def generate_longcat_long_video(
                 logger.info("")
 
             finally:
-                # Clean up temporary file
-                if os.path.exists(temp_video_path):
-                    os.remove(temp_video_path)
-
                 # Memory cleanup
                 clean_memory_on_device(device)
                 gc.collect()
