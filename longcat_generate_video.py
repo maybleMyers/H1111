@@ -5006,29 +5006,6 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     return full_latents
 
 
-def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) -> Optional[torch.Tensor]:
-    """LongCat Image-to-Video generation (wrapper around generate_longcat).
-
-    This is essentially the same as T2V but allows specifying an image for consistency.
-    The LongCat model uses text prompts for I2V, not image conditioning like Wan I2V models.
-
-    Args:
-        args: command line arguments
-        device: torch device
-        cfg: model configuration
-
-    Returns:
-        Generated latent tensor [B, C, F, H, W]
-    """
-    logger.info("LongCat I2V: Using T2V generation (LongCat uses text-based I2V)")
-
-    # For LongCat, I2V is text-based, so route to T2V generation
-    # The image_path can be used for reference but doesn't affect generation
-    if args.image_path:
-        logger.info(f"Reference image: {args.image_path} (not used for generation)")
-
-    return generate_longcat(args, device, cfg)
-
 
 def generate_longcat_long_video(
     args: argparse.Namespace,
@@ -5445,22 +5422,113 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
 
-    # Load text encoder and DiT (same as T2V from this point)
-    # ... (rest follows same structure as generate_longcat but with image_latent as conditioning)
+    # Load text encoder
+    logger.info("Loading UMT5-XXL text encoder...")
+    from transformers import AutoTokenizer, UMT5EncoderModel
 
-    # For brevity, I'll use the pipeline approach from the official demo
-    # The key difference is passing the image_latent as conditioning to the DiT
+    text_encoder_device = device
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.ckpt_dir,
+        subfolder="tokenizer",
+        torch_dtype=dit_dtype
+    )
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="text_encoder",
+        torch_dtype=dit_dtype
+    ).to(text_encoder_device)
+    text_encoder.eval()
+    logger.info("Text encoder loaded")
 
-    logger.info("I2V generation: Using official pipeline approach")
-    # TODO: Complete I2V implementation using official pipeline
-    # For now, return None to allow testing other features
-    logger.warning("I2V generation not fully implemented yet - returning None")
+    # Load scheduler
+    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.ckpt_dir,
+        subfolder="scheduler",
+        torch_dtype=dit_dtype
+    )
 
-    # Store VAE for decoding
+    # Load DiT
+    logger.info("Loading LongCat DiT model...")
+    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+    dit = LongCatVideoTransformer3DModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="dit",
+        torch_dtype=dit_dtype
+    )
+
+    # Enable block swapping if requested
+    if args.blocks_to_swap > 0:
+        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        dit.to("cpu")
+        dit.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        dit.move_to_device_except_swap_blocks(device)
+        dit.prepare_block_swap_before_forward()
+    else:
+        dit.to(device)
+
+    dit.eval()
+    logger.info("LongCat DiT loaded and ready")
+
+    # Create pipeline
+    from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
+    pipe = LongCatVideoPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae.to(device),  # Move VAE back to device for pipeline
+        scheduler=scheduler,
+        dit=dit,
+    )
+    pipe.to(device)
+
+    # Setup generator
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    # Generate I2V
+    logger.info(f"Generating I2V with {args.video_length} frames...")
+    negative_prompt = args.negative_prompt if args.negative_prompt else ""
+
+    # Determine resolution
+    resolution = '480p' if height == 480 else '720p'
+
+    output = pipe.generate_i2v(
+        image=image,
+        prompt=args.prompt,
+        negative_prompt=negative_prompt,
+        resolution=resolution,
+        num_frames=args.video_length,
+        num_inference_steps=args.infer_steps,
+        guidance_scale=args.guidance_scale,
+        generator=generator
+    )[0]
+
+    logger.info(f"I2V generation complete! Output shape: {output.shape}")
+
+    # Convert output to latents
+    # Output is numpy array [F, H, W, C] in range [0, 1]
+    output_uint8 = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
+    output_pil = [Image.fromarray(img) for img in output_uint8]
+
+    # Save output video directly (matching long_video implementation)
+    import time
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    output_filename = f"{timestamp}_{seed}.mp4"
+    output_path = os.path.join(args.save_path, output_filename)
+    os.makedirs(args.save_path, exist_ok=True)
+
+    output_tensor = torch.from_numpy(np.array(output_pil))
+    from torchvision.io import write_video
+    write_video(output_path, output_tensor, fps=int(args.target_fps), video_codec="libx264", options={"crf": "18"})
+
+    logger.info(f"Video saved to: {output_path}")
+
+    # Store VAE for potential later use
     args._longcat_vae = vae
     args._longcat_cfg = cfg
 
-    return None  # Placeholder
+    # Return None since video was already saved
+    return None
 
 
 @torch.no_grad()
@@ -6650,9 +6718,9 @@ def main():
             logger.info("Exiting after saving merged model.")
             return # Exit if only saving model
 
-        # For long_video mode, generated_latent is None because video was already saved
+        # For long_video and i2v modes, generated_latent is None because video was already saved
         if generated_latent is None:
-            if args.mode == "long_video":
+            if args.mode in ["long_video", "i2v"]:
                 logger.info("Done!")
                 return
             else:
