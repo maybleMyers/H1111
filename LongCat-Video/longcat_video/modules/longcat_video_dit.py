@@ -238,18 +238,23 @@ class LongCatVideoTransformer3DModel(
     def _create_multi_lora_forward(self, module, loras):
         def multi_lora_forward(x, *args, **kwargs):
             weight_dtype = x.dtype
+            x_device = x.device
             org_output = module.org_forward(x, *args, **kwargs)
-            
+
             total_lora_output = 0
             for lora in loras:
                 if lora.use_lora:
+                    # Move LoRA to input device (for block swapping support)
+                    if lora.lora_down.weight.device != x_device:
+                        lora.to(x_device, non_blocking=True)
+
                     lx = lora.lora_down(x.to(lora.lora_down.weight.dtype))
                     lx = lora.lora_up(lx)
                     lora_output = lx.to(weight_dtype) * lora.multiplier * lora.alpha_scale
                     total_lora_output += lora_output
-            
+
             return org_output + total_lora_output
-        
+
         return multi_lora_forward
     
     def _get_module_by_name(self, module_name):

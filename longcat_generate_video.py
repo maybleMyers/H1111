@@ -5373,13 +5373,13 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
         torch_dtype=dit_dtype
     )
 
-    # Load refinement LoRA and enable BSA (matching run_demo_long_video.py lines 137-140)
+    # Load and enable refinement LoRA and BSA BEFORE block swapping (matching run_demo_video_continuation.py lines 154-156)
     dit.load_lora(refinement_lora_path, 'refinement_lora')
     dit.enable_loras(['refinement_lora'])
     logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
     dit.enable_bsa()
 
-    # Move model to device
+    # Now move model to device (with block swapping if enabled)
     if args.blocks_to_swap > 0:
         logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
         dit.to("cpu")
@@ -7184,17 +7184,16 @@ def main():
                         torch_dtype=dit_dtype
                     )
 
-                    # Load refinement LoRA (matching run_demo_long_video.py lines 137-139)
+                    # Load and enable refinement LoRA and BSA BEFORE block swapping (matching run_demo_video_continuation.py lines 154-156)
                     logger.info(f"Loading refinement LoRA from: {refinement_lora_path}")
                     refinement_dit.load_lora(refinement_lora_path, 'refinement_lora')
                     refinement_dit.enable_loras(['refinement_lora'])
-
                     # CRITICAL: Enable BSA (Block Sparse Attention) for refinement
                     # This is required for refinement to work properly (line 140 in run_demo_long_video.py)
                     logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
                     refinement_dit.enable_bsa()
 
-                    # Move model to device
+                    # Now move model to device (with block swapping if enabled)
                     if args.blocks_to_swap > 0:
                         logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
                         refinement_dit.to("cpu")
