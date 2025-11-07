@@ -624,8 +624,8 @@ def parse_args() -> argparse.Namespace:
 
     # Video Continuation Arguments (LongCat)
     parser.add_argument("--mode", type=str, default="generation",
-                       choices=["generation", "continuation", "i2v", "long_video"],
-                       help="Generation mode: 'generation' for T2V, 'i2v' for image-to-video, 'long_video' for iterative long video, 'continuation' for video continuation (LongCat only)")
+                       choices=["generation", "continuation", "i2v", "long_video", "refine"],
+                       help="Generation mode: 'generation' for T2V, 'i2v' for image-to-video, 'long_video' for iterative long video, 'continuation' for video continuation, 'refine' for refinement-only (480p@15fps -> 720p@30fps upscaling, LongCat only)")
     parser.add_argument("--input_video", type=str, default=None,
                        help="Path to input video for continuation/long_video mode")
     parser.add_argument("--num_cond_frames", type=int, default=None,
@@ -693,6 +693,17 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--target_fps must be positive")
         if args.video_length is not None and args.num_cond_frames >= args.video_length:
             raise ValueError("--num_cond_frames must be less than --video_length")
+
+    # Refinement mode validation
+    if args.mode == "refine":
+        if not args.task.startswith("longcat-"):
+            raise ValueError("Refinement mode (--mode refine) is only supported with LongCat models (--task longcat-*)")
+        if args.input_video is None:
+            raise ValueError("--input_video is required when --mode refine is specified")
+        if not os.path.exists(args.input_video):
+            raise ValueError(f"Input video not found: {args.input_video}")
+        if not DIFFUSERS_LOAD_VIDEO_AVAILABLE:
+            raise ValueError("diffusers.utils.load_video is required for refinement mode but is not available")
 
     return args
 
@@ -5286,6 +5297,192 @@ def generate_longcat_refine(
     )
 
 
+@torch.no_grad()
+def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device, cfg) -> None:
+    """Refinement-only mode: upscale existing 480p@15fps video to 720p@30fps.
+
+    This function implements standalone refinement matching LongCat-Video/run_demo_long_video.py
+    lines 136-176. It ONLY runs refinement without any generation.
+
+    Args:
+        args: command line arguments with:
+            - input_video: path to 480p@15fps video to refine
+            - ckpt_dir: LongCat checkpoint directory
+            - refinement_lora_path: path to refinement LoRA
+            - seed: random seed
+        device: torch device
+        cfg: model configuration
+
+    Returns:
+        None (video is saved directly)
+    """
+    logger.info("=" * 80)
+    logger.info("LongCat Refinement-Only Mode")
+    logger.info("Upscaling 480p@15fps -> 720p@30fps")
+    logger.info("=" * 80)
+
+    if not LONGCAT_AVAILABLE:
+        raise ImportError("transformers not available. Install: pip install transformers")
+
+    if args.ckpt_dir is None:
+        raise ValueError("--ckpt_dir is required for LongCat refinement")
+
+    # Setup dtype
+    dit_dtype = torch.bfloat16
+
+    # Setup seed
+    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    args.seed = seed
+    logger.info(f"Using seed: {seed}")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    # Load input video
+    logger.info(f"Loading input video: {args.input_video}")
+    from PIL import Image
+    from diffusers.utils import load_video
+
+    # Load video frames
+    video_frames = load_video(args.input_video)
+    num_frames = len(video_frames)
+    logger.info(f"Loaded {num_frames} frames from input video")
+
+    # Convert to PIL images
+    stage1_pil_frames = [Image.fromarray(frame) for frame in video_frames]
+
+    # Build refinement LoRA path
+    if hasattr(args, 'refinement_lora_path') and args.refinement_lora_path:
+        if not os.path.isabs(args.refinement_lora_path):
+            refinement_lora_path = os.path.join(args.ckpt_dir, args.refinement_lora_path)
+        else:
+            refinement_lora_path = args.refinement_lora_path
+    else:
+        refinement_lora_path = os.path.join(args.ckpt_dir, 'lora/refinement_lora.safetensors')
+
+    if not os.path.exists(refinement_lora_path):
+        raise ValueError(f"Refinement LoRA not found at: {refinement_lora_path}")
+
+    logger.info(f"Loading refinement LoRA from: {refinement_lora_path}")
+
+    # Load DiT model
+    logger.info("Loading LongCat DiT model...")
+    from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
+    dit = LongCatVideoTransformer3DModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="dit",
+        torch_dtype=dit_dtype
+    )
+
+    # Load refinement LoRA and enable BSA (matching run_demo_long_video.py lines 137-140)
+    dit.load_lora(refinement_lora_path, 'refinement_lora')
+    dit.enable_loras(['refinement_lora'])
+    logger.info("Enabling Block Sparse Attention (BSA) for refinement...")
+    dit.enable_bsa()
+
+    # Move model to device
+    if args.blocks_to_swap > 0:
+        logger.info(f"Enabling block swapping for {args.blocks_to_swap} blocks...")
+        dit.to("cpu")
+        dit.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        dit.move_to_device_except_swap_blocks(device)
+        dit.prepare_block_swap_before_forward()
+    else:
+        dit.to(device)
+
+    dit.eval()
+    logger.info("DiT loaded with refinement LoRA and BSA enabled")
+
+    # Load text encoder
+    logger.info("Loading text encoder...")
+    from transformers import AutoTokenizer, UMT5EncoderModel
+    tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        args.ckpt_dir,
+        subfolder="text_encoder",
+        torch_dtype=dit_dtype
+    ).to(device)
+    text_encoder.eval()
+
+    # Load VAE
+    logger.info("Loading VAE...")
+    from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
+    vae = AutoencoderKLWan.from_pretrained(
+        args.ckpt_dir,
+        subfolder="vae",
+        torch_dtype=dit_dtype
+    ).to(device)
+    vae.eval()
+
+    # Load scheduler
+    from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.ckpt_dir,
+        subfolder="scheduler",
+        torch_dtype=dit_dtype
+    )
+
+    # Create refinement pipeline
+    from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
+    pipe = LongCatVideoPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=scheduler,
+        dit=dit,
+    )
+
+    # Skip pipe.to(device) if block swapping is enabled (same fix as I2V)
+    if args.blocks_to_swap == 0:
+        pipe.to(device)
+    else:
+        pipe.device = device
+
+    logger.info("Pipeline created")
+
+    # Setup generator
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    # Run refinement (matching run_demo_long_video.py line 155-162)
+    logger.info(f"Refining {num_frames} frames to 720p@30fps...")
+    logger.info("Using empty prompt (refinement only needs stage1 video)")
+
+    refined_output = pipe.generate_refine(
+        prompt='',  # Empty prompt as per source (run_demo_long_video.py:157)
+        stage1_video=stage1_pil_frames,
+        num_cond_frames=0,  # No conditioning for single-pass refinement
+        num_inference_steps=args.infer_steps if args.infer_steps else 50,
+        generator=generator,
+        output_type="np"
+    )[0]
+
+    logger.info(f"Refinement complete! Output shape: {refined_output.shape}")
+    logger.info(f"Refined video: {refined_output.shape[0]} frames @ 720p")
+    logger.info("Note: Temporal resolution doubled (15fps -> 30fps)")
+
+    # Save refined video
+    import time
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    output_filename = f"{timestamp}_{seed}_refined.mp4"
+    output_path = os.path.join(args.save_path, output_filename)
+    os.makedirs(args.save_path, exist_ok=True)
+
+    # Convert to tensor for saving
+    output_tensor = torch.from_numpy((refined_output * 255).astype(np.uint8))
+    from torchvision.io import write_video
+    write_video(output_path, output_tensor, fps=30, video_codec="libx264", options={"crf": "10"})
+
+    logger.info(f"Refined video saved to: {output_path}")
+    logger.info("=" * 80)
+    logger.info("Refinement Complete!")
+    logger.info("=" * 80)
+
+    return None
+
+
 def load_loras_on_model(
     model,  # LongCatVideoTransformer3DModel
     lora_paths: List[str],
@@ -6687,7 +6884,9 @@ def main():
 
         # Determine specific mode string
         mode_str = "Unknown"
-        if args.mode == "continuation":
+        if args.mode == "refine":
+            mode_str = "Refinement-Only"
+        elif args.mode == "continuation":
             mode_str = "Video Continuation"
         elif args.video_path: mode_str = "V2V"
         elif args.image_path and args.control_path: mode_str = "FunControl-I2V" # FunControl overrides if control_path is present
@@ -6703,6 +6902,7 @@ def main():
         if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
         if mode_str == "Video Continuation": logger.info(f"Input Video: {args.input_video}, Conditioning Frames: {args.num_cond_frames}, Target FPS: {args.target_fps}")
+        if mode_str == "Refinement-Only": logger.info(f"Input Video: {args.input_video}, LoRA: {getattr(args, 'refinement_lora_path', 'not set')}")
 
         # Log LoRA info if specified
         if args.lora_weight:
@@ -6727,6 +6927,12 @@ def main():
                 logger.info(f"Refinement is ENABLED - will upscale to 720p@30fps after generation")
                 logger.info(f"Refinement LoRA path: {getattr(args, 'refinement_lora_path', 'not set')}")
             generated_latent = generate_longcat_vc(args, args.device, cfg)
+        elif args.mode == "refine":
+            # Refinement-only mode (LongCat only)
+            logger.info("Routing to LongCat Refinement-Only mode")
+            generate_longcat_refine_only(args, args.device, cfg)
+            logger.info("Done!")
+            return  # Exit early, video already saved
         else:
             # Standard generation modes (T2V, I2V, V2V, Fun-Control)
             logger.info("Routing to standard generation pipeline")
