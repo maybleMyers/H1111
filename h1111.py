@@ -5453,7 +5453,8 @@ def longcat_batch_handler(
         "Text-to-Video": "generation",
         "Image-to-Video": "i2v",
         "Long Video": "long_video",
-        "Video Continuation": "continuation"
+        "Video Continuation": "continuation",
+        "Refinement Only": "refine"
     }
     mode = mode_map.get(generation_mode, "generation")
 
@@ -5461,6 +5462,10 @@ def longcat_batch_handler(
     if mode == "i2v":
         if not i2v_input_image or not os.path.exists(i2v_input_image):
             yield [], "Error: Input image required for Image-to-Video mode", ""
+            return
+    elif mode == "refine":
+        if not input_video or not os.path.exists(input_video):
+            yield [], "Error: Input video required for Refinement Only mode", ""
             return
     elif mode in ["continuation", "long_video"]:
         if mode == "continuation" and (not input_video or not os.path.exists(input_video)):
@@ -7661,7 +7666,7 @@ with gr.Blocks(
             with gr.Accordion("Generation Mode", open=False):
                 with gr.Row():
                     longcat_generation_mode = gr.Radio(
-                        choices=["Text-to-Video", "Image-to-Video", "Long Video", "Video Continuation"],
+                        choices=["Text-to-Video", "Image-to-Video", "Long Video", "Video Continuation", "Refinement Only"],
                         label="Mode",
                         value="Text-to-Video"
                     )
@@ -9527,11 +9532,11 @@ with gr.Blocks(
         """Update UI visibility based on selected generation mode"""
         return {
             longcat_i2v_input_image: gr.update(visible=(mode == "Image-to-Video")),
-            longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video", "Refinement Only"])),
             longcat_num_segments: gr.update(visible=(mode == "Long Video")),
             longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
             longcat_enable_refinement: gr.update(visible=(mode == "Video Continuation")),
-            longcat_refinement_lora_path: gr.update(visible=(mode == "Video Continuation"))
+            longcat_refinement_lora_path: gr.update(visible=(mode in ["Video Continuation", "Refinement Only"]))
         }
 
     longcat_generation_mode.change(
