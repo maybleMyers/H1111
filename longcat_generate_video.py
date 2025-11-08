@@ -6324,7 +6324,7 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.ckpt_dir,
         subfolder="scheduler",
-        torch_dtype=dit_dtype
+        torch_dtype=torch.float32  # Schedulers use float32 (matching T2V mode)
     )
 
     # Load DiT
@@ -6371,18 +6371,37 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
         dit=dit,
     )
 
-    # Monkey-patch encode_prompt to return cached embeddings
-    def cached_encode_prompt(prompt, negative_prompt=None, do_classifier_free_guidance=True, *args, **kwargs):
-        """Return pre-computed prompt embeddings."""
+    # Monkey-patch encode_prompt to return cached embeddings with proper dtype conversion
+    def cached_encode_prompt(prompt, negative_prompt=None, do_classifier_free_guidance=True,
+                           dtype=None, device=None, *args, **kwargs):
+        """Return pre-computed prompt embeddings, converting to target dtype.
+
+        This is critical: T2V mode explicitly converts embeddings to bfloat16 before use.
+        I2V must do the same to avoid dtype mismatches in the pipeline.
+        """
+        # Use provided dtype/device or fall back to defaults
+        target_dtype = dtype if dtype is not None else dit_dtype
+        target_device = device if device is not None else cached_prompt_embeds.device
+
         if do_classifier_free_guidance and negative_prompt is not None:
-            # Return both positive and negative
-            return cached_prompt_embeds, cached_prompt_attention_mask, cached_negative_embeds, cached_negative_attention_mask
+            # Return both positive and negative, with dtype conversion
+            return (
+                cached_prompt_embeds.to(dtype=target_dtype, device=target_device),
+                cached_prompt_attention_mask.to(device=target_device),
+                cached_negative_embeds.to(dtype=target_dtype, device=target_device),
+                cached_negative_attention_mask.to(device=target_device)
+            )
         else:
-            # Return only positive
-            return cached_prompt_embeds, cached_prompt_attention_mask, None, None
+            # Return only positive, with dtype conversion
+            return (
+                cached_prompt_embeds.to(dtype=target_dtype, device=target_device),
+                cached_prompt_attention_mask.to(device=target_device),
+                None,
+                None
+            )
 
     pipe.encode_prompt = cached_encode_prompt
-    logger.info("Pipeline created with cached prompt embeddings")
+    logger.info("Pipeline created with cached prompt embeddings (with dtype conversion)")
 
     # Only call pipe.to(device) if block swapping is NOT enabled
     # When block swapping is enabled, DiT is already correctly positioned (some blocks on CPU, some on GPU)
