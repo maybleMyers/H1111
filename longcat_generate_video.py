@@ -5842,6 +5842,136 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
 
     logger.info("")
 
+    # ============================================================================
+    # GPU Memory Optimization: Pre-encode empty prompt and delete text encoder
+    # ============================================================================
+    # Since refinement uses empty prompt (run_demo_long_video.py:157), we can:
+    # 1. Encode empty prompt ONCE before the loop
+    # 2. Cache the embeddings
+    # 3. Delete text encoder to free ~24GB GPU memory
+    # 4. Monkey-patch encode_prompt to return cached embeddings
+
+    logger.info("GPU Memory Optimization: Pre-encoding empty prompt...")
+    mem_before = torch.cuda.memory_allocated(device) / 1024**3
+    logger.info(f"  GPU memory before optimization: {mem_before:.2f} GB")
+
+    # Pre-encode empty prompt
+    dit_dtype = dit.dtype
+    with torch.no_grad():
+        (
+            cached_prompt_embeds,
+            cached_prompt_attention_mask,
+            _,
+            _,
+        ) = pipe.encode_prompt(
+            prompt='',
+            do_classifier_free_guidance=False,
+            num_videos_per_prompt=1,
+            max_sequence_length=512,
+            dtype=dit_dtype,
+            device=device,
+        )
+
+    logger.info("  Empty prompt encoded. Deleting text encoder to free GPU memory...")
+
+    # Delete text encoder and tokenizer from pipeline
+    if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+        pipe.text_encoder.cpu()
+        del pipe.text_encoder
+        pipe.text_encoder = None
+
+    if hasattr(pipe, 'tokenizer') and pipe.tokenizer is not None:
+        del pipe.tokenizer
+        pipe.tokenizer = None
+
+    # Also delete the standalone references
+    if 'text_encoder' in locals():
+        text_encoder.cpu()
+        del text_encoder
+    if 'tokenizer' in locals():
+        del tokenizer
+
+    # Force garbage collection
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    mem_after = torch.cuda.memory_allocated(device) / 1024**3
+    mem_freed = mem_before - mem_after
+    logger.info(f"  GPU memory after optimization: {mem_after:.2f} GB")
+    logger.info(f"  GPU memory freed: {mem_freed:.2f} GB")
+
+    # Monkey-patch encode_prompt to return cached embeddings
+    original_encode_prompt = pipe.encode_prompt
+    def cached_encode_prompt(*args, **kwargs):
+        """Return pre-computed empty prompt embeddings."""
+        return cached_prompt_embeds, cached_prompt_attention_mask, None, None
+    pipe.encode_prompt = cached_encode_prompt
+
+    logger.info("  Text encoder deleted. Using cached empty prompt embeddings for all segments.")
+    logger.info("")
+
+    # ============================================================================
+    # GPU Memory Optimization: VAE CPU offloading
+    # ============================================================================
+    # The VAE is used twice per segment:
+    # 1. encode() at start - encodes stage1 video to latents
+    # 2. decode() at end - decodes latents to refined video
+    # During the denoising loop (between encode/decode), VAE is NOT used.
+    # We monkey-patch encode/decode to automatically offload VAE to CPU after encoding,
+    # saving ~4-5GB GPU memory during the denoising phase.
+
+    logger.info("GPU Memory Optimization: Enabling VAE CPU offloading...")
+
+    # Store original VAE methods
+    original_vae_encode = pipe.vae.encode
+    original_vae_decode = pipe.vae.decode
+
+    # Create wrapper that offloads to CPU after encoding
+    def vae_encode_with_offload(sample, *args, **kwargs):
+        """Encode on GPU, then offload VAE to CPU to free memory during denoising."""
+        # Ensure VAE is on GPU for encoding
+        if next(pipe.vae.parameters()).device.type == 'cpu':
+            pipe.vae.to(device)
+            torch.cuda.empty_cache()
+
+        # Encode
+        result = original_vae_encode(sample, *args, **kwargs)
+
+        # Offload VAE to CPU after encoding
+        pipe.vae.to('cpu')
+        torch.cuda.empty_cache()
+
+        return result
+
+    # Create wrapper that loads VAE to GPU before decoding
+    def vae_decode_with_offload(z, *args, **kwargs):
+        """Load VAE to GPU before decoding, then keep on GPU for next segment."""
+        # Ensure VAE is on GPU for decoding
+        if next(pipe.vae.parameters()).device.type == 'cpu':
+            pipe.vae.to(device)
+            torch.cuda.empty_cache()
+
+        # Decode
+        result = original_vae_decode(z, *args, **kwargs)
+
+        # Keep VAE on GPU after decode (needed for next segment's encode)
+        # It will be offloaded again after the next encode
+
+        return result
+
+    # Monkey-patch VAE methods
+    pipe.vae.encode = vae_encode_with_offload
+    pipe.vae.decode = vae_decode_with_offload
+
+    logger.info("  VAE CPU offloading enabled.")
+    logger.info("  VAE will automatically move to CPU during denoising to save GPU memory.")
+    logger.info("")
+
+    # ============================================================================
+    # End GPU Memory Optimization
+    # ============================================================================
+
     # Setup segmented refinement loop variables (matching run_demo_long_video.py:146-149)
     cur_condition_video = None      # Previous refined segment
     cur_num_cond_frames = 0         # 0 for first, 26 for subsequent (13*2)
