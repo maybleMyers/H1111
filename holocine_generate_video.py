@@ -679,20 +679,175 @@ def parse_args() -> argparse.Namespace:
 
 
 # ====================================================================================
-#                                MAIN SCRIPT (TO BE CONTINUED)
+#                           HOLOCINE GENERATE FUNCTION
 # ====================================================================================
 
-# This file will be continued in the next Write operation with:
-# 1. Extended DynamicModelManager with shot support
-# 2. Modified generate() function with shot processing
-# 3. main() function integration
-# 4. Helper functions for shot-aware inference
+def generate_holocine(args: argparse.Namespace) -> Optional[torch.Tensor]:
+    """
+    HoloCine video generation with shot support.
+
+    This function preprocesses shot-specific inputs and delegates to wan2_base.generate()
+    with the appropriate parameters.
+
+    Args:
+        args: Command line arguments (extended with HoloCine shot parameters)
+
+    Returns:
+        Generated latent tensor [B, C, F, H, W] or None
+    """
+    logger.info("=== HoloCine Video Generation ===")
+
+    # --- Shot Input Processing ---
+    shot_inputs_processed = False
+
+    # Mode 1: Structured multi-shot input (--global_caption + --shot_captions)
+    if args.global_caption and args.shot_captions:
+        logger.info("Mode 1: Structured multi-shot input")
+
+        # Use helper to prepare HoloCine format
+        shot_data = prepare_multishot_inputs(
+            global_caption=args.global_caption,
+            shot_captions=args.shot_captions,
+            total_frames=args.video_length,
+            custom_shot_cut_frames=args.shot_cut_frames
+        )
+
+        # Update args with processed data
+        args.prompt = shot_data["prompt"]
+        args.shot_cut_frames = shot_data["shot_cut_frames"]
+        args.video_length = shot_data["num_frames"]
+
+        shot_inputs_processed = True
+        logger.info(f"Generated HoloCine prompt format")
+        logger.info(f"Shot cuts: {args.shot_cut_frames}")
+        logger.info(f"Adjusted video_length: {args.video_length} (4t+1)")
+
+    # Mode 2: Raw HoloCine format prompt (--prompt with shot cuts)
+    elif args.shot_cut_frames is not None:
+        logger.info("Mode 2: Raw HoloCine format prompt with custom cuts")
+
+        # Enforce 4t+1 on frame count if provided
+        if args.video_length is not None:
+            original_length = args.video_length
+            args.video_length = enforce_4t_plus_1(args.video_length)
+            if original_length != args.video_length:
+                logger.info(f"Adjusted video_length: {original_length} -> {args.video_length} (4t+1)")
+
+        # Enforce 4t+1 on shot cuts
+        adjusted_cuts = [enforce_4t_plus_1(f) for f in args.shot_cut_frames]
+        if adjusted_cuts != args.shot_cut_frames:
+            logger.info(f"Adjusted shot cuts to 4t+1: {args.shot_cut_frames} -> {adjusted_cuts}")
+            args.shot_cut_frames = adjusted_cuts
+
+        shot_inputs_processed = True
+
+    # Mode 3: Standard T2V (no shots, but still enforce 4t+1 for HoloCine models)
+    else:
+        logger.info("Mode 3: Standard T2V (no multi-shot)")
+        if args.video_length is not None:
+            original_length = args.video_length
+            args.video_length = enforce_4t_plus_1(args.video_length)
+            if original_length != args.video_length:
+                logger.info(f"Adjusted video_length: {original_length} -> {args.video_length} (4t+1)")
+
+    # --- Pass to wan2_base Infrastructure ---
+    # The shot_cut_frames and shot_mask_type will be available in args
+    # The wan2 infrastructure will need to be extended to handle these
+    # For now, we'll note that this requires wan2_generate_video.py modifications
+
+    logger.info("Delegating to wan2_generate_video infrastructure...")
+    logger.info("NOTE: Full shot support requires modified wan2_generate_video.py to handle:")
+    logger.info("  - shot_cut_frames parameter")
+    logger.info("  - shot_indices tensor generation")
+    logger.info("  - shot_mask_type parameter")
+    logger.info("  - Passing shot_indices to DiT model during inference")
+
+    # For now, we can call the base generate() but it won't use shot features
+    # This will at least allow basic generation to work
+    try:
+        # Import the base generate function
+        from wan2_generate_video import generate as base_generate
+
+        # Call base generation with our preprocessed args
+        result = base_generate(args)
+        return result
+
+    except Exception as e:
+        logger.error(f"Error during generation: {e}")
+        logger.error("This may be because wan2_generate_video.py doesn't yet have shot support")
+        logger.error("To fully enable HoloCine multi-shot features, wan2_generate_video.py needs to be extended")
+        raise
+
+
+# ====================================================================================
+#                                    MAIN FUNCTION
+# ====================================================================================
+
+def main():
+    """Main entry point for HoloCine video generation."""
+    # Parse arguments
+    args = parse_args()
+
+    # Set device
+    device_str = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = torch.device(device_str)
+    logger.info(f"Using device: {args.device}")
+
+    # Set defaults for critical parameters if not provided
+    if args.infer_steps is None:
+        args.infer_steps = 50
+        logger.info(f"Using default infer_steps: {args.infer_steps}")
+
+    if args.video_length is None:
+        # For multi-shot, video_length is required
+        if args.global_caption and args.shot_captions:
+            raise ValueError("--video_length is required for multi-shot generation")
+        # For standard T2V, use a default
+        args.video_length = 81
+        logger.info(f"Using default video_length: {args.video_length}")
+
+    # Log HoloCine-specific settings
+    if args.global_caption and args.shot_captions:
+        logger.info(f"=== HoloCine Multi-Shot Generation ===")
+        logger.info(f"Global caption: {args.global_caption[:100]}...")
+        logger.info(f"Number of shots: {len(args.shot_captions)}")
+        logger.info(f"Shot mask type: {args.shot_mask_type}")
+    elif args.shot_cut_frames:
+        logger.info(f"=== HoloCine Generation with Shot Cuts ===")
+        logger.info(f"Shot cuts: {args.shot_cut_frames}")
+        logger.info(f"Shot mask type: {args.shot_mask_type}")
+
+    # Log model paths
+    if args.dit_low_noise or args.dit_high_noise:
+        logger.info(f"=== HoloCine Model Paths ===")
+        if args.dit_low_noise:
+            logger.info(f"Low noise DiT: {args.dit_low_noise}")
+        if args.dit_high_noise:
+            logger.info(f"High noise DiT: {args.dit_high_noise}")
+
+    try:
+        # Generate video with HoloCine shot support
+        generated_latent = generate_holocine(args)
+
+        if generated_latent is None:
+            logger.error("Generation failed or was skipped")
+            return
+
+        logger.info(f"Generation complete! Latent shape: {generated_latent.shape}")
+        logger.info(f"Output saved to: {args.save_path}")
+
+    except Exception as e:
+        logger.error(f"HoloCine generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    logger.info("Done!")
+
+
+# ====================================================================================
+#                                  ENTRY POINT
+# ====================================================================================
 
 if __name__ == "__main__":
-    logger.info("HoloCine video generation script")
-    logger.info("This is a template file - implementation continues in next update")
-    logger.info("Full implementation will include:")
-    logger.info("  - Shot-aware model loading")
-    logger.info("  - Multi-shot prompt processing")
-    logger.info("  - Shot indices generation")
-    logger.info("  - Integration with wan2_generate_video infrastructure")
+    main()
