@@ -1674,9 +1674,11 @@ def load_text_encoder(args: argparse.Namespace, config, device: torch.device) ->
     checkpoint_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_checkpoint)
     tokenizer_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_tokenizer)
 
+    # Use fp32 dtype to respect original weight precision (fp32 weights)
+    # The T5EncoderModel will handle dtype conversion internally if needed
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
-        dtype=config.t5_dtype,
+        dtype=torch.float32,
         device=device,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -2134,7 +2136,7 @@ def prepare_t2v_inputs(
     with t5_encoder_on_gpu(args, config, device) as text_encoder:
         with torch.no_grad():
             if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                     context = text_encoder([args.prompt], device)
                     context_null = text_encoder([n_prompt], device)
             else:
@@ -2259,7 +2261,7 @@ def prepare_i2v_inputs(
         with t5_encoder_on_gpu(args, config, device) as text_encoder:
             with torch.no_grad():
                 if args.fp8_t5:
-                    with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                         context = text_encoder([args.prompt], device)
                         context_null = text_encoder([n_prompt], device)
                 else:
@@ -2422,7 +2424,7 @@ def prepare_i2v_inputs(
         with t5_encoder_on_gpu(args, config, device) as text_encoder:
             with torch.no_grad():
                 if args.fp8_t5:
-                    with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                         context = text_encoder([args.prompt], device)
                         context_null = text_encoder([n_prompt], device)
                 else:
@@ -2829,7 +2831,7 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     with t5_encoder_on_gpu(args, config, device) as text_encoder:
         with torch.no_grad():
             if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                     context = text_encoder([args.prompt], device)
                     context_null = text_encoder([n_prompt], device)
             else:
@@ -2919,7 +2921,7 @@ def prepare_v2v_i2v_inputs(
     with t5_encoder_on_gpu(args, config, device) as text_encoder:
         with torch.no_grad():
             if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                     context = text_encoder([args.prompt], device)
                     context_null = text_encoder([n_prompt], device)
             else:
@@ -3666,7 +3668,7 @@ def prepare_video_extension_inputs(
     with t5_encoder_on_gpu(args, config, device) as text_encoder:
         with torch.no_grad():
             if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
                     context = text_encoder([args.prompt], device)  # Full conditional
                     context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
                     context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
@@ -6547,9 +6549,10 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     
                     # Create text encoder with correct tokenizer path
                     shard_fn = partial(shard_model, device_id=kwargs.get('device_id', 0))
+                    # Use fp32 dtype to respect original weight precision (fp32 weights)
                     self.text_encoder = T5EncoderModel(
                         text_len=config.text_len,
-                        dtype=config.t5_dtype,
+                        dtype=torch.float32,
                         device=torch.device('cpu'),
                         checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
                         tokenizer_path="google/umt5-xxl",  # Use HF repo ID directly
