@@ -4377,10 +4377,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        text_encoder_dir,
-        torch_dtype=dit_dtype
-    ).to(device)
+    # Load without torch_dtype to respect original fp32 weight precision
+    text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir).to(device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
 
@@ -4768,10 +4766,8 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        text_encoder_dir,
-        torch_dtype=dit_dtype
-    ).to(device)
+    # Load without torch_dtype to respect original fp32 weight precision
+    text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir).to(device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
 
@@ -5198,10 +5194,10 @@ def _create_refinement_pipeline(
     # Load text encoder
     logger.info("Loading text encoder...")
     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(device)
     text_encoder.eval()
 
@@ -5772,10 +5768,10 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     logger.info("Loading text encoder...")
     from transformers import AutoTokenizer, UMT5EncoderModel
     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(device)
     text_encoder.eval()
 
@@ -6129,13 +6125,12 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     text_encoder_device = device
     tokenizer = AutoTokenizer.from_pretrained(
         args.ckpt_dir,
-        subfolder="tokenizer",
-        torch_dtype=dit_dtype
+        subfolder="tokenizer"
     )
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(text_encoder_device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
@@ -7724,10 +7719,10 @@ def main():
                     logger.info("Loading text encoder for refinement...")
                     from transformers import AutoTokenizer, UMT5EncoderModel
                     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+                    # Load without torch_dtype to respect original fp32 weight precision
                     text_encoder = UMT5EncoderModel.from_pretrained(
                         args.ckpt_dir,
-                        subfolder="text_encoder",
-                        torch_dtype=dit_dtype
+                        subfolder="text_encoder"
                     ).to(device)
                     text_encoder.eval()
 
