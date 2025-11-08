@@ -6351,6 +6351,33 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
 
     logger.info(f"I2V generation complete! Output shape: {output.shape}")
 
+    # ============================================================================
+    # GPU Memory Optimization: Offload text encoder after generation
+    # ============================================================================
+    # The text encoder was only needed during the initial encoding phase.
+    # Now that generation is complete, we can offload it to free GPU memory.
+    logger.info("Offloading text encoder to CPU to free GPU memory...")
+    mem_before = torch.cuda.memory_allocated(device) / 1024**3
+
+    if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+        pipe.text_encoder.cpu()
+        del pipe.text_encoder
+        pipe.text_encoder = None
+
+    if hasattr(pipe, 'tokenizer') and pipe.tokenizer is not None:
+        del pipe.tokenizer
+        pipe.tokenizer = None
+
+    # Force garbage collection
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    mem_after = torch.cuda.memory_allocated(device) / 1024**3
+    mem_freed = mem_before - mem_after
+    logger.info(f"  GPU memory freed: {mem_freed:.2f} GB (was {mem_before:.2f} GB, now {mem_after:.2f} GB)")
+    # ============================================================================
+
     # Convert output to latents
     # Output is numpy array [F, H, W, C] in range [0, 1]
     output_uint8 = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
