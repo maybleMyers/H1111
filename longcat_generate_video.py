@@ -6288,6 +6288,9 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
             input_ids=prompt_inputs.input_ids.to(device),
             attention_mask=prompt_inputs.attention_mask.to(device)
         )[0]
+        # Add dimension to match pipeline expected shape: [B, seq_len, dim] -> [B, 1, seq_len, dim]
+        # This matches pipeline's _get_t5_prompt_embeds line 122
+        cached_prompt_embeds = cached_prompt_embeds.unsqueeze(1)
         cached_prompt_attention_mask = prompt_inputs.attention_mask.to(device)
 
         # Encode negative prompt
@@ -6302,6 +6305,8 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
             input_ids=negative_inputs.input_ids.to(device),
             attention_mask=negative_inputs.attention_mask.to(device)
         )[0]
+        # Add dimension to match pipeline expected shape: [B, seq_len, dim] -> [B, 1, seq_len, dim]
+        cached_negative_embeds = cached_negative_embeds.unsqueeze(1)
         cached_negative_attention_mask = negative_inputs.attention_mask.to(device)
 
     logger.info("Prompts encoded. Deleting text encoder to free GPU memory...")
