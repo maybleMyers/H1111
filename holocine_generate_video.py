@@ -513,8 +513,8 @@ def parse_args() -> argparse.Namespace:
                        help="Save merged model path (no inference)")
 
     # === Inference Arguments ===
-    parser.add_argument("--prompt", type=str, required=True,
-                       help="Prompt for generation (HoloCine or standard format)")
+    parser.add_argument("--prompt", type=str, required=False, default=None,
+                       help="Prompt for generation (HoloCine or standard format). Not required if using --global_caption + --shot_captions")
     parser.add_argument("--negative_prompt", type=str, default=None,
                        help="Negative prompt (uses default if not specified)")
     parser.add_argument("--video_size", type=int, nargs=2, default=[480, 832],
@@ -648,6 +648,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     # === Validation ===
+    # Check that we have either --prompt OR (--global_caption + --shot_captions)
+    has_prompt = args.prompt is not None
+    has_structured_input = args.global_caption is not None and args.shot_captions is not None
+
+    if not has_prompt and not has_structured_input:
+        parser.error("Must provide either --prompt OR (--global_caption + --shot_captions)")
+
     # Check for conflicting modes
     if args.global_caption and not args.shot_captions:
         raise ValueError("--global_caption requires --shot_captions")
