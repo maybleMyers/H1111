@@ -6248,8 +6248,12 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
 
-    # Load text encoder
-    logger.info("Loading UMT5-XXL text encoder...")
+    # ============================================================================
+    # GPU Memory Optimization: Pre-encode prompts and delete text encoder
+    # ============================================================================
+    # Load text encoder temporarily to encode prompts, then delete it before
+    # loading the DiT model to minimize peak GPU memory usage.
+    logger.info("Loading UMT5-XXL text encoder for prompt encoding...")
     from transformers import AutoTokenizer, UMT5EncoderModel
 
     text_encoder_device = device
@@ -6263,7 +6267,57 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
         subfolder="text_encoder"
     ).to(text_encoder_device)
     text_encoder.eval()
-    logger.info("Text encoder loaded")
+    logger.info("Text encoder loaded, encoding prompts...")
+
+    # Pre-encode prompts using the text encoder before deleting it
+    mem_before = torch.cuda.memory_allocated(device) / 1024**3
+    negative_prompt = args.negative_prompt if args.negative_prompt else ""
+
+    # Manually encode prompts
+    max_length = 512  # Standard LongCat max sequence length
+    with torch.no_grad():
+        # Encode positive prompt
+        prompt_inputs = tokenizer(
+            args.prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        cached_prompt_embeds = text_encoder(
+            input_ids=prompt_inputs.input_ids.to(device),
+            attention_mask=prompt_inputs.attention_mask.to(device)
+        )[0]
+        cached_prompt_attention_mask = prompt_inputs.attention_mask.to(device)
+
+        # Encode negative prompt
+        negative_inputs = tokenizer(
+            negative_prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        cached_negative_embeds = text_encoder(
+            input_ids=negative_inputs.input_ids.to(device),
+            attention_mask=negative_inputs.attention_mask.to(device)
+        )[0]
+        cached_negative_attention_mask = negative_inputs.attention_mask.to(device)
+
+    logger.info("Prompts encoded. Deleting text encoder to free GPU memory...")
+
+    # Delete text encoder
+    text_encoder.cpu()
+    del text_encoder
+    del tokenizer
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    mem_after = torch.cuda.memory_allocated(device) / 1024**3
+    mem_freed = mem_before - mem_after
+    logger.info(f"  Text encoder deleted. GPU memory freed: {mem_freed:.2f} GB")
+    # ============================================================================
 
     # Load scheduler
     from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
@@ -6307,15 +6361,28 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
             device=device
         )
 
-    # Create pipeline
+    # Create pipeline WITHOUT text encoder (we already encoded prompts)
     from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
     pipe = LongCatVideoPipeline(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
+        tokenizer=None,  # Not needed - we have pre-computed embeddings
+        text_encoder=None,  # Already deleted
         vae=vae.to(device),  # Move VAE back to device for pipeline
         scheduler=scheduler,
         dit=dit,
     )
+
+    # Monkey-patch encode_prompt to return cached embeddings
+    def cached_encode_prompt(prompt, negative_prompt=None, do_classifier_free_guidance=True, *args, **kwargs):
+        """Return pre-computed prompt embeddings."""
+        if do_classifier_free_guidance and negative_prompt is not None:
+            # Return both positive and negative
+            return cached_prompt_embeds, cached_prompt_attention_mask, cached_negative_embeds, cached_negative_attention_mask
+        else:
+            # Return only positive
+            return cached_prompt_embeds, cached_prompt_attention_mask, None, None
+
+    pipe.encode_prompt = cached_encode_prompt
+    logger.info("Pipeline created with cached prompt embeddings")
 
     # Only call pipe.to(device) if block swapping is NOT enabled
     # When block swapping is enabled, DiT is already correctly positioned (some blocks on CPU, some on GPU)
@@ -6333,7 +6400,6 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
 
     # Generate I2V
     logger.info(f"Generating I2V with {args.video_length} frames...")
-    negative_prompt = args.negative_prompt if args.negative_prompt else ""
 
     # Determine resolution
     resolution = '480p' if height == 480 else '720p'
@@ -6350,33 +6416,6 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     )[0]
 
     logger.info(f"I2V generation complete! Output shape: {output.shape}")
-
-    # ============================================================================
-    # GPU Memory Optimization: Offload text encoder after generation
-    # ============================================================================
-    # The text encoder was only needed during the initial encoding phase.
-    # Now that generation is complete, we can offload it to free GPU memory.
-    logger.info("Offloading text encoder to CPU to free GPU memory...")
-    mem_before = torch.cuda.memory_allocated(device) / 1024**3
-
-    if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
-        pipe.text_encoder.cpu()
-        del pipe.text_encoder
-        pipe.text_encoder = None
-
-    if hasattr(pipe, 'tokenizer') and pipe.tokenizer is not None:
-        del pipe.tokenizer
-        pipe.tokenizer = None
-
-    # Force garbage collection
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    mem_after = torch.cuda.memory_allocated(device) / 1024**3
-    mem_freed = mem_before - mem_after
-    logger.info(f"  GPU memory freed: {mem_freed:.2f} GB (was {mem_before:.2f} GB, now {mem_after:.2f} GB)")
-    # ============================================================================
 
     # Convert output to latents
     # Output is numpy array [F, H, W, C] in range [0, 1]
