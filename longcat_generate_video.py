@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 import gc
 import random
@@ -103,6 +104,130 @@ def synchronize_device(device: torch.device):
         torch.xpu.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+@contextmanager
+def t5_encoder_on_gpu(args: argparse.Namespace, config, device: torch.device):
+    """
+    Context manager that ensures T5 encoder is completely removed from GPU memory after use.
+
+    This context manager handles the complete lifecycle of T5 encoder GPU usage:
+    1. Load T5 encoder to GPU
+    2. Yield encoder for prompt encoding
+    3. Explicitly move encoder to CPU
+    4. Delete encoder object
+    5. Synchronize device and clear GPU cache
+
+    Usage:
+        with t5_encoder_on_gpu(args, config, device) as text_encoder:
+            context = text_encoder([prompt], device)
+            context_null = text_encoder([neg_prompt], device)
+        # T5 is guaranteed to be off GPU at this point
+
+    Args:
+        args: command line arguments
+        config: model configuration
+        device: device to use (typically CUDA device)
+
+    Yields:
+        T5EncoderModel: loaded text encoder model on GPU
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Load T5 encoder to GPU
+    text_encoder = load_text_encoder(args, config, device)
+    text_encoder.model.to(device)
+
+    if device.type == "cuda":
+        mem_before = torch.cuda.memory_allocated(device) / 1e9
+        logger.info(f"T5 encoder loaded to GPU. Memory: {mem_before:.2f} GB")
+
+    try:
+        yield text_encoder
+    finally:
+        # CRITICAL: Explicit cleanup sequence to guarantee GPU memory is freed
+
+        # Step 1: Move model to CPU before deletion
+        text_encoder.model.cpu()
+
+        # Step 2: Synchronize device to ensure transfer completes
+        synchronize_device(device)
+
+        # Step 3: Delete model and encoder references
+        del text_encoder.model
+        del text_encoder
+
+        # Step 4: Clean GPU memory
+        clean_memory_on_device(device)
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Step 5: Log memory status
+        if device.type == "cuda":
+            mem_after = torch.cuda.memory_allocated(device) / 1e9
+            logger.info(f"T5 encoder removed from GPU. Memory: {mem_after:.2f} GB (freed: {mem_before - mem_after:.2f} GB)")
+
+
+@contextmanager
+def umt5_encoder_on_gpu(text_encoder, tokenizer, device: torch.device):
+    """
+    Context manager for transformers UMT5EncoderModel that ensures complete GPU memory cleanup.
+
+    This is for LongCat-specific code paths that use transformers library directly.
+    Handles the complete lifecycle of UMT5 encoder GPU usage:
+    1. Text encoder is already loaded (passed in)
+    2. Yield encoder and tokenizer for prompt encoding
+    3. Explicitly move encoder to CPU
+    4. Delete encoder and tokenizer objects
+    5. Synchronize device and clear GPU cache
+
+    Usage:
+        # After loading text_encoder and tokenizer
+        with umt5_encoder_on_gpu(text_encoder, tokenizer, device) as (te, tok):
+            embeds = te(input_ids=..., attention_mask=...)
+        # UMT5 encoder is guaranteed to be off GPU at this point
+
+    Args:
+        text_encoder: already-loaded UMT5EncoderModel
+        tokenizer: AutoTokenizer instance
+        device: device to use (typically CUDA device)
+
+    Yields:
+        Tuple[UMT5EncoderModel, AutoTokenizer]: encoder and tokenizer for use
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if device.type == "cuda":
+        mem_before = torch.cuda.memory_allocated(device) / 1e9
+        logger.info(f"UMT5 encoder on GPU. Memory: {mem_before:.2f} GB")
+
+    try:
+        yield text_encoder, tokenizer
+    finally:
+        # CRITICAL: Explicit cleanup sequence to guarantee GPU memory is freed
+
+        # Step 1: Move model to CPU before deletion
+        text_encoder.cpu()
+
+        # Step 2: Synchronize device to ensure transfer completes
+        synchronize_device(device)
+
+        # Step 3: Delete encoder and tokenizer references
+        del text_encoder
+        del tokenizer
+
+        # Step 4: Clean GPU memory
+        clean_memory_on_device(device)
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Step 5: Log memory status
+        if device.type == "cuda":
+            mem_after = torch.cuda.memory_allocated(device) / 1e9
+            logger.info(f"UMT5 encoder removed from GPU. Memory: {mem_after:.2f} GB (freed: {mem_before - mem_after:.2f} GB)")
+
 
 def glob_images(directory, base="*"):
     img_paths = []
@@ -1549,9 +1674,11 @@ def load_text_encoder(args: argparse.Namespace, config, device: torch.device) ->
     checkpoint_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_checkpoint)
     tokenizer_path = None if args.ckpt_dir is None else os.path.join(args.ckpt_dir, config.t5_tokenizer)
 
+    # Use fp32 dtype to respect original weight precision (fp32 weights)
+    # The T5EncoderModel will handle dtype conversion internally if needed
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
-        dtype=config.t5_dtype,
+        dtype=torch.float32,
         device=device,
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -2005,27 +2132,17 @@ def prepare_t2v_inputs(
         # trash compatible noise
         seed_g = torch.manual_seed(seed)
 
-    # load text encoder
-    text_encoder = load_text_encoder(args, config, device)
-    text_encoder.model.to(device)
-
-    # encode prompt
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+    # load text encoder and encode prompts (with automatic GPU cleanup)
+    with t5_encoder_on_gpu(args, config, device) as text_encoder:
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                    context = text_encoder([args.prompt], device)
+                    context_null = text_encoder([n_prompt], device)
+            else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
-        else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
-
-    # free text encoder and clean memory
-    del text_encoder
-    clean_memory_on_device(device)
-    # Always unload to save memory
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Unloaded T5 model from memory")
+    # T5 encoder is now guaranteed to be removed from GPU memory
 
     # Initialize 'y' (conditioning latent) to None
     y = None
@@ -2140,23 +2257,17 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-        # load text encoder & encode prompts
-        text_encoder = load_text_encoder(args, config, device)
-        text_encoder.model.to(device)
-        with torch.no_grad():
-            if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+        # load text encoder & encode prompts (with automatic GPU cleanup)
+        with t5_encoder_on_gpu(args, config, device) as text_encoder:
+            with torch.no_grad():
+                if args.fp8_t5:
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                        context = text_encoder([args.prompt], device)
+                        context_null = text_encoder([n_prompt], device)
+                else:
                     context = text_encoder([args.prompt], device)
                     context_null = text_encoder([n_prompt], device)
-            else:
-                context = text_encoder([args.prompt], device)
-                context_null = text_encoder([n_prompt], device)
-        del text_encoder
-        clean_memory_on_device(device)
-        # Always unload to save memory
-        torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Unloaded T5 model from memory")
+        # T5 encoder is now guaranteed to be removed from GPU memory
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -2309,23 +2420,17 @@ def prepare_i2v_inputs(
         # configure negative prompt
         n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
 
-        # load text encoder & encode prompts
-        text_encoder = load_text_encoder(args, config, device)
-        text_encoder.model.to(device)
-        with torch.no_grad():
-            if args.fp8_t5:
-                with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+        # load text encoder & encode prompts (with automatic GPU cleanup)
+        with t5_encoder_on_gpu(args, config, device) as text_encoder:
+            with torch.no_grad():
+                if args.fp8_t5:
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                        context = text_encoder([args.prompt], device)
+                        context_null = text_encoder([n_prompt], device)
+                else:
                     context = text_encoder([args.prompt], device)
                     context_null = text_encoder([n_prompt], device)
-            else:
-                context = text_encoder([args.prompt], device)
-                context_null = text_encoder([n_prompt], device)
-        del text_encoder
-        clean_memory_on_device(device)
-        # Always unload to save memory
-        torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Unloaded T5 model from memory")
+        # T5 encoder is now guaranteed to be removed from GPU memory
 
         # load CLIP model & encode image
         clip = load_clip_model(args, config, device)
@@ -2509,25 +2614,15 @@ def prepare_ti2v_inputs(
         vae.to_device("cpu")
         clean_memory_on_device(device)
     
-    # Prepare text context
-    t5 = load_text_encoder(args, config, device)
-    
-    # Encode positive prompt - follow official API
-    context = t5([args.prompt], device)[0]  # [1, seq_len, dim]
-    
-    # Encode negative prompt (use default if not specified)
-    negative_prompt = args.negative_prompt if args.negative_prompt else ""
-    context_null = t5([negative_prompt], device)[0]  # [1, seq_len, dim]
-    
-    # Move T5 to CPU for memory management - follow official pattern
-    t5.model.cpu()
-    clean_memory_on_device(device)
-    # Always unload to save memory
-    del t5.model
-    del t5
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Unloaded T5 model from memory")
+    # Prepare text context (with automatic GPU cleanup)
+    with t5_encoder_on_gpu(args, config, device) as t5:
+        # Encode positive prompt - follow official API
+        context = t5([args.prompt], device)[0]  # [1, seq_len, dim]
+
+        # Encode negative prompt (use default if not specified)
+        negative_prompt = args.negative_prompt if args.negative_prompt else ""
+        context_null = t5([negative_prompt], device)[0]  # [1, seq_len, dim]
+    # T5 encoder is now guaranteed to be removed from GPU memory
     
     # Generate noise matching the latent dimensions - follow official pattern
     # Create noise tensor [z_dim, F, H, W] - 4D like official implementation  
@@ -2732,27 +2827,17 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
     else:
         seed_g = torch.manual_seed(seed)
 
-    # Load text encoder
-    text_encoder = load_text_encoder(args, config, device)
-    text_encoder.model.to(device)
-
-    # Encode prompt
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+    # Load text encoder and encode prompts (with automatic GPU cleanup)
+    with t5_encoder_on_gpu(args, config, device) as text_encoder:
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                    context = text_encoder([args.prompt], device)
+                    context_null = text_encoder([n_prompt], device)
+            else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
-        else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
-
-    # Free text encoder and clean memory
-    del text_encoder
-    clean_memory_on_device(device)
-    # Always unload to save memory
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Unloaded T5 model from memory")
+    # T5 encoder is now guaranteed to be removed from GPU memory
 
     # Generate noise with the same shape as video_latents (including batch dimension)
     noise = torch.randn(
@@ -2832,25 +2917,17 @@ def prepare_v2v_i2v_inputs(
     else:
         seed_g = torch.manual_seed(seed)
     
-    # Load text encoder and encode prompts
-    text_encoder = load_text_encoder(args, config, device)
-    text_encoder.model.to(device)
-    
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+    # Load text encoder and encode prompts (with automatic GPU cleanup)
+    with t5_encoder_on_gpu(args, config, device) as text_encoder:
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                    context = text_encoder([args.prompt], device)
+                    context_null = text_encoder([n_prompt], device)
+            else:
                 context = text_encoder([args.prompt], device)
                 context_null = text_encoder([n_prompt], device)
-        else:
-            context = text_encoder([args.prompt], device)
-            context_null = text_encoder([n_prompt], device)
-    
-    # Free text encoder
-    del text_encoder
-    clean_memory_on_device(device)
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Unloaded T5 model from memory")
+    # T5 encoder is now guaranteed to be removed from GPU memory
     
     # Load CLIP model and encode first frame
     clip = load_clip_model(args, config, device)
@@ -3586,28 +3663,20 @@ def prepare_video_extension_inputs(
     )
     noise = noise.to(device)
     
-    # Load text encoder and encode prompts
-    text_encoder = load_text_encoder(args, config, device)
-    text_encoder.model.to(device)
-    
+    # Load text encoder and encode prompts (with automatic GPU cleanup)
     # Generate three contexts for proper CFG (multitalk-style)
-    with torch.no_grad():
-        if args.fp8_t5:
-            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+    with t5_encoder_on_gpu(args, config, device) as text_encoder:
+        with torch.no_grad():
+            if args.fp8_t5:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+                    context = text_encoder([args.prompt], device)  # Full conditional
+                    context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
+                    context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
+            else:
                 context = text_encoder([args.prompt], device)  # Full conditional
                 context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
                 context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
-        else:
-            context = text_encoder([args.prompt], device)  # Full conditional
-            context_text_dropped = text_encoder([""], device)  # Text-dropped (empty prompt)
-            context_null = text_encoder([n_prompt], device)  # Unconditional (negative prompt)
-    
-    # Free text encoder
-    del text_encoder
-    clean_memory_on_device(device)
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Unloaded T5 model from memory")
+    # T5 encoder is now guaranteed to be removed from GPU memory
     
     # Prepare zero padding for future frames
     padding_frames = frame_num - cond_f
@@ -4302,19 +4371,72 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
     vae.eval()
     logger.info("VAE loaded successfully")
 
-    # --- Load UMT5 text encoder ---
+    # --- Load UMT5 text encoder and encode prompts immediately ---
+    # Encode prompts BEFORE loading DiT to minimize peak memory usage
     logger.info("Loading UMT5-XXL text encoder...")
     tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
-    # Load to CPU first if using block swapping
-    te_device = "cpu" if args.blocks_to_swap > 0 else device
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        text_encoder_dir,
-        torch_dtype=dit_dtype
-    ).to(te_device)
+    # Load without torch_dtype to respect original fp32 weight precision
+    text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir).to(device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
+
+    # Encode prompts using context manager for automatic cleanup
+    logger.info(f"Encoding prompt: {args.prompt}")
+    max_length = cfg.text_len
+
+    with umt5_encoder_on_gpu(text_encoder, tokenizer, device) as (te, tok):
+        # Encode positive prompt
+        prompt_inputs = tok(
+            args.prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            prompt_embeds_raw = te(
+                input_ids=prompt_inputs.input_ids.to(te.device),
+                attention_mask=prompt_inputs.attention_mask.to(te.device)
+            )[0]
+
+        prompt_attention_mask = prompt_inputs.attention_mask
+
+        # Encode negative prompt
+        negative_prompt = args.negative_prompt if args.negative_prompt else ""
+        uncond_inputs = tok(
+            negative_prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            negative_prompt_embeds_raw = te(
+                input_ids=uncond_inputs.input_ids.to(te.device),
+                attention_mask=uncond_inputs.attention_mask.to(te.device)
+            )[0]
+
+        negative_attention_mask = uncond_inputs.attention_mask
+    # UMT5 encoder is now completely removed from GPU memory
+
+    # Prepare context tensors as List[Tensor] with padding removed
+    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
+
+    def build_context_list(embeds: torch.Tensor, mask: torch.Tensor) -> List[torch.Tensor]:
+        context_list: List[torch.Tensor] = []
+        for emb_row, mask_row in zip(embeds, mask):
+            valid_len = int(mask_row.sum().item())
+            if valid_len <= 0 or valid_len > emb_row.shape[0]:
+                valid_len = emb_row.shape[0]
+            context_list.append(emb_row[:valid_len].to(device=device, dtype=embed_dtype))
+        return context_list
+
+    prompt_context_list = build_context_list(prompt_embeds_raw, prompt_attention_mask)
+    negative_context_list = build_context_list(negative_prompt_embeds_raw, negative_attention_mask)
 
     # --- Load LongCat DiT Model (Official) ---
     logger.info("Loading LongCat DiT model using official LongCatVideoTransformer3DModel...")
@@ -4355,64 +4477,8 @@ def generate_longcat(args: argparse.Namespace, device: torch.device, cfg) -> Opt
             device=device
         )
 
-    # --- Encode prompts ---
-    logger.info(f"Encoding prompt: {args.prompt}")
-    max_length = cfg.text_len
-
-    # Encode prompts using official layout
-    prompt_inputs = tokenizer(
-        args.prompt,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    with torch.no_grad():
-        prompt_embeds_raw = text_encoder(
-            input_ids=prompt_inputs.input_ids.to(text_encoder.device),
-            attention_mask=prompt_inputs.attention_mask.to(text_encoder.device)
-        )[0]
-
-    prompt_attention_mask = prompt_inputs.attention_mask
-
-    negative_prompt = args.negative_prompt if args.negative_prompt else ""
-    uncond_inputs = tokenizer(
-        negative_prompt,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    with torch.no_grad():
-        negative_prompt_embeds_raw = text_encoder(
-            input_ids=uncond_inputs.input_ids.to(text_encoder.device),
-            attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
-        )[0]
-
-    negative_attention_mask = uncond_inputs.attention_mask
-
-    # Prepare context tensors as List[Tensor] with padding removed
-    embed_dtype = dit_dtype if dit_dtype is not None else prompt_embeds_raw.dtype
-
-    def build_context_list(embeds: torch.Tensor, mask: torch.Tensor) -> List[torch.Tensor]:
-        context_list: List[torch.Tensor] = []
-        for emb_row, mask_row in zip(embeds, mask):
-            valid_len = int(mask_row.sum().item())
-            if valid_len <= 0 or valid_len > emb_row.shape[0]:
-                valid_len = emb_row.shape[0]
-            context_list.append(emb_row[:valid_len].to(device=device, dtype=embed_dtype))
-        return context_list
-
-    prompt_context_list = build_context_list(prompt_embeds_raw, prompt_attention_mask)
-    negative_context_list = build_context_list(negative_prompt_embeds_raw, negative_attention_mask)
-
-    # Cleanup text encoder
-    del text_encoder, tokenizer
-    clean_memory_on_device(device)
-
     # --- Prepare latents ---
+    # (Prompts already encoded and text encoder cleaned up above)
     height, width = args.video_size
     # LongCat default frame count (use 129 if not specified)
     default_frames = getattr(cfg, 'default_frames', 129)
@@ -4694,18 +4760,75 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
     gc.collect()
     logger.info("Cleaned up video loading artifacts")
 
-    # --- Load UMT5 text encoder ---
+    # --- Load UMT5 text encoder and encode prompts immediately ---
+    # Encode prompts BEFORE loading DiT to minimize peak memory usage
     logger.info("Loading UMT5-XXL text encoder...")
     tokenizer_dir = os.path.join(args.ckpt_dir, "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     text_encoder_dir = os.path.join(args.ckpt_dir, "text_encoder")
-    te_device = "cpu" if args.blocks_to_swap > 0 else device
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        text_encoder_dir,
-        torch_dtype=dit_dtype
-    ).to(te_device)
+    # Load without torch_dtype to respect original fp32 weight precision
+    text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir).to(device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
+
+    # Encode prompts using context manager for automatic cleanup
+    logger.info(f"Encoding prompt: {args.prompt}")
+    max_length = cfg.text_len
+
+    with umt5_encoder_on_gpu(text_encoder, tokenizer, device) as (te, tok):
+        # Encode positive prompt
+        prompt_inputs = tok(
+            args.prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            prompt_embeds_raw = te(
+                input_ids=prompt_inputs.input_ids.to(te.device),
+                attention_mask=prompt_inputs.attention_mask.to(te.device)
+            )[0]
+
+        prompt_attention_mask = prompt_inputs.attention_mask
+
+        # Encode negative prompt
+        negative_prompt = args.negative_prompt if args.negative_prompt else ""
+        uncond_inputs = tok(
+            negative_prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            negative_prompt_embeds_raw = te(
+                input_ids=uncond_inputs.input_ids.to(te.device),
+                attention_mask=uncond_inputs.attention_mask.to(te.device)
+            )[0]
+
+        negative_attention_mask = uncond_inputs.attention_mask
+    # UMT5 encoder is now completely removed from GPU memory
+
+    # CRITICAL: Move text embeddings to CPU to free GPU memory before KV cache computation
+    # UMT5-XXL embeddings can be quite large and we don't need them during KV cache computation
+    logger.info("Moving text embeddings to CPU to free GPU memory before KV cache computation...")
+
+    # Save dtype before moving to CPU
+    prompt_embeds_dtype = prompt_embeds_raw.dtype
+
+    prompt_embeds_cpu = prompt_embeds_raw.cpu()
+    negative_prompt_embeds_cpu = negative_prompt_embeds_raw.cpu()
+    prompt_attention_mask_cpu = prompt_attention_mask.cpu()
+    negative_attention_mask_cpu = negative_attention_mask.cpu()
+
+    # Delete GPU versions
+    del prompt_embeds_raw, negative_prompt_embeds_raw, prompt_attention_mask, negative_attention_mask
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    logger.info("Text embeddings moved to CPU, GPU memory freed")
 
     # --- Load LongCat DiT Model ---
     logger.info("Loading LongCat DiT model using official LongCatVideoTransformer3DModel...")
@@ -4744,66 +4867,8 @@ def generate_longcat_vc(args: argparse.Namespace, device: torch.device, cfg) -> 
             device=device
         )
 
-    # --- Encode prompts ---
-    logger.info(f"Encoding prompt: {args.prompt}")
-    max_length = cfg.text_len
-
-    prompt_inputs = tokenizer(
-        args.prompt,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    with torch.no_grad():
-        prompt_embeds_raw = text_encoder(
-            input_ids=prompt_inputs.input_ids.to(text_encoder.device),
-            attention_mask=prompt_inputs.attention_mask.to(text_encoder.device)
-        )[0]
-
-    prompt_attention_mask = prompt_inputs.attention_mask
-
-    negative_prompt = args.negative_prompt if args.negative_prompt else ""
-    uncond_inputs = tokenizer(
-        negative_prompt,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    with torch.no_grad():
-        negative_prompt_embeds_raw = text_encoder(
-            input_ids=uncond_inputs.input_ids.to(text_encoder.device),
-            attention_mask=uncond_inputs.attention_mask.to(text_encoder.device)
-        )[0]
-
-    negative_attention_mask = uncond_inputs.attention_mask
-
-    # Cleanup text encoder
-    del text_encoder, tokenizer
-    clean_memory_on_device(device)
-
-    # CRITICAL: Move text embeddings to CPU to free GPU memory before KV cache computation
-    # UMT5-XXL embeddings can be quite large and we don't need them during KV cache computation
-    logger.info("Moving text embeddings to CPU to free GPU memory before KV cache computation...")
-
-    # Save dtype before moving to CPU
-    prompt_embeds_dtype = prompt_embeds_raw.dtype
-
-    prompt_embeds_cpu = prompt_embeds_raw.cpu()
-    negative_prompt_embeds_cpu = negative_prompt_embeds_raw.cpu()
-    prompt_attention_mask_cpu = prompt_attention_mask.cpu()
-    negative_attention_mask_cpu = negative_attention_mask.cpu()
-
-    # Delete GPU versions
-    del prompt_embeds_raw, negative_prompt_embeds_raw, prompt_attention_mask, negative_attention_mask
-    clean_memory_on_device(device)
-    torch.cuda.empty_cache()
-    logger.info("Text embeddings moved to CPU, GPU memory freed")
-
     # --- Prepare latents dimensions (but don't create full tensor yet!) ---
+    # (Prompts already encoded, text encoder cleaned up, and embeddings moved to CPU above)
     default_frames = getattr(cfg, 'default_frames', 129)
     video_length = args.video_length if args.video_length is not None else default_frames
 
@@ -5129,10 +5194,10 @@ def _create_refinement_pipeline(
     # Load text encoder
     logger.info("Loading text encoder...")
     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(device)
     text_encoder.eval()
 
@@ -5703,10 +5768,10 @@ def generate_longcat_refine_only(args: argparse.Namespace, device: torch.device,
     logger.info("Loading text encoder...")
     from transformers import AutoTokenizer, UMT5EncoderModel
     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(device)
     text_encoder.eval()
 
@@ -6060,13 +6125,12 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     text_encoder_device = device
     tokenizer = AutoTokenizer.from_pretrained(
         args.ckpt_dir,
-        subfolder="tokenizer",
-        torch_dtype=dit_dtype
+        subfolder="tokenizer"
     )
+    # Load without torch_dtype to respect original fp32 weight precision
     text_encoder = UMT5EncoderModel.from_pretrained(
         args.ckpt_dir,
-        subfolder="text_encoder",
-        torch_dtype=dit_dtype
+        subfolder="text_encoder"
     ).to(text_encoder_device)
     text_encoder.eval()
     logger.info("Text encoder loaded")
@@ -6480,9 +6544,10 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     
                     # Create text encoder with correct tokenizer path
                     shard_fn = partial(shard_model, device_id=kwargs.get('device_id', 0))
+                    # Use fp32 dtype to respect original weight precision (fp32 weights)
                     self.text_encoder = T5EncoderModel(
                         text_len=config.text_len,
-                        dtype=config.t5_dtype,
+                        dtype=torch.float32,
                         device=torch.device('cpu'),
                         checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
                         tokenizer_path="google/umt5-xxl",  # Use HF repo ID directly
@@ -7654,10 +7719,10 @@ def main():
                     logger.info("Loading text encoder for refinement...")
                     from transformers import AutoTokenizer, UMT5EncoderModel
                     tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, subfolder="tokenizer")
+                    # Load without torch_dtype to respect original fp32 weight precision
                     text_encoder = UMT5EncoderModel.from_pretrained(
                         args.ckpt_dir,
-                        subfolder="text_encoder",
-                        torch_dtype=dit_dtype
+                        subfolder="text_encoder"
                     ).to(device)
                     text_encoder.eval()
 
