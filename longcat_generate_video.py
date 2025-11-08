@@ -6366,7 +6366,7 @@ def generate_longcat_i2v(args: argparse.Namespace, device: torch.device, cfg) ->
     pipe = LongCatVideoPipeline(
         tokenizer=None,  # Not needed - we have pre-computed embeddings
         text_encoder=None,  # Already deleted
-        vae=vae.to(device),  # Move VAE back to device for pipeline
+        vae=vae.to(device=device, dtype=vae_dtype),  # Move VAE back to device with correct dtype
         scheduler=scheduler,
         dit=dit,
     )
