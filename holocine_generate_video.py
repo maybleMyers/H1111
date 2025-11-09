@@ -280,10 +280,25 @@ class DynamicModelManager:
         # Unload current model
         if self.current_model is not None:
             logger.info(f"Unloading {self.current_model_type} noise model")
+
+            # Unwrap to get the actual WanModel
+            actual_model = self.current_model.model if hasattr(self.current_model, 'model') else self.current_model
+
+            # Move model to CPU first to free GPU memory
+            logger.info("Moving model to CPU to free GPU memory...")
+            actual_model.to('cpu')
+
+            # Delete both wrapper and model
             del self.current_model
+            del actual_model
+
+            # Aggressive memory cleanup
             clean_memory_on_device(self.device)
             torch.cuda.empty_cache()
             gc.collect()
+            torch.cuda.empty_cache()  # Call twice for fragmented memory
+
+            logger.info("Model unloaded, GPU memory freed")
 
         # Load new model
         logger.info(f"Loading {model_type} noise model from: {self.model_paths[model_type]}")
