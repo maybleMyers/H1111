@@ -705,11 +705,20 @@ def run_inference(
     vae.to_device(device_obj)
 
     with torch.no_grad():
-        # Normalize latent for VAE
-        latent_for_vae = latent / config.vae_scaling_factor
+        # VAE expects a list of tensors [C, F, H, W]
+        # latent shape: [C, F, H, W] or [B, C, F, H, W]
+        if latent.dim() == 5:
+            # Has batch dimension, convert to list
+            latent_list = [latent[i] for i in range(latent.shape[0])]
+        else:
+            # No batch dimension, wrap in list
+            latent_list = [latent]
 
         # Decode
-        video = vae.decode(latent_for_vae)
+        video_list = vae.decode(latent_list)
+
+        # Convert list back to tensor
+        video = torch.stack(video_list, dim=0) if len(video_list) > 1 else video_list[0].unsqueeze(0)
 
     # Move VAE back to CPU
     vae.to_device("cpu")
