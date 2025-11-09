@@ -109,7 +109,7 @@ def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config,
     """Calculate latent dimensions and sequence length"""
     height, width = video_size
 
-    # Calculate latent dimensions
+    # Calculate latent dimensions (before patch embedding)
     lat_h = height // config.vae_stride[1]
     lat_w = width // config.vae_stride[2]
     lat_f = (video_length - 1) // config.vae_stride[0] + 1
@@ -117,8 +117,15 @@ def calculate_dimensions(video_size: Tuple[int, int], video_length: int, config,
     # Channel dimension
     ch = config.in_dim
 
-    # Calculate sequence length
-    seq_len = lat_h * lat_w * lat_f
+    # Account for patch embedding - patch_size is (1, 2, 2) for t2v-A14B
+    # After patch embedding, spatial dimensions are divided by patch_size
+    patch_size = config.patch_size
+    emb_f = lat_f // patch_size[0]  # Usually patch_size[0] = 1
+    emb_h = lat_h // patch_size[1]  # Usually patch_size[1] = 2
+    emb_w = lat_w // patch_size[2]  # Usually patch_size[2] = 2
+
+    # Calculate sequence length after patch embedding
+    seq_len = emb_f * emb_h * emb_w
 
     return (ch, lat_f, lat_h, lat_w), seq_len
 
