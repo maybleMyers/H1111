@@ -40,6 +40,82 @@ from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.utils.fm_solvers_euler import EulerScheduler
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
+# ===================================================================
+#                    FlowMatchScheduler (HoloCine)
+# ===================================================================
+
+class FlowMatchScheduler:
+    """
+    Flow Matching Scheduler used by HoloCine pipeline.
+    Based on HoloCine/diffsynth/schedulers/flow_match.py
+    """
+
+    def __init__(self, num_inference_steps=100, num_train_timesteps=1000, shift=3.0,
+                 sigma_max=1.0, sigma_min=0.003/1.002, inverse_timesteps=False,
+                 extra_one_step=False, reverse_sigmas=False):
+        self.num_train_timesteps = num_train_timesteps
+        self.shift = shift
+        self.sigma_max = sigma_max
+        self.sigma_min = sigma_min
+        self.inverse_timesteps = inverse_timesteps
+        self.extra_one_step = extra_one_step
+        self.reverse_sigmas = reverse_sigmas
+        self.set_timesteps(num_inference_steps)
+
+    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False, shift=None):
+        if shift is not None:
+            self.shift = shift
+        sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
+        if self.extra_one_step:
+            self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
+        else:
+            self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps)
+        if self.inverse_timesteps:
+            self.sigmas = torch.flip(self.sigmas, dims=[0])
+        self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+        if self.reverse_sigmas:
+            self.sigmas = 1 - self.sigmas
+        self.timesteps = self.sigmas * self.num_train_timesteps
+        if training:
+            x = self.timesteps
+            y = torch.exp(-2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2)
+            y_shifted = y - y.min()
+            bsmntw_weighing = y_shifted * (num_inference_steps / y_shifted.sum())
+            self.linear_timesteps_weights = bsmntw_weighing
+            self.training = True
+        else:
+            self.training = False
+
+    def step(self, model_output, timestep, sample, to_final=False, generator=None, return_dict=True, **kwargs):
+        """Perform one step of denoising"""
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.cpu()
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        sigma = self.sigmas[timestep_id]
+        if to_final or timestep_id + 1 >= len(self.timesteps):
+            sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+        else:
+            sigma_ = self.sigmas[timestep_id + 1]
+        prev_sample = sample + model_output * (sigma_ - sigma)
+
+        if return_dict:
+            # Return a simple object with prev_sample attribute for compatibility
+            class SchedulerOutput:
+                def __init__(self, prev_sample):
+                    self.prev_sample = prev_sample
+                def __getitem__(self, idx):
+                    return self.prev_sample if idx == 0 else None
+            return SchedulerOutput(prev_sample)
+        return prev_sample
+
+    def add_noise(self, original_samples, noise, timestep):
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.cpu()
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        sigma = self.sigmas[timestep_id]
+        sample = (1 - sigma) * original_samples + sigma * noise
+        return sample
+
 from utils.model_utils import str_to_dtype
 from utils.device_utils import clean_memory_on_device
 from utils.safetensors_utils import load_safetensors
@@ -362,7 +438,17 @@ class DynamicModelManager:
 def setup_scheduler(sample_solver: str, num_train_timesteps: int, infer_steps: int,
                    flow_shift: float, device: torch.device) -> Tuple[Any, torch.Tensor]:
     """Setup scheduler for sampling"""
-    if sample_solver == "unipc":
+    # Use FlowMatchScheduler for HoloCine (matches official implementation)
+    if sample_solver == "flowmatch" or sample_solver == "holocine":
+        scheduler = FlowMatchScheduler(
+            num_train_timesteps=num_train_timesteps,
+            shift=flow_shift if flow_shift > 1 else 5,  # Default to 5 like HoloCine
+            sigma_min=0.0,
+            extra_one_step=True
+        )
+        scheduler.set_timesteps(infer_steps, denoising_strength=1.0, shift=flow_shift if flow_shift > 1 else 5)
+        timesteps = scheduler.timesteps
+    elif sample_solver == "unipc":
         scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=num_train_timesteps, shift=1, use_dynamic_shifting=False)
         scheduler.set_timesteps(infer_steps, device=device, shift=flow_shift)
         timesteps = scheduler.timesteps
@@ -408,6 +494,70 @@ def setup_scheduler(sample_solver: str, num_train_timesteps: int, infer_steps: i
     return scheduler, timesteps
 
 # ===================================================================
+#                    Shot Encoding Helper
+# ===================================================================
+
+def create_shot_indices(shot_cut_frames: Optional[list[int]], num_frames: int, device: torch.device) -> Optional[torch.Tensor]:
+    """
+    Convert shot_cut_frames to shot_indices tensor for HoloCine.
+    Based on HoloCine/diffsynth/pipelines/wan_video_holocine.py WanVideoUnit_ShotEmbedder
+    """
+    if shot_cut_frames is None or len(shot_cut_frames) == 0:
+        return None
+
+    # Convert frame count to latent frame count (video frames are compressed 4:1 temporally)
+    num_latent_frames = (num_frames - 1) // 4 + 1
+
+    # Convert frame cut indices to latent cut indices
+    shot_cut_latents = [0]  # Always start at 0
+    for frame_idx in sorted(shot_cut_frames):
+        if frame_idx > 0:
+            latent_idx = (frame_idx - 1) // 4 + 1
+            if latent_idx < num_latent_frames:
+                shot_cut_latents.append(latent_idx)
+
+    cuts = sorted(list(set(shot_cut_latents))) + [num_latent_frames]
+
+    # Create shot indices: each latent frame gets a shot ID
+    shot_indices = torch.zeros(num_latent_frames, dtype=torch.long)
+    for i in range(len(cuts) - 1):
+        start_latent, end_latent = cuts[i], cuts[i+1]
+        shot_indices[start_latent:end_latent] = i
+
+    shot_indices = shot_indices.unsqueeze(0).to(device=device)
+    return shot_indices
+
+def add_shot_mask_to_latents(latent: torch.Tensor, shot_indices: Optional[torch.Tensor], shot_mask_type: str = "normalized") -> torch.Tensor:
+    """
+    Add shot mask as extra channel to latents (HoloCine approach).
+    Based on HoloCine model_fn_wan_video at line 1092-1105
+    """
+    if shot_indices is None:
+        return latent
+
+    b, c, f, h, w = latent.shape
+    num_shots = shot_indices.max() + 1
+
+    # Create shot mask tensor
+    if shot_mask_type == "id":
+        shot_mask_tensor = shot_indices.to(latent.dtype)
+    elif shot_mask_type == "normalized":
+        # Normalize by 20 (HoloCine default)
+        shot_mask_tensor = shot_indices.to(latent.dtype) / 20.0 if num_shots > 1 else torch.zeros_like(shot_indices, dtype=latent.dtype)
+    elif shot_mask_type == "alternating":
+        shot_mask_tensor = (shot_indices % 2).to(latent.dtype)
+    else:
+        return latent
+
+    # Expand shot mask to match latent spatial dimensions
+    mask = shot_mask_tensor.view(b, 1, f, 1, 1).expand(b, 1, f, h, w)
+
+    # Concatenate along channel dimension
+    latent_with_shot = torch.cat([latent, mask], dim=1)
+
+    return latent_with_shot
+
+# ===================================================================
 #                    Sampling Function
 # ===================================================================
 
@@ -421,30 +571,37 @@ def run_sampling(
     seed_g: torch.Generator,
     guidance_scale: float = 5.0,
     dual_dit_boundary: float = 0.875,
-    shot_cut_frames: Optional[list[int]] = None
+    shot_cut_frames: Optional[list[int]] = None,
+    num_frames: int = 81
 ) -> torch.Tensor:
-    """Run sampling loop with dual-DiT support"""
+    """Run sampling loop with dual-DiT support and shot encoding"""
     arg_c, arg_null = inputs
     latent = noise
 
-    # Add shot_cut_frames to inputs if provided
+    # Create shot indices if shot_cut_frames provided (HoloCine approach)
+    shot_indices = None
     if shot_cut_frames is not None and len(shot_cut_frames) > 0:
-        arg_c["shot_cut_frames"] = shot_cut_frames
-        arg_null["shot_cut_frames"] = shot_cut_frames
-        logger.info(f"Added shot_cut_frames to model inputs: {shot_cut_frames}")
+        shot_indices = create_shot_indices(shot_cut_frames, num_frames, device)
+        logger.info(f"Created shot_indices tensor: shape={shot_indices.shape}, num_shots={shot_indices.max().item() + 1}")
 
     num_timesteps = len(timesteps)
 
-    # Determine boundary timestep for dual-DiT switching
-    boundary_timestep_idx = int(num_timesteps * dual_dit_boundary)
-    logger.info(f"Dual-DiT boundary: {dual_dit_boundary} (timestep index: {boundary_timestep_idx})")
+    # Determine boundary timestep VALUE for dual-DiT switching (HoloCine way)
+    # HoloCine: if timestep.item() < switch_DiT_boundary * num_train_timesteps, use low noise model
+    # Timesteps go from HIGH (e.g., 1000) to LOW (e.g., 0) during denoising
+    boundary_timestep_value = dual_dit_boundary * 1000  # num_train_timesteps = 1000
+    logger.info(f"Dual-DiT boundary: {dual_dit_boundary} (timestep value: {boundary_timestep_value})")
+    logger.info(f"Timestep range: {timesteps[0].item():.1f} → {timesteps[-1].item():.1f}")
 
     for step_idx, t in enumerate(timesteps):
-        # Determine which model to use
-        if step_idx < boundary_timestep_idx:
-            model_type = 'high'  # High noise model for early steps
+        # Determine which model to use based on TIMESTEP VALUE (not step index)
+        # When timestep is high (early denoising), use high noise model
+        # When timestep is low (late denoising), use low noise model
+        timestep_value = t.item() if isinstance(t, torch.Tensor) else t
+        if timestep_value < boundary_timestep_value:
+            model_type = 'low'   # Low timestep value = late denoising = low noise model
         else:
-            model_type = 'low'   # Low noise model for later steps
+            model_type = 'high'  # High timestep value = early denoising = high noise model
 
         # Load appropriate model
         model = model_manager.load_model(model_type)
@@ -455,6 +612,10 @@ def run_sampling(
 
         # Prepare latent for model
         latent_model_input = latent.to(device, dtype=model.dtype)
+
+        # Add shot mask to latent if shot_indices exist (HoloCine approach)
+        if shot_indices is not None:
+            latent_model_input = add_shot_mask_to_latents(latent_model_input, shot_indices, shot_mask_type="normalized")
 
         # CFG: Run unconditional and conditional predictions
         with torch.no_grad():
@@ -702,7 +863,8 @@ def run_inference(
         seed_g=seed_g,
         guidance_scale=guidance_scale,
         dual_dit_boundary=dual_dit_boundary,
-        shot_cut_frames=shot_cut_frames
+        shot_cut_frames=shot_cut_frames,
+        num_frames=num_frames
     )
 
     logger.info("Generation complete! Decoding latent...")
@@ -793,11 +955,11 @@ def parse_args():
                        help="Guidance scale for classifier-free guidance (default: 5.0)")
 
     # Solver and flow matching
-    parser.add_argument("--sample_solver", type=str, default="unipc",
-                       choices=["unipc", "dpm++", "vanilla", "euler"],
-                       help="Sampling solver (default: unipc)")
-    parser.add_argument("--flow_shift", type=float, default=1.0,
-                       help="Flow shift for flow matching (default: 1.0)")
+    parser.add_argument("--sample_solver", type=str, default="flowmatch",
+                       choices=["flowmatch", "holocine", "unipc", "dpm++", "vanilla", "euler"],
+                       help="Sampling solver (default: flowmatch for HoloCine)")
+    parser.add_argument("--flow_shift", type=float, default=5.0,
+                       help="Flow shift for flow matching (default: 5.0 for HoloCine)")
 
     # Dual-DiT parameters
     parser.add_argument("--dual_dit_boundary", type=float, default=0.875,
