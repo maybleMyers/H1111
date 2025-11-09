@@ -312,13 +312,19 @@ class DynamicModelManager:
         if self.blocks_to_swap > 0:
             logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
             wan_model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
+            logger.info("Moving non-swapped blocks to GPU...")
             wan_model.move_to_device_except_swap_blocks(self.device)
+            logger.info("Preparing block swap for forward pass...")
             wan_model.prepare_block_swap_before_forward()
+            logger.info("Block swap preparation complete")
         else:
+            logger.info(f"Moving model to {self.device}...")
             wan_model.to(self.device)
 
+        logger.info("Setting model to eval mode...")
         wan_model.eval().requires_grad_(False)
         clean_memory_on_device(self.device)
+        logger.info("Model ready for inference")
 
         # Wrap the model to support HoloCine-specific parameters
         wrapped_model = HoloCineWanModelWrapper(wan_model)
@@ -422,6 +428,10 @@ def run_sampling(
         # Load appropriate model
         model = model_manager.load_model(model_type)
 
+        # Log first step (which may be slow due to warmup)
+        if step_idx == 0:
+            logger.info(f"Starting denoising step 1/{num_timesteps} (this may take a moment for warmup)...")
+
         # Prepare latent for model
         latent_model_input = latent.to(device, dtype=model.dtype)
 
@@ -439,8 +449,8 @@ def run_sampling(
         # Scheduler step
         latent = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)[0]
 
-        # Progress logging
-        if (step_idx + 1) % 10 == 0 or step_idx == num_timesteps - 1:
+        # Progress logging - log every step for first few, then every 10
+        if step_idx < 3 or (step_idx + 1) % 5 == 0 or step_idx == num_timesteps - 1:
             logger.info(f"Step {step_idx + 1}/{num_timesteps} (model: {model_type})")
 
     return latent
