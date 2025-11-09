@@ -223,6 +223,12 @@ class HoloCineWanModelWrapper:
             # Already a list
             x_list = x
 
+        # Cast context to model's dtype to avoid dtype mismatches
+        if isinstance(context, list):
+            context = [c.to(self.dtype) if isinstance(c, torch.Tensor) else c for c in context]
+        elif isinstance(context, torch.Tensor):
+            context = context.to(self.dtype)
+
         # Call model and return first element (standard pattern)
         result = self.model(x_list, t, context, seq_len, **kwargs)
         return result[0]
