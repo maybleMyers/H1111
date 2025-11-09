@@ -134,6 +134,9 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
     import torchvision
     from einops import rearrange
 
+    # Move to CPU if on GPU
+    videos = videos.cpu()
+
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
     for x in videos:
