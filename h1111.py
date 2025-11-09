@@ -709,6 +709,170 @@ def wan22_batch_handler(
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
+### HoloCine - Multi-Shot Video Generation
+def holocine_batch_handler(
+    # Prompting
+    global_caption: str,
+    shot_captions_str: str,  # Newline-separated shot captions
+    negative_prompt: str,
+    # Generation Parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    block_swap: int,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    vae_path: str,
+    t5_path: str,
+    # Advanced
+    shot_cut_frames_str: str = "",  # Comma-separated frame numbers (optional)
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+
+    # Parse shot captions (newline-separated)
+    shot_captions_list = [s.strip() for s in shot_captions_str.split('\n') if s.strip()]
+    if not shot_captions_list:
+        yield [], "Error: Please provide at least one shot caption (one per line).", ""
+        return
+
+    # Parse shot cut frames (optional, comma-separated)
+    shot_cut_frames_list = None
+    if shot_cut_frames_str.strip():
+        try:
+            shot_cut_frames_list = [int(x.strip()) for x in shot_cut_frames_str.split(',') if x.strip()]
+        except ValueError:
+            yield [], "Error: Shot cut frames must be comma-separated integers.", ""
+            return
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        command = [
+            sys.executable, "holocine_generate_video.py",
+            "--global_caption", str(global_caption),
+            "--num_frames", str(frame_num),
+            "--height", str(height),
+            "--width", str(width),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path),
+            "--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+        ]
+
+        # Add shot captions
+        for shot_caption in shot_captions_list:
+            command.extend(["--shot_captions", shot_caption])
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        if fp8_t5:
+            command.append("--fp8_t5")
+
+        # Add shot cut frames if provided
+        if shot_cut_frames_list:
+            for cut_frame in shot_cut_frames_list:
+                command.extend(["--shot_cut_frames", str(cut_frame)])
+
+        # --- Execute Subprocess ---
+        print(f"Running HoloCine Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"HOLOCINE_SUBPROCESS: {line_strip}")
+            progress_text_update = line_strip
+
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_elapsed = tqdm_match.group(3)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+
+            yield all_generated_videos.copy(), status_text, progress_text_update
+
+        process.wait()
+        return_code = process.returncode
+
+        if return_code == 0 and current_video_file_for_item:
+            all_generated_videos.append((current_video_file_for_item, f"Seed {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Complete"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, "HoloCine Batch complete.", ""
+
 ### Multitalk
 def multitalk_batch_handler(
     prompt: str,
@@ -8375,7 +8539,128 @@ with gr.Blocks(
                         interactive=True
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
-        
+
+        # HoloCine Tab - Multi-Shot Scenecut Video Generation
+        with gr.Tab(id=15, label="HoloCine") as holocine_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    holocine_global_caption = gr.Textbox(
+                        label="Global Caption (Scene Description)",
+                        value="The scene features a young painter, [character1], with paint-smudged cheeks and intense, focused eyes. Her hair is tied up messily. The setting is a bright, sun-drenched art studio with large windows, canvases, and the smell of oil paint.",
+                        lines=4,
+                        info="Describe the overall scene, characters, and setting. Use [character1], [character2], etc. for consistency."
+                    )
+                    holocine_shot_captions = gr.Textbox(
+                        label="Shot Captions (One Per Line)",
+                        value="Medium shot of [character1] standing back from a large canvas, brush in hand, critically observing her work.\nClose-up of her hand holding the brush, dabbing it thoughtfully onto a palette of vibrant colors.\nExtreme close-up of her eyes, narrowed in concentration as she studies the canvas.\nClose-up on the canvas, showing a detailed, textured brushstroke being slowly applied.\nMedium close-up of [character1]'s face, a small, satisfied smile appears as she finds the right color.\nOver-the-shoulder shot showing her add a final, delicate highlight to the painting.",
+                        lines=8,
+                        info="Enter one shot caption per line. Each describes what happens in that shot."
+                    )
+                    holocine_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    holocine_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    holocine_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    holocine_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+            with gr.Row():
+                holocine_generate_btn = gr.Button("Generate Multi-Shot Video", elem_classes="green-btn")
+                holocine_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        holocine_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        holocine_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    holocine_frame_num = gr.Slider(minimum=81, maximum=611, step=4, label="Frame Count", value=241, info="Must be 4n+1. Default: 241 (15s @ 16fps)")
+                    holocine_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    holocine_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=50)
+                    holocine_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0, info="HoloCine default: 5.0")
+                    holocine_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    holocine_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise model used after this threshold")
+                    holocine_sample_solver = gr.Radio(
+                        choices=["unipc", "dpm++", "vanilla", "euler", "flowmatch"],
+                        label="Sample Solver",
+                        value="unipc",
+                        info="Use 'flowmatch' for HoloCine-style scheduling"
+                    )
+                    with gr.Row():
+                        holocine_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        holocine_random_seed_btn = gr.Button("🎲")
+
+                    gr.Markdown("### Advanced Options")
+                    holocine_shot_cut_frames = gr.Textbox(
+                        label="Shot Cut Frames (Optional, Comma-separated)",
+                        value="",
+                        placeholder="e.g., 37, 73, 113, 169, 205",
+                        info="Leave empty for automatic calculation. Must be 4n+1 format."
+                    )
+
+                with gr.Column():
+                    holocine_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, allow_preview=True, preview=True
+                    )
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    holocine_attn_mode = gr.Radio(
+                        choices=["sdpa", "flash", "torch", "xformers"],
+                        label="Attention Mode",
+                        value="sdpa",
+                        info="Use 'flash' for FlashAttention (faster)"
+                    )
+                    holocine_block_swap = gr.Slider(
+                        minimum=0, maximum=39, step=1,
+                        label="Block Swap to Save VRAM",
+                        value=0,
+                        info="Offload N blocks to CPU. Try 30 if low on VRAM"
+                    )
+                with gr.Row():
+                    holocine_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    holocine_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    holocine_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    holocine_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model (.safetensors)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="HoloCine fine-tuned models (e.g., full_low_noise.safetensors)"
+                    )
+                    holocine_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model (.safetensors)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="HoloCine fine-tuned models (e.g., full_high_noise.safetensors)"
+                    )
+                with gr.Row():
+                    holocine_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    holocine_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                holocine_save_path = gr.Textbox(label="Save Path", value="outputs/holocine")
+
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
             with gr.Row():
@@ -12036,6 +12321,57 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== HoloCine Button Handlers =====
+    holocine_generate_btn.click(
+        fn=holocine_batch_handler,
+        inputs=[
+            holocine_global_caption,
+            holocine_shot_captions,
+            holocine_negative_prompt,
+            holocine_width,
+            holocine_height,
+            holocine_frame_num,
+            holocine_fps,
+            holocine_seed,
+            holocine_sample_solver,
+            holocine_sample_steps,
+            holocine_flow_shift,
+            holocine_sample_guide_scale,
+            holocine_dual_dit_boundary,
+            holocine_batch_size,
+            holocine_save_path,
+            holocine_attn_mode,
+            holocine_block_swap,
+            holocine_fp8_t5,
+            holocine_dit_low_noise_path,
+            holocine_dit_high_noise_path,
+            holocine_vae_path,
+            holocine_t5_path,
+            holocine_shot_cut_frames,
+        ],
+        outputs=[holocine_output, holocine_batch_progress, holocine_progress_text],
+        queue=True
+    )
+
+    holocine_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    holocine_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[holocine_seed])
+
+    # Refresh models for HoloCine
+    def refresh_holocine_models(folder: str):
+        """Refresh model dropdowns for HoloCine"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    holocine_refresh_models_btn.click(
+        fn=refresh_holocine_models,
+        inputs=[holocine_model_folder],
+        outputs=[holocine_dit_low_noise_path, holocine_dit_high_noise_path, holocine_vae_path, holocine_t5_path]
     )
 
     #Video Info
