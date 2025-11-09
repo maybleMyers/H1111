@@ -208,7 +208,24 @@ class HoloCineWanModelWrapper:
         """
         # Remove shot_cut_frames from kwargs as standard WanModel doesn't accept it
         # The shot information is encoded in the text prompt via [shot cut] markers
-        return self.model(x, t, context, seq_len, **kwargs)
+
+        # Convert x to list format if needed (WanModel expects list of tensors)
+        if isinstance(x, torch.Tensor):
+            if len(x.shape) == 5:
+                # Has batch dimension [B, C, F, H, W] - split into list
+                x_list = [x[i] for i in range(x.shape[0])]
+            elif len(x.shape) == 4:
+                # No batch dimension [C, F, H, W] - wrap in list
+                x_list = [x]
+            else:
+                raise ValueError(f"Unexpected tensor shape for x: {x.shape}")
+        else:
+            # Already a list
+            x_list = x
+
+        # Call model and return first element (standard pattern)
+        result = self.model(x_list, t, context, seq_len, **kwargs)
+        return result[0]
 
     def to(self, device):
         """Move model to device"""
