@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Any, Union
 import numpy as np
 import av
+from tqdm import tqdm
 
 import accelerate
 from accelerate import Accelerator
@@ -604,8 +605,9 @@ def run_sampling(
     boundary_timestep_value = dual_dit_boundary * 1000  # num_train_timesteps = 1000
     logger.info(f"Dual-DiT boundary: {dual_dit_boundary} (timestep value: {boundary_timestep_value})")
     logger.info(f"Timestep range: {timesteps[0].item():.1f} → {timesteps[-1].item():.1f}")
+    logger.info(f"Starting sampling loop for {num_timesteps} steps.")
 
-    for step_idx, t in enumerate(timesteps):
+    for step_idx, t in enumerate(tqdm(timesteps, desc="HOLOCINE")):
         # Determine which model to use based on TIMESTEP VALUE (not step index)
         # When timestep is high (early denoising), use high noise model
         # When timestep is low (late denoising), use low noise model
@@ -617,10 +619,6 @@ def run_sampling(
 
         # Load appropriate model
         model = model_manager.load_model(model_type)
-
-        # Log first step (which may be slow due to warmup)
-        if step_idx == 0:
-            logger.info(f"Starting denoising step 1/{num_timesteps} (this may take a moment for warmup)...")
 
         # Prepare latent for model
         latent_model_input = latent.to(device, dtype=model.dtype)
@@ -647,10 +645,6 @@ def run_sampling(
         # Scheduler step
         # Note: return_dict=False returns tensor directly, not a tuple
         latent = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)
-
-        # Progress logging - log every step for first few, then every 10
-        if step_idx < 3 or (step_idx + 1) % 5 == 0 or step_idx == num_timesteps - 1:
-            logger.info(f"Step {step_idx + 1}/{num_timesteps} (model: {model_type})")
 
     return latent
 
