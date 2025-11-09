@@ -535,6 +535,14 @@ def add_shot_mask_to_latents(latent: torch.Tensor, shot_indices: Optional[torch.
     if shot_indices is None:
         return latent
 
+    # Handle both 4D (C, F, H, W) and 5D (B, C, F, H, W) latents
+    if latent.dim() == 4:
+        # Add batch dimension
+        latent = latent.unsqueeze(0)
+        added_batch_dim = True
+    else:
+        added_batch_dim = False
+
     b, c, f, h, w = latent.shape
     num_shots = shot_indices.max() + 1
 
@@ -554,6 +562,10 @@ def add_shot_mask_to_latents(latent: torch.Tensor, shot_indices: Optional[torch.
 
     # Concatenate along channel dimension
     latent_with_shot = torch.cat([latent, mask], dim=1)
+
+    # Remove batch dimension if it was added
+    if added_batch_dim:
+        latent_with_shot = latent_with_shot.squeeze(0)
 
     return latent_with_shot
 
