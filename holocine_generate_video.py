@@ -148,7 +148,10 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
         x = (x * 255).numpy().astype(np.uint8)
         outputs.append(x)
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Create directory if path contains one
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
 
     height, width, _ = outputs[0].shape
 
