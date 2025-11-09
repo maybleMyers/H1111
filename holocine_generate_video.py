@@ -910,15 +910,30 @@ def run_inference(
     clean_memory_on_device(device_obj)
 
     # --- Save Video ---
-    logger.info(f"Saving video to: {output_path}")
+    # Handle both directory and file paths
+    if os.path.isdir(output_path) or not output_path.endswith('.mp4'):
+        # If it's a directory or doesn't have .mp4 extension, generate a filename
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        if os.path.isdir(output_path):
+            final_output_path = os.path.join(output_path, f"holocine_{timestamp}_seed{seed}.mp4")
+        else:
+            # Assume it's a directory that doesn't exist yet
+            os.makedirs(output_path, exist_ok=True)
+            final_output_path = os.path.join(output_path, f"holocine_{timestamp}_seed{seed}.mp4")
+    else:
+        final_output_path = output_path
+
+    logger.info(f"Saving video to: {final_output_path}")
 
     # Ensure video is in correct format [B, C, T, H, W]
     if video.dim() == 4:
         video = video.unsqueeze(0)
 
-    save_videos_grid(video, output_path, rescale=True, fps=fps)
+    save_videos_grid(video, final_output_path, rescale=True, fps=fps)
 
-    logger.info(f"✅ Video successfully saved to: {output_path}")
+    logger.info(f"✅ Video successfully saved to: {final_output_path}")
+    print(f"Video saved to: {final_output_path}")
 
     return video
 
