@@ -240,7 +240,7 @@ class DynamicModelManager:
     """Manages dynamic loading and unloading of DiT models during inference."""
 
     def __init__(self, config, device, dit_dtype, dit_weight_dtype, low_noise_path, high_noise_path,
-                 attn_mode, lora_weights_list_low=None, lora_multipliers_low=None,
+                 attn_mode, blocks_to_swap=0, lora_weights_list_low=None, lora_multipliers_low=None,
                  lora_weights_list_high=None, lora_multipliers_high=None):
         self.config = config
         self.device = device
@@ -253,6 +253,7 @@ class DynamicModelManager:
             'high': high_noise_path
         }
         self.attn_mode = attn_mode
+        self.blocks_to_swap = blocks_to_swap
         self.lora_weights_list_low = lora_weights_list_low
         self.lora_multipliers_low = lora_multipliers_low
         self.lora_weights_list_high = lora_weights_list_high
@@ -291,7 +292,17 @@ class DynamicModelManager:
             lora_multipliers=lora_multipliers
         )
 
-        wan_model.to(self.device)
+        # Setup block swapping if requested
+        if self.blocks_to_swap > 0:
+            logger.info(f"Enable swap {self.blocks_to_swap} blocks to CPU from device: {self.device}")
+            wan_model.enable_block_swap(self.blocks_to_swap, self.device, supports_backward=False)
+            wan_model.move_to_device_except_swap_blocks(self.device)
+            wan_model.prepare_block_swap_before_forward()
+        else:
+            wan_model.to(self.device)
+
+        wan_model.eval().requires_grad_(False)
+        clean_memory_on_device(self.device)
 
         # Wrap the model to support HoloCine-specific parameters
         wrapped_model = HoloCineWanModelWrapper(wan_model)
@@ -461,6 +472,7 @@ def run_inference(
     dual_dit_boundary: float = 0.875,
     attn_mode: str = "torch",
     fp8_t5: bool = False,
+    blocks_to_swap: int = 0,
 
     # Output Parameters
     fps: int = 15,
@@ -614,6 +626,8 @@ def run_inference(
 
     # --- Setup Dynamic Model Manager for Dual-DiT ---
     logger.info("Setting up dynamic dual-DiT model manager...")
+    if blocks_to_swap > 0:
+        logger.info(f"Block swapping enabled: {blocks_to_swap} blocks will be offloaded to CPU")
     model_manager = DynamicModelManager(
         config=config,
         device=device_obj,
@@ -622,6 +636,7 @@ def run_inference(
         low_noise_path=dit_low_noise,
         high_noise_path=dit_high_noise,
         attn_mode=attn_mode,
+        blocks_to_swap=blocks_to_swap,
         lora_weights_list_low=None,
         lora_multipliers_low=None,
         lora_weights_list_high=None,
@@ -749,12 +764,12 @@ def parse_args():
                        help="Attention mode (default: torch)")
     parser.add_argument("--fp8_t5", action="store_true",
                        help="Use FP8 for T5 encoder")
+    parser.add_argument("--blocks_to_swap", type=int, default=0,
+                       help="Number of transformer blocks to swap to CPU to reduce VRAM usage (default: 0)")
 
     # Compatibility arguments (ignored but accepted)
     parser.add_argument("--video_length", type=int, default=None,
                        help="Alias for --num_frames")
-    parser.add_argument("--blocks_to_swap", type=int, default=None,
-                       help="(Ignored - for compatibility only)")
     parser.add_argument("--tiled", action="store_true", default=True,
                        help="(Ignored - for compatibility only)")
     parser.add_argument("--quality", type=int, default=5,
@@ -798,6 +813,7 @@ def main():
         dual_dit_boundary=args.dual_dit_boundary,
         attn_mode=args.attn_mode,
         fp8_t5=args.fp8_t5,
+        blocks_to_swap=args.blocks_to_swap if args.blocks_to_swap else 0,
         fps=args.fps
     )
 
