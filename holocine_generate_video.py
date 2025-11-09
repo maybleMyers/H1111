@@ -645,7 +645,8 @@ def run_sampling(
             noise_pred = noise_pred_null + guidance_scale * (noise_pred_c - noise_pred_null)
 
         # Scheduler step
-        latent = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)[0]
+        # Note: return_dict=False returns tensor directly, not a tuple
+        latent = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)
 
         # Progress logging - log every step for first few, then every 10
         if step_idx < 3 or (step_idx + 1) % 5 == 0 or step_idx == num_timesteps - 1:
