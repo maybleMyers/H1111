@@ -442,7 +442,10 @@ class WanAttentionBlock(nn.Module):
         # x += self.cross_attn(self.norm3(x), context, context_lens) # backward error
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
         del context
-        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        # Cast FFN input to match FFN weight dtype to avoid dtype mismatch
+        ffn_input = self.norm2(x).float() * (1 + e[4]) + e[3]
+        ffn_input = ffn_input.to(self.ffn[0].weight.dtype)
+        y = self.ffn(ffn_input)
         x = x + y.to(torch.float32) * e[5]
         del y
         return x
@@ -482,7 +485,10 @@ class Head(nn.Module):
         #     x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         # support fp8
         e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
-        x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+        # Cast head input to match head weight dtype to avoid dtype mismatch
+        head_input = self.norm(x) * (1 + e[1]) + e[0]
+        head_input = head_input.to(self.head.weight.dtype)
+        x = self.head(head_input)
         return x
 
 
