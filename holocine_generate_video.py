@@ -191,6 +191,34 @@ def load_text_encoder(t5_path: str, device: torch.device, text_len: int = 512, f
     )
     return text_encoder
 
+class HoloCineWanModelWrapper:
+    """
+    Wrapper around WanModel that adds support for HoloCine-specific parameters like shot_cut_frames.
+    This allows us to use the standard WanModel without modifying it.
+    """
+    def __init__(self, wan_model: WanModel):
+        self.model = wan_model
+        self.dtype = next(wan_model.parameters()).dtype
+
+    def __call__(self, x, t, context, seq_len, shot_cut_frames=None, **kwargs):
+        """
+        Forward pass that accepts shot_cut_frames but doesn't pass it to the underlying model.
+        HoloCine models should be trained to handle multi-shot structure implicitly through
+        the text prompts which contain [shot cut] markers.
+        """
+        # Remove shot_cut_frames from kwargs as standard WanModel doesn't accept it
+        # The shot information is encoded in the text prompt via [shot cut] markers
+        return self.model(x, t, context, seq_len, **kwargs)
+
+    def to(self, device):
+        """Move model to device"""
+        self.model.to(device)
+        return self
+
+    def parameters(self):
+        """Return model parameters"""
+        return self.model.parameters()
+
 class DynamicModelManager:
     """Manages dynamic loading and unloading of DiT models during inference."""
 
@@ -213,8 +241,8 @@ class DynamicModelManager:
         self.lora_weights_list_high = lora_weights_list_high
         self.lora_multipliers_high = lora_multipliers_high
 
-    def load_model(self, model_type: str) -> WanModel:
-        """Load specified model type ('low' or 'high')"""
+    def load_model(self, model_type: str):
+        """Load specified model type ('low' or 'high') and wrap it"""
         if self.current_model_type == model_type:
             return self.current_model
 
@@ -233,7 +261,7 @@ class DynamicModelManager:
         lora_weights = self.lora_weights_list_low if model_type == 'low' else self.lora_weights_list_high
         lora_multipliers = self.lora_multipliers_low if model_type == 'low' else self.lora_multipliers_high
 
-        model = load_wan_model(
+        wan_model = load_wan_model(
             self.config,
             self.device,
             self.model_paths[model_type],
@@ -246,11 +274,15 @@ class DynamicModelManager:
             lora_multipliers=lora_multipliers
         )
 
-        model.to(self.device)
-        self.current_model = model
+        wan_model.to(self.device)
+
+        # Wrap the model to support HoloCine-specific parameters
+        wrapped_model = HoloCineWanModelWrapper(wan_model)
+
+        self.current_model = wrapped_model
         self.current_model_type = model_type
 
-        return model
+        return wrapped_model
 
 # ===================================================================
 #                    Scheduler Setup
