@@ -35,7 +35,8 @@ from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
-from wan.utils.fm_solvers import FlowUniPCMultistepScheduler, FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.utils.fm_solvers_euler import EulerScheduler
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
