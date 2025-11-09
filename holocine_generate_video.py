@@ -643,8 +643,14 @@ def run_sampling(
             noise_pred = noise_pred_null + guidance_scale * (noise_pred_c - noise_pred_null)
 
         # Scheduler step
-        # Note: return_dict=False returns tensor directly, not a tuple
-        latent = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)
+        # Some schedulers return tuple even with return_dict=False, handle both cases
+        step_output = scheduler.step(noise_pred, t, latent, generator=seed_g, return_dict=False)
+
+        # Handle both tensor and tuple returns
+        if isinstance(step_output, tuple):
+            latent = step_output[0]
+        else:
+            latent = step_output
 
     return latent
 
