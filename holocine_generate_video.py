@@ -290,13 +290,16 @@ class DynamicModelManager:
             self.device,
             self.model_paths[model_type],
             self.attn_mode,
-            False,  # is_i2v
+            False,  # is_i2v (split_attn)
             "cpu",  # loading_device
             self.dit_dtype,  # loading_weight_dtype
             False,  # fp8
             lora_weights_list=lora_weights,
             lora_multipliers=lora_multipliers
         )
+
+        # Verify attn_mode was set correctly
+        logger.info(f"Model loaded with attn_mode: {wan_model.attn_mode}")
 
         # Setup block swapping if requested
         if self.blocks_to_swap > 0:
