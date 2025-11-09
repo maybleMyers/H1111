@@ -625,9 +625,13 @@ def run_sampling(
         # Prepare latent for model
         latent_model_input = latent.to(device, dtype=model.dtype)
 
-        # Add shot mask to latent if shot_indices exist (HoloCine approach)
-        if shot_indices is not None:
-            latent_model_input = add_shot_mask_to_latents(latent_model_input, shot_indices, shot_mask_type="normalized")
+        # NOTE: Shot mask concatenation is disabled because it requires HoloCine-specific models
+        # with modified patch_embedding layers that accept 17 channels (16 VAE + 1 shot mask).
+        # Standard Wan2.2 models only accept 16 channels.
+        #
+        # If using official HoloCine fine-tuned models, uncomment this:
+        # if shot_indices is not None:
+        #     latent_model_input = add_shot_mask_to_latents(latent_model_input, shot_indices, shot_mask_type="normalized")
 
         # CFG: Run unconditional and conditional predictions
         with torch.no_grad():
