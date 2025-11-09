@@ -262,6 +262,10 @@ class WanT2VCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
+        # Ensure x and context have the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
+
         # compute query, key, value
         # q = self.norm_q(self.q(x)).view(b, -1, n, d)
         # k = self.norm_k(self.k(context)).view(b, -1, n, d)
@@ -308,6 +312,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         context_img = context[:, :257]
         context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # Ensure x and context have the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
+        context_img = context_img.to(self.k_img.weight.dtype)
 
         # compute query, key, value
         q = self.q(x)
