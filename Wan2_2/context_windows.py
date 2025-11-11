@@ -113,10 +113,10 @@ ContextResults = collections.namedtuple("ContextResults", ['window_idx', 'sub_co
 
 class IndexListContextHandler(ContextHandlerABC):
     """Main handler for sliding window context processing."""
-    
+
     def __init__(self, context_schedule: ContextSchedule, fuse_method: ContextFuseMethod,
                  context_length: int = 1, context_overlap: int = 0, context_stride: int = 1,
-                 closed_loop: bool = False, dim: int = 0):
+                 closed_loop: bool = False, dim: int = 0, ending_frame: int = 0):
         self.context_schedule = context_schedule
         self.fuse_method = fuse_method
         self.context_length = context_length
@@ -124,6 +124,7 @@ class IndexListContextHandler(ContextHandlerABC):
         self.context_stride = context_stride
         self.closed_loop = closed_loop
         self.dim = dim
+        self.ending_frame = ending_frame  # 0=loop to start, -1=loop to last frame
         self._step = 0
         self.callbacks = {}
     
@@ -405,9 +406,13 @@ def create_windows_uniform_looped(num_frames: int, handler: IndexListContextHand
     if num_frames < handler.context_length:
         windows.append(list(range(num_frames)))
         return windows
-    
+
     context_stride = min(handler.context_stride, int(np.ceil(np.log2(num_frames / handler.context_length))) + 1)
-    
+
+    # Determine the target frame for loop wrapping
+    # ending_frame: 0 = loop to start (frame 0), -1 = loop to last frame
+    target_loop_frame = num_frames - 1 if handler.ending_frame == -1 else 0
+
     for context_step in 1 << np.arange(context_stride):
         pad = int(round(num_frames * ordered_halving(handler._step)))
         for j in range(
@@ -415,8 +420,17 @@ def create_windows_uniform_looped(num_frames: int, handler: IndexListContextHand
             num_frames + pad + (0 if handler.closed_loop else -handler.context_overlap),
             (handler.context_length * context_step - handler.context_overlap),
         ):
-            windows.append([e % num_frames for e in range(j, j + handler.context_length * context_step, context_step)])
-    
+            # Create window with custom wrapping for ending frame support
+            window_indices = []
+            for e in range(j, j + handler.context_length * context_step, context_step):
+                idx = e % num_frames
+                # If we're wrapping around (e >= num_frames) and ending_frame is set to last frame,
+                # remap frame 0 to the last frame
+                if e >= num_frames and handler.ending_frame == -1 and idx == 0:
+                    idx = target_loop_frame
+                window_indices.append(idx)
+            windows.append(window_indices)
+
     return windows
 
 
@@ -623,13 +637,13 @@ def shift_window_to_end(window: List[int], num_frames: int):
 
 class WanContextWindowsHandler:
     """WAN-specific context windows handler with optimizations for video generation."""
-    
+
     def __init__(self, context_length: int = 81, context_overlap: int = 30,
                  context_schedule: str = "standard_static",
                  context_stride: int = 1, closed_loop: bool = False,
-                 fuse_method: str = "pyramid"):
+                 fuse_method: str = "pyramid", ending_frame: int = 0):
         """Initialize WAN context windows handler.
-        
+
         Args:
             context_length: Length of context window in frames (default 81)
             context_overlap: Overlap between windows in frames (default 30)
@@ -637,19 +651,20 @@ class WanContextWindowsHandler:
             context_stride: Stride for uniform schedules
             closed_loop: Whether to close loop for cyclic videos
             fuse_method: Method for fusing window results
+            ending_frame: Frame to loop back to (0=start, -1=last frame)
         """
         # Store original frame counts
         self.context_length_frames = context_length
         self.context_overlap_frames = context_overlap
-        
+
         # Adjust for VAE stride (4x temporal compression)
         self.context_length = max(((context_length - 1) // 4) + 1, 1)
         self.context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
-        
+
         # Create handler with dimension 2 (temporal for [B, C, F, H, W])
         schedule = get_matching_context_schedule(context_schedule)
         method = get_matching_fuse_method(fuse_method)
-        
+
         # Set dim based on whether we expect batch dimension
         # For [C, F, H, W] tensor, F is at index 1
         # For [B, C, F, H, W] tensor, F is at index 2
@@ -661,13 +676,15 @@ class WanContextWindowsHandler:
             context_overlap=self.context_overlap,
             context_stride=context_stride,
             closed_loop=closed_loop,
-            dim=1  # Temporal dimension for [C, F, H, W] tensors
+            dim=1,  # Temporal dimension for [C, F, H, W] tensors
+            ending_frame=ending_frame
         )
-        
+
+        ending_desc = "last frame" if ending_frame == -1 else "start frame"
         logger.info(f"WAN Context Windows initialized: {self.context_length_frames} frames "
                    f"({self.context_length} latent), {self.context_overlap_frames} overlap "
                    f"({self.context_overlap} latent), schedule={context_schedule}, "
-                   f"fuse={fuse_method}")
+                   f"fuse={fuse_method}, loop_target={ending_desc}")
     
     def should_use(self, latent: torch.Tensor) -> bool:
         """Check if context windows should be used for given latent."""

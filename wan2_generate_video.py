@@ -871,6 +871,10 @@ def create_funcontrol_conditioning_latent(
                 # Result shape [C', F', H', W'] - needs batch dim for processing here
                 end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
+            # Determine if using looped schedule
+            using_looped = (hasattr(args, 'use_context_windows') and args.use_context_windows and
+                           hasattr(args, 'context_schedule') and args.context_schedule == "looped_uniform")
+
             # Calculate end image influence transition (S-curve / cubic)
             end_influence_mask = torch.zeros([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
             falloff_len_frames = max(1, int(total_latent_frames * args.control_falloff_percentage))
@@ -882,7 +886,12 @@ def create_funcontrol_conditioning_latent(
                  influence_start_frame = max(0, int(total_latent_frames * args.control_end) - falloff_len_frames // 2)
             else:
                  # Default: start influence around 60% mark if no control or control runs full length
-                 influence_start_frame = max(0, int(total_latent_frames * 0.6))
+                 # For looped mode: start earlier for stronger end image conditioning
+                 if using_looped:
+                     influence_start_frame = max(0, int(total_latent_frames * 0.5))
+                     logger.info("Looped mode: Starting end image influence earlier (50% mark)")
+                 else:
+                     influence_start_frame = max(0, int(total_latent_frames * 0.6))
 
             # Ensure start frame isn't too close to the beginning if start image exists
             if has_start_image:
@@ -898,8 +907,12 @@ def create_funcontrol_conditioning_latent(
                          # Cubic ease-in-out curve (smoother than cosine)
                          if pos < 0.5: influence = 4 * pos * pos * pos
                          else: p = pos - 1; influence = 1 + 4 * p * p * p
-                         # Ensure full influence near the end
-                         if idx >= total_latent_frames - 3: influence = 1.0
+                         # Ensure full influence near the end - stronger for looped mode
+                         frames_from_end = total_latent_frames - 1 - idx
+                         if using_looped and frames_from_end < 5:
+                             influence = 1.0  # Force full influence in last 5 frames for looped
+                         elif frames_from_end < 3:
+                             influence = 1.0  # Force full influence in last 3 frames for non-looped
                          end_influence_mask[0, 0, idx] = influence
 
                  # Blending logic (similar to base_nodes)
@@ -920,7 +933,13 @@ def create_funcontrol_conditioning_latent(
                                  )
 
                  # Ensure final frames are exactly the end image latent
-                 last_frames_exact = min(3, total_latent_frames) # Ensure at least last 3 frames are end image
+                 # Use more frames for looped mode to ensure clean loop
+                 if using_looped:
+                     last_frames_exact = min(5, total_latent_frames)  # Last 5 frames for looped
+                     logger.info("Looped mode: Forcing last 5 frames to exact end image")
+                 else:
+                     last_frames_exact = min(3, total_latent_frames)  # Last 3 frames for non-looped
+
                  if last_frames_exact > 0:
                      end_offset = total_latent_frames - last_frames_exact
                      if end_offset >= 0:
@@ -1604,6 +1623,13 @@ def apply_context_windows(args: argparse.Namespace, model_options: dict = None) 
     if "transformer_options" not in model_options:
         model_options["transformer_options"] = {}
     
+    # Determine ending frame for looped schedules
+    ending_frame = 0  # Default: loop to start frame
+    if args.context_schedule == "looped_uniform" and hasattr(args, 'end_image_path') and args.end_image_path:
+        # Auto-enable ending frame loop when end image provided with looped schedule
+        ending_frame = -1  # Loop to last frame
+        logger.info("End image detected with looped_uniform schedule - configuring loop to end at last frame")
+
     # Create WAN context windows handler
     try:
         context_handler = WanContextWindowsHandler(
@@ -1612,17 +1638,18 @@ def apply_context_windows(args: argparse.Namespace, model_options: dict = None) 
             context_schedule=args.context_schedule,
             context_stride=args.context_stride,
             closed_loop=args.context_closed_loop,
-            fuse_method=args.context_fuse_method
+            fuse_method=args.context_fuse_method,
+            ending_frame=ending_frame
         )
-        
+
         # Store handler in model options
         model_options["context_handler"] = context_handler.handler
         model_options["transformer_options"]["context_handler"] = context_handler.handler
-        
+
         logger.info(f"Context windows enabled: length={args.context_length} frames, "
                    f"overlap={args.context_overlap} frames, schedule={args.context_schedule}, "
                    f"fuse={args.context_fuse_method}")
-        
+
         return model_options
         
     except Exception as e:
@@ -2032,7 +2059,19 @@ def prepare_i2v_inputs(
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #1: Frame Dimension ---
         lat_f_base = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
-        lat_f_effective = lat_f_base + (1 if has_end_image else 0) # Adjust frame dim if end image exists
+
+        # Determine if we're using looped schedule with end image
+        using_looped_with_end = (hasattr(args, 'use_context_windows') and args.use_context_windows and
+                                  hasattr(args, 'context_schedule') and args.context_schedule == "looped_uniform" and
+                                  has_end_image)
+
+        # For looped videos: place end image at last frame (no extra frame)
+        # For non-looped: add end image as extra frame (original behavior)
+        if using_looped_with_end:
+            lat_f_effective = lat_f_base  # Keep same frame count for looped videos
+            logger.info("Looped mode: End image will replace last frame instead of adding extra frame")
+        else:
+            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Original behavior
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #2: Sequence Length ---
         max_seq_len = math.ceil(lat_f_effective * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
@@ -2143,8 +2182,15 @@ def prepare_i2v_inputs(
             if has_end_image and end_img_resized is not None:
                  # Encode the single end frame
                  y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
-                 # Concatenate along frame dimension (dim=1)
-                 y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
+
+                 if using_looped_with_end:
+                     # For looped mode: REPLACE last frame instead of concatenating
+                     y_latent_combined = y_latent_base.clone()  # Clone to avoid modifying original
+                     y_latent_combined[:, -1:, :, :] = y_end  # Replace last frame
+                     logger.info("Looped mode: Replaced last frame with end image")
+                 else:
+                     # For non-looped mode: CONCATENATE as extra frame (original behavior)
+                     y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W]
             else:
                  y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
 
