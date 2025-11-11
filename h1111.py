@@ -468,7 +468,7 @@ def wan22_batch_handler(
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
-    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -576,6 +576,8 @@ def wan22_batch_handler(
             if context_closed_loop:
                 command.append("--context_closed_loop")
             command.extend(["--context_fuse_method", str(context_fuse_method)])
+            if context_end_image:
+                command.extend(["--end_image_path", str(context_end_image)])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -8386,7 +8388,14 @@ with gr.Blocks(
                                     value="pyramid",
                                     info="Method for fusing context window results"
                                 )
-                    
+                            with gr.Row():
+                                wan22_context_end_image = gr.Image(
+                                    label="Ending Image (Optional)",
+                                    type="filepath",
+                                    sources=["upload"],
+                                    info="Optional ending image for context windows generation"
+                                )
+
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
@@ -12295,6 +12304,7 @@ with gr.Blocks(
             wan22_context_stride,
             wan22_context_closed_loop,
             wan22_context_fuse_method,
+            wan22_context_end_image,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
