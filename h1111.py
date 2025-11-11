@@ -8392,8 +8392,7 @@ with gr.Blocks(
                                 wan22_context_end_image = gr.Image(
                                     label="Ending Image (Optional)",
                                     type="filepath",
-                                    sources=["upload"],
-                                    info="Optional ending image for context windows generation"
+                                    sources=["upload"]
                                 )
 
                     gr.Markdown("### Generation Parameters")
