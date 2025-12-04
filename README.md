@@ -496,6 +496,8 @@ You can set cuda device to 1,2,3,4,5,6,7 etc in the env once activated in a sepa
 ie for linux on the second gpu: CUDA_VISIBLE_DEVICES=1 python h1111.py
 
 ## full changlog  
+12/3/2025  
+    I have been working on a kandinksy implementation. It is really a great model, can do so much more than wan. I created a separate repository for it here https://github.com/maybleMyers/kandinsky5  
 9/28/2025  
     Supports lightx2v 4 step loras via the lightx2v branch. Achieve good generations in as little as 4 steps with wan2.2 xD.  
 9/19/2025  
