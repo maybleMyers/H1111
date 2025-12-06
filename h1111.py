@@ -728,9 +728,11 @@ def wan22_batch_handler(
                 "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
                 "flow_shift": flow_shift, "sample_guide_scale": sample_guide_scale,
-                "dual_dit_boundary": dual_dit_boundary,  # Add dual_dit_boundary to metadata
+                "dual_dit_boundary": dual_dit_boundary,
                 "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str],
                 "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult],
+                "lora_apply_low": [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low],
+                "lora_apply_high": [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high, lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high],
             }
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
@@ -4434,6 +4436,45 @@ def extract_last_frame(video_path: str) -> Optional[str]:
 
     except Exception as e:
         print(f"❌ Unexpected error: {str(e)}")
+        return None
+    finally:
+        if 'cap' in locals():
+            cap.release()
+
+def extract_first_frame(video_path: str) -> Optional[str]:
+    """Extract first frame from video and return temporary image path"""
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Error: Video file does not exist")
+        return None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("❌ Error: Failed to open video file")
+            return None
+
+        # Read first frame (frame 0)
+        success, frame = cap.read()
+
+        if not success or frame is None:
+            print("❌ Error: Failed to read first frame")
+            return None
+
+        # Prepare output path
+        temp_dir = os.path.abspath("temp_frames")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"first_frame_{os.path.basename(video_path)}.png")
+
+        # Write frame
+        if not cv2.imwrite(temp_path, frame):
+            print("❌ Error: Failed to write frame to file")
+            return None
+
+        print(f"✅ First frame extracted: {temp_path}")
+        return temp_path
+
+    except Exception as e:
+        print(f"❌ Unexpected error extracting first frame: {str(e)}")
         return None
     finally:
         if 'cap' in locals():
@@ -11306,37 +11347,43 @@ with gr.Blocks(
     )
     
     # Add a function to handle video transfer to wan22 tab
-    def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+    def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str, Optional[str]]:
         """Handle both parameters and video transfer from Video Info to Wan2.2 tab"""
         if not metadata:
             metadata = {}
-        
-        # If we have a video, enable V2V mode automatically
+
+        first_frame_path = None
+        # If we have a video, enable V2V mode and extract first frame
         if video_path:
             metadata["enable_v2v"] = True
-            
-        return f"Parameters ready for Wan2.2", metadata, video_path
+            first_frame_path = extract_first_frame(video_path)
+
+        return f"Parameters ready for Wan2.2", metadata, video_path, first_frame_path
 
 # Wan2.2 send-to logic
     send_to_wan22_btn.click(
         fn=handle_send_to_wan22_tab,
         inputs=[metadata_output, video_input],
-        outputs=[status, params_state, wan22_input_video]
+        outputs=[status, params_state, wan22_input_video, wan22_input_image]
     ).then(
         # This lambda function is updated to return values for all 8 LoRAs and other new controls.
-        lambda params, video_path: (
+        lambda params, video_path, first_frame: (
             (
                 # Helper to safely get and pad LoRA lists from metadata
                 (weights_from_meta := params.get("lora_weights", [])),
                 (mults_from_meta := params.get("lora_multipliers", [])),
+                (apply_low_from_meta := params.get("lora_apply_low", [])),
+                (apply_high_from_meta := params.get("lora_apply_high", [])),
                 (padded_weights := (weights_from_meta + ["None"] * 8)[:8]),
                 (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 8)[:8]),
-                
+                (padded_apply_low := ([bool(v) for v in apply_low_from_meta] + [True] * 8)[:8]),
+                (padded_apply_high := ([bool(v) for v in apply_high_from_meta] + [False] * 8)[:8]),
+
                 # Create the full list of return values
                 [
                     params.get("prompt", ""),
                     params.get("negative_prompt", ""),
-                    None,  # image_path
+                    first_frame,  # image_path - use extracted first frame
                     params.get("task", "i2v-A14B"),
                     params.get('width', 832),
                     params.get('height', 480),
@@ -11366,9 +11413,9 @@ with gr.Blocks(
                     # LoRAs
                     "lora",  # lora_folder
                     *padded_weights,          # Unpack 8 LoRA weights
-                    *padded_mults,            # FIX: Corrected variable name from padded_multipliers
-                    *[True] * 8,              # Defaults for 8 "apply low" checkboxes
-                    *[False] * 8,             # Defaults for 8 "apply high" checkboxes
+                    *padded_mults,            # Unpack 8 LoRA multipliers
+                    *padded_apply_low,        # Unpack 8 "apply low" checkboxes from metadata
+                    *padded_apply_high,       # Unpack 8 "apply high" checkboxes from metadata
                     # Previews & Performance
                     True,  # enable_preview
                     5,  # preview_steps
@@ -11380,7 +11427,7 @@ with gr.Blocks(
                 ]
             )[-1] # Return the created list
         ),
-        inputs=[params_state, wan22_input_video],
+        inputs=[params_state, wan22_input_video, wan22_input_image],
         outputs=[
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
