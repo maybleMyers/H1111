@@ -662,6 +662,7 @@ def wan22_batch_handler(
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
+        current_context_window = None  # Track current context window state
         for line in iter(process.stdout.readline, ''):
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
@@ -676,6 +677,8 @@ def wan22_batch_handler(
 
             tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
             video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+            # Context windows progress: "Processing window 0/1: frames 13-0 (21 frames)"
+            context_window_match = re.search(r"Processing window (\d+)/(\d+):\s*frames\s*(\d+)-(\d+)\s*\((\d+)\s*frames\)", line_strip)
 
             if video_saved_match:
                 found_path = video_saved_match.group(1).strip()
@@ -683,13 +686,26 @@ def wan22_batch_handler(
                     current_video_file_for_item = found_path
                 progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+                current_context_window = None  # Reset context window state
+            elif context_window_match:
+                window_idx = int(context_window_match.group(1)) + 1  # Convert 0-based to 1-based
+                window_total = int(context_window_match.group(2))
+                window_frames = context_window_match.group(5)
+                current_context_window = {"idx": window_idx, "total": window_total, "frames": window_frames}
+                progress_text_update = f"Window {window_idx}/{window_total} ({window_frames} frames) - Starting..."
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Window {window_idx}/{window_total}"
             elif tqdm_match:
                 percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
                 time_elapsed = tqdm_match.group(3)
                 time_remaining = tqdm_match.group(4)
-                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
-                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                if current_context_window:
+                    # Include context window info with time
+                    progress_text_update = f"Window {current_context_window['idx']}/{current_context_window['total']} | Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                    status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Window {current_context_window['idx']}/{current_context_window['total']}"
+                else:
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                    status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
 
             if enable_preview:
                 if os.path.exists(preview_mp4_path):
