@@ -1722,6 +1722,14 @@ def optimize_model(
         logger.info(
             f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
         )
+        # Enable persistent disk caching for compiled kernels
+        try:
+            import torch._inductor.config
+            torch._inductor.config.fx_graph_cache = True
+            logger.info("Inductor disk cache enabled - compiled kernels will be cached for faster subsequent runs")
+        except (ImportError, AttributeError):
+            logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
+
         torch._dynamo.config.cache_size_limit = 32
         for i in range(len(model.blocks)):
             model.blocks[i] = torch.compile(
