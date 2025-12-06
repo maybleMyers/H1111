@@ -355,27 +355,46 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
     # max_value = calculate_fp8_maxval(5, 2)
     max_value = None  # do not quantize input tensor
 
-    # Find all scale keys to identify FP8-optimized layers
-    scale_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
+    # Remove prescaled FP8 marker key if present (not part of model weights)
+    if "scaled_fp8" in optimized_state_dict:
+        del optimized_state_dict["scaled_fp8"]
+        logger.info("Removed 'scaled_fp8' marker from state dict")
 
-    # Enumerate patched layers
+    # Find all scale keys to identify FP8-optimized layers
+    scale_weight_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
+    scale_input_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_input")]
+
+    # Enumerate patched layers (based on scale_weight keys)
     patched_module_paths = set()
-    for scale_key in scale_keys:
+    for scale_key in scale_weight_keys:
         # Extract module path from scale key (remove .scale_weight)
         module_path = scale_key.rsplit(".scale_weight", 1)[0]
         patched_module_paths.add(module_path)
 
+    # Also collect modules that have scale_input (for prescaled models)
+    scale_input_module_paths = set()
+    for scale_key in scale_input_keys:
+        module_path = scale_key.rsplit(".scale_input", 1)[0]
+        scale_input_module_paths.add(module_path)
+
     patched_count = 0
+    scale_input_count = 0
 
     # Apply monkey patch to each layer with FP8 weights
     for name, module in model.named_modules():
         # Check if this module has a corresponding scale_weight
-        has_scale = name in patched_module_paths
+        has_scale_weight = name in patched_module_paths
+        has_scale_input = name in scale_input_module_paths
 
         # Apply patch if it's a Linear layer with FP8 scale
-        if isinstance(module, nn.Linear) and has_scale:
+        if isinstance(module, nn.Linear) and has_scale_weight:
             # register the scale_weight as a buffer to load the state_dict
             module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+
+            # Also register scale_input if present (for prescaled models)
+            if has_scale_input:
+                module.register_buffer("scale_input", torch.tensor(1.0, dtype=module.weight.dtype))
+                scale_input_count += 1
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):
@@ -385,8 +404,14 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
             module.forward = new_forward.__get__(module, type(module))
 
             patched_count += 1
+        elif isinstance(module, nn.Linear) and has_scale_input and not has_scale_weight:
+            # Handle edge case: module has scale_input but no scale_weight
+            module.register_buffer("scale_input", torch.tensor(1.0, dtype=module.weight.dtype))
+            scale_input_count += 1
 
     logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
+    if scale_input_count > 0:
+        logger.info(f"Number of layers with scale_input registered: {scale_input_count}")
     return model
 
 
