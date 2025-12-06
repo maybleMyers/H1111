@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 from utils.device_utils import clean_memory_on_device
 
 from .attention import flash_attention
+from .ultravico import get_ultravico_bias_auto, is_ultravico_enabled
 from utils.device_utils import clean_memory_on_device
 from modules.custom_offloading_utils import ModelOffloader
 from modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -241,8 +242,17 @@ class WanSelfAttention(nn.Module):
         rope_apply_inplace_cached(k, grid_sizes, freqs)
         qkv = [q, k, v]
         del q, k, v
+
+        # Get UltraViCo attention bias if enabled (only for self-attention on visual tokens)
+        ultravico_bias = None
+        if is_ultravico_enabled():
+            # seq_lens contains the actual sequence lengths for each batch item
+            # For self-attention, we use the full visual token sequence length
+            ultravico_bias = get_ultravico_bias_auto(s, x.device if hasattr(x, 'device') else qkv[0].device, qkv[0].dtype)
+
         x = flash_attention(
-            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn
+            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn,
+            attn_bias=ultravico_bias
         )
 
         # output

@@ -32,6 +32,7 @@ from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
+from wan.modules.ultravico import UltraViCoConfig, set_ultravico_config, set_current_visual_shape, clear_ultravico_cache
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
@@ -454,6 +455,20 @@ def parse_args() -> argparse.Namespace:
                        help="Method for fusing context window results (default: pyramid)")
     parser.add_argument("--context_dim", type=int, default=2,
                        help="Dimension to apply context windows (2=temporal for video, default: 2)")
+
+    # UltraViCo: Attention decay for long video extrapolation
+    parser.add_argument("--ultravico", action='store_true', default=False,
+                       help="Enable UltraViCo attention decay for long video generation. Helps prevent quality degradation and content repetition when generating videos longer than training length.")
+    parser.add_argument("--ultravico_alpha", type=float, default=0.9,
+                       help="UltraViCo: Decay factor for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay. Default: 0.9")
+    parser.add_argument("--ultravico_training_frames", type=int, default=None,
+                       help="UltraViCo: Training window in latent frames. Auto-detected from video_length if not set (e.g., 21 for 5s@24fps with 4x compression).")
+    parser.add_argument("--ultravico_suppress_harmonics", action='store_true', default=False,
+                       help="UltraViCo: Enable stronger suppression at harmonic positions. Use if you see content repetition/looping.")
+    parser.add_argument("--ultravico_beta", type=float, default=0.6,
+                       help="UltraViCo: Decay factor for harmonic risk positions (only with --ultravico_suppress_harmonics). Default: 0.6")
+    parser.add_argument("--ultravico_gamma", type=int, default=4,
+                       help="UltraViCo: Number of frames around harmonic peaks to suppress. Default: 4")
 
     args = parser.parse_args()
 
@@ -4835,7 +4850,46 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Apply Context Windows if Enabled ---
     model_options = apply_context_windows(args)
-    
+
+    # --- Initialize UltraViCo if Enabled ---
+    if args.ultravico:
+        # UltraViCo requires SDPA attention mode for attention bias support
+        if args.attn_mode not in ("torch", "sdpa"):
+            logger.warning(f"UltraViCo requires --attn_mode torch or sdpa, but got '{args.attn_mode}'. "
+                          f"UltraViCo attention decay will NOT be applied. Consider switching to --attn_mode torch.")
+
+        # Get latent dimensions from the latent tensor shape
+        # latent shape is [B, C, F, H, W] or [C, F, H, W]
+        if len(latent.shape) == 5:
+            _, _, lat_f_uv, lat_h_uv, lat_w_uv = latent.shape
+        else:
+            _, lat_f_uv, lat_h_uv, lat_w_uv = latent.shape
+
+        # Determine training frames (default based on typical Wan2.2 training)
+        training_frames = args.ultravico_training_frames
+        if training_frames is None:
+            # Auto-detect: Wan2.2 typically trained on 5s@24fps = 120 frames
+            # With 4x temporal compression: ~30 latent frames
+            # Use half of typical video length as training window
+            training_frames = min(21, lat_f_uv)  # Default 21 latent frames (~5s)
+
+        ultravico_config = UltraViCoConfig(
+            enabled=True,
+            training_frames=training_frames,
+            alpha=args.ultravico_alpha,
+            beta=args.ultravico_beta,
+            suppress_harmonics=args.ultravico_suppress_harmonics,
+            gamma=args.ultravico_gamma,
+        )
+        set_ultravico_config(ultravico_config)
+
+        # Set the visual shape for attention bias computation
+        # Shape is (T, H, W) in latent space
+        set_current_visual_shape((lat_f_uv, lat_h_uv, lat_w_uv))
+
+        logger.info(f"UltraViCo enabled: training_frames={training_frames}, alpha={args.ultravico_alpha}, "
+                   f"suppress_harmonics={args.ultravico_suppress_harmonics}, visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
+
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
     
@@ -4868,9 +4922,13 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     )
 
     # --- Cleanup ---
+    # Clear UltraViCo cache if it was enabled
+    if args.ultravico:
+        clear_ultravico_cache()
+
     if model_manager:
         model_manager.cleanup()
-    
+
     # Only delete model if it exists
     if model is not None:
         del model
