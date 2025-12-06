@@ -479,7 +479,9 @@ def wan22_batch_handler(
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
-    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -599,6 +601,16 @@ def wan22_batch_handler(
             command.extend(["--context_fuse_method", str(context_fuse_method)])
             if context_end_image:
                 command.extend(["--end_image_path", str(context_end_image)])
+
+        # --- UltraViCo Handling ---
+        if ultravico_enabled:
+            command.append("--ultravico")
+            command.extend(["--ultravico_alpha", str(ultravico_alpha)])
+            command.extend(["--ultravico_training_frames", str(int(ultravico_training_frames))])
+            if ultravico_suppress_harmonics:
+                command.append("--ultravico_suppress_harmonics")
+                command.extend(["--ultravico_beta", str(ultravico_beta)])
+                command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -8584,6 +8596,56 @@ with gr.Blocks(
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
 
+            with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
+                gr.Markdown("""
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
+
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
+                """)
+                wan22_ultravico_enabled = gr.Checkbox(
+                    label="Enable UltraViCo",
+                    value=False,
+                    info="Apply attention decay for long video generation"
+                )
+                with gr.Group(visible=False) as wan22_ultravico_controls:
+                    with gr.Row():
+                        wan22_ultravico_alpha = gr.Slider(
+                            minimum=0.5, maximum=1.0, step=0.01,
+                            label="Alpha (Decay Factor)",
+                            value=0.9,
+                            info="Decay for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay."
+                        )
+                        wan22_ultravico_training_frames = gr.Number(
+                            label="Training Frames",
+                            value=21,
+                            minimum=5,
+                            maximum=100,
+                            step=1,
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
+                        )
+                    with gr.Row():
+                        wan22_ultravico_suppress_harmonics = gr.Checkbox(
+                            label="Suppress Harmonics",
+                            value=False,
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
+                        )
+                        wan22_ultravico_beta = gr.Slider(
+                            minimum=0.1, maximum=1.0, step=0.05,
+                            label="Beta (Harmonic Decay)",
+                            value=0.6,
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
+                        )
+                        wan22_ultravico_gamma = gr.Number(
+                            label="Gamma (Harmonic Window)",
+                            value=4,
+                            minimum=1,
+                            maximum=20,
+                            step=1,
+                            info="Frames around harmonic peaks to suppress"
+                        )
+
         # HoloCine Tab - Multi-Shot Scenecut Video Generation
         with gr.Tab(id=15, label="HoloCine") as holocine_tab:
             with gr.Row():
@@ -12165,7 +12227,14 @@ with gr.Blocks(
         inputs=[wan22_use_context_windows],
         outputs=[wan22_context_controls]
     )
-    
+
+    # UltraViCo visibility toggle
+    wan22_ultravico_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_ultravico_enabled],
+        outputs=[wan22_ultravico_controls]
+    )
+
     # Extension visibility toggle
     wan22_enable_extension.change(
         fn=lambda enabled: gr.update(visible=enabled),
@@ -12350,6 +12419,13 @@ with gr.Blocks(
             wan22_context_closed_loop,
             wan22_context_fuse_method,
             wan22_context_end_image,
+            # UltraViCo arguments
+            wan22_ultravico_enabled,
+            wan22_ultravico_alpha,
+            wan22_ultravico_training_frames,
+            wan22_ultravico_suppress_harmonics,
+            wan22_ultravico_beta,
+            wan22_ultravico_gamma,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
