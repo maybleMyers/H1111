@@ -472,10 +472,6 @@ def wan22_batch_handler(
     vae_fp32: bool,
     # Compile options
     compile_enabled: bool,
-    compile_backend: str,
-    compile_mode: str,
-    compile_dynamic: bool,
-    compile_fullgraph: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
@@ -579,11 +575,6 @@ def wan22_batch_handler(
         # torch.compile options
         if compile_enabled:
             command.append("--compile")
-            command.extend(["--compile_args",
-                str(compile_backend),
-                str(compile_mode),
-                str(compile_dynamic),
-                str(compile_fullgraph)])
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -8533,17 +8524,11 @@ with gr.Blocks(
                         value=True,
                     )
                 with gr.Row():
-                    wan22_compile = gr.Checkbox(label="Enable torch.compile", value=False, info="JIT compile for faster inference (first run slower)")
-                    wan22_compile_backend = gr.Dropdown(
-                        label="Compile Backend", choices=["inductor", "cudagraphs", "eager"],
-                        value="inductor", interactive=True
+                    wan22_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
                     )
-                    wan22_compile_mode = gr.Dropdown(
-                        label="Compile Mode", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-                        value="max-autotune-no-cudagraphs", interactive=True
-                    )
-                    wan22_compile_dynamic = gr.Checkbox(label="Dynamic Shapes", value=False, info="Allow dynamic tensor shapes")
-                    wan22_compile_fullgraph = gr.Checkbox(label="Full Graph", value=False, info="Compile entire graph (stricter)")
                 with gr.Row():
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
@@ -12396,10 +12381,6 @@ with gr.Blocks(
             wan22_vae_fp32,
             # Compile options
             wan22_compile,
-            wan22_compile_backend,
-            wan22_compile_mode,
-            wan22_compile_dynamic,
-            wan22_compile_fullgraph,
             # V2V arguments
             wan22_enable_v2v,
             wan22_input_video,

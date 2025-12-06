@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 from utils.device_utils import clean_memory_on_device
 
+from .compile_config import maybe_compile
 from .attention import flash_attention
 from .ultravico import get_ultravico_bias_auto, is_ultravico_enabled
 from utils.device_utils import clean_memory_on_device
@@ -121,6 +122,18 @@ def rope_apply_inplace_cached(x, grid_sizes, freqs_list):
         x[i, :seq_len] = x_i.to(x.dtype)
 
     return x
+
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def apply_gate_residual(x, y, gate):
+    """Apply gated residual connection: x + y.to(float32) * gate"""
+    return x + y.to(torch.float32) * gate
+
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def apply_modulated_norm(norm_out, scale, shift):
+    """Apply scale and shift to normalized output: norm * (1 + scale) + shift"""
+    return norm_out * (1 + scale) + shift
 
 
 class WanRMSNorm(nn.Module):
@@ -425,38 +438,30 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
-        #     e = (self.modulation + e).chunk(6, dim=1)
         # support fp8
         e = self.modulation.to(torch.float32) + e
         e = e.chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
-        # with amp.autocast(dtype=torch.float32):
-        #     x = x + y * e[2]
-        x = x + y.to(torch.float32) * e[2]
+        # self-attention with compiled modulated norm
+        self_attn_input = apply_modulated_norm(self.norm1(x).float(), e[1], e[0])
+        y = self.self_attn(self_attn_input, seq_lens, grid_sizes, freqs)
+        del self_attn_input
+        # compiled gated residual
+        x = apply_gate_residual(x, y, e[2])
         del y
 
-        # cross-attention & ffn function
-        # def cross_attn_ffn(x, context, context_lens, e):
-        #     x += self.cross_attn(self.norm3(x), context, context_lens)
-        #     y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-        #     # with amp.autocast(dtype=torch.float32):
-        #     #     x = x + y * e[5]
-        #     x += y.to(torch.float32) * e[5]
-        #     return x
-        # x = cross_attn_ffn(x, context, context_lens, e)
-
-        # x += self.cross_attn(self.norm3(x), context, context_lens) # backward error
+        # cross-attention
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
         del context
-        # Cast FFN input to match FFN weight dtype to avoid dtype mismatch
-        ffn_input = self.norm2(x).float() * (1 + e[4]) + e[3]
+
+        # FFN with compiled modulated norm
+        ffn_input = apply_modulated_norm(self.norm2(x).float(), e[4], e[3])
         ffn_input = ffn_input.to(self.ffn[0].weight.dtype)
         y = self.ffn(ffn_input)
-        x = x + y.to(torch.float32) * e[5]
+        del ffn_input
+        # compiled gated residual
+        x = apply_gate_residual(x, y, e[5])
         del y
         return x
 

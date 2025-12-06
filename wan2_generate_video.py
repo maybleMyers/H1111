@@ -4,6 +4,7 @@ import gc
 import random
 import os
 import re
+import sys
 import time
 import math
 from typing import Tuple, Optional, List, Union, Any
@@ -11,6 +12,20 @@ from pathlib import Path # Added for glob_images in V2V
 
 # Set PyTorch CUDA allocator to reduce memory fragmentation
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Early parse --compile flag to set compile config before importing wan modules
+def _early_parse_compile():
+    for i, arg in enumerate(sys.argv):
+        if arg == '--compile':
+            return True
+    return False
+
+# Set global compile flag BEFORE importing wan modules
+import wan.modules.compile_config as compile_config
+_use_compile = _early_parse_compile()
+compile_config.USE_TORCH_COMPILE = _use_compile
+if _use_compile:
+    print("torch.compile() enabled for optimized inference (function-level compilation)")
 
 import torch
 import accelerate
@@ -402,13 +417,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
     parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile with function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True). "
+             "Compatible with all dtypes (fp8, int8, bf16, fp32, fp16, mixed weights) and block swapping."
+    )
     parser.add_argument(
         "--compile_args",
         nargs=4,
         metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-        default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
-        help="Torch.compile settings",
+        default=["inductor", "max-autotune-no-cudagraphs", "True", "False"],
+        help="[DEPRECATED] Compile settings are now handled by function-level decorators. This argument is ignored.",
     )
     parser.add_argument("--preview", type=int, default=None, metavar="N",
         help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory.",
@@ -1733,10 +1753,9 @@ def optimize_model(
         model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
 
     if args.compile:
-        compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
-        logger.info(
-            f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
-        )
+        # Function-level compilation is handled via @maybe_compile decorators in wan.modules
+        # This is set early in the script before importing wan modules
+        logger.info("torch.compile enabled via function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True)")
         # Enable persistent disk caching for compiled kernels
         try:
             import torch._inductor.config
@@ -1746,14 +1765,6 @@ def optimize_model(
             logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
 
         torch._dynamo.config.cache_size_limit = 32
-        for i in range(len(model.blocks)):
-            model.blocks[i] = torch.compile(
-                model.blocks[i],
-                backend=compile_backend,
-                mode=compile_mode,
-                dynamic=compile_dynamic.lower() in "true",
-                fullgraph=compile_fullgraph.lower() in "true",
-            )
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
