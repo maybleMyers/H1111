@@ -289,9 +289,14 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     """
     if use_scaled_mm:
         input_dtype = x.dtype
-        original_weight_dtype = self.scale_weight.dtype
         weight_dtype = self.weight.dtype
         target_dtype = torch.float8_e5m2
+        # Determine output dtype - should be float16 or bfloat16, not FP8
+        # Use input dtype if it's not FP8, otherwise default to float16
+        if input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            output_dtype = torch.float16
+        else:
+            output_dtype = input_dtype
         assert weight_dtype == torch.float8_e4m3fn, "Only FP8 E4M3FN format is supported"
         assert x.ndim == 3, "Input tensor must be 3D (batch_size, seq_len, hidden_dim)"
 
@@ -312,23 +317,27 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         scale_weight = self.scale_weight.to(torch.float32)
 
         if self.bias is not None:
-            # float32 is not supported with bias in scaled_mm
-            o = torch._scaled_mm(x, weight, out_dtype=original_weight_dtype, bias=self.bias, scale_a=scale_x, scale_b=scale_weight)
+            # Use float16/bfloat16 output dtype (float32 is not supported with bias in scaled_mm)
+            o = torch._scaled_mm(x, weight, out_dtype=output_dtype, bias=self.bias, scale_a=scale_x, scale_b=scale_weight)
         else:
-            o = torch._scaled_mm(x, weight, out_dtype=input_dtype, scale_a=scale_x, scale_b=scale_weight)
+            o = torch._scaled_mm(x, weight, out_dtype=output_dtype, scale_a=scale_x, scale_b=scale_weight)
 
-        return o.reshape(original_shape[0], original_shape[1], -1).to(input_dtype)
+        return o.reshape(original_shape[0], original_shape[1], -1)
 
     else:
-        # Dequantize the weight
-        original_dtype = self.scale_weight.dtype
-        dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
+        # Dequantize the weight - use input dtype for output consistency
+        input_dtype = x.dtype
+        # Use float16 as default if scale_weight is in FP8 format
+        scale_dtype = self.scale_weight.dtype
+        if scale_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            scale_dtype = torch.float16
+        dequantized_weight = self.weight.to(scale_dtype) * self.scale_weight.to(scale_dtype)
 
         # Perform linear transformation
         if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
+            output = F.linear(x, dequantized_weight.to(input_dtype), self.bias)
         else:
-            output = F.linear(x, dequantized_weight)
+            output = F.linear(x, dequantized_weight.to(input_dtype))
 
         return output
 
@@ -383,11 +392,12 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
         # Apply patch if it's a Linear layer with FP8 scale_weight
         if isinstance(module, nn.Linear) and has_scale_weight:
             # register the scale_weight as a buffer to load the state_dict
-            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+            # Use float32 for scale buffers (not FP8) - actual values loaded from state dict
+            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=torch.float32))
 
             # Also register scale_input if present
             if has_scale_input:
-                module.register_buffer("scale_input", torch.tensor(1.0, dtype=module.weight.dtype))
+                module.register_buffer("scale_input", torch.tensor(1.0, dtype=torch.float32))
                 scale_input_count += 1
 
             # Create a new forward method with the patched version.
@@ -400,7 +410,7 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
             patched_count += 1
         elif isinstance(module, nn.Linear) and has_scale_input and not has_scale_weight:
             # Edge case: has scale_input but no scale_weight
-            module.register_buffer("scale_input", torch.tensor(1.0, dtype=module.weight.dtype))
+            module.register_buffer("scale_input", torch.tensor(1.0, dtype=torch.float32))
             scale_input_count += 1
 
     logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
