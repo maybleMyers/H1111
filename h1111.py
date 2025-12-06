@@ -189,6 +189,7 @@ def wan_one_frame_handler(
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
+    fp8_prescaled: bool,
     fp8_t5: bool,
     mixed_dtype: bool,
     vae_fp32: bool,
@@ -311,7 +312,9 @@ def wan_one_frame_handler(
         if fp8:
             cmd.append("--fp8")
         if fp8_scaled:
-            cmd.append("--fp8_scaled") 
+            cmd.append("--fp8_scaled")
+        if fp8_prescaled:
+            cmd.append("--fp8_prescaled")
         if fp8_t5:
             cmd.append("--fp8_t5")
         if mixed_dtype:
@@ -9627,8 +9630,10 @@ with gr.Blocks(
                     wan_of_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan_of_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime conversion to FP8")
+                    wan_of_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
                     wan_of_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
                     wan_of_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
                     wan_of_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
@@ -9713,6 +9718,7 @@ with gr.Blocks(
             wan_of_block_swap,
             wan_of_fp8,
             wan_of_fp8_scaled,
+            wan_of_fp8_prescaled,
             wan_of_fp8_t5,
             wan_of_mixed_dtype,
             wan_of_vae_fp32,

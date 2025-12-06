@@ -946,6 +946,7 @@ def load_wan_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
+    fp8_prescaled: bool = False,
     lora_weights_list: Optional[Dict[str, torch.Tensor]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
@@ -962,19 +963,20 @@ def load_wan_model(
         loading_device (Union[str, torch.device]): Device to load the model weights on.
         dit_weight_dtype (Optional[torch.dtype]): Data type of the DiT weights.
             If None, it will be loaded as is (same as the state_dict) or scaled for fp8. if not None, model weights will be casted to this dtype.
-        fp8_scaled (bool): Whether to use fp8 scaling for the model weights.
+        fp8_scaled (bool): Whether to use fp8 scaling for the model weights (runtime conversion).
+        fp8_prescaled (bool): Whether the model is prescaled FP8 (has embedded scale_weight tensors).
         lora_weights_list (Optional[Dict[str, torch.Tensor]]): LoRA weights to apply, if any.
         lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
     """
-    # dit_weight_dtype is None for fp8_scaled
-    assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
+    # dit_weight_dtype is None for fp8_scaled or fp8_prescaled
+    assert (not (fp8_scaled or fp8_prescaled) and dit_weight_dtype is not None) or ((fp8_scaled or fp8_prescaled) and dit_weight_dtype is None)
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
     with init_empty_weights():
         logger.info(
-            f"Creating WanModel. I2V: {config.i2v}, FLF2V: {config.flf2v}, V2.2: {config.v2_2}, device: {device}, loading_device: {loading_device}, fp8_scaled: {fp8_scaled}"
+            f"Creating WanModel. I2V: {config.i2v}, FLF2V: {config.flf2v}, V2.2: {config.v2_2}, device: {device}, loading_device: {loading_device}, fp8_scaled: {fp8_scaled}, fp8_prescaled: {fp8_prescaled}"
         )
         model = WanModel(
             model_type="i2v" if config.i2v else ("flf2v" if config.flf2v else "t2v"),
@@ -997,11 +999,13 @@ def load_wan_model(
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
 
+    # For prescaled FP8, we don't run fp8_optimization (weights are already FP8 with scales)
+    # For runtime fp8_scaled, we convert weights to FP8 during loading
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,
         lora_multipliers=lora_multipliers,
-        fp8_optimization=fp8_scaled,
+        fp8_optimization=fp8_scaled and not fp8_prescaled,  # Only optimize for runtime scaling, not prescaled
         calc_device=device,
         move_to_device=(loading_device == device),
         target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
@@ -1013,7 +1017,9 @@ def load_wan_model(
         if key.startswith("model.diffusion_model."):
             sd[key[22:]] = sd.pop(key)
 
-    if fp8_scaled:
+    # Apply monkey patch for both fp8_scaled and fp8_prescaled to use scale_weight during inference
+    if fp8_scaled or fp8_prescaled:
+        logger.info(f"Applying FP8 monkey patch (prescaled={fp8_prescaled}, use_scaled_mm={use_scaled_mm})")
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=use_scaled_mm)
 
         if loading_device.type != "cpu":

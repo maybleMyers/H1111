@@ -27,7 +27,7 @@ from utils.lora_utils import filter_lora_state_dict
 from utils.safetensors_utils import mem_eff_save_file, load_safetensors
 from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan as wan
-from wan.modules.model import WanModel, detect_wan_sd_dtype
+from wan.modules.model import WanModel, detect_wan_sd_dtype, detect_prescaled_fp8
 # Import load_wan_model from musubi-tuner to get the correct function signature with use_scaled_mm support
 import sys
 import os
@@ -208,7 +208,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
-    parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arithmetic (RTX 4XXX+), only for fp8_scaled")
+    parser.add_argument("--fp8_prescaled", action="store_true", help="load prescaled fp8 model (model already has scale_weight tensors)")
+    parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arithmetic (RTX 4XXX+), only for fp8_scaled or fp8_prescaled")
     parser.add_argument("--fp8_t5", action="store_true", help="use fp8 for Text Encoder model")
     parser.add_argument(
         "--device", type=str, default=None, help="device to use for inference. If None, use CUDA if available, otherwise use CPU"
@@ -635,8 +636,9 @@ def load_dit_model(
         lora_weights_list = None
 
     loading_weight_dtype = dit_weight_dtype
-    if args.fp8_scaled and not args.lycoris:
-        loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
+    fp8_prescaled = getattr(args, 'fp8_prescaled', False)
+    if (args.fp8_scaled or fp8_prescaled) and not args.lycoris:
+        loading_weight_dtype = None  # we will load weights as-is (prescaled) or optimize to fp8 (scaled)
 
     model = load_wan_model(
         config,
@@ -646,7 +648,8 @@ def load_dit_model(
         False,
         loading_device,
         loading_weight_dtype,
-        args.fp8_scaled and not args.lycoris,
+        args.fp8_scaled and not args.lycoris and not fp8_prescaled,  # fp8_scaled only for runtime conversion
+        fp8_prescaled=fp8_prescaled and not args.lycoris,  # fp8_prescaled for prescaled models
         lora_weights_list=lora_weights_list,
         lora_multipliers=lora_multipliers,
         use_scaled_mm=args.fp8_fast,
@@ -682,8 +685,8 @@ def load_dit_model(
     if args.save_merged_model:
         return None
 
-    if not args.fp8_scaled:
-        # simple cast to dit_weight_dtype
+    if not args.fp8_scaled and not fp8_prescaled:
+        # simple cast to dit_weight_dtype (skip for fp8_scaled and fp8_prescaled as they have mixed precision weights)
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
         target_device = None
 
@@ -2263,23 +2266,33 @@ def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
 
     # select dtype
     dit_dtype = detect_wan_sd_dtype(args.dit) if args.dit is not None else torch.bfloat16
+
+    # Check if model is prescaled FP8 (has embedded scale tensors)
+    is_prescaled_fp8 = False
+    if args.dit is not None:
+        is_prescaled_fp8 = detect_prescaled_fp8(args.dit)
+        if is_prescaled_fp8:
+            logger.info("Detected prescaled FP8 model - will load with embedded scales")
+            # Auto-enable fp8_prescaled if detected
+            args.fp8_prescaled = True
+
     if dit_dtype.itemsize == 1:
         # if weight is in fp8, use bfloat16 for DiT (input/output)
         dit_dtype = torch.bfloat16
-        if args.fp8_scaled:
+        if args.fp8_scaled and not args.fp8_prescaled:
             raise ValueError(
-                "DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights / DiTの重みはすでにfp8形式です。fp8にスケーリングできません。fp16/bf16の重みを使用してください"
+                "DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights or use --fp8_prescaled for prescaled models / DiTの重みはすでにfp8形式です。fp8にスケーリングできません。fp16/bf16の重みを使用するか、事前スケーリングされたモデルには--fp8_prescaledを使用してください"
             )
 
     dit_weight_dtype = dit_dtype  # default
-    if args.fp8_scaled:
+    if args.fp8_scaled or args.fp8_prescaled:
         dit_weight_dtype = None  # various precision weights, so don't cast to specific dtype
     elif args.fp8:
         dit_weight_dtype = torch.float8_e4m3fn
 
     vae_dtype = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else dit_dtype
     logger.info(
-        f"Using device: {device}, DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}, VAE precision: {vae_dtype}"
+        f"Using device: {device}, DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}, VAE precision: {vae_dtype}, prescaled_fp8: {args.fp8_prescaled}"
     )
 
     gen_settings = GenerationSettings(
