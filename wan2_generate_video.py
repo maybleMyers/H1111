@@ -380,6 +380,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
+    parser.add_argument("--fp8_prescaled", action="store_true", help="load prescaled fp8 model (model already has scale_weight tensors)")
     parser.add_argument("--mixed_dtype", action="store_true", help="use model with mixed weight dtypes (preserves original dtypes, e.g. mixed fp16/fp32)")
     parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arithmetic (RTX 4XXX+), only for fp8_scaled")
     parser.add_argument("--fp8_t5", action="store_true", help="use fp8 for Text Encoder model")
@@ -658,9 +659,12 @@ class DynamicModelManager:
             
         # Load model with LoRA weights if available
         model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type], 
-            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+            self.config, self.device, self.model_paths[model_type],
+            self.args.attn_mode, False, loading_device, loading_weight_dtype,
+            fp8_scaled=False,  # handled in optimize_model
+            fp8_prescaled=getattr(self.args, 'fp8_prescaled', False),
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
+            use_scaled_mm=getattr(self.args, 'fp8_fast', False)
         )
         
         # Optimize model
@@ -1486,9 +1490,12 @@ def load_dit_model(
         logger.info(f"DEBUG: Loading single DiT model with NO LoRA weights")
         
     model = load_wan_model(
-        config, device, dit_path, args.attn_mode, False, 
-        loading_device, loading_weight_dtype, False,
-        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low
+        config, device, dit_path, args.attn_mode, False,
+        loading_device, loading_weight_dtype,
+        fp8_scaled=False,  # handled in optimize_model
+        fp8_prescaled=getattr(args, 'fp8_prescaled', False),
+        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
+        use_scaled_mm=getattr(args, 'fp8_fast', False)
     )
     return model
 
@@ -1669,6 +1676,8 @@ def optimize_model(
         dit_dtype: dtype for the model
         dit_weight_dtype: dtype for the model weights
     """
+    fp8_prescaled = getattr(args, 'fp8_prescaled', False)
+
     if args.fp8_scaled:
         # load state dict as-is and optimize to fp8
         state_dict = model.state_dict()
@@ -1682,6 +1691,12 @@ def optimize_model(
 
         if args.blocks_to_swap == 0:
             model.to(device)  # make sure all parameters are on the right device (e.g. RoPE etc.)
+    elif fp8_prescaled:
+        # Prescaled FP8: model already has FP8 weights with embedded scales
+        # Just move to device without dtype conversion
+        logger.info(f"Using prescaled FP8 model - moving to device: {device}")
+        if args.blocks_to_swap == 0:
+            model.to(device)
     else:
         # simple cast to dit_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)

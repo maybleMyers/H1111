@@ -445,6 +445,8 @@ def wan22_batch_handler(
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
     fp8_t5: bool,
     dit_low_noise_path: str,
     dit_high_noise_path: str,
@@ -468,6 +470,12 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
+    compile_backend: str,
+    compile_mode: str,
+    compile_dynamic: bool,
+    compile_fullgraph: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
@@ -555,15 +563,25 @@ def wan22_batch_handler(
 
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_prescaled: command.append("--fp8_prescaled")
+        if fp8_fast: command.append("--fp8_fast")
         if mixed_dtype: command.append("--mixed_dtype")
         if fp8_t5: command.append("--fp8_t5")
-        # ADD THIS:
         if dynamic_model_loading and "A14B" in task:
             command.append("--dynamic_model_loading")
         if unload_text_encoders:
             command.append("--unload_text_encoders")
         if vae_fp32:
             command.extend(["--vae_dtype", "float32"])
+
+        # torch.compile options
+        if compile_enabled:
+            command.append("--compile")
+            command.extend(["--compile_args",
+                str(compile_backend),
+                str(compile_mode),
+                str(compile_dynamic),
+                str(compile_fullgraph)])
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -8484,10 +8502,13 @@ with gr.Blocks(
                     wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    wan22_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    wan22_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
                     wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
                     wan22_dynamic_model_loading = gr.Checkbox(
-                        label="Dynamic Model Loading (A14B models only to lower RAM usages)", 
+                        label="Dynamic Model Loading (A14B models only to lower RAM usages)",
                         value=False, visible=False
                     )
                     wan22_unload_text_encoders = gr.Checkbox(
@@ -8499,6 +8520,18 @@ with gr.Blocks(
                         label="Use FP32 VAE (higher quality, more VRAM)",
                         value=True,
                     )
+                with gr.Row():
+                    wan22_compile = gr.Checkbox(label="Enable torch.compile", value=False, info="JIT compile for faster inference (first run slower)")
+                    wan22_compile_backend = gr.Dropdown(
+                        label="Compile Backend", choices=["inductor", "cudagraphs", "eager"],
+                        value="inductor", interactive=True
+                    )
+                    wan22_compile_mode = gr.Dropdown(
+                        label="Compile Mode", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        value="max-autotune-no-cudagraphs", interactive=True
+                    )
+                    wan22_compile_dynamic = gr.Checkbox(label="Dynamic Shapes", value=False, info="Allow dynamic tensor shapes")
+                    wan22_compile_fullgraph = gr.Checkbox(label="Full Graph", value=False, info="Compile entire graph (stricter)")
                 with gr.Row():
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     wan22_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
@@ -12271,6 +12304,8 @@ with gr.Blocks(
             wan22_block_swap,
             wan22_fp8,
             wan22_fp8_scaled,
+            wan22_fp8_prescaled,
+            wan22_fp8_fast,
             wan22_fp8_t5,
             wan22_dit_low_noise_path,
             wan22_dit_high_noise_path,
@@ -12287,10 +12322,15 @@ with gr.Blocks(
             # Previews
             wan22_enable_preview,
             wan22_preview_steps,
-            # ADD THIS:
             wan22_dynamic_model_loading,
             wan22_unload_text_encoders,
             wan22_vae_fp32,
+            # Compile options
+            wan22_compile,
+            wan22_compile_backend,
+            wan22_compile_mode,
+            wan22_compile_dynamic,
+            wan22_compile_fullgraph,
             # V2V arguments
             wan22_enable_v2v,
             wan22_input_video,

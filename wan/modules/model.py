@@ -1016,16 +1016,18 @@ def load_wan_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
+    fp8_prescaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
 ) -> WanModel:
-    # dit_weight_dtype is None for fp8_scaled
-    assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
+    # dit_weight_dtype is None for fp8_scaled or fp8_prescaled
+    assert fp8_scaled or fp8_prescaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
+    # For fp8_scaled, we need CPU for optimization. For fp8_prescaled, load directly to target device.
     wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
     
     # Check if we should use efficient LoRA loading
@@ -1098,10 +1100,10 @@ def load_wan_model(
             add_ref_conv=has_ref_conv,             # <<< Pass detected flag
             in_dim_ref_conv=in_dim_ref_conv,             
         )
-        if dit_weight_dtype is not None and not fp8_scaled: # Don't pre-cast if optimizing to FP8 later
+        if dit_weight_dtype is not None and not fp8_scaled and not fp8_prescaled: # Don't pre-cast if using FP8
             model.to(dit_weight_dtype)
 
-    # ... (fp8 optimization - sd is already loaded) ...
+    # Handle FP8 modes
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info(f"Optimizing model weights to fp8. This may take a while.")
@@ -1112,6 +1114,18 @@ def load_wan_model(
             logger.info(f"Moving weights to {loading_device}")
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
+    elif fp8_prescaled:
+        # Prescaled FP8: model already has FP8 weights with embedded scale tensors
+        logger.info(f"Loading prescaled FP8 model (has embedded scale tensors)")
+
+        # Remove scaled_fp8 marker if present
+        if "scaled_fp8" in sd:
+            del sd["scaled_fp8"]
+            logger.info("Removed 'scaled_fp8' marker from state dict")
+
+        # Apply FP8 monkey patch to register scale_weight and scale_input buffers
+        from modules.fp8_optimization_utils import apply_fp8_monkey_patch
+        apply_fp8_monkey_patch(model, sd, use_scaled_mm=use_scaled_mm)
 
     # Load the potentially modified state dict
     # Use strict=False initially if ref_conv might be missing in older models but present in the class
