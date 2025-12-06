@@ -248,7 +248,7 @@ class WanSelfAttention(nn.Module):
         if is_ultravico_enabled():
             # seq_lens contains the actual sequence lengths for each batch item
             # For self-attention, we use the full visual token sequence length
-            ultravico_bias = get_ultravico_bias_auto(s, x.device if hasattr(x, 'device') else qkv[0].device, qkv[0].dtype)
+            ultravico_bias = get_ultravico_bias_auto(s, qkv[0].device, qkv[0].dtype)
 
         x = flash_attention(
             qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn,
