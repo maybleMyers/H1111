@@ -863,6 +863,42 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     return dit_dtype
 
 
+def detect_prescaled_fp8(path: str) -> bool:
+    """
+    Detect if a model is prescaled FP8 (has embedded scale tensors).
+
+    Prescaled FP8 models have:
+    - A 'scaled_fp8' marker tensor, OR
+    - scale_weight tensors alongside FP8 weight tensors
+
+    Returns:
+        bool: True if model is prescaled FP8, False otherwise
+    """
+    with MemoryEfficientSafeOpen(path) as f:
+        keys = set(f.keys())
+
+        # Check for explicit prescaled marker
+        if "scaled_fp8" in keys:
+            logger.info(f"Detected prescaled FP8 model (has scaled_fp8 marker)")
+            return True
+
+        # Check for scale_weight keys alongside FP8 weights
+        has_scale_weight = any(k.endswith(".scale_weight") for k in keys)
+        if has_scale_weight:
+            # Verify weights are actually FP8
+            key1 = "model.diffusion_model.blocks.0.cross_attn.k.weight"
+            key2 = "blocks.0.cross_attn.k.weight"
+            weight_key = key1 if key1 in keys else (key2 if key2 in keys else None)
+            if weight_key:
+                weight_dtype = f.get_tensor(weight_key).dtype
+                if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e5m2:
+                    logger.info(f"Detected prescaled FP8 model (has scale_weight keys with FP8 weights)")
+                    return True
+
+        logger.info(f"Model is not prescaled FP8")
+        return False
+
+
 def load_wan_model(
     config: any,
     i2v: bool,

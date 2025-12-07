@@ -4,6 +4,7 @@ import gc
 import random
 import os
 import re
+import sys
 import time
 import math
 from typing import Tuple, Optional, List, Union, Any
@@ -11,6 +12,20 @@ from pathlib import Path # Added for glob_images in V2V
 
 # Set PyTorch CUDA allocator to reduce memory fragmentation
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Early parse --compile flag to set compile config before importing wan modules
+def _early_parse_compile():
+    for i, arg in enumerate(sys.argv):
+        if arg == '--compile':
+            return True
+    return False
+
+# Set global compile flag BEFORE importing wan modules
+import wan.modules.compile_config as compile_config
+_use_compile = _early_parse_compile()
+compile_config.USE_TORCH_COMPILE = _use_compile
+if _use_compile:
+    print("torch.compile() enabled for optimized inference (function-level compilation)")
 
 import torch
 import accelerate
@@ -32,12 +47,15 @@ from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
+from wan.modules.ultravico import UltraViCoConfig, set_ultravico_config, set_current_visual_shape, clear_ultravico_cache
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wan.utils.fm_solvers_euler import EulerScheduler
+from wan.utils.step_distill_scheduler import StepDistillScheduler
 
 from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -238,7 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
     parser.add_argument("--task", type=str, default="t2v-A14B", choices=list(WAN_CONFIGS.keys()), help="The task to run.")
     parser.add_argument(
-        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla"], help="The solver used to sample."
+        "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], help="The solver used to sample."
     )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
@@ -378,6 +396,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
+    parser.add_argument("--fp8_prescaled", action="store_true", help="load prescaled fp8 model (model already has scale_weight tensors)")
     parser.add_argument("--mixed_dtype", action="store_true", help="use model with mixed weight dtypes (preserves original dtypes, e.g. mixed fp16/fp32)")
     parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arithmetic (RTX 4XXX+), only for fp8_scaled")
     parser.add_argument("--fp8_t5", action="store_true", help="use fp8 for Text Encoder model")
@@ -398,13 +417,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
     parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile with function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True). "
+             "Compatible with all dtypes (fp8, int8, bf16, fp32, fp16, mixed weights) and block swapping."
+    )
     parser.add_argument(
         "--compile_args",
         nargs=4,
         metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-        default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
-        help="Torch.compile settings",
+        default=["inductor", "max-autotune-no-cudagraphs", "True", "False"],
+        help="[DEPRECATED] Compile settings are now handled by function-level decorators. This argument is ignored.",
     )
     parser.add_argument("--preview", type=int, default=None, metavar="N",
         help="Enable latent preview every N steps. Generates previews in 'previews' subdirectory.",
@@ -451,6 +475,20 @@ def parse_args() -> argparse.Namespace:
                        help="Method for fusing context window results (default: pyramid)")
     parser.add_argument("--context_dim", type=int, default=2,
                        help="Dimension to apply context windows (2=temporal for video, default: 2)")
+
+    # UltraViCo: Attention decay for long video extrapolation
+    parser.add_argument("--ultravico", action='store_true', default=False,
+                       help="Enable UltraViCo attention decay for long video generation. Helps prevent quality degradation and content repetition when generating videos longer than training length.")
+    parser.add_argument("--ultravico_alpha", type=float, default=0.9,
+                       help="UltraViCo: Decay factor for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay. Default: 0.9")
+    parser.add_argument("--ultravico_training_frames", type=int, default=None,
+                       help="UltraViCo: Training window in latent frames. Auto-detected from video_length if not set (e.g., 21 for 5s@24fps with 4x compression).")
+    parser.add_argument("--ultravico_suppress_harmonics", action='store_true', default=False,
+                       help="UltraViCo: Enable stronger suppression at harmonic positions. Use if you see content repetition/looping.")
+    parser.add_argument("--ultravico_beta", type=float, default=0.6,
+                       help="UltraViCo: Decay factor for harmonic risk positions (only with --ultravico_suppress_harmonics). Default: 0.6")
+    parser.add_argument("--ultravico_gamma", type=int, default=4,
+                       help="UltraViCo: Number of frames around harmonic peaks to suppress. Default: 4")
 
     args = parser.parse_args()
 
@@ -656,9 +694,12 @@ class DynamicModelManager:
             
         # Load model with LoRA weights if available
         model = load_wan_model(
-            self.config, self.device, self.model_paths[model_type], 
-            self.args.attn_mode, False, loading_device, loading_weight_dtype, False,
-            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers
+            self.config, self.device, self.model_paths[model_type],
+            self.args.attn_mode, False, loading_device, loading_weight_dtype,
+            fp8_scaled=False,  # handled in optimize_model
+            fp8_prescaled=getattr(self.args, 'fp8_prescaled', False),
+            lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
+            use_scaled_mm=getattr(self.args, 'fp8_fast', False)
         )
         
         # Optimize model
@@ -869,6 +910,10 @@ def create_funcontrol_conditioning_latent(
                 # Result shape [C', F', H', W'] - needs batch dim for processing here
                 end_latent = vae.encode([img_tensor])[0].unsqueeze(0).to(device).contiguous() # [1, 16, 1, lat_h, lat_w]
 
+            # Determine if using looped schedule
+            using_looped = (hasattr(args, 'use_context_windows') and args.use_context_windows and
+                           hasattr(args, 'context_schedule') and args.context_schedule == "looped_uniform")
+
             # Calculate end image influence transition (S-curve / cubic)
             end_influence_mask = torch.zeros([1, 1, total_latent_frames], device=device, dtype=torch.float32).contiguous()
             falloff_len_frames = max(1, int(total_latent_frames * args.control_falloff_percentage))
@@ -880,7 +925,12 @@ def create_funcontrol_conditioning_latent(
                  influence_start_frame = max(0, int(total_latent_frames * args.control_end) - falloff_len_frames // 2)
             else:
                  # Default: start influence around 60% mark if no control or control runs full length
-                 influence_start_frame = max(0, int(total_latent_frames * 0.6))
+                 # For looped mode: start earlier for stronger end image conditioning
+                 if using_looped:
+                     influence_start_frame = max(0, int(total_latent_frames * 0.5))
+                     logger.info("Looped mode: Starting end image influence earlier (50% mark)")
+                 else:
+                     influence_start_frame = max(0, int(total_latent_frames * 0.6))
 
             # Ensure start frame isn't too close to the beginning if start image exists
             if has_start_image:
@@ -896,8 +946,12 @@ def create_funcontrol_conditioning_latent(
                          # Cubic ease-in-out curve (smoother than cosine)
                          if pos < 0.5: influence = 4 * pos * pos * pos
                          else: p = pos - 1; influence = 1 + 4 * p * p * p
-                         # Ensure full influence near the end
-                         if idx >= total_latent_frames - 3: influence = 1.0
+                         # Ensure full influence near the end - stronger for looped mode
+                         frames_from_end = total_latent_frames - 1 - idx
+                         if using_looped and frames_from_end < 5:
+                             influence = 1.0  # Force full influence in last 5 frames for looped
+                         elif frames_from_end < 3:
+                             influence = 1.0  # Force full influence in last 3 frames for non-looped
                          end_influence_mask[0, 0, idx] = influence
 
                  # Blending logic (similar to base_nodes)
@@ -918,7 +972,13 @@ def create_funcontrol_conditioning_latent(
                                  )
 
                  # Ensure final frames are exactly the end image latent
-                 last_frames_exact = min(3, total_latent_frames) # Ensure at least last 3 frames are end image
+                 # Use more frames for looped mode to ensure clean loop
+                 if using_looped:
+                     last_frames_exact = min(5, total_latent_frames)  # Last 5 frames for looped
+                     logger.info("Looped mode: Forcing last 5 frames to exact end image")
+                 else:
+                     last_frames_exact = min(3, total_latent_frames)  # Last 3 frames for non-looped
+
                  if last_frames_exact > 0:
                      end_offset = total_latent_frames - last_frames_exact
                      if end_offset >= 0:
@@ -1465,9 +1525,12 @@ def load_dit_model(
         logger.info(f"DEBUG: Loading single DiT model with NO LoRA weights")
         
     model = load_wan_model(
-        config, device, dit_path, args.attn_mode, False, 
-        loading_device, loading_weight_dtype, False,
-        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low
+        config, device, dit_path, args.attn_mode, False,
+        loading_device, loading_weight_dtype,
+        fp8_scaled=False,  # handled in optimize_model
+        fp8_prescaled=getattr(args, 'fp8_prescaled', False),
+        lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
+        use_scaled_mm=getattr(args, 'fp8_fast', False)
     )
     return model
 
@@ -1602,6 +1665,13 @@ def apply_context_windows(args: argparse.Namespace, model_options: dict = None) 
     if "transformer_options" not in model_options:
         model_options["transformer_options"] = {}
     
+    # Determine ending frame for looped schedules
+    ending_frame = 0  # Default: loop to start frame
+    if args.context_schedule == "looped_uniform" and hasattr(args, 'end_image_path') and args.end_image_path:
+        # Auto-enable ending frame loop when end image provided with looped schedule
+        ending_frame = -1  # Loop to last frame
+        logger.info("End image detected with looped_uniform schedule - configuring loop to end at last frame")
+
     # Create WAN context windows handler
     try:
         context_handler = WanContextWindowsHandler(
@@ -1610,17 +1680,18 @@ def apply_context_windows(args: argparse.Namespace, model_options: dict = None) 
             context_schedule=args.context_schedule,
             context_stride=args.context_stride,
             closed_loop=args.context_closed_loop,
-            fuse_method=args.context_fuse_method
+            fuse_method=args.context_fuse_method,
+            ending_frame=ending_frame
         )
-        
+
         # Store handler in model options
         model_options["context_handler"] = context_handler.handler
         model_options["transformer_options"]["context_handler"] = context_handler.handler
-        
+
         logger.info(f"Context windows enabled: length={args.context_length} frames, "
                    f"overlap={args.context_overlap} frames, schedule={args.context_schedule}, "
                    f"fuse={args.context_fuse_method}")
-        
+
         return model_options
         
     except Exception as e:
@@ -1640,6 +1711,8 @@ def optimize_model(
         dit_dtype: dtype for the model
         dit_weight_dtype: dtype for the model weights
     """
+    fp8_prescaled = getattr(args, 'fp8_prescaled', False)
+
     if args.fp8_scaled:
         # load state dict as-is and optimize to fp8
         state_dict = model.state_dict()
@@ -1653,6 +1726,12 @@ def optimize_model(
 
         if args.blocks_to_swap == 0:
             model.to(device)  # make sure all parameters are on the right device (e.g. RoPE etc.)
+    elif fp8_prescaled:
+        # Prescaled FP8: model already has FP8 weights with embedded scales
+        # Just move to device without dtype conversion
+        logger.info(f"Using prescaled FP8 model - moving to device: {device}")
+        if args.blocks_to_swap == 0:
+            model.to(device)
     else:
         # simple cast to dit_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
@@ -1674,19 +1753,18 @@ def optimize_model(
         model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
 
     if args.compile:
-        compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
-        logger.info(
-            f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
-        )
+        # Function-level compilation is handled via @maybe_compile decorators in wan.modules
+        # This is set early in the script before importing wan modules
+        logger.info("torch.compile enabled via function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True)")
+        # Enable persistent disk caching for compiled kernels
+        try:
+            import torch._inductor.config
+            torch._inductor.config.fx_graph_cache = True
+            logger.info("Inductor disk cache enabled - compiled kernels will be cached for faster subsequent runs")
+        except (ImportError, AttributeError):
+            logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
+
         torch._dynamo.config.cache_size_limit = 32
-        for i in range(len(model.blocks)):
-            model.blocks[i] = torch.compile(
-                model.blocks[i],
-                backend=compile_backend,
-                mode=compile_mode,
-                dynamic=compile_dynamic.lower() in "true",
-                fullgraph=compile_fullgraph.lower() in "true",
-            )
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
@@ -2030,7 +2108,19 @@ def prepare_i2v_inputs(
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #1: Frame Dimension ---
         lat_f_base = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
-        lat_f_effective = lat_f_base + (1 if has_end_image else 0) # Adjust frame dim if end image exists
+
+        # Determine if we're using looped schedule with end image
+        using_looped_with_end = (hasattr(args, 'use_context_windows') and args.use_context_windows and
+                                  hasattr(args, 'context_schedule') and args.context_schedule == "looped_uniform" and
+                                  has_end_image)
+
+        # For looped videos: place end image at last frame (no extra frame)
+        # For non-looped: add end image as extra frame (original behavior)
+        if using_looped_with_end:
+            lat_f_effective = lat_f_base  # Keep same frame count for looped videos
+            logger.info("Looped mode: End image will replace last frame instead of adding extra frame")
+        else:
+            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Original behavior
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #2: Sequence Length ---
         max_seq_len = math.ceil(lat_f_effective * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
@@ -2141,8 +2231,15 @@ def prepare_i2v_inputs(
             if has_end_image and end_img_resized is not None:
                  # Encode the single end frame
                  y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
-                 # Concatenate along frame dimension (dim=1)
-                 y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W] = [C', lat_f_effective, H, W]
+
+                 if using_looped_with_end:
+                     # For looped mode: REPLACE last frame instead of concatenating
+                     y_latent_combined = y_latent_base.clone()  # Clone to avoid modifying original
+                     y_latent_combined[:, -1:, :, :] = y_end  # Replace last frame
+                     logger.info("Looped mode: Replaced last frame with end image")
+                 else:
+                     # For non-looped mode: CONCATENATE as extra frame (original behavior)
+                     y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W]
             else:
                  y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
 
@@ -2754,6 +2851,21 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
 
 
         scheduler.step = step_wrapper
+    elif args.sample_solver == "euler":
+        scheduler = EulerScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            shift=args.flow_shift,
+            device=device
+        )
+        scheduler.set_timesteps(args.infer_steps, device=device)
+        timesteps = scheduler.timesteps[:-1].clone()  # CRITICAL: Remove last timestep for Lightning
+    elif args.sample_solver == "step_distill":
+        scheduler = StepDistillScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            shift=args.flow_shift
+        )
+        scheduler.set_timesteps(args.infer_steps, device=device)
+        timesteps = scheduler.timesteps
     else:
         raise NotImplementedError(f"Unsupported solver: {args.sample_solver}")
 
@@ -2852,6 +2964,12 @@ def run_sampling(
     else:
         # Apply CFG on all steps
         apply_cfg_array = [True] * num_timesteps
+
+    # Lightning optimization: Skip CFG entirely when guidance_scale is 1.0
+    # Lightning models are trained without CFG, so we should skip the unconditional pass
+    if abs(args.guidance_scale - 1.0) < 1e-6:
+        apply_cfg_array = [False] * num_timesteps
+        logger.info("Lightning mode: CFG disabled (guidance_scale=1.0), using conditional-only inference")
 
     # SLG (Skip Layer Guidance) setup
     apply_slg_global = args.slg_layers is not None and args.slg_mode is not None
@@ -3577,110 +3695,112 @@ def blend_video_transition(video1: torch.Tensor, video2: torch.Tensor, blend_fra
 def generate_extended_video_i2v_based(
     args: argparse.Namespace,
     initial_video_path: str,
-    total_frames: int,
+    num_new_sections: int,
 ) -> torch.Tensor:
-    """Generate extended video using clean i2v approach with smooth blending"""
+    """
+    Generate extended video using a clean i2v approach by iteratively adding new sections.
+    Each new section is generated from the sharpest frame of the previously extended video.
+    """
     import tempfile
     import cv2
-    
-    device = torch.device(args.device)
-    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to {total_frames} frames")
-    
-    # Extract the best transition frame
-    best_frame_idx = extract_best_transition_frame(initial_video_path, frames_to_check=args.frames_to_check)
-    
-    # Load initial video up to the best frame
-    if best_frame_idx > 0:
-        video_frames_np, initial_frames = load_video(
-            initial_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
-        )
-    else:
-        # Use entire video as fallback
-        video_frames_np, initial_frames = load_video(
-            initial_video_path, 0, None, bucket_reso=tuple(args.video_size)
-        )
-    
-    # Convert initial video to tensor [1, C, F, H, W]
-    initial_video = torch.from_numpy(np.stack(video_frames_np, axis=0))
-    initial_video = initial_video.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
-    initial_video = initial_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
-    
-    logger.info(f"Initial video loaded: {initial_video.shape[2]} frames")
-    
-    if initial_frames >= total_frames:
-        logger.info("Video already has desired length")
-        return initial_video[:, :, :total_frames]
-    
-    # Store original arguments
+    import shutil
+    import time
+
+    logger.info(f"Starting clean i2v-based video extension from {initial_video_path} to add {num_new_sections} new section(s).")
+    logger.info(f"Each new section will have a length of {args.video_length} frames.")
+
+    current_video_path = initial_video_path
+    final_video_tensor = None
+
+    # Create a temporary directory for intermediate videos and frames
+    temp_dir = tempfile.mkdtemp()
+
+    # Store original arguments that will be modified during recursive calls
     original_image_path = args.image_path
     original_video_length = args.video_length
     original_extend_video = args.extend_video
-    
-    # Generate extension chunks using i2v
-    all_videos = [initial_video]
-    current_frames = initial_frames
-    chunk_size = 81  # Standard i2v length
-    
-    # Get the best transition frame as starting image
-    best_frame_tensor = initial_video[0, :, -1]  # [C, H, W] - last frame
-    best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
-    best_frame_np = best_frame_np.astype(np.uint8)
-    
+
     try:
-        while current_frames < total_frames:
-            remaining_frames = total_frames - current_frames
-            frames_to_generate = min(chunk_size, remaining_frames)
-            
-            logger.info(f"Generating chunk: {frames_to_generate} frames (progress: {current_frames}/{total_frames})")
-            
-            # Save the frame as temporary image
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
-                cv2.imwrite(tmp_file.name, cv2.cvtColor(best_frame_np, cv2.COLOR_RGB2BGR))
+        # Main loop to generate the requested number of new sections
+        for i in range(num_new_sections):
+            logger.info(f"--- Generating new section {i + 1}/{num_new_sections} ---")
+
+            # 1. Extract the best transition frame from the *current* video
+            best_frame_idx = extract_best_transition_frame(current_video_path, frames_to_check=args.frames_to_check)
+
+            # 2. Load the current video up to the best transition frame
+            if best_frame_idx > 0:
+                base_video_frames_np, _ = load_video(
+                    current_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
+                )
+            else:  # Fallback: use the whole video if frame extraction fails
+                logger.warning(f"Could not find a sharp frame for section {i+1}. Using the entire previous video as base.")
+                base_video_frames_np, _ = load_video(
+                    current_video_path, 0, None, bucket_reso=tuple(args.video_size)
+                )
+
+            if not base_video_frames_np:
+                raise ValueError(f"Failed to load base video frames from {current_video_path} for section {i+1}")
+
+            # Convert the base video (up to the sharpest frame) to a tensor
+            base_video_tensor = torch.from_numpy(np.stack(base_video_frames_np, axis=0))
+            base_video_tensor = base_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+            base_video_tensor = base_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+            logger.info(f"Section {i+1}: Base video loaded with {base_video_tensor.shape[2]} frames.")
+
+            # 3. Get the last frame of the base video to use as the start image for the new i2v generation
+            last_frame_np = (base_video_tensor[0, :, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+            # 4. Generate the new video chunk
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_file:
+                cv2.imwrite(tmp_file.name, cv2.cvtColor(last_frame_np, cv2.COLOR_RGB2BGR))
                 temp_image_path = tmp_file.name
-            
-            # Modify args for i2v generation
+
+            # Modify args for the recursive i2v generation call
             args.image_path = temp_image_path
-            args.video_length = frames_to_generate
-            args.extend_video = None  # Prevent recursive extension calls
-            
-            # Generate new chunk using the main generation function
-            new_chunk = generate(args)
-            
-            # Clean up temp file
+            args.video_length = original_video_length  # This is the length of one new section
+            args.extend_video = None  # Prevent infinite recursion
+
+            # Generate the new chunk as a latent tensor by calling the main generate function
+            new_chunk_latent = generate(args)
             os.unlink(temp_image_path)
-            
-            if new_chunk is not None:
-                logger.info(f"Generated chunk shape: {new_chunk.shape}")
-                # Decode the latent chunk to pixel space for blending
-                decoded_chunk = decode_latent(new_chunk, args, WAN_CONFIGS[args.task])
-                logger.info(f"Decoded chunk shape: {decoded_chunk.shape}")
-                all_videos.append(decoded_chunk)
-                current_frames += frames_to_generate
-                
-                # Use the last frame of the decoded chunk as the next starting frame
-                best_frame_tensor = decoded_chunk[0, :, -1]
-                best_frame_np = best_frame_tensor.permute(1, 2, 0).cpu().numpy() * 255
-                best_frame_np = best_frame_np.astype(np.uint8)
-            else:
-                logger.error("Failed to generate video chunk")
-                break
-        
-        # Blend all video segments smoothly
-        logger.info(f"Blending {len(all_videos)} video segments")
-        result = all_videos[0]
-        
-        for i in range(1, len(all_videos)):
-            result = blend_video_transition(result, all_videos[i], blend_frames=8)
-            logger.info(f"Blended segment {i+1}, current length: {result.shape[2]} frames")
-        
-        logger.info(f"Final extended video: {result.shape}")
-        return result
-        
+
+            if new_chunk_latent is None:
+                raise RuntimeError(f"Failed to generate latent for section {i+1}")
+
+            # 5. Decode the new chunk from latent to pixel space
+            decoded_chunk = decode_latent(new_chunk_latent, args, WAN_CONFIGS[args.task]) # Returns [B, C, F, H, W], range [0, 1]
+            logger.info(f"Section {i+1}: Decoded new chunk with shape: {decoded_chunk.shape}")
+
+            # 6. Concatenate the base video and the new chunk.
+            # Skip the first frame of the new chunk as it's a repeat of the start image.
+            final_video_tensor = torch.cat([base_video_tensor, decoded_chunk[:, :, 1:, :, :]], dim=2)
+
+            # 7. Update current_video_path for the next iteration by saving the new longer video
+            if i < num_new_sections - 1: # No need to save the very last intermediate video
+                temp_video_filename = f"intermediate_section_{i+1}.mp4"
+                current_video_path = os.path.join(temp_dir, temp_video_filename)
+
+                logger.info(f"Section {i+1}: Saving intermediate video of length {final_video_tensor.shape[2]} to {current_video_path}")
+                save_videos_grid(final_video_tensor, current_video_path, fps=args.fps, rescale=False)
+                time.sleep(1) # Give a moment for the file to be fully written to disk
+
     finally:
-        # Restore original arguments
+        # Restore original arguments to avoid side effects
         args.image_path = original_image_path
         args.video_length = original_video_length
         args.extend_video = original_extend_video
+
+        # Clean up the temporary directory and all its contents
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+    if final_video_tensor is None:
+        raise RuntimeError("Video extension process failed to produce a final video.")
+
+    logger.info(f"Final extended video generated with shape: {final_video_tensor.shape}")
+    return final_video_tensor
 
 def generate_extended_video(
     args: argparse.Namespace,
@@ -4741,7 +4861,46 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Apply Context Windows if Enabled ---
     model_options = apply_context_windows(args)
-    
+
+    # --- Initialize UltraViCo if Enabled ---
+    if args.ultravico:
+        # UltraViCo requires SDPA attention mode for attention bias support
+        if args.attn_mode not in ("torch", "sdpa"):
+            logger.warning(f"UltraViCo requires --attn_mode torch or sdpa, but got '{args.attn_mode}'. "
+                          f"UltraViCo attention decay will NOT be applied. Consider switching to --attn_mode torch.")
+
+        # Get latent dimensions from the latent tensor shape
+        # latent shape is [B, C, F, H, W] or [C, F, H, W]
+        if len(latent.shape) == 5:
+            _, _, lat_f_uv, lat_h_uv, lat_w_uv = latent.shape
+        else:
+            _, lat_f_uv, lat_h_uv, lat_w_uv = latent.shape
+
+        # Determine training frames (default based on typical Wan2.2 training)
+        training_frames = args.ultravico_training_frames
+        if training_frames is None:
+            # Auto-detect: Wan2.2 typically trained on 5s@24fps = 120 frames
+            # With 4x temporal compression: ~30 latent frames
+            # Use half of typical video length as training window
+            training_frames = min(21, lat_f_uv)  # Default 21 latent frames (~5s)
+
+        ultravico_config = UltraViCoConfig(
+            enabled=True,
+            training_frames=training_frames,
+            alpha=args.ultravico_alpha,
+            beta=args.ultravico_beta,
+            suppress_harmonics=args.ultravico_suppress_harmonics,
+            gamma=args.ultravico_gamma,
+        )
+        set_ultravico_config(ultravico_config)
+
+        # Set the visual shape for attention bias computation
+        # Shape is (T, H, W) in latent space
+        set_current_visual_shape((lat_f_uv, lat_h_uv, lat_w_uv))
+
+        logger.info(f"UltraViCo enabled: training_frames={training_frames}, alpha={args.ultravico_alpha}, "
+                   f"suppress_harmonics={args.ultravico_suppress_harmonics}, visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
+
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")
     
@@ -4774,9 +4933,13 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     )
 
     # --- Cleanup ---
+    # Clear UltraViCo cache if it was enabled
+    if args.ultravico:
+        clear_ultravico_cache()
+
     if model_manager:
         model_manager.cleanup()
-    
+
     # Only delete model if it exists
     if model is not None:
         del model

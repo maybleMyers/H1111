@@ -4,6 +4,7 @@ from typing import Optional, Union, List, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from accelerate import init_empty_weights
 
@@ -16,7 +17,9 @@ logging.basicConfig(level=logging.INFO)
 
 from utils.device_utils import clean_memory_on_device
 
+from .compile_config import maybe_compile
 from .attention import flash_attention
+from .ultravico import get_ultravico_bias_auto, is_ultravico_enabled
 from utils.device_utils import clean_memory_on_device
 from modules.custom_offloading_utils import ModelOffloader
 from modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -29,6 +32,9 @@ def sinusoidal_embedding_1d(dim, position):
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
+    # Ensure position is 1-D for torch.outer
+    if position.dim() == 0:
+        position = position.unsqueeze(0)
 
     # calculation
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
@@ -118,6 +124,18 @@ def rope_apply_inplace_cached(x, grid_sizes, freqs_list):
     return x
 
 
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def apply_gate_residual(x, y, gate):
+    """Apply gated residual connection: x + y.to(float32) * gate"""
+    return x + y.to(torch.float32) * gate
+
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def apply_modulated_norm(norm_out, scale, shift):
+    """Apply scale and shift to normalized output: norm * (1 + scale) + shift"""
+    return norm_out * (1 + scale) + shift
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -165,7 +183,18 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Convert both input and parameters to float32 for LayerNorm computation
+        # to avoid dtype mismatch when weights are in BFloat16
+        if self.weight is not None:
+            return F.layer_norm(
+                x.float(),
+                self.normalized_shape,
+                self.weight.float(),
+                self.bias.float() if self.bias is not None else None,
+                self.eps
+            ).type_as(x)
+        else:
+            return super().forward(x.float()).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -210,6 +239,8 @@ class WanSelfAttention(nn.Module):
         # del x
         # query, key, value function
 
+        # Ensure x has the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
@@ -224,8 +255,17 @@ class WanSelfAttention(nn.Module):
         rope_apply_inplace_cached(k, grid_sizes, freqs)
         qkv = [q, k, v]
         del q, k, v
+
+        # Get UltraViCo attention bias if enabled (only for self-attention on visual tokens)
+        ultravico_bias = None
+        if is_ultravico_enabled():
+            # seq_lens contains the actual sequence lengths for each batch item
+            # For self-attention, we use the full visual token sequence length
+            ultravico_bias = get_ultravico_bias_auto(s, qkv[0].device, qkv[0].dtype)
+
         x = flash_attention(
-            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn
+            qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn,
+            attn_bias=ultravico_bias
         )
 
         # output
@@ -244,6 +284,10 @@ class WanT2VCrossAttention(WanSelfAttention):
             context_lens(Tensor): Shape [B]
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # Ensure x and context have the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
 
         # compute query, key, value
         # q = self.norm_q(self.q(x)).view(b, -1, n, d)
@@ -291,6 +335,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         context_img = context[:, :257]
         context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # Ensure x and context have the same dtype as the linear layer weights to avoid dtype mismatch
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
+        context_img = context_img.to(self.k_img.weight.dtype)
 
         # compute query, key, value
         q = self.q(x)
@@ -389,35 +438,30 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
-        #     e = (self.modulation + e).chunk(6, dim=1)
         # support fp8
         e = self.modulation.to(torch.float32) + e
         e = e.chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
-        # with amp.autocast(dtype=torch.float32):
-        #     x = x + y * e[2]
-        x = x + y.to(torch.float32) * e[2]
+        # self-attention with compiled modulated norm
+        self_attn_input = apply_modulated_norm(self.norm1(x).float(), e[1], e[0])
+        y = self.self_attn(self_attn_input, seq_lens, grid_sizes, freqs)
+        del self_attn_input
+        # compiled gated residual
+        x = apply_gate_residual(x, y, e[2])
         del y
 
-        # cross-attention & ffn function
-        # def cross_attn_ffn(x, context, context_lens, e):
-        #     x += self.cross_attn(self.norm3(x), context, context_lens)
-        #     y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-        #     # with amp.autocast(dtype=torch.float32):
-        #     #     x = x + y * e[5]
-        #     x += y.to(torch.float32) * e[5]
-        #     return x
-        # x = cross_attn_ffn(x, context, context_lens, e)
-
-        # x += self.cross_attn(self.norm3(x), context, context_lens) # backward error
+        # cross-attention
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
         del context
-        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-        x = x + y.to(torch.float32) * e[5]
+
+        # FFN with compiled modulated norm
+        ffn_input = apply_modulated_norm(self.norm2(x).float(), e[4], e[3])
+        ffn_input = ffn_input.to(self.ffn[0].weight.dtype)
+        y = self.ffn(ffn_input)
+        del ffn_input
+        # compiled gated residual
+        x = apply_gate_residual(x, y, e[5])
         del y
         return x
 
@@ -456,7 +500,10 @@ class Head(nn.Module):
         #     x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         # support fp8
         e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
-        x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+        # Cast head input to match head weight dtype to avoid dtype mismatch
+        head_input = self.norm(x) * (1 + e[1]) + e[0]
+        head_input = head_input.to(self.head.weight.dtype)
+        x = self.head(head_input)
         return x
 
 
@@ -939,6 +986,42 @@ def detect_wan_sd_dtype(path: str) -> torch.dtype:
     return dit_dtype
 
 
+def detect_prescaled_fp8(path: str) -> bool:
+    """
+    Detect if a model is prescaled FP8 (has embedded scale tensors).
+
+    Prescaled FP8 models have:
+    - A 'scaled_fp8' marker tensor, OR
+    - scale_weight tensors alongside FP8 weight tensors
+
+    Returns:
+        bool: True if model is prescaled FP8, False otherwise
+    """
+    with MemoryEfficientSafeOpen(path) as f:
+        keys = set(f.keys())
+
+        # Check for explicit prescaled marker
+        if "scaled_fp8" in keys:
+            logger.info(f"Detected prescaled FP8 model (has scaled_fp8 marker)")
+            return True
+
+        # Check for scale_weight keys alongside FP8 weights
+        has_scale_weight = any(k.endswith(".scale_weight") for k in keys)
+        if has_scale_weight:
+            # Verify weights are actually FP8
+            key1 = "model.diffusion_model.blocks.0.cross_attn.k.weight"
+            key2 = "blocks.0.cross_attn.k.weight"
+            weight_key = key1 if key1 in keys else (key2 if key2 in keys else None)
+            if weight_key:
+                weight_dtype = f.get_tensor(weight_key).dtype
+                if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e5m2:
+                    logger.info(f"Detected prescaled FP8 model (has scale_weight keys with FP8 weights)")
+                    return True
+
+        logger.info(f"Model is not prescaled FP8")
+        return False
+
+
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
@@ -948,16 +1031,18 @@ def load_wan_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
+    fp8_prescaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
 ) -> WanModel:
-    # dit_weight_dtype is None for fp8_scaled
-    assert fp8_scaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
+    # dit_weight_dtype is None for fp8_scaled or fp8_prescaled
+    assert fp8_scaled or fp8_prescaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
 
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
+    # For fp8_scaled, we need CPU for optimization. For fp8_prescaled, load directly to target device.
     wan_loading_device = torch.device("cpu") if fp8_scaled else loading_device
     
     # Check if we should use efficient LoRA loading
@@ -1030,10 +1115,10 @@ def load_wan_model(
             add_ref_conv=has_ref_conv,             # <<< Pass detected flag
             in_dim_ref_conv=in_dim_ref_conv,             
         )
-        if dit_weight_dtype is not None and not fp8_scaled: # Don't pre-cast if optimizing to FP8 later
+        if dit_weight_dtype is not None and not fp8_scaled and not fp8_prescaled: # Don't pre-cast if using FP8
             model.to(dit_weight_dtype)
 
-    # ... (fp8 optimization - sd is already loaded) ...
+    # Handle FP8 modes
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info(f"Optimizing model weights to fp8. This may take a while.")
@@ -1044,6 +1129,18 @@ def load_wan_model(
             logger.info(f"Moving weights to {loading_device}")
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
+    elif fp8_prescaled:
+        # Prescaled FP8: model already has FP8 weights with embedded scale tensors
+        logger.info(f"Loading prescaled FP8 model (has embedded scale tensors)")
+
+        # Remove scaled_fp8 marker if present
+        if "scaled_fp8" in sd:
+            del sd["scaled_fp8"]
+            logger.info("Removed 'scaled_fp8' marker from state dict")
+
+        # Apply FP8 monkey patch to register scale_weight and scale_input buffers
+        from modules.fp8_optimization_utils import apply_fp8_monkey_patch
+        apply_fp8_monkey_patch(model, sd, use_scaled_mm=use_scaled_mm)
 
     # Load the potentially modified state dict
     # Use strict=False initially if ref_conv might be missing in older models but present in the class

@@ -289,9 +289,14 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     """
     if use_scaled_mm:
         input_dtype = x.dtype
-        original_weight_dtype = self.scale_weight.dtype
         weight_dtype = self.weight.dtype
         target_dtype = torch.float8_e5m2
+        # Determine output dtype - should be float16 or bfloat16, not FP8
+        # Use input dtype if it's not FP8, otherwise default to float16
+        if input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            output_dtype = torch.float16
+        else:
+            output_dtype = input_dtype
         assert weight_dtype == torch.float8_e4m3fn, "Only FP8 E4M3FN format is supported"
         assert x.ndim == 3, "Input tensor must be 3D (batch_size, seq_len, hidden_dim)"
 
@@ -312,23 +317,27 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         scale_weight = self.scale_weight.to(torch.float32)
 
         if self.bias is not None:
-            # float32 is not supported with bias in scaled_mm
-            o = torch._scaled_mm(x, weight, out_dtype=original_weight_dtype, bias=self.bias, scale_a=scale_x, scale_b=scale_weight)
+            # Use float16/bfloat16 output dtype (float32 is not supported with bias in scaled_mm)
+            o = torch._scaled_mm(x, weight, out_dtype=output_dtype, bias=self.bias, scale_a=scale_x, scale_b=scale_weight)
         else:
-            o = torch._scaled_mm(x, weight, out_dtype=input_dtype, scale_a=scale_x, scale_b=scale_weight)
+            o = torch._scaled_mm(x, weight, out_dtype=output_dtype, scale_a=scale_x, scale_b=scale_weight)
 
-        return o.reshape(original_shape[0], original_shape[1], -1).to(input_dtype)
+        return o.reshape(original_shape[0], original_shape[1], -1)
 
     else:
-        # Dequantize the weight
-        original_dtype = self.scale_weight.dtype
-        dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
+        # Dequantize the weight - use input dtype for output consistency
+        input_dtype = x.dtype
+        # Use float16 as default if scale_weight is in FP8 format
+        scale_dtype = self.scale_weight.dtype
+        if scale_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            scale_dtype = torch.float16
+        dequantized_weight = self.weight.to(scale_dtype) * self.scale_weight.to(scale_dtype)
 
         # Perform linear transformation
         if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
+            output = F.linear(x, dequantized_weight.to(input_dtype), self.bias)
         else:
-            output = F.linear(x, dequantized_weight)
+            output = F.linear(x, dequantized_weight.to(input_dtype))
 
         return output
 
@@ -349,27 +358,47 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
     # max_value = calculate_fp8_maxval(5, 2)
     max_value = None  # do not quantize input tensor
 
-    # Find all scale keys to identify FP8-optimized layers
-    scale_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
+    # Remove prescaled FP8 marker key if present
+    if "scaled_fp8" in optimized_state_dict:
+        del optimized_state_dict["scaled_fp8"]
+        logger.info("Removed 'scaled_fp8' marker from state dict")
 
-    # Enumerate patched layers
+    # Find all scale_weight keys to identify FP8-optimized layers
+    scale_weight_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
+
+    # Find all scale_input keys (for prescaled FP8 models)
+    scale_input_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_input")]
+
+    # Enumerate patched layers for scale_weight
     patched_module_paths = set()
-    for scale_key in scale_keys:
-        # Extract module path from scale key (remove .scale_weight)
+    for scale_key in scale_weight_keys:
         module_path = scale_key.rsplit(".scale_weight", 1)[0]
         patched_module_paths.add(module_path)
 
+    # Enumerate layers with scale_input
+    scale_input_module_paths = set()
+    for scale_key in scale_input_keys:
+        module_path = scale_key.rsplit(".scale_input", 1)[0]
+        scale_input_module_paths.add(module_path)
+
     patched_count = 0
+    scale_input_count = 0
 
     # Apply monkey patch to each layer with FP8 weights
     for name, module in model.named_modules():
-        # Check if this module has a corresponding scale_weight
-        has_scale = name in patched_module_paths
+        has_scale_weight = name in patched_module_paths
+        has_scale_input = name in scale_input_module_paths
 
-        # Apply patch if it's a Linear layer with FP8 scale
-        if isinstance(module, nn.Linear) and has_scale:
+        # Apply patch if it's a Linear layer with FP8 scale_weight
+        if isinstance(module, nn.Linear) and has_scale_weight:
             # register the scale_weight as a buffer to load the state_dict
-            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+            # Use float32 for scale buffers (not FP8) - actual values loaded from state dict
+            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=torch.float32))
+
+            # Also register scale_input if present
+            if has_scale_input:
+                module.register_buffer("scale_input", torch.tensor(1.0, dtype=torch.float32))
+                scale_input_count += 1
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):
@@ -379,8 +408,14 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
             module.forward = new_forward.__get__(module, type(module))
 
             patched_count += 1
+        elif isinstance(module, nn.Linear) and has_scale_input and not has_scale_weight:
+            # Edge case: has scale_input but no scale_weight
+            module.register_buffer("scale_input", torch.tensor(1.0, dtype=torch.float32))
+            scale_input_count += 1
 
     logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
+    if scale_input_count > 0:
+        logger.info(f"Number of layers with scale_input registered: {scale_input_count}")
     return model
 
 

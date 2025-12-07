@@ -1,6 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 from typing import Optional
 import torch
+import torch.nn.functional as F
+
+from .compile_config import maybe_compile
 
 try:
     import flash_attn_interface
@@ -33,6 +36,14 @@ except ImportError:
 
 import warnings
 
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def sdpa_attention(q, k, v, attn_mask=None, is_causal=False, dropout_p=0.0, softmax_scale=None):
+    """Compiled SDPA attention function."""
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=is_causal, dropout_p=dropout_p, scale=softmax_scale
+    )
+
 __all__ = [
     "flash_attention",
     "attention",
@@ -53,6 +64,7 @@ def flash_attention(
     version=None,
     attn_mode: Optional[str] = "torch",
     split_attn: bool = False,
+    attn_bias: Optional[torch.Tensor] = None,  # UltraViCo attention bias
 ):
     """
     q:              [B, Lq, Nq, C1].
@@ -97,16 +109,21 @@ def flash_attention(
         k = half(k.transpose(1, 2))
         v = half(v.transpose(1, 2))
 
+        # Prepare attention mask/bias for UltraViCo
+        # attn_bias shape: [seq_len, seq_len] -> [1, 1, seq_len, seq_len] for broadcasting
+        sdpa_attn_mask = None
+        if attn_bias is not None:
+            # Expand bias for batch and heads: [1, 1, seq_len, seq_len]
+            sdpa_attn_mask = attn_bias.unsqueeze(0).unsqueeze(0).to(dtype=q.dtype, device=q.device)
+
         if not split_attn:
-            q = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
-            )
-            x = q
+            # Use compiled SDPA function
+            x = sdpa_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=causal, dropout_p=dropout_p, softmax_scale=softmax_scale)
         else:
             x = torch.empty_like(q)
             for i in range(q.size(0)):
-                x[i : i + 1] = torch.nn.functional.scaled_dot_product_attention(
-                    q[i : i + 1], k[i : i + 1], v[i : i + 1], is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
+                x[i : i + 1] = sdpa_attention(
+                    q[i : i + 1], k[i : i + 1], v[i : i + 1], attn_mask=sdpa_attn_mask, is_causal=causal, dropout_p=dropout_p, softmax_scale=softmax_scale
                 )
 
         del q, k, v

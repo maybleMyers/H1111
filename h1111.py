@@ -189,6 +189,7 @@ def wan_one_frame_handler(
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
+    fp8_prescaled: bool,
     fp8_t5: bool,
     mixed_dtype: bool,
     vae_fp32: bool,
@@ -311,7 +312,9 @@ def wan_one_frame_handler(
         if fp8:
             cmd.append("--fp8")
         if fp8_scaled:
-            cmd.append("--fp8_scaled") 
+            cmd.append("--fp8_scaled")
+        if fp8_prescaled:
+            cmd.append("--fp8_prescaled")
         if fp8_t5:
             cmd.append("--fp8_t5")
         if mixed_dtype:
@@ -442,6 +445,8 @@ def wan22_batch_handler(
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
     fp8_t5: bool,
     dit_low_noise_path: str,
     dit_high_noise_path: str,
@@ -465,10 +470,14 @@ def wan22_batch_handler(
     dynamic_model_loading: bool,
     unload_text_encoders: bool,
     vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
     # Context Windows parameters
-    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -552,15 +561,20 @@ def wan22_batch_handler(
 
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_prescaled: command.append("--fp8_prescaled")
+        if fp8_fast: command.append("--fp8_fast")
         if mixed_dtype: command.append("--mixed_dtype")
         if fp8_t5: command.append("--fp8_t5")
-        # ADD THIS:
         if dynamic_model_loading and "A14B" in task:
             command.append("--dynamic_model_loading")
         if unload_text_encoders:
             command.append("--unload_text_encoders")
         if vae_fp32:
             command.extend(["--vae_dtype", "float32"])
+
+        # torch.compile options
+        if compile_enabled:
+            command.append("--compile")
         
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -576,6 +590,18 @@ def wan22_batch_handler(
             if context_closed_loop:
                 command.append("--context_closed_loop")
             command.extend(["--context_fuse_method", str(context_fuse_method)])
+            if context_end_image:
+                command.extend(["--end_image_path", str(context_end_image)])
+
+        # --- UltraViCo Handling ---
+        if ultravico_enabled:
+            command.append("--ultravico")
+            command.extend(["--ultravico_alpha", str(ultravico_alpha)])
+            command.extend(["--ultravico_training_frames", str(int(ultravico_training_frames))])
+            if ultravico_suppress_harmonics:
+                command.append("--ultravico_suppress_harmonics")
+                command.extend(["--ultravico_beta", str(ultravico_beta)])
+                command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -636,6 +662,7 @@ def wan22_batch_handler(
 
         current_video_file_for_item = None
         progress_text_update = "Subprocess started..."
+        current_context_window = None  # Track current context window state
         for line in iter(process.stdout.readline, ''):
             if stop_event.is_set():
                 try: process.terminate(); process.wait(timeout=5)
@@ -646,10 +673,10 @@ def wan22_batch_handler(
             line_strip = line.strip()
             if not line_strip: continue
             print(f"WAN2.2_SUBPROCESS: {line_strip}")
-            progress_text_update = line_strip
 
-            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[([0-9:]+)<([0-9:]+)', line_strip)
             video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+            context_window_match = re.search(r"Processing window (\d+)/(\d+):\s*frames\s*(\d+)-(\d+)\s*\((\d+)\s*frames\)", line_strip)
 
             if video_saved_match:
                 found_path = video_saved_match.group(1).strip()
@@ -657,13 +684,23 @@ def wan22_batch_handler(
                     current_video_file_for_item = found_path
                 progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
                 status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+                current_context_window = None
             elif tqdm_match:
                 percentage = tqdm_match.group(1)
                 steps_iter = tqdm_match.group(2)
-                time_elapsed = tqdm_match.group(3)
                 time_remaining = tqdm_match.group(4)
-                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
-                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+                if current_context_window:
+                    progress_text_update = f"Window {current_context_window['idx']}/{current_context_window['total']} | Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                    status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Window {current_context_window['idx']}/{current_context_window['total']}"
+                else:
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                    status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+            elif context_window_match:
+                window_idx = int(context_window_match.group(1)) + 1
+                window_total = int(context_window_match.group(2))
+                window_frames = context_window_match.group(5)
+                current_context_window = {"idx": window_idx, "total": window_total, "frames": window_frames}
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Window {window_idx}/{window_total}"
 
             if enable_preview:
                 if os.path.exists(preview_mp4_path):
@@ -686,9 +723,11 @@ def wan22_batch_handler(
                 "dit": dit_path, "vae": vae_path, "t5": t5_path, "clip": clip_path,
                 "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
                 "flow_shift": flow_shift, "sample_guide_scale": sample_guide_scale,
-                "dual_dit_boundary": dual_dit_boundary,  # Add dual_dit_boundary to metadata
+                "dual_dit_boundary": dual_dit_boundary,
                 "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str],
                 "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult],
+                "lora_apply_low": [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low],
+                "lora_apply_high": [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high, lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high],
             }
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
@@ -708,6 +747,170 @@ def wan22_batch_handler(
         time.sleep(0.2)
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
+
+### HoloCine - Multi-Shot Video Generation
+def holocine_batch_handler(
+    # Prompting
+    global_caption: str,
+    shot_captions_str: str,  # Newline-separated shot captions
+    negative_prompt: str,
+    # Generation Parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    block_swap: int,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    vae_path: str,
+    t5_path: str,
+    # Advanced
+    shot_cut_frames_str: str = "",  # Comma-separated frame numbers (optional)
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    # --- Initial Checks ---
+    os.makedirs(save_path, exist_ok=True)
+
+    all_generated_videos = []
+
+    # Parse shot captions (newline-separated)
+    shot_captions_list = [s.strip() for s in shot_captions_str.split('\n') if s.strip()]
+    if not shot_captions_list:
+        yield [], "Error: Please provide at least one shot caption (one per line).", ""
+        return
+
+    # Parse shot cut frames (optional, comma-separated)
+    shot_cut_frames_list = None
+    if shot_cut_frames_str.strip():
+        try:
+            shot_cut_frames_list = [int(x.strip()) for x in shot_cut_frames_str.split(',') if x.strip()]
+        except ValueError:
+            yield [], "Error: Shot cut frames must be comma-separated integers.", ""
+            return
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), status_text, "Starting item..."
+
+        # --- Prepare command for a single generation ---
+        command = [
+            sys.executable, "holocine_generate_video.py",
+            "--global_caption", str(global_caption),
+            "--num_frames", str(frame_num),
+            "--height", str(height),
+            "--width", str(width),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path),
+            "--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+        ]
+
+        # Add shot captions
+        for shot_caption in shot_captions_list:
+            command.extend(["--shot_captions", shot_caption])
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        if fp8_t5:
+            command.append("--fp8_t5")
+
+        # Add shot cut frames if provided
+        if shot_cut_frames_list:
+            for cut_frame in shot_cut_frames_list:
+                command.extend(["--shot_cut_frames", str(cut_frame)])
+
+        # --- Execute Subprocess ---
+        print(f"Running HoloCine Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"HOLOCINE_SUBPROCESS: {line_strip}")
+            progress_text_update = line_strip
+
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[(\d{2}:\d{2})<(\d{2}:\d{2})', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_elapsed = tqdm_match.group(3)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+
+            yield all_generated_videos.copy(), status_text, progress_text_update
+
+        process.wait()
+        return_code = process.returncode
+
+        if return_code == 0 and current_video_file_for_item:
+            all_generated_videos.append((current_video_file_for_item, f"Seed {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Complete"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, "HoloCine Batch complete.", ""
 
 ### Multitalk
 def multitalk_batch_handler(
@@ -4233,6 +4436,45 @@ def extract_last_frame(video_path: str) -> Optional[str]:
         if 'cap' in locals():
             cap.release()
 
+def extract_first_frame(video_path: str) -> Optional[str]:
+    """Extract first frame from video and return temporary image path"""
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Error: Video file does not exist")
+        return None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("❌ Error: Failed to open video file")
+            return None
+
+        # Read first frame (frame 0)
+        success, frame = cap.read()
+
+        if not success or frame is None:
+            print("❌ Error: Failed to read first frame")
+            return None
+
+        # Prepare output path
+        temp_dir = os.path.abspath("temp_frames")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"first_frame_{os.path.basename(video_path)}.png")
+
+        # Write frame
+        if not cv2.imwrite(temp_path, frame):
+            print("❌ Error: Failed to write frame to file")
+            return None
+
+        print(f"✅ First frame extracted: {temp_path}")
+        return temp_path
+
+    except Exception as e:
+        print(f"❌ Unexpected error extracting first frame: {str(e)}")
+        return None
+    finally:
+        if 'cap' in locals():
+            cap.release()
+
 def handle_last_frame_transfer(gallery: list, selected_idx: int) -> Optional[str]:
     """Improved frame transfer with video input validation"""
     try:
@@ -5245,6 +5487,299 @@ def wanx_batch_handler(
                 enable_preview=enable_preview,
                 preview_steps=preview_steps
             )
+
+def longcat_generate_video(
+    prompt: str,
+    negative_prompt: str,
+    video_width: int,
+    video_height: int,
+    video_length: int,
+    target_fps: int,
+    infer_steps: int,
+    guidance_scale: float,
+    seed: int,
+    task: str,
+    ckpt_dir: str,
+    save_path: str,
+    blocks_to_swap: int,
+    mode: str,
+    i2v_input_image: Optional[str],
+    input_video: Optional[str],
+    num_segments: int,
+    num_cond_frames: int,
+    enable_refinement: bool,
+    refinement_lora_path: str,
+    refine_segment_size: int,
+    output_type: str,
+    attn_mode: str,
+    lora_folder: str,
+    loras: List[Tuple[str, float]],
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Generate video using longcat_generate_video.py subprocess with LoRA support"""
+    global stop_event
+
+    if stop_event.is_set():
+        yield [], "Generation stopped.", ""
+        return
+
+    # Create output directory
+    os.makedirs(save_path, exist_ok=True)
+
+    # Set seed
+    if seed == -1:
+        seed = random.randint(0, 2**32 - 1)
+
+    # Build command
+    cmd = [
+        sys.executable,
+        "longcat_generate_video.py",
+        "--task", task,
+        "--ckpt_dir", ckpt_dir,
+        "--prompt", prompt,
+        "--video_size", str(video_height), str(video_width),
+        "--video_length", str(video_length),
+        "--infer_steps", str(infer_steps),
+        "--guidance_scale", str(guidance_scale),
+        "--seed", str(seed),
+        "--save_path", save_path,
+        "--blocks_to_swap", str(blocks_to_swap),
+        "--output_type", output_type,
+        "--attn_mode", attn_mode,
+        "--mode", mode,
+        "--target_fps", str(target_fps),
+    ]
+
+    if negative_prompt:
+        cmd.extend(["--negative_prompt", negative_prompt])
+
+    # Mode-specific arguments
+    if mode == "i2v" and i2v_input_image:
+        cmd.extend(["--image_path", i2v_input_image])
+
+    if mode == "refine":
+        # Refinement-only mode
+        if input_video:
+            cmd.extend(["--input_video", input_video])
+        if refinement_lora_path:
+            cmd.extend(["--refinement_lora_path", refinement_lora_path])
+        if refine_segment_size and refine_segment_size != 93:
+            cmd.extend(["--refine_segment_size", str(refine_segment_size)])
+
+    if mode in ["continuation", "long_video"]:
+        cmd.extend(["--num_cond_frames", str(num_cond_frames)])
+        if input_video:
+            cmd.extend(["--input_video", input_video])
+        if mode == "long_video":
+            cmd.extend(["--num_segments", str(num_segments)])
+            # Refinement support for long_video mode
+            if enable_refinement:
+                cmd.extend(["--enable_refinement"])
+                if refinement_lora_path:
+                    cmd.extend(["--refinement_lora_path", refinement_lora_path])
+                if refine_segment_size and refine_segment_size != 93:
+                    cmd.extend(["--refine_segment_size", str(refine_segment_size)])
+        # Refinement support for continuation mode
+        elif mode == "continuation" and enable_refinement:
+            cmd.extend(["--enable_refinement"])
+            if refinement_lora_path:
+                cmd.extend(["--refinement_lora_path", refinement_lora_path])
+
+    # Add LoRA arguments
+    for lora_path, multiplier in loras:
+        if lora_path and lora_path != "None" and multiplier > 0:
+            # Convert relative path to absolute if needed
+            if not os.path.isabs(lora_path):
+                lora_path = os.path.join(lora_folder, lora_path)
+            if os.path.exists(lora_path):
+                cmd.extend(["--lora_weight", lora_path, "--lora_multiplier", str(multiplier)])
+
+    # Set up environment
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print(f"Running LongCat command: {' '.join(cmd)}")
+
+    # Start subprocess
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    # Parse output
+    output_video_path = None
+    for line in iter(process.stdout.readline, ''):
+        if stop_event.is_set():
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            yield [], "Generation stopped by user.", ""
+            return
+
+        line = line.strip()
+        if not line:
+            continue
+
+        print(f"LONGCAT: {line}")
+
+        # Look for output video path
+        if "saved" in line.lower() and ".mp4" in line:
+            # Try to extract the video path
+            match = re.search(r'([^\s]+\.mp4)', line)
+            if match:
+                output_video_path = match.group(1)
+
+        # Yield progress updates
+        progress_text = line
+        yield [], f"Generating... (Seed: {seed})", progress_text
+
+    # Wait for process to complete
+    return_code = process.wait()
+
+    if return_code != 0:
+        yield [], f"Error: Process exited with code {return_code}", "Generation failed"
+        return
+
+    # Find output video
+    if not output_video_path or not os.path.exists(output_video_path):
+        # Try to find the most recent video in save_path
+        video_files = sorted(
+            glob.glob(os.path.join(save_path, "*.mp4")),
+            key=os.path.getmtime,
+            reverse=True
+        )
+        if video_files:
+            output_video_path = video_files[0]
+
+    if output_video_path and os.path.exists(output_video_path):
+        yield [(output_video_path, f"Seed: {seed}")], f"Completed (seed: {seed})", ""
+    else:
+        yield [], "Error: Output video not found", "Generation may have failed"
+
+
+def longcat_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    video_width: int,
+    video_height: int,
+    video_length: int,
+    target_fps: int,
+    infer_steps: int,
+    guidance_scale: float,
+    seed: int,
+    batch_count: int,
+    task: str,
+    ckpt_dir: str,
+    save_path: str,
+    blocks_to_swap: int,
+    generation_mode: str,
+    i2v_input_image: Optional[str],
+    input_video: Optional[str],
+    num_segments: int,
+    num_cond_frames: int,
+    enable_refinement: bool,
+    refinement_lora_path: str,
+    refine_segment_size: int,
+    output_type: str,
+    attn_mode: str,
+    lora_folder: str,
+    lora_1: str, lora_1_multiplier: float,
+    lora_2: str, lora_2_multiplier: float,
+    lora_3: str, lora_3_multiplier: float,
+    lora_4: str, lora_4_multiplier: float,
+    lora_5: str, lora_5_multiplier: float,
+    lora_6: str, lora_6_multiplier: float,
+    lora_7: str, lora_7_multiplier: float,
+    lora_8: str, lora_8_multiplier: float,
+) -> Generator[Tuple[List[Tuple[str, str]], str, str], None, None]:
+    """Handle batch generation for LongCat with LoRA support"""
+    global stop_event
+    stop_event.clear()
+
+    all_videos = []
+
+    # Convert mode names
+    mode_map = {
+        "Text-to-Video": "generation",
+        "Image-to-Video": "i2v",
+        "Long Video": "long_video",
+        "Video Continuation": "continuation",
+        "Refinement Only": "refine"
+    }
+    mode = mode_map.get(generation_mode, "generation")
+
+    # Validate inputs based on mode
+    if mode == "i2v":
+        if not i2v_input_image or not os.path.exists(i2v_input_image):
+            yield [], "Error: Input image required for Image-to-Video mode", ""
+            return
+    elif mode == "refine":
+        if not input_video or not os.path.exists(input_video):
+            yield [], "Error: Input video required for Refinement Only mode", ""
+            return
+    elif mode in ["continuation", "long_video"]:
+        if mode == "continuation" and (not input_video or not os.path.exists(input_video)):
+            yield [], "Error: Input video required for Video Continuation mode", ""
+            return
+        # long_video mode can optionally use input_video
+
+    # Collect LoRA configurations
+    loras = [
+        (lora_1, lora_1_multiplier),
+        (lora_2, lora_2_multiplier),
+        (lora_3, lora_3_multiplier),
+        (lora_4, lora_4_multiplier),
+        (lora_5, lora_5_multiplier),
+        (lora_6, lora_6_multiplier),
+        (lora_7, lora_7_multiplier),
+        (lora_8, lora_8_multiplier),
+    ]
+
+    for i in range(int(batch_count)):
+        if stop_event.is_set():
+            yield all_videos, "Batch stopped by user.", ""
+            return
+
+        # Calculate seed for this batch item
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = seed + i
+
+        status_text = f"Processing {i+1}/{batch_count} (Seed: {current_seed})"
+        yield all_videos, status_text, "Starting..."
+
+        # Generate single video
+        for videos, status, progress in longcat_generate_video(
+            prompt, negative_prompt, video_width, video_height,
+            video_length, target_fps, infer_steps, guidance_scale,
+            current_seed, task, ckpt_dir, save_path, blocks_to_swap,
+            mode, i2v_input_image, input_video, num_segments, num_cond_frames,
+            enable_refinement, refinement_lora_path, refine_segment_size,
+            output_type, attn_mode, lora_folder, loras
+        ):
+            if videos:
+                # Add new video to collection
+                if videos[0] not in all_videos:
+                    all_videos.extend(videos)
+            yield all_videos, f"Item {i+1}/{batch_count}: {status}", progress
+
+        # Brief pause between batch items
+        time.sleep(0.2)
+
+    yield all_videos, "Batch complete.", ""
+
 
 def process_single_video(
     prompt: str,
@@ -7327,92 +7862,158 @@ with gr.Blocks(
                 infinitetalk_save_path = gr.Textbox(label="Save Path", value="outputs/infinitetalk")
 
         # Text to Video Tab
-        with gr.Tab(id=1, label="Hunyuan-t2v"):
+        # LongCat Video Generation Tab
+        with gr.Tab(id=1, label="LongCat"):
             with gr.Row():
                 with gr.Column(scale=4):
-                    prompt = gr.Textbox(scale=3, label="Enter your prompt", value="POV video of a cat chasing a frob.", lines=5)
+                    longcat_prompt = gr.Textbox(scale=3, label="Enter your prompt",
+                                               value="an insanely long cat walking through a vibrant, futuristic cyberpunk city at night, neon lights reflecting on its fur",
+                                               lines=5)
 
                 with gr.Column(scale=1):
-                    token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    longcat_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
 
                 with gr.Column(scale=2):
-                    batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    longcat_batch_progress = gr.Textbox(label="", visible=True, elem_id="longcat_batch_progress")
+                    longcat_progress_text = gr.Textbox(label="", visible=True, elem_id="longcat_progress_text")
 
             with gr.Row():
-                generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                stop_btn = gr.Button("Stop Generation", variant="stop")
+                longcat_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                longcat_stop_btn = gr.Button("Stop Generation", variant="stop")
 
             with gr.Row():
                 with gr.Column():
-                    
-                    t2v_width = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Width")
-                    t2v_height = gr.Slider(minimum=64, maximum=1536, step=16, value=544, label="Video Height")
-                    video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=25, elem_id="my_special_slider")
-                    fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24, elem_id="my_special_slider")
-                    infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=30, elem_id="my_special_slider")
-                    flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=11.0, elem_id="my_special_slider")
-                    cfg_scale = gr.Slider(minimum=0.0, maximum=14.0, step=0.1, label="cfg Scale", value=7.0, elem_id="my_special_slider")
-            
-                with gr.Column():
+                    longcat_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=3
+                    )
 
+                    longcat_width = gr.Slider(minimum=64, maximum=1536, step=16, value=832, label="Video Width")
+                    longcat_height = gr.Slider(minimum=64, maximum=1536, step=16, value=480, label="Video Height")
+                    longcat_video_length = gr.Slider(minimum=1, maximum=201, step=1, label="Video Length in Frames", value=93, elem_id="longcat_video_length")
+                    longcat_target_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Target FPS", value=15, elem_id="longcat_target_fps")
+                    longcat_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=50, elem_id="longcat_infer_steps")
+                    longcat_guidance_scale = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0, elem_id="longcat_guidance_scale")
+
+                with gr.Column():
                     with gr.Row():
-                        video_output = gr.Gallery(
+                        longcat_video_output = gr.Gallery(
                             label="Generated Videos (Click to select)",
                             columns=[2],
                             rows=[2],
                             object_fit="contain",
                             height="auto",
                             show_label=True,
-                            elem_id="gallery",
+                            elem_id="longcat_gallery",
                             allow_preview=True,
                             preview=True
                         )
-                    with gr.Row():send_t2v_to_v2v_btn = gr.Button("Send Selected to Video2Video")
-            
+
             with gr.Row():
-                    refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    lora_weights = []
-                    lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
+                longcat_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                longcat_blocks_to_swap = gr.Slider(minimum=0, maximum=50, step=1, label="Blocks to Swap (VRAM Optimization)", value=26)
+                longcat_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Row():
+                longcat_task = gr.Textbox(label="Task/Model", value="longcat-t2v-13.6B")
+                longcat_ckpt_dir = gr.Textbox(label="Checkpoint Directory", value="/home/mayble/diffusion/LongCat-Video")
+                longcat_output_type = gr.Radio(choices=["video", "images", "both"], label="Output Type", value="video")
+                longcat_attn_mode = gr.Radio(choices=["sdpa", "flash", "flash2", "flash3", "sageattn", "xformers", "torch"],
+                                            label="Attention Mode", value="sdpa")
+
+            # Generation Mode Section
+            with gr.Accordion("Generation Mode", open=False):
+                with gr.Row():
+                    longcat_generation_mode = gr.Radio(
+                        choices=["Text-to-Video", "Image-to-Video", "Long Video", "Video Continuation", "Refinement Only"],
+                        label="Mode",
+                        value="Text-to-Video"
+                    )
+
+                # Mode-specific controls
+                with gr.Row():
+                    longcat_i2v_input_image = gr.Image(label="Input Image (for I2V)", type="filepath", visible=False)
+                    longcat_input_video = gr.Video(label="Input Video (for Continuation/Long Video)", value=None, visible=False)
+
+                with gr.Row():
+                    longcat_num_segments = gr.Slider(
+                        minimum=1, maximum=50, step=1,
+                        label="Continuation Segments (1 T2V + N continuations, 11 cont. ≈ 1 minute @ 15fps)",
+                        value=11, visible=False
+                    )
+                    longcat_num_cond_frames = gr.Slider(
+                        minimum=1, maximum=50, step=1,
+                        label="Conditioning Frames (for Continuation/Long Video)",
+                        value=13, visible=False
+                    )
+
+                    # Refinement options for continuation
+                    longcat_enable_refinement = gr.Checkbox(
+                        label="Enable Refinement (720p @ 30fps upscaling)",
+                        value=False,
+                        visible=False,
+                        info="Requires refinement LoRA. Upscales 480p@15fps to 720p@30fps"
+                    )
+
+                    longcat_refinement_lora_path = gr.Textbox(
+                        label="Refinement LoRA Path (relative to checkpoint dir)",
+                        value="lora/refinement_lora.safetensors",
+                        placeholder="Path to refinement LoRA file",
+                        visible=False
+                    )
+
+                    longcat_refine_segment_size = gr.Slider(
+                        minimum=30, maximum=150, step=1,
+                        label="Refine Segment Size (frames per segment, lower = less VRAM)",
+                        value=93,
+                        visible=False,
+                        info="Reduce if OOM. Each segment is processed separately with overlapping frames."
+                    )
+
+            # LoRA Section
+            with gr.Accordion("LoRA", open=True):
+                with gr.Row():
+                    longcat_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                    longcat_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+
+                longcat_lora_weights = []
+                longcat_lora_multipliers = []
+
+                # Primary LoRAs (1-4)
+                for i in range(4):
+                    with gr.Row():
+                        longcat_lora_weights.append(gr.Dropdown(
+                            label=f"LoRA {i+1}",
+                            choices=get_lora_options("lora"),
+                            value="None",
+                            allow_custom_value=False,
+                            interactive=True,
+                            scale=2
+                        ))
+                        longcat_lora_multipliers.append(gr.Slider(
+                            label=f"Multiplier",
+                            minimum=0.0, maximum=2.0, step=0.05,
+                            value=1.0, scale=1, interactive=True
+                        ))
+
+                # Additional LoRAs (5-8)
+                with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                    for i in range(4, 8):
+                        with gr.Row():
+                            longcat_lora_weights.append(gr.Dropdown(
+                                label=f"LoRA {i+1}",
+                                choices=get_lora_options("lora"),
+                                value="None",
+                                allow_custom_value=False,
+                                interactive=True,
+                                scale=2
                             ))
-                            lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))            
-            with gr.Row():
-                exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
-                model = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("hunyuan"),
-                    value="mp_rank_00_model_states.pt",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                vae = gr.Textbox(label="vae", value="hunyuan/pytorch_model.pt")
-                te1 = gr.Textbox(label="te1", value="hunyuan/llava_llama3_fp16.safetensors")
-                te2 = gr.Textbox(label="te2", value="hunyuan/clip_l.safetensors")
-                save_path = gr.Textbox(label="Save Path", value="outputs")
-            with gr.Row():
-                lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                use_split_attn = gr.Checkbox(label="Use Split Attention", value=False)
-                use_fp8 = gr.Checkbox(label="Use FP8 (faster but lower precision)", value=True)
-                attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                block_swap = gr.Slider(minimum=0, maximum=36, step=1, label="Block Swap to Save Vram", value=0)
+                            longcat_lora_multipliers.append(gr.Slider(
+                                label=f"Multiplier",
+                                minimum=0.0, maximum=2.0, step=0.05,
+                                value=1.0, scale=1, interactive=True
+                            ))
 
         #Image to Video Tab
         with gr.Tab(label="Hunyuan-i2v", visible=False) as i2v_tab:
@@ -7790,12 +8391,12 @@ with gr.Blocks(
                         )
                         with gr.Row(visible=False) as wan22_extension_controls:
                             wan22_extend_frames = gr.Number(
-                                label="Total Frames to Generate", 
-                                value=200, 
-                                minimum=81, 
-                                maximum=500,
+                                label="Number of New Sections to Generate",
+                                value=1,
+                                minimum=1,
+                                maximum=11,
                                 step=1,
-                                info="Total number of frames in the extended video (81-500 frames)"
+                                info="Number of new video sections to generate and append. Each section's length is set by 'Frame Count'."
                             )
                             wan22_frames_to_check = gr.Number(
                                 label="Frames to Check from End",
@@ -7863,7 +8464,13 @@ with gr.Blocks(
                                     value="pyramid",
                                     info="Method for fusing context window results"
                                 )
-                    
+                            with gr.Row():
+                                wan22_context_end_image = gr.Image(
+                                    label="Ending Image (Optional)",
+                                    type="filepath",
+                                    sources=["upload"]
+                                )
+
                     gr.Markdown("### Generation Parameters")
                     wan22_task = gr.Dropdown(
                         label="Task", 
@@ -7873,17 +8480,17 @@ with gr.Blocks(
                     )
                     # Width and height inputs
                     with gr.Row():
-                        wan22_width = gr.Number(label="Width", value=832, interactive=True)
+                        wan22_width = gr.Number(label="Width", value=832, step=32, interactive=True)
                         wan22_calc_height_btn = gr.Button("→")
                         wan22_calc_width_btn = gr.Button("←")
-                        wan22_height = gr.Number(label="Height", value=480, interactive=True)
+                        wan22_height = gr.Number(label="Height", value=480, step=32, interactive=True)
                     wan22_frame_num = gr.Slider(minimum=9, maximum=611, step=4, label="Frame Count", value=81, info="Must be 4n+1")
                     wan22_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     wan22_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     wan22_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
                     wan22_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
                     wan22_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
-                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    wan22_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         wan22_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         wan22_random_seed_btn = gr.Button("🎲")
@@ -7950,10 +8557,13 @@ with gr.Blocks(
                     wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    wan22_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    wan22_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
                     wan22_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
                     wan22_dynamic_model_loading = gr.Checkbox(
-                        label="Dynamic Model Loading (A14B models only to lower RAM usages)", 
+                        label="Dynamic Model Loading (A14B models only to lower RAM usages)",
                         value=False, visible=False
                     )
                     wan22_unload_text_encoders = gr.Checkbox(
@@ -7964,6 +8574,12 @@ with gr.Blocks(
                     wan22_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
                         value=True,
+                    )
+                with gr.Row():
+                    wan22_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
                     )
                 with gr.Row():
                     wan22_model_folder = gr.Textbox(label="Model Folder", value="wan")
@@ -8016,7 +8632,178 @@ with gr.Blocks(
                         interactive=True
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
-        
+
+            with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
+                gr.Markdown("""
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
+
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
+                """)
+                wan22_ultravico_enabled = gr.Checkbox(
+                    label="Enable UltraViCo",
+                    value=False,
+                    info="Apply attention decay for long video generation"
+                )
+                with gr.Group(visible=False) as wan22_ultravico_controls:
+                    with gr.Row():
+                        wan22_ultravico_alpha = gr.Slider(
+                            minimum=0.5, maximum=1.0, step=0.01,
+                            label="Alpha (Decay Factor)",
+                            value=0.9,
+                            info="Decay for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay."
+                        )
+                        wan22_ultravico_training_frames = gr.Number(
+                            label="Training Frames",
+                            value=21,
+                            minimum=5,
+                            maximum=100,
+                            step=1,
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
+                        )
+                    with gr.Row():
+                        wan22_ultravico_suppress_harmonics = gr.Checkbox(
+                            label="Suppress Harmonics",
+                            value=False,
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
+                        )
+                        wan22_ultravico_beta = gr.Slider(
+                            minimum=0.1, maximum=1.0, step=0.05,
+                            label="Beta (Harmonic Decay)",
+                            value=0.6,
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
+                        )
+                        wan22_ultravico_gamma = gr.Number(
+                            label="Gamma (Harmonic Window)",
+                            value=4,
+                            minimum=1,
+                            maximum=20,
+                            step=1,
+                            info="Frames around harmonic peaks to suppress"
+                        )
+
+        # HoloCine Tab - Multi-Shot Scenecut Video Generation
+        with gr.Tab(id=15, label="HoloCine") as holocine_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    holocine_global_caption = gr.Textbox(
+                        label="Global Caption (Scene Description)",
+                        value="The scene features a young painter, [character1], with paint-smudged cheeks and intense, focused eyes. Her hair is tied up messily. The setting is a bright, sun-drenched art studio with large windows, canvases, and the smell of oil paint.",
+                        lines=4,
+                        info="Describe the overall scene, characters, and setting. Use [character1], [character2], etc. for consistency."
+                    )
+                    holocine_shot_captions = gr.Textbox(
+                        label="Shot Captions (One Per Line)",
+                        value="Medium shot of [character1] standing back from a large canvas, brush in hand, critically observing her work.\nClose-up of her hand holding the brush, dabbing it thoughtfully onto a palette of vibrant colors.\nExtreme close-up of her eyes, narrowed in concentration as she studies the canvas.\nClose-up on the canvas, showing a detailed, textured brushstroke being slowly applied.\nMedium close-up of [character1]'s face, a small, satisfied smile appears as she finds the right color.\nOver-the-shoulder shot showing her add a final, delicate highlight to the painting.",
+                        lines=8,
+                        info="Enter one shot caption per line. Each describes what happens in that shot."
+                    )
+                    holocine_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    holocine_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    holocine_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    holocine_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+            with gr.Row():
+                holocine_generate_btn = gr.Button("Generate Multi-Shot Video", elem_classes="green-btn")
+                holocine_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        holocine_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        holocine_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    holocine_frame_num = gr.Slider(minimum=81, maximum=611, step=4, label="Frame Count", value=241, info="Must be 4n+1. Default: 241 (15s @ 16fps)")
+                    holocine_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    holocine_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=50)
+                    holocine_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0, info="HoloCine default: 5.0")
+                    holocine_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    holocine_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise model used after this threshold")
+                    holocine_sample_solver = gr.Radio(
+                        choices=["unipc", "dpm++", "vanilla", "euler", "flowmatch"],
+                        label="Sample Solver",
+                        value="unipc",
+                        info="Use 'flowmatch' for HoloCine-style scheduling"
+                    )
+                    with gr.Row():
+                        holocine_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        holocine_random_seed_btn = gr.Button("🎲")
+
+                    gr.Markdown("### Advanced Options")
+                    holocine_shot_cut_frames = gr.Textbox(
+                        label="Shot Cut Frames (Optional, Comma-separated)",
+                        value="",
+                        placeholder="e.g., 37, 73, 113, 169, 205",
+                        info="Leave empty for automatic calculation. Must be 4n+1 format."
+                    )
+
+                with gr.Column():
+                    holocine_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, allow_preview=True, preview=True
+                    )
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    holocine_attn_mode = gr.Radio(
+                        choices=["sdpa", "flash", "torch", "xformers"],
+                        label="Attention Mode",
+                        value="sdpa",
+                        info="Use 'flash' for FlashAttention (faster)"
+                    )
+                    holocine_block_swap = gr.Slider(
+                        minimum=0, maximum=39, step=1,
+                        label="Block Swap to Save VRAM",
+                        value=0,
+                        info="Offload N blocks to CPU. Try 30 if low on VRAM"
+                    )
+                with gr.Row():
+                    holocine_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    holocine_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    holocine_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    holocine_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model (.safetensors)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="HoloCine fine-tuned models (e.g., full_low_noise.safetensors)"
+                    )
+                    holocine_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model (.safetensors)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="HoloCine fine-tuned models (e.g., full_high_noise.safetensors)"
+                    )
+                with gr.Row():
+                    holocine_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    holocine_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                holocine_save_path = gr.Textbox(label="Save Path", value="outputs/holocine")
+
 # Phantom Tab (Subject-to-Video style)
         with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
             with gr.Row():
@@ -8975,8 +9762,10 @@ with gr.Blocks(
                     wan_of_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan_of_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False)
+                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime conversion to FP8")
+                    wan_of_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
                     wan_of_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
                     wan_of_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
                     wan_of_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
@@ -9061,6 +9850,7 @@ with gr.Blocks(
             wan_of_block_swap,
             wan_of_fp8,
             wan_of_fp8_scaled,
+            wan_of_fp8_prescaled,
             wan_of_fp8_t5,
             wan_of_mixed_dtype,
             wan_of_vae_fp32,
@@ -9191,7 +9981,110 @@ with gr.Blocks(
         outputs=[wan_of_dit_low_noise_path, wan_of_dit_high_noise_path, wan_of_clip_path, wan_of_conditioning_strength]
     )
 
-#multitalk event handlers
+    # LongCat event handlers
+
+    # Mode visibility toggling
+    def update_longcat_mode_visibility(mode):
+        """Update UI visibility based on selected generation mode"""
+        return {
+            longcat_i2v_input_image: gr.update(visible=(mode == "Image-to-Video")),
+            longcat_input_video: gr.update(visible=(mode in ["Video Continuation", "Long Video", "Refinement Only"])),
+            longcat_num_segments: gr.update(visible=(mode == "Long Video")),
+            longcat_num_cond_frames: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_enable_refinement: gr.update(visible=(mode in ["Video Continuation", "Long Video"])),
+            longcat_refinement_lora_path: gr.update(visible=(mode in ["Video Continuation", "Long Video", "Refinement Only"])),
+            longcat_refine_segment_size: gr.update(visible=(mode in ["Long Video", "Refinement Only"]))
+        }
+
+    longcat_generation_mode.change(
+        fn=update_longcat_mode_visibility,
+        inputs=[longcat_generation_mode],
+        outputs=[
+            longcat_i2v_input_image,
+            longcat_input_video,
+            longcat_num_segments,
+            longcat_num_cond_frames,
+            longcat_enable_refinement,
+            longcat_refinement_lora_path,
+            longcat_refine_segment_size
+        ]
+    )
+
+    # LoRA refresh functionality
+    def update_longcat_lora_dropdowns(lora_folder: str, *current_values) -> List[gr.update]:
+        """Refresh LoRA dropdown choices"""
+        new_choices = get_lora_options(lora_folder)
+        weights = current_values[:8]
+        multipliers = current_values[8:16]
+
+        results = []
+        for i in range(8):
+            # Update dropdown with new choices, keeping current value if it still exists
+            current_weight = weights[i] if i < len(weights) else "None"
+            new_value = current_weight if current_weight in new_choices else "None"
+            results.extend([
+                gr.update(choices=new_choices, value=new_value),
+                gr.update(value=multipliers[i] if i < len(multipliers) else 1.0)
+            ])
+
+        return results
+
+    longcat_lora_refresh_outputs_list = []
+    for i in range(len(longcat_lora_weights)):
+        longcat_lora_refresh_outputs_list.extend([longcat_lora_weights[i], longcat_lora_multipliers[i]])
+
+    longcat_lora_refresh_btn.click(
+        fn=update_longcat_lora_dropdowns,
+        inputs=[longcat_lora_folder] + longcat_lora_weights + longcat_lora_multipliers,
+        outputs=longcat_lora_refresh_outputs_list
+    )
+
+    # Stop button
+    longcat_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Generate button
+    longcat_generate_btn.click(
+        fn=longcat_batch_handler,
+        inputs=[
+            longcat_prompt,
+            longcat_negative_prompt,
+            longcat_width,
+            longcat_height,
+            longcat_video_length,
+            longcat_target_fps,
+            longcat_infer_steps,
+            longcat_guidance_scale,
+            longcat_seed,
+            longcat_batch_size,
+            longcat_task,
+            longcat_ckpt_dir,
+            longcat_save_path,
+            longcat_blocks_to_swap,
+            longcat_generation_mode,
+            longcat_i2v_input_image,
+            longcat_input_video,
+            longcat_num_segments,
+            longcat_num_cond_frames,
+            longcat_enable_refinement,
+            longcat_refinement_lora_path,
+            longcat_refine_segment_size,
+            longcat_output_type,
+            longcat_attn_mode,
+            longcat_lora_folder,
+            longcat_lora_weights[0], longcat_lora_multipliers[0],
+            longcat_lora_weights[1], longcat_lora_multipliers[1],
+            longcat_lora_weights[2], longcat_lora_multipliers[2],
+            longcat_lora_weights[3], longcat_lora_multipliers[3],
+            longcat_lora_weights[4], longcat_lora_multipliers[4],
+            longcat_lora_weights[5], longcat_lora_multipliers[5],
+            longcat_lora_weights[6], longcat_lora_multipliers[6],
+            longcat_lora_weights[7], longcat_lora_multipliers[7]
+        ],
+        outputs=[longcat_video_output, longcat_batch_progress, longcat_progress_text],
+        queue=True
+    )
+
+    #multitalk event handlers
     multitalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     multitalk_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[multitalk_seed])
     multitalk_cond_image.change(
@@ -9290,7 +10183,7 @@ with gr.Blocks(
     )
     
     infinitetalk_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-    
+
     infinitetalk_random_seed_btn.click(
         fn=set_random_seed,
         inputs=None,
@@ -9377,7 +10270,7 @@ with gr.Blocks(
     )
 
     fpe_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-    
+
     def handle_fpe_gallery_select(evt: gr.SelectData) -> int:
         return evt.index
     fpe_output_gallery.select(fn=handle_fpe_gallery_select, outputs=fpe_selected_index)
@@ -10449,37 +11342,43 @@ with gr.Blocks(
     )
     
     # Add a function to handle video transfer to wan22 tab
-    def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str]:
+    def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str, Optional[str]]:
         """Handle both parameters and video transfer from Video Info to Wan2.2 tab"""
         if not metadata:
             metadata = {}
-        
-        # If we have a video, enable V2V mode automatically
+
+        first_frame_path = None
+        # If we have a video, enable V2V mode and extract first frame
         if video_path:
             metadata["enable_v2v"] = True
-            
-        return f"Parameters ready for Wan2.2", metadata, video_path
+            first_frame_path = extract_first_frame(video_path)
+
+        return f"Parameters ready for Wan2.2", metadata, video_path, first_frame_path
 
 # Wan2.2 send-to logic
     send_to_wan22_btn.click(
         fn=handle_send_to_wan22_tab,
         inputs=[metadata_output, video_input],
-        outputs=[status, params_state, wan22_input_video]
+        outputs=[status, params_state, wan22_input_video, wan22_input_image]
     ).then(
         # This lambda function is updated to return values for all 8 LoRAs and other new controls.
-        lambda params, video_path: (
+        lambda params, video_path, first_frame: (
             (
                 # Helper to safely get and pad LoRA lists from metadata
                 (weights_from_meta := params.get("lora_weights", [])),
                 (mults_from_meta := params.get("lora_multipliers", [])),
+                (apply_low_from_meta := params.get("lora_apply_low", [])),
+                (apply_high_from_meta := params.get("lora_apply_high", [])),
                 (padded_weights := (weights_from_meta + ["None"] * 8)[:8]),
                 (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 8)[:8]),
-                
+                (padded_apply_low := ([bool(v) for v in apply_low_from_meta] + [True] * 8)[:8]),
+                (padded_apply_high := ([bool(v) for v in apply_high_from_meta] + [False] * 8)[:8]),
+
                 # Create the full list of return values
                 [
                     params.get("prompt", ""),
                     params.get("negative_prompt", ""),
-                    None,  # image_path
+                    first_frame,  # image_path - use extracted first frame
                     params.get("task", "i2v-A14B"),
                     params.get('width', 832),
                     params.get('height', 480),
@@ -10509,9 +11408,9 @@ with gr.Blocks(
                     # LoRAs
                     "lora",  # lora_folder
                     *padded_weights,          # Unpack 8 LoRA weights
-                    *padded_mults,            # FIX: Corrected variable name from padded_multipliers
-                    *[True] * 8,              # Defaults for 8 "apply low" checkboxes
-                    *[False] * 8,             # Defaults for 8 "apply high" checkboxes
+                    *padded_mults,            # Unpack 8 LoRA multipliers
+                    *padded_apply_low,        # Unpack 8 "apply low" checkboxes from metadata
+                    *padded_apply_high,       # Unpack 8 "apply high" checkboxes from metadata
                     # Previews & Performance
                     True,  # enable_preview
                     5,  # preview_steps
@@ -10523,7 +11422,7 @@ with gr.Blocks(
                 ]
             )[-1] # Return the created list
         ),
-        inputs=[params_state, wan22_input_video],
+        inputs=[params_state, wan22_input_video, wan22_input_image],
         outputs=[
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
@@ -11124,9 +12023,9 @@ with gr.Blocks(
         outputs=merge_refresh_outputs
     )
     # Event handlers
-    prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
+    # prompt.change(fn=count_prompt_tokens, inputs=prompt, outputs=token_counter)
+    # Removed - old Hunyuan-t2v tab
     v2v_prompt.change(fn=count_prompt_tokens, inputs=v2v_prompt, outputs=v2v_token_counter)
-    stop_btn.click(fn=lambda: stop_event.set(), queue=False)
     v2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
 
     #Image_to_Video
@@ -11371,7 +12270,14 @@ with gr.Blocks(
         inputs=[wan22_use_context_windows],
         outputs=[wan22_context_controls]
     )
-    
+
+    # UltraViCo visibility toggle
+    wan22_ultravico_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_ultravico_enabled],
+        outputs=[wan22_ultravico_controls]
+    )
+
     # Extension visibility toggle
     wan22_enable_extension.change(
         fn=lambda enabled: gr.update(visible=enabled),
@@ -11510,6 +12416,8 @@ with gr.Blocks(
             wan22_block_swap,
             wan22_fp8,
             wan22_fp8_scaled,
+            wan22_fp8_prescaled,
+            wan22_fp8_fast,
             wan22_fp8_t5,
             wan22_dit_low_noise_path,
             wan22_dit_high_noise_path,
@@ -11526,10 +12434,11 @@ with gr.Blocks(
             # Previews
             wan22_enable_preview,
             wan22_preview_steps,
-            # ADD THIS:
             wan22_dynamic_model_loading,
             wan22_unload_text_encoders,
             wan22_vae_fp32,
+            # Compile options
+            wan22_compile,
             # V2V arguments
             wan22_enable_v2v,
             wan22_input_video,
@@ -11548,6 +12457,14 @@ with gr.Blocks(
             wan22_context_stride,
             wan22_context_closed_loop,
             wan22_context_fuse_method,
+            wan22_context_end_image,
+            # UltraViCo arguments
+            wan22_ultravico_enabled,
+            wan22_ultravico_alpha,
+            wan22_ultravico_training_frames,
+            wan22_ultravico_suppress_harmonics,
+            wan22_ultravico_beta,
+            wan22_ultravico_gamma,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
         queue=True
@@ -11574,6 +12491,57 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== HoloCine Button Handlers =====
+    holocine_generate_btn.click(
+        fn=holocine_batch_handler,
+        inputs=[
+            holocine_global_caption,
+            holocine_shot_captions,
+            holocine_negative_prompt,
+            holocine_width,
+            holocine_height,
+            holocine_frame_num,
+            holocine_fps,
+            holocine_seed,
+            holocine_sample_solver,
+            holocine_sample_steps,
+            holocine_flow_shift,
+            holocine_sample_guide_scale,
+            holocine_dual_dit_boundary,
+            holocine_batch_size,
+            holocine_save_path,
+            holocine_attn_mode,
+            holocine_block_swap,
+            holocine_fp8_t5,
+            holocine_dit_low_noise_path,
+            holocine_dit_high_noise_path,
+            holocine_vae_path,
+            holocine_t5_path,
+            holocine_shot_cut_frames,
+        ],
+        outputs=[holocine_output, holocine_batch_progress, holocine_progress_text],
+        queue=True
+    )
+
+    holocine_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    holocine_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[holocine_seed])
+
+    # Refresh models for HoloCine
+    def refresh_holocine_models(folder: str):
+        """Refresh model dropdowns for HoloCine"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    holocine_refresh_models_btn.click(
+        fn=refresh_holocine_models,
+        inputs=[holocine_model_folder],
+        outputs=[holocine_dit_low_noise_path, holocine_dit_high_noise_path, holocine_vae_path, holocine_t5_path]
     )
 
     #Video Info
@@ -11666,66 +12634,71 @@ with gr.Blocks(
         outputs=[metadata_output, status]
     )
 
-    send_to_t2v_btn.click(
-        fn=lambda m: send_parameters_to_tab(m, "t2v"),
-        inputs=metadata_output,
-        outputs=[status, params_state]
-    ).then(
-        fn=change_to_tab_one, inputs=None, outputs=[tabs]
-    ).then(
-        lambda params: [
-            params.get("prompt", ""),
-            params.get("width", 544),              # Parameter mapping is fine here
-            params.get("height", 544),             # Parameter mapping is fine here
-            params.get("batch_size", 1),
-            params.get("video_length", 25),
-            params.get("fps", 24),
-            params.get("infer_steps", 30),
-            params.get("seed", -1),
-            params.get("model", "hunyuan/mp_rank_00_model_states.pt"),
-            params.get("vae", "hunyuan/pytorch_model.pt"),
-            params.get("te1", "hunyuan/llava_llama3_fp16.safetensors"),
-            params.get("te2", "hunyuan/clip_l.safetensors"),
-            params.get("save_path", "outputs"),
-            params.get("flow_shift", 11.0),
-            params.get("cfg_scale", 7.0),
-            params.get("output_type", "video"),
-            params.get("attn_mode", "sdpa"),
-            params.get("block_swap", "0"),
-            *[params.get(f"lora{i+1}", "") for i in range(4)],
-            *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
-        ] if params else [gr.update()]*26, # This lambda returns values based on param keys
-        inputs=params_state,
-        outputs=[prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps, seed, # <<< CORRECTED HERE: use t2v_width, t2v_height
-                 model, vae, te1, te2, save_path, flow_shift, cfg_scale,
-                 output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
-    )
-    # Text to Video generation
-    generate_btn.click(
-        fn=process_batch,
-        inputs=[
-            prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
-            seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
-            output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
-            lora_folder, *lora_weights, *lora_multipliers, gr.Textbox(visible=False), gr.Number(visible=False), use_fp8
-        ],
-        outputs=[video_output, batch_progress, progress_text],
-        queue=True
-    ).then(
-        fn=lambda batch_size: 0 if batch_size == 1 else None,
-        inputs=[batch_size],
-        outputs=selected_index
-    )    
+    # NOTE: The following event handlers reference the old Hunyuan-t2v tab variables
+    # (prompt, generate_btn, video_output, send_t2v_to_v2v_btn, etc.) which no longer exist.
+    # These sections have been commented out since the tab was replaced with LongCat.
 
-    # Update gallery selection handling
-    def handle_gallery_select(evt: gr.SelectData) -> int:
-        return evt.index
+    # send_to_t2v_btn.click(
+    #     fn=lambda m: send_parameters_to_tab(m, "t2v"),
+    #     inputs=metadata_output,
+    #     outputs=[status, params_state]
+    # ).then(
+    #     fn=change_to_tab_one, inputs=None, outputs=[tabs]
+    # ).then(
+    #     lambda params: [
+    #         params.get("prompt", ""),
+    #         params.get("width", 544),
+    #         params.get("height", 544),
+    #         params.get("batch_size", 1),
+    #         params.get("video_length", 25),
+    #         params.get("fps", 24),
+    #         params.get("infer_steps", 30),
+    #         params.get("seed", -1),
+    #         params.get("model", "hunyuan/mp_rank_00_model_states.pt"),
+    #         params.get("vae", "hunyuan/pytorch_model.pt"),
+    #         params.get("te1", "hunyuan/llava_llama3_fp16.safetensors"),
+    #         params.get("te2", "hunyuan/clip_l.safetensors"),
+    #         params.get("save_path", "outputs"),
+    #         params.get("flow_shift", 11.0),
+    #         params.get("cfg_scale", 7.0),
+    #         params.get("output_type", "video"),
+    #         params.get("attn_mode", "sdpa"),
+    #         params.get("block_swap", "0"),
+    #         *[params.get(f"lora{i+1}", "") for i in range(4)],
+    #         *[params.get(f"lora{i+1}_multiplier", 1.0) for i in range(4)]
+    #     ] if params else [gr.update()]*26,
+    #     inputs=params_state,
+    #     outputs=[prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps, seed,
+    #              model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+    #              output_type, attn_mode, block_swap] + lora_weights + lora_multipliers
+    # )
 
-    # Track selected index when gallery item is clicked
-    video_output.select(
-        fn=handle_gallery_select,
-        outputs=selected_index
-    )
+    # # Text to Video generation
+    # generate_btn.click(
+    #     fn=process_batch,
+    #     inputs=[
+    #         prompt, t2v_width, t2v_height, batch_size, video_length, fps, infer_steps,
+    #         seed, dit_folder, model, vae, te1, te2, save_path, flow_shift, cfg_scale,
+    #         output_type, attn_mode, block_swap, exclude_single_blocks, use_split_attn,
+    #         lora_folder, *lora_weights, *lora_multipliers, gr.Textbox(visible=False), gr.Number(visible=False), use_fp8
+    #     ],
+    #     outputs=[video_output, batch_progress, progress_text],
+    #     queue=True
+    # ).then(
+    #     fn=lambda batch_size: 0 if batch_size == 1 else None,
+    #     inputs=[batch_size],
+    #     outputs=selected_index
+    # )
+
+    # # Update gallery selection handling
+    # def handle_gallery_select(evt: gr.SelectData) -> int:
+    #     return evt.index
+    #
+    # # Track selected index when gallery item is clicked
+    # video_output.select(
+    #     fn=handle_gallery_select,
+    #     outputs=selected_index
+    # )
 
     # Track selected index when Video2Video gallery item is clicked
     def handle_v2v_gallery_select(evt: gr.SelectData) -> int:
@@ -11808,30 +12781,30 @@ with gr.Blocks(
             lora4_multiplier,
             ""  # Add empty string for negative_prompt
         )
-    
-    send_t2v_to_v2v_btn.click(
-        fn=handle_send_button,
-        inputs=[
-            video_output, prompt, selected_index,
-            t2v_width, t2v_height, batch_size, video_length,
-            fps, infer_steps, seed, flow_shift, cfg_scale
-        ] + lora_weights + lora_multipliers,  # Remove the string here
-        outputs=[
-            v2v_input, 
-            v2v_prompt,
-            v2v_width,
-            v2v_height,
-            v2v_batch_size,
-            v2v_video_length,
-            v2v_fps,
-            v2v_infer_steps,
-            v2v_seed,
-            v2v_flow_shift,
-            v2v_cfg_scale
-        ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
-    ).then(
-        fn=change_to_tab_two, inputs=None, outputs=[tabs]
-    )
+
+    # send_t2v_to_v2v_btn.click(
+    #     fn=handle_send_button,
+    #     inputs=[
+    #         video_output, prompt, selected_index,
+    #         t2v_width, t2v_height, batch_size, video_length,
+    #         fps, infer_steps, seed, flow_shift, cfg_scale
+    #     ] + lora_weights + lora_multipliers,
+    #     outputs=[
+    #         v2v_input,
+    #         v2v_prompt,
+    #         v2v_width,
+    #         v2v_height,
+    #         v2v_batch_size,
+    #         v2v_video_length,
+    #         v2v_fps,
+    #         v2v_infer_steps,
+    #         v2v_seed,
+    #         v2v_flow_shift,
+    #         v2v_cfg_scale
+    #     ] + v2v_lora_weights + v2v_lora_multipliers + [v2v_negative_prompt]
+    # ).then(
+    #     fn=change_to_tab_two, inputs=None, outputs=[tabs]
+    # )
 
     def handle_send_to_v2v(metadata: dict, video_path: str) -> Tuple[str, dict, str]:
         """Handle both parameters and video transfer"""
@@ -11943,15 +12916,15 @@ with gr.Blocks(
         inputs=[v2v_batch_size],
         outputs=v2v_selected_index
     )
-    refresh_outputs = [model]  # Add model dropdown to outputs
-    for i in range(4):
-        refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
-    
-    refresh_btn.click(
-        fn=update_dit_and_lora_dropdowns,
-        inputs=[dit_folder, lora_folder, model] + lora_weights + lora_multipliers,
-        outputs=refresh_outputs
-    )
+    # refresh_outputs = [model]  # Add model dropdown to outputs
+    # for i in range(4):
+    #     refresh_outputs.extend([lora_weights[i], lora_multipliers[i]])
+    #
+    # refresh_btn.click(
+    #     fn=update_dit_and_lora_dropdowns,
+    #     inputs=[dit_folder, lora_folder, model] + lora_weights + lora_multipliers,
+    #     outputs=refresh_outputs
+    # )
     # Image2Video refresh
     i2v_refresh_outputs = [i2v_model]  # Add model dropdown to outputs
     for i in range(4):
@@ -11977,7 +12950,7 @@ with gr.Blocks(
     # WanX-i2v tab connections
     wanx_prompt.change(fn=count_prompt_tokens, inputs=wanx_prompt, outputs=wanx_token_counter)
     wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-    
+
     # Image input handling for WanX-i2v
     wanx_input.change(
         fn=update_wanx_image_dimensions,
