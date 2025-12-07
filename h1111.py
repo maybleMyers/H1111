@@ -9074,10 +9074,8 @@ with gr.Blocks(
                 with gr.Column():
                     # Input images for SVI
                     with gr.Row():
-                        svi_input_image = gr.Image(label="Input Image (Required)", type="filepath",
-                                                  info="Starting image for first clip")
-                        svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath",
-                                                   info="Reference for cross-clip consistency. Defaults to input image.")
+                        svi_input_image = gr.Image(label="Input Image (Required - Starting image for first clip)", type="filepath")
+                        svi_anchor_image = gr.Image(label="Anchor Image (Optional - Defaults to input image)", type="filepath")
 
                     # SVI-specific settings
                     gr.Markdown("### SVI Multi-Clip Settings")
