@@ -4199,6 +4199,7 @@ def generate_svi_multi_clip(
     original_prompt = args.prompt
     original_anchor_image = getattr(args, 'anchor_image', None)
     original_svi_mode = getattr(args, 'svi_mode', False)
+    original_seed = args.seed  # Store original seed for per-clip variation
 
     # Create temp directory for intermediate outputs
     temp_dir = tempfile.mkdtemp()
@@ -4213,6 +4214,12 @@ def generate_svi_multi_clip(
 
         for clip_idx in range(num_clips):
             logger.info(f"=== Generating clip {clip_idx + 1}/{num_clips} ===")
+
+            # SVI: Vary seed per clip for different motion (following SVI reference implementation)
+            # seed = clip_idx * seed_multiplier pattern from Stable-Video-Infinity
+            clip_seed = original_seed + clip_idx * 42
+            args.seed = clip_seed
+            logger.info(f"Clip {clip_idx + 1} seed: {clip_seed} (base: {original_seed}, offset: {clip_idx * 42})")
 
             # Set prompt for this clip
             if prompts and clip_idx < len(prompts):
@@ -4270,6 +4277,7 @@ def generate_svi_multi_clip(
         args.prompt = original_prompt
         args.anchor_image = original_anchor_image
         args.svi_mode = original_svi_mode
+        args.seed = original_seed  # Restore original seed
 
         # Cleanup temp directory
         if os.path.exists(temp_dir):
