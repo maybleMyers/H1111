@@ -5760,13 +5760,13 @@ def main():
 
             # Save the video
             if args.output_type in ("video", "both"):
-                video_path = os.path.join(args.output, f"{output_base}.mp4")
+                video_path = os.path.join(args.save_path, f"{output_base}.mp4")
                 save_videos_grid(final_video_tensor, video_path, fps=args.fps, rescale=False)
                 logger.info(f"SVI multi-clip video saved to: {video_path}")
 
             # Save as images if requested
             if args.output_type in ("images", "both"):
-                image_dir = os.path.join(args.output, output_base)
+                image_dir = os.path.join(args.save_path, output_base)
                 os.makedirs(image_dir, exist_ok=True)
                 save_images_grid(final_video_tensor, image_dir, "frame", rescale=False, save_individually=True)
                 logger.info(f"SVI multi-clip frames saved to: {image_dir}")
