@@ -891,12 +891,16 @@ def svi_batch_handler(
             command.append("--prompt_list")
             command.extend(prompt_list[:effective_num_clips])
 
-        # Anchor image
+        # SVI mode and anchor image
+        # Always enable SVI mode for multi-clip generation
+        command.append("--svi_mode")
+
+        # Anchor image: use provided anchor or fall back to input image
         if anchor_image_path and os.path.exists(anchor_image_path):
             command.extend(["--anchor_image", str(anchor_image_path)])
         else:
             # Use input image as anchor (default SVI behavior)
-            command.append("--svi_mode")
+            command.extend(["--anchor_image", str(image_path)])
 
         # SVI LoRA format conversion
         if svi_lora:

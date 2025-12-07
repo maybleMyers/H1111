@@ -254,6 +254,7 @@ def convert_svi_lora_keys(svi_state_dict: dict, verbose: bool = True) -> dict:
     """Convert SVI/DiffSynth LoRA keys to Kohya/Musubi format.
 
     SVI format:  blocks.0.self_attn.q.lora_up.weight / blocks.0.self_attn.q.lora_A.weight
+                 blocks.0.self_attn.q.lora_down.default.weight (with .default suffix)
     Target:      lora_unet_blocks_0_self_attn_q.lora_up.weight / lora_unet_blocks_0_self_attn_q.lora_down.weight
 
     Args:
@@ -278,6 +279,11 @@ def convert_svi_lora_keys(svi_state_dict: dict, verbose: bool = True) -> dict:
             elif '.lora_B.' in key:
                 new_key = key.replace('.lora_B.', '.lora_up.')
             # lora_up/lora_down are already correct naming
+
+            # Remove .default. from keys (SVI LoRA uses .lora_down.default.weight format)
+            # Convert to standard .lora_down.weight format
+            new_key = new_key.replace('.default.weight', '.weight')
+            new_key = new_key.replace('.default.bias', '.bias')
 
             # Convert dot notation to underscore and add prefix
             # e.g., blocks.0.self_attn.q.lora_up.weight -> lora_unet_blocks_0_self_attn_q.lora_up.weight
@@ -335,7 +341,11 @@ def detect_svi_lora_format(state_dict: dict) -> bool:
         # SVI format indicators:
         # 1. Keys start with 'blocks.' (not 'lora_unet_blocks_')
         # 2. Contains '.lora_A.' or '.lora_B.' or '.lora_up.' or '.lora_down.'
+        # 3. May contain '.default.weight' suffix (SVI-specific pattern)
         if key.startswith('blocks.') and '.lora_' in key:
+            return True
+        # Also detect by .default.weight pattern which is SVI-specific
+        if '.default.weight' in key and '.lora_' in key:
             return True
     return False
 
@@ -4223,8 +4233,8 @@ def generate_svi_multi_clip(
                 raise RuntimeError(f"Failed to generate clip {clip_idx + 1}")
 
             # Decode latent to pixels
-            from wan.configs import WAN_CONFIGS
-            cfg = WAN_CONFIGS[args.task]
+            from Wan2_2.wan.configs import WAN_CONFIGS as WAN22_CONFIGS
+            cfg = WAN22_CONFIGS[args.task]
             clip_tensor = decode_latent(clip_latent, args, cfg)  # [1, C, F, H, W], range [0, 1]
             logger.info(f"Clip {clip_idx + 1} generated with shape: {clip_tensor.shape}")
 
