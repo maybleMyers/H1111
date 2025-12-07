@@ -248,6 +248,280 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+# ========================= SVI (Stable-Video-Infinity) Utility Functions =========================
+
+def convert_svi_lora_keys(svi_state_dict: dict, verbose: bool = True) -> dict:
+    """Convert SVI/DiffSynth LoRA keys to Kohya/Musubi format.
+
+    SVI format:  blocks.0.self_attn.q.lora_up.weight / blocks.0.self_attn.q.lora_A.weight
+    Target:      lora_unet_blocks_0_self_attn_q.lora_up.weight / lora_unet_blocks_0_self_attn_q.lora_down.weight
+
+    Args:
+        svi_state_dict: State dict with SVI/DiffSynth format LoRA keys
+        verbose: Whether to log conversion details
+
+    Returns:
+        Converted state dict with Kohya format keys
+    """
+    converted = {}
+    converted_count = 0
+    skipped_count = 0
+
+    for key, value in svi_state_dict.items():
+        new_key = key
+
+        # Detect SVI format: keys start with 'blocks.' and contain '.lora_' patterns
+        if key.startswith('blocks.') and '.lora_' in key:
+            # Handle lora_A/lora_B naming (SVI/DiffSynth style)
+            if '.lora_A.' in key:
+                new_key = key.replace('.lora_A.', '.lora_down.')
+            elif '.lora_B.' in key:
+                new_key = key.replace('.lora_B.', '.lora_up.')
+            # lora_up/lora_down are already correct naming
+
+            # Convert dot notation to underscore and add prefix
+            # e.g., blocks.0.self_attn.q.lora_up.weight -> lora_unet_blocks_0_self_attn_q.lora_up.weight
+            parts = new_key.split('.')
+            # Find the split point (lora_up or lora_down)
+            for i, part in enumerate(parts):
+                if part in ('lora_up', 'lora_down'):
+                    module_path = '_'.join(parts[:i])  # everything before lora_up/down
+                    lora_part = '.'.join(parts[i:])    # lora_up.weight or lora_down.weight
+                    new_key = f"lora_unet_{module_path}.{lora_part}"
+                    break
+
+            converted_count += 1
+        elif '.lora_' in key:
+            # Non-blocks keys with LoRA (handle other possible module prefixes)
+            skipped_count += 1
+            if verbose:
+                logger.debug(f"Skipping non-block LoRA key: {key}")
+        else:
+            # Non-LoRA keys (alpha, etc.) - keep as-is but also add prefix if needed
+            if key.startswith('blocks.') and 'alpha' in key:
+                # Convert alpha keys too
+                parts = key.split('.')
+                for i, part in enumerate(parts):
+                    if 'alpha' in part:
+                        module_path = '_'.join(parts[:i])
+                        alpha_part = '.'.join(parts[i:])
+                        new_key = f"lora_unet_{module_path}.{alpha_part}"
+                        break
+                converted_count += 1
+            else:
+                skipped_count += 1
+
+        converted[new_key] = value
+
+    if verbose:
+        logger.info(f"SVI LoRA conversion: {converted_count} keys converted, {skipped_count} keys kept as-is")
+        if converted_count > 0:
+            sample_keys = list(converted.keys())[:3]
+            logger.info(f"Sample converted keys: {sample_keys}")
+
+    return converted
+
+
+def detect_svi_lora_format(state_dict: dict) -> bool:
+    """Detect if a state dict uses SVI/DiffSynth LoRA format.
+
+    Args:
+        state_dict: LoRA state dict to check
+
+    Returns:
+        True if SVI format detected, False otherwise
+    """
+    for key in state_dict.keys():
+        # SVI format indicators:
+        # 1. Keys start with 'blocks.' (not 'lora_unet_blocks_')
+        # 2. Contains '.lora_A.' or '.lora_B.' or '.lora_up.' or '.lora_down.'
+        if key.startswith('blocks.') and '.lora_' in key:
+            return True
+    return False
+
+
+class TeaCacheManager:
+    """Manages TeaCache feature caching for accelerated inference.
+
+    TeaCache caches intermediate DiT block outputs when the L1 difference
+    from the previous step is below a threshold, skipping redundant computations.
+    """
+
+    def __init__(self, l1_thresh: float = 0.1, start_step: int = 2, end_ratio: float = 0.8):
+        """Initialize TeaCache manager.
+
+        Args:
+            l1_thresh: L1 threshold for cache hit. Lower = more aggressive caching.
+            start_step: Start caching after this step (allow model to "warm up").
+            end_ratio: Stop caching after this ratio of total steps.
+        """
+        self.l1_thresh = l1_thresh
+        self.start_step = start_step
+        self.end_ratio = end_ratio
+        self.cache = {}
+        self.prev_features = None
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.enabled = True
+
+    def reset(self):
+        """Reset cache state for new generation."""
+        self.cache = {}
+        self.prev_features = None
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def should_cache(self, step: int, total_steps: int) -> bool:
+        """Check if caching should be active for this step."""
+        if not self.enabled or self.l1_thresh is None:
+            return False
+        if step < self.start_step:
+            return False
+        if step > int(total_steps * self.end_ratio):
+            return False
+        return True
+
+    def check_cache(self, features: torch.Tensor, step: int, total_steps: int) -> tuple:
+        """Check if cached features can be reused.
+
+        Args:
+            features: Current intermediate features
+            step: Current denoising step
+            total_steps: Total number of steps
+
+        Returns:
+            Tuple of (use_cache: bool, cached_output: Optional[Tensor])
+        """
+        if not self.should_cache(step, total_steps):
+            self.prev_features = features.clone()
+            return False, None
+
+        if self.prev_features is None:
+            self.prev_features = features.clone()
+            self.cache_misses += 1
+            return False, None
+
+        # Calculate L1 difference
+        l1_diff = (features - self.prev_features).abs().mean().item()
+
+        if l1_diff < self.l1_thresh and 'output' in self.cache:
+            self.cache_hits += 1
+            return True, self.cache['output']
+        else:
+            self.cache_misses += 1
+            self.prev_features = features.clone()
+            return False, None
+
+    def store_cache(self, output: torch.Tensor):
+        """Store output in cache for potential reuse."""
+        self.cache['output'] = output.clone()
+
+    def get_stats(self) -> dict:
+        """Get cache hit/miss statistics."""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0
+        return {
+            'hits': self.cache_hits,
+            'misses': self.cache_misses,
+            'total': total,
+            'hit_rate': hit_rate
+        }
+
+
+class SVISlidingWindowDenoiser:
+    """Sliding window denoiser for temporal consistency in long videos.
+
+    Processes video in overlapping temporal windows, blending the results
+    for smooth transitions and memory efficiency.
+    """
+
+    def __init__(self, window_size: int, stride: int = None):
+        """Initialize sliding window denoiser.
+
+        Args:
+            window_size: Size of each temporal window in latent frames
+            stride: Stride between windows. Defaults to window_size // 2.
+        """
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+
+    def get_windows(self, num_frames: int) -> list:
+        """Calculate window positions for the given number of frames.
+
+        Args:
+            num_frames: Total number of latent frames
+
+        Returns:
+            List of (start, end) tuples for each window
+        """
+        windows = []
+        start = 0
+        while start < num_frames:
+            end = min(start + self.window_size, num_frames)
+            windows.append((start, end))
+            if end >= num_frames:
+                break
+            start += self.stride
+        return windows
+
+    def blend_windows(self, window_outputs: list, window_positions: list, num_frames: int) -> torch.Tensor:
+        """Blend overlapping window outputs with linear interpolation.
+
+        Args:
+            window_outputs: List of output tensors from each window
+            window_positions: List of (start, end) tuples
+            num_frames: Total number of frames in output
+
+        Returns:
+            Blended output tensor
+        """
+        if len(window_outputs) == 1:
+            return window_outputs[0]
+
+        # Get output shape from first window
+        sample = window_outputs[0]
+        device = sample.device
+        dtype = sample.dtype
+
+        # Initialize output and weight accumulator
+        output_shape = list(sample.shape)
+        output_shape[1] = num_frames  # Adjust frame dimension
+        output = torch.zeros(output_shape, device=device, dtype=dtype)
+        weights = torch.zeros(num_frames, device=device, dtype=torch.float32)
+
+        for window_out, (start, end) in zip(window_outputs, window_positions):
+            window_len = end - start
+
+            # Create blending weights (linear ramp at edges)
+            blend = torch.ones(window_len, device=device, dtype=torch.float32)
+
+            # Ramp up at start (if not first window)
+            if start > 0:
+                ramp_len = min(self.window_size - self.stride, window_len // 2)
+                if ramp_len > 0:
+                    blend[:ramp_len] = torch.linspace(0, 1, ramp_len, device=device)
+
+            # Ramp down at end (if not last window)
+            if end < num_frames:
+                ramp_len = min(self.window_size - self.stride, window_len // 2)
+                if ramp_len > 0:
+                    blend[-ramp_len:] = torch.linspace(1, 0, ramp_len, device=device)
+
+            # Apply weighted contribution
+            blend_expanded = blend.view(1, -1, 1, 1)  # [1, F, 1, 1] for broadcasting
+            output[:, start:end] += window_out[:, :window_len] * blend_expanded
+            weights[start:end] += blend
+
+        # Normalize by total weights
+        weights = weights.clamp(min=1e-6)
+        output = output / weights.view(1, -1, 1, 1)
+
+        return output
+
+
+# ========================= End SVI Utility Functions =========================
+
+
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Wan 2.2 inference script with new model architecture support")
@@ -489,6 +763,44 @@ def parse_args() -> argparse.Namespace:
                        help="UltraViCo: Decay factor for harmonic risk positions (only with --ultravico_suppress_harmonics). Default: 0.6")
     parser.add_argument("--ultravico_gamma", type=int, default=4,
                        help="UltraViCo: Number of frames around harmonic peaks to suppress. Default: 4")
+
+    # ========================= SVI (Stable-Video-Infinity) Arguments =========================
+    # Anchor mechanism for cross-clip consistency
+    parser.add_argument("--anchor_image", type=str, default=None,
+                       help="Path to anchor image for SVI cross-clip consistency. Fills non-first frames with anchor instead of zeros.")
+    parser.add_argument("--svi_mode", action="store_true",
+                       help="Enable SVI mode for multi-clip streaming video generation with anchor padding.")
+
+    # Multi-clip streaming generation
+    parser.add_argument("--num_clips", type=int, default=1,
+                       help="Number of clips to generate for multi-clip streaming (SVI mode). Each clip uses last frame of previous clip as input.")
+    parser.add_argument("--prompt_list", type=str, nargs="*", default=None,
+                       help="List of prompts for multi-clip generation. One prompt per clip. If fewer prompts than clips, last prompt is repeated.")
+    parser.add_argument("--overlap_frames", type=int, default=1,
+                       help="Number of overlapping frames between clips for smooth transitions (SVI mode).")
+
+    # SVI LoRA format support
+    parser.add_argument("--svi_lora", action="store_true",
+                       help="Convert SVI/DiffSynth format LoRA keys to Kohya format before loading.")
+
+    # TeaCache acceleration
+    parser.add_argument("--tea_cache_l1_thresh", type=float, default=None,
+                       help="TeaCache L1 threshold for feature caching acceleration. Recommended: 0.05-0.15. None disables TeaCache.")
+    parser.add_argument("--tea_cache_start_step", type=int, default=2,
+                       help="TeaCache: Start caching after this many steps. Default: 2")
+    parser.add_argument("--tea_cache_end_ratio", type=float, default=0.8,
+                       help="TeaCache: Stop caching after this ratio of total steps. Default: 0.8")
+
+    # CFG merge for efficiency
+    parser.add_argument("--cfg_merge", action="store_true",
+                       help="Merge conditional and unconditional predictions in a single forward pass (2x batch). Faster but uses more VRAM.")
+
+    # Temporal sliding window for denoising
+    parser.add_argument("--svi_sliding_window_size", type=int, default=None,
+                       help="SVI sliding window size in latent frames for temporal denoising. None disables sliding window.")
+    parser.add_argument("--svi_sliding_window_stride", type=int, default=None,
+                       help="SVI sliding window stride in latent frames. Defaults to window_size // 2 if not specified.")
+    # ========================= End SVI Arguments =========================
 
     args = parser.parse_args()
 
@@ -1428,23 +1740,28 @@ def load_dit_model(
     
     if args.lora_weight is not None and len(args.lora_weight) > 0:
         lora_weights_list_low = []
-        
+
         for i, lora_path in enumerate(args.lora_weight):
             logger.info(f"Loading LoRA weight from: {lora_path}")
             lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
-            
+
+            # SVI LoRA format conversion: auto-detect or force with --svi_lora
+            if getattr(args, 'svi_lora', False) or detect_svi_lora_format(lora_sd):
+                logger.info(f"Detected SVI/DiffSynth LoRA format, converting keys...")
+                lora_sd = convert_svi_lora_keys(lora_sd, verbose=True)
+
             # Apply include/exclude patterns if specified
             include_pattern = None
             exclude_pattern = None
-            
+
             if args.include_patterns is not None and i < len(args.include_patterns):
                 include_pattern = args.include_patterns[i]
             if args.exclude_patterns is not None and i < len(args.exclude_patterns):
                 exclude_pattern = args.exclude_patterns[i]
-            
+
             if include_pattern or exclude_pattern:
                 lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
-            
+
             lora_weights_list_low.append(lora_sd)
         
         # Set up multipliers
@@ -1456,23 +1773,28 @@ def load_dit_model(
     # Load high noise model LoRA weights if specified
     if hasattr(args, 'lora_weight_high') and args.lora_weight_high is not None and len(args.lora_weight_high) > 0:
         lora_weights_list_high = []
-        
+
         for i, lora_path in enumerate(args.lora_weight_high):
             logger.info(f"Loading LoRA weight for high noise model from: {lora_path}")
             lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
-            
+
+            # SVI LoRA format conversion: auto-detect or force with --svi_lora
+            if getattr(args, 'svi_lora', False) or detect_svi_lora_format(lora_sd):
+                logger.info(f"Detected SVI/DiffSynth LoRA format for high noise LoRA, converting keys...")
+                lora_sd = convert_svi_lora_keys(lora_sd, verbose=True)
+
             # Apply include/exclude patterns if specified
             include_pattern = None
             exclude_pattern = None
-            
+
             if hasattr(args, 'include_patterns_high') and args.include_patterns_high is not None and i < len(args.include_patterns_high):
                 include_pattern = args.include_patterns_high[i]
             if hasattr(args, 'exclude_patterns_high') and args.exclude_patterns_high is not None and i < len(args.exclude_patterns_high):
                 exclude_pattern = args.exclude_patterns_high[i]
-            
+
             if include_pattern or exclude_pattern:
                 lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
-            
+
             lora_weights_list_high.append(lora_sd)
         
         # Set up multipliers
@@ -2215,11 +2537,37 @@ def prepare_i2v_inputs(
 
             img_padded = img_resized # Start with [C, 1, H, W]
             if padding_frames_needed > 0:
+                 # === SVI ANCHOR MECHANISM ===
+                 # If anchor_image is specified, use it for padding instead of zeros
+                 # This enables cross-clip consistency in SVI mode
+                 anchor_tensor = None
+                 if getattr(args, 'anchor_image', None) is not None:
+                     try:
+                         anchor_img = Image.open(args.anchor_image).convert("RGB")
+                         anchor_cv2 = np.array(anchor_img)
+                         anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
+                         anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
+                         anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)  # [-1, 1], CHW
+                         logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
+                     except Exception as e:
+                         logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
+                         anchor_tensor = None
+                 elif getattr(args, 'svi_mode', False):
+                     # In SVI mode without explicit anchor, use the input image as anchor
+                     anchor_tensor = img_resized.squeeze(1)  # Remove frame dim to get [C, H, W]
+                     logger.info("SVI mode: Using input image as anchor for frame padding")
+
                  # Create padding tensor [C, padding_frames_needed, H, W]
-                 padding_tensor = torch.zeros(
-                     img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
-                     device=device, dtype=img_resized.dtype
-                 )
+                 if anchor_tensor is not None:
+                     # Repeat anchor image for all padding frames (SVI anchor padding)
+                     padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
+                     logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
+                 else:
+                     # Standard behavior: use zeros for padding
+                     padding_tensor = torch.zeros(
+                         img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                         device=device, dtype=img_resized.dtype
+                     )
                  # Concatenate along frame dimension (dim=1)
                  img_padded = torch.cat([img_resized, padding_tensor], dim=1)
                  # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
@@ -3802,6 +4150,125 @@ def generate_extended_video_i2v_based(
     logger.info(f"Final extended video generated with shape: {final_video_tensor.shape}")
     return final_video_tensor
 
+
+def generate_svi_multi_clip(
+    args: argparse.Namespace,
+    initial_image_path: str,
+    num_clips: int,
+    prompts: Optional[list] = None,
+    overlap_frames: int = 1,
+) -> torch.Tensor:
+    """Generate multi-clip streaming video using SVI (Stable-Video-Infinity) approach.
+
+    This implements the SVI algorithm for generating consistent long videos:
+    1. Generate first clip from initial image
+    2. For each subsequent clip:
+       - Use last frame of previous clip as new input image
+       - Use original image as anchor for cross-clip consistency
+       - Optionally use different prompts per clip for storytelling
+
+    Args:
+        args: Command line arguments
+        initial_image_path: Path to the starting image
+        num_clips: Number of clips to generate
+        prompts: Optional list of prompts (one per clip). If None or shorter, uses args.prompt.
+        overlap_frames: Number of overlapping frames between clips for smooth transitions
+
+    Returns:
+        torch.Tensor: Combined video tensor [1, C, F, H, W]
+    """
+    import tempfile
+    import shutil
+    import time
+
+    logger.info(f"Starting SVI multi-clip generation: {num_clips} clips from {initial_image_path}")
+    logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
+
+    # Store original values
+    original_image_path = args.image_path
+    original_prompt = args.prompt
+    original_anchor_image = getattr(args, 'anchor_image', None)
+    original_svi_mode = getattr(args, 'svi_mode', False)
+
+    # Create temp directory for intermediate outputs
+    temp_dir = tempfile.mkdtemp()
+    all_clips = []
+    current_input_image = initial_image_path
+    anchor_image = initial_image_path  # SVI anchor: always the original image
+
+    try:
+        # Enable SVI mode for anchor padding
+        args.svi_mode = True
+        args.anchor_image = anchor_image
+
+        for clip_idx in range(num_clips):
+            logger.info(f"=== Generating clip {clip_idx + 1}/{num_clips} ===")
+
+            # Set prompt for this clip
+            if prompts and clip_idx < len(prompts):
+                args.prompt = prompts[clip_idx]
+                logger.info(f"Clip {clip_idx + 1} prompt: {args.prompt}")
+            elif prompts and len(prompts) > 0:
+                # Use last prompt if we've run out
+                args.prompt = prompts[-1]
+            # else: use original args.prompt
+
+            # Set input image
+            args.image_path = current_input_image
+            logger.info(f"Clip {clip_idx + 1} input image: {args.image_path}")
+
+            # Generate clip
+            clip_latent = generate(args)
+            if clip_latent is None:
+                raise RuntimeError(f"Failed to generate clip {clip_idx + 1}")
+
+            # Decode latent to pixels
+            from wan.configs import WAN_CONFIGS
+            cfg = WAN_CONFIGS[args.task]
+            clip_tensor = decode_latent(clip_latent, args, cfg)  # [1, C, F, H, W], range [0, 1]
+            logger.info(f"Clip {clip_idx + 1} generated with shape: {clip_tensor.shape}")
+
+            # Store clip (skip first frame for non-first clips to avoid duplication)
+            if clip_idx == 0:
+                all_clips.append(clip_tensor)
+            else:
+                # Skip first `overlap_frames` frames to avoid duplication
+                all_clips.append(clip_tensor[:, :, overlap_frames:, :, :])
+
+            # Extract last frame as input for next clip
+            if clip_idx < num_clips - 1:
+                last_frame = clip_tensor[0, :, -1, :, :]  # [C, H, W]
+                last_frame_np = (last_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+                # Save last frame as temp image
+                temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_last_frame.png")
+                cv2.imwrite(temp_image_path, cv2.cvtColor(last_frame_np, cv2.COLOR_RGB2BGR))
+                current_input_image = temp_image_path
+                logger.info(f"Saved last frame to {temp_image_path} for next clip input")
+
+            # Brief pause between clips
+            time.sleep(0.5)
+
+        # Concatenate all clips
+        logger.info(f"Concatenating {len(all_clips)} clips...")
+        final_video = torch.cat(all_clips, dim=2)  # Concatenate along frame dimension
+        logger.info(f"Final SVI video shape: {final_video.shape}")
+
+    finally:
+        # Restore original values
+        args.image_path = original_image_path
+        args.prompt = original_prompt
+        args.anchor_image = original_anchor_image
+        args.svi_mode = original_svi_mode
+
+        # Cleanup temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temp directory: {temp_dir}")
+
+    return final_video
+
+
 def generate_extended_video(
     args: argparse.Namespace,
     initial_video_path: str,
@@ -4114,11 +4581,34 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
     elif is_extension: logger.info(f"Running Video Extension (multitalk-style) to {args.extend_frames} frames")
-    else: 
+    else:
         if args.task == "ti2v-5B" and args.image_path is None:
             logger.info(f"Running Text-to-Video (T2V) inference for ti2v-5B (no image provided)")
         else:
             logger.info(f"Running Text-to-Video (T2V) inference")
+
+    # === Log SVI Features Status ===
+    svi_features_active = []
+    if getattr(args, 'svi_mode', False):
+        svi_features_active.append("SVI mode (anchor padding)")
+    if getattr(args, 'anchor_image', None) is not None:
+        svi_features_active.append(f"Anchor image: {args.anchor_image}")
+    if getattr(args, 'tea_cache_l1_thresh', None) is not None:
+        svi_features_active.append(f"TeaCache (L1 thresh: {args.tea_cache_l1_thresh})")
+    if getattr(args, 'cfg_merge', False):
+        svi_features_active.append("CFG merge (batched)")
+    if getattr(args, 'svi_sliding_window_size', None) is not None:
+        stride = args.svi_sliding_window_stride or (args.svi_sliding_window_size // 2)
+        svi_features_active.append(f"Sliding window (size: {args.svi_sliding_window_size}, stride: {stride})")
+    if getattr(args, 'svi_lora', False):
+        svi_features_active.append("SVI LoRA format conversion")
+
+    if svi_features_active:
+        logger.info("=" * 50)
+        logger.info("SVI (Stable-Video-Infinity) Features Active:")
+        for feature in svi_features_active:
+            logger.info(f"  - {feature}")
+        logger.info("=" * 50)
 
     # --- Data Types ---
     # Default to fp16 for new Wan2.2 models, detect from checkpoint if available
@@ -5216,7 +5706,66 @@ def main():
         if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
 
-        # Core generation pipeline
+        # === SVI Multi-Clip Generation ===
+        # Handle SVI multi-clip mode: generate multiple clips and concatenate
+        is_svi_multi_clip = (
+            getattr(args, 'num_clips', 1) > 1 and
+            args.image_path is not None and
+            "i2v" in args.task
+        )
+
+        if is_svi_multi_clip:
+            logger.info("=" * 60)
+            logger.info("SVI MULTI-CLIP MODE ENABLED")
+            logger.info(f"Generating {args.num_clips} clips with {args.overlap_frames} frame overlap")
+            logger.info("=" * 60)
+
+            # Parse prompt list if provided
+            prompts = None
+            if getattr(args, 'prompt_list', None) is not None and len(args.prompt_list) > 0:
+                prompts = args.prompt_list
+                logger.info(f"Using {len(prompts)} prompts for multi-clip generation")
+            else:
+                logger.info(f"Using single prompt for all clips: {args.prompt}")
+
+            # Generate multi-clip video (returns pixel tensor [1, C, F, H, W])
+            final_video_tensor = generate_svi_multi_clip(
+                args,
+                initial_image_path=args.image_path,
+                num_clips=args.num_clips,
+                prompts=prompts,
+                overlap_frames=args.overlap_frames,
+            )
+
+            # Save the multi-clip video directly (it's already in pixel space)
+            logger.info(f"SVI multi-clip video generated: {final_video_tensor.shape}")
+
+            # Update dimensions from the final video tensor
+            _, _, pixel_frames, pixel_height, pixel_width = final_video_tensor.shape
+
+            # Generate output filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+            output_base = f"svi_{args.task}_{timestamp}_{seed}"
+
+            # Save the video
+            if args.output_type in ("video", "both"):
+                video_path = os.path.join(args.output, f"{output_base}.mp4")
+                save_videos_grid(final_video_tensor, video_path, fps=args.fps, rescale=False)
+                logger.info(f"SVI multi-clip video saved to: {video_path}")
+
+            # Save as images if requested
+            if args.output_type in ("images", "both"):
+                image_dir = os.path.join(args.output, output_base)
+                os.makedirs(image_dir, exist_ok=True)
+                save_images_grid(final_video_tensor, image_dir, "frame", rescale=False, save_individually=True)
+                logger.info(f"SVI multi-clip frames saved to: {image_dir}")
+
+            logger.info("SVI multi-clip generation complete!")
+            return  # Exit after SVI multi-clip generation
+        # === End SVI Multi-Clip Generation ===
+
+        # Core generation pipeline (standard single-clip mode)
         generated_latent = generate(args) # Returns [B, C, F, H, W] or None
 
         if args.save_merged_model:

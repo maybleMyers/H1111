@@ -748,6 +748,340 @@ def wan22_batch_handler(
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
+
+### SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+def svi_batch_handler(
+    # Multi-clip prompts
+    prompt1: str, prompt2: str, prompt3: str, prompt4: str,
+    prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    negative_prompt: str,
+    image_path: str,
+    anchor_image_path: str,
+    # SVI settings
+    num_clips: int,
+    overlap_frames: int,
+    svi_lora: bool,
+    # TeaCache settings
+    tea_cache_enabled: bool,
+    tea_cache_l1_thresh: float,
+    tea_cache_start_step: int,
+    tea_cache_end_ratio: float,
+    # CFG merge
+    cfg_merge: bool,
+    # Sliding window
+    sliding_window_enabled: bool,
+    sliding_window_size: int,
+    sliding_window_stride: int,
+    # Generation parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    vae_fp32: bool,
+    compile_enabled: bool,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    """SVI (Stable-Video-Infinity) multi-clip long video generation handler."""
+    global stop_event
+    stop_event.clear()
+
+    os.makedirs(save_path, exist_ok=True)
+    all_generated_videos = []
+
+    # Collect non-empty prompts into a list
+    prompt_list = []
+    for p in [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]:
+        if p and p.strip():
+            prompt_list.append(p.strip())
+
+    if not prompt_list:
+        yield [], [], "Error: At least one prompt is required.", ""
+        return
+
+    if not image_path:
+        yield [], [], "Error: Input image is required for SVI mode.", ""
+        return
+
+    # Determine effective number of clips
+    effective_num_clips = min(int(num_clips), max(1, len(prompt_list))) if num_clips > 0 else len(prompt_list)
+    if effective_num_clips < 1:
+        effective_num_clips = 1
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, [], "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing SVI Batch {i+1}/{batch_size} (Seed: {current_seed}, Clips: {effective_num_clips})"
+        yield all_generated_videos.copy(), [], status_text, "Starting SVI generation..."
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"svi_{run_id}"
+
+        # Build the command for wan2_generate_video.py with SVI options
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", "i2v-A14B",  # SVI is always i2v
+            "--prompt", prompt_list[0],  # First prompt
+            "--image_path", str(image_path),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path),
+            "--clip", os.path.join("wan", clip_path),
+        ]
+
+        # SVI multi-clip options
+        if effective_num_clips > 1:
+            command.extend(["--num_clips", str(effective_num_clips)])
+            command.extend(["--overlap_frames", str(overlap_frames)])
+            # Add prompt list for multi-clip
+            command.append("--prompt_list")
+            command.extend(prompt_list[:effective_num_clips])
+
+        # Anchor image
+        if anchor_image_path and os.path.exists(anchor_image_path):
+            command.extend(["--anchor_image", str(anchor_image_path)])
+        else:
+            # Use input image as anchor (default SVI behavior)
+            command.append("--svi_mode")
+
+        # SVI LoRA format conversion
+        if svi_lora:
+            command.append("--svi_lora")
+
+        # TeaCache options
+        if tea_cache_enabled and tea_cache_l1_thresh > 0:
+            command.extend(["--tea_cache_l1_thresh", str(tea_cache_l1_thresh)])
+            command.extend(["--tea_cache_start_step", str(tea_cache_start_step)])
+            command.extend(["--tea_cache_end_ratio", str(tea_cache_end_ratio)])
+
+        # CFG merge
+        if cfg_merge:
+            command.append("--cfg_merge")
+
+        # Sliding window
+        if sliding_window_enabled and sliding_window_size > 0:
+            command.extend(["--svi_sliding_window_size", str(sliding_window_size)])
+            if sliding_window_stride > 0:
+                command.extend(["--svi_sliding_window_stride", str(sliding_window_stride)])
+
+        # Negative prompt
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Performance options
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_prescaled: command.append("--fp8_prescaled")
+        if fp8_fast: command.append("--fp8_fast")
+        if mixed_dtype: command.append("--mixed_dtype")
+        if fp8_t5: command.append("--fp8_t5")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        if lora_weights_paths_high:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        # Execute subprocess
+        print(f"Running SVI Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+        current_clip_info = None
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, [], "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"SVI_SUBPROCESS: {line_strip}")
+
+            # Parse progress
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[([0-9:]+)<([0-9:]+)', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+            svi_saved_match = re.search(r"SVI multi-clip video saved to:\s*(.*\.mp4)", line_strip)
+            clip_match = re.search(r"=== Generating clip (\d+)/(\d+) ===", line_strip)
+
+            if svi_saved_match or video_saved_match:
+                found_path = (svi_saved_match or video_saved_match).group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+                current_clip_info = None
+            elif clip_match:
+                clip_idx = int(clip_match.group(1))
+                clip_total = int(clip_match.group(2))
+                current_clip_info = {"idx": clip_idx, "total": clip_total}
+                status_text = f"Batch {i+1}/{batch_size} - Clip {clip_idx}/{clip_total}"
+                progress_text_update = f"Generating clip {clip_idx}/{clip_total}..."
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_remaining = tqdm_match.group(4)
+                if current_clip_info:
+                    progress_text_update = f"Clip {current_clip_info['idx']}/{current_clip_info['total']} | Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                else:
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item:
+            params_for_meta = {
+                "model_type": "SVI (Stable-Video-Infinity)",
+                "prompts": prompt_list[:effective_num_clips],
+                "negative_prompt": negative_prompt,
+                "image_path": os.path.basename(image_path) if image_path else None,
+                "anchor_image": os.path.basename(anchor_image_path) if anchor_image_path else None,
+                "num_clips": effective_num_clips,
+                "overlap_frames": overlap_frames,
+                "width": width, "height": height, "frame_num": frame_num, "fps": fps,
+                "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
+                "flow_shift": flow_shift, "guidance_scale": sample_guide_scale,
+                "dual_dit_boundary": dual_dit_boundary,
+                "tea_cache_enabled": tea_cache_enabled,
+                "cfg_merge": cfg_merge,
+                "sliding_window_enabled": sliding_window_enabled,
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+            all_generated_videos.append((current_video_file_for_item, f"SVI - Seed: {current_seed}, Clips: {effective_num_clips}"))
+            status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, [], "SVI Batch complete.", ""
+
+
 ### HoloCine - Multi-Shot Video Generation
 def holocine_batch_handler(
     # Prompting
@@ -8683,6 +9017,337 @@ with gr.Blocks(
                             info="Frames around harmonic peaks to suppress"
                         )
 
+        # SVI Tab (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+        with gr.Tab(id=16, label="SVI (Long Video)") as svi_tab:
+            gr.Markdown("""
+            ## SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+            Generate long, consistent videos by chaining multiple clips. Each clip uses the last frame of the previous clip as input.
+            **Features:** Multi-clip streaming • Anchor padding for consistency • Per-clip prompts • TeaCache acceleration
+            """)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    # Multi-prompt inputs for SVI
+                    with gr.Accordion("Clip Prompts (Up to 8 clips)", open=True):
+                        svi_prompt1 = gr.Textbox(
+                            label="Clip 1 Prompt (Required)",
+                            value="A woman walks through a sunlit garden, her dress flowing in the breeze.",
+                            lines=3,
+                            info="First clip - always required"
+                        )
+                        svi_prompt2 = gr.Textbox(
+                            label="Clip 2 Prompt",
+                            value="She pauses to smell a beautiful red rose, smiling softly.",
+                            lines=2
+                        )
+                        svi_prompt3 = gr.Textbox(
+                            label="Clip 3 Prompt",
+                            value="A butterfly lands on her outstretched hand.",
+                            lines=2
+                        )
+                        svi_prompt4 = gr.Textbox(
+                            label="Clip 4 Prompt",
+                            value="She continues walking deeper into the garden.",
+                            lines=2
+                        )
+                    with gr.Accordion("Additional Clip Prompts (5-8)", open=False):
+                        svi_prompt5 = gr.Textbox(label="Clip 5 Prompt", value="", lines=2)
+                        svi_prompt6 = gr.Textbox(label="Clip 6 Prompt", value="", lines=2)
+                        svi_prompt7 = gr.Textbox(label="Clip 7 Prompt", value="", lines=2)
+                        svi_prompt8 = gr.Textbox(label="Clip 8 Prompt", value="", lines=2)
+                    svi_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
+                        lines=2,
+                    )
+                with gr.Column(scale=1):
+                    svi_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    svi_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    svi_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="svi_progress_text")
+
+            with gr.Row():
+                svi_generate_btn = gr.Button("Generate SVI Video", elem_classes="green-btn")
+                svi_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    # Input images for SVI
+                    with gr.Row():
+                        svi_input_image = gr.Image(label="Input Image (Required)", type="filepath",
+                                                  info="Starting image for first clip")
+                        svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath",
+                                                   info="Reference for cross-clip consistency. Defaults to input image.")
+
+                    # SVI-specific settings
+                    gr.Markdown("### SVI Multi-Clip Settings")
+                    with gr.Row():
+                        svi_num_clips = gr.Slider(minimum=1, maximum=8, step=1, label="Number of Clips", value=4,
+                                                 info="How many clips to chain together")
+                        svi_overlap_frames = gr.Slider(minimum=0, maximum=16, step=1, label="Overlap Frames", value=1,
+                                                      info="Overlapping frames between clips")
+
+                    svi_lora_format = gr.Checkbox(
+                        label="SVI LoRA Format Conversion",
+                        value=False,
+                        info="Auto-convert SVI/DiffSynth format LoRA keys to Kohya format"
+                    )
+
+                    # TeaCache Acceleration
+                    with gr.Accordion("TeaCache (Acceleration)", open=False):
+                        svi_tea_cache_enabled = gr.Checkbox(
+                            label="Enable TeaCache",
+                            value=False,
+                            info="Cache intermediate features for faster inference"
+                        )
+                        with gr.Group(visible=False) as svi_tea_cache_controls:
+                            svi_tea_cache_l1_thresh = gr.Slider(
+                                minimum=0.01, maximum=0.5, step=0.01,
+                                label="L1 Threshold", value=0.1,
+                                info="Lower = more aggressive caching (faster but may reduce quality)"
+                            )
+                            with gr.Row():
+                                svi_tea_cache_start_step = gr.Number(
+                                    label="Start Step", value=2, minimum=0, maximum=20,
+                                    info="Start caching after this step"
+                                )
+                                svi_tea_cache_end_ratio = gr.Slider(
+                                    minimum=0.5, maximum=1.0, step=0.05,
+                                    label="End Ratio", value=0.8,
+                                    info="Stop caching after this ratio of total steps"
+                                )
+
+                    # CFG Merge
+                    svi_cfg_merge = gr.Checkbox(
+                        label="CFG Merge (Batch cond+uncond)",
+                        value=False,
+                        info="Merge CFG in single forward pass (faster, uses more VRAM)"
+                    )
+
+                    # Sliding Window
+                    with gr.Accordion("Sliding Window (Temporal)", open=False):
+                        svi_sliding_window_enabled = gr.Checkbox(
+                            label="Enable Sliding Window",
+                            value=False,
+                            info="Process video in overlapping temporal windows"
+                        )
+                        with gr.Group(visible=False) as svi_sliding_window_controls:
+                            with gr.Row():
+                                svi_sliding_window_size = gr.Number(
+                                    label="Window Size", value=16, minimum=4, maximum=64,
+                                    info="Size in latent frames"
+                                )
+                                svi_sliding_window_stride = gr.Number(
+                                    label="Window Stride", value=8, minimum=1, maximum=32,
+                                    info="Stride between windows (0 = auto)"
+                                )
+
+                    gr.Markdown("### Generation Parameters")
+                    # Width and height inputs
+                    with gr.Row():
+                        svi_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        svi_calc_height_btn = gr.Button("→")
+                        svi_calc_width_btn = gr.Button("←")
+                        svi_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    svi_frame_num = gr.Slider(minimum=9, maximum=241, step=4, label="Frames Per Clip", value=81, info="Frame count for each individual clip (4n+1)")
+                    svi_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    svi_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    svi_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    svi_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                    svi_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
+                    svi_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        svi_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        svi_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    svi_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_svi", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        svi_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        svi_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        svi_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="svi_preview_gallery"
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            svi_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            svi_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        svi_lora_weights = []
+                        svi_lora_multipliers = []
+                        svi_lora_apply_low = []
+                        svi_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                svi_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                svi_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                svi_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                svi_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                svi_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                svi_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                svi_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                svi_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    svi_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                    svi_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                with gr.Row():
+                    svi_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    svi_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    svi_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    svi_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                    svi_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    svi_dynamic_model_loading = gr.Checkbox(
+                        label="Dynamic Model Loading (A14B models only to lower RAM usages)",
+                        value=False, visible=False
+                    )
+                    svi_unload_text_encoders = gr.Checkbox(
+                        label="Unload Text Encoders after use (T5/CLIP) to save RAM",
+                        value=False, visible=False
+                    )
+                    svi_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    svi_vae_fp32 = gr.Checkbox(
+                        label="Use FP32 VAE (higher quality, more VRAM)",
+                        value=True,
+                    )
+                with gr.Row():
+                    svi_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
+                    )
+                with gr.Row():
+                    svi_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    svi_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    with gr.Group(visible=True) as svi_a14b_paths:
+                        svi_dit_low_noise_path = gr.Dropdown(
+                            label="DiT Low Noise Model (.safetensors)",
+                            choices=get_wan_of_low_noise_models("wan"),
+                            value=get_default_low_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        svi_dit_high_noise_path = gr.Dropdown(
+                            label="DiT High Noise Model (.safetensors)",
+                            choices=get_wan_of_high_noise_models("wan"),
+                            value=get_default_high_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        svi_clip_path = gr.Dropdown(
+                            label="CLIP Model (.pth, for i2v)",
+                            choices=get_wan_of_clip_models("wan"),
+                            value=get_default_clip_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True,
+                            visible=True
+                        )
+                    with gr.Group(visible=False) as svi_ti2v5b_paths:
+                        svi_dit_path = gr.Dropdown(
+                            label="DiT Model (.safetensors, for ti2v-5B)",
+                            choices=get_wan_of_dit_models("wan"),
+                            value="Wan2.2-TI2V-5B_fp16.safetensors",
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                with gr.Row():
+                    svi_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    svi_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                svi_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+            with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
+                gr.Markdown("""
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
+
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
+                """)
+                svi_ultravico_enabled = gr.Checkbox(
+                    label="Enable UltraViCo",
+                    value=False,
+                    info="Apply attention decay for long video generation"
+                )
+                with gr.Group(visible=False) as svi_ultravico_controls:
+                    with gr.Row():
+                        svi_ultravico_alpha = gr.Slider(
+                            minimum=0.5, maximum=1.0, step=0.01,
+                            label="Alpha (Decay Factor)",
+                            value=0.9,
+                            info="Decay for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay."
+                        )
+                        svi_ultravico_training_frames = gr.Number(
+                            label="Training Frames",
+                            value=21,
+                            minimum=5,
+                            maximum=100,
+                            step=1,
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
+                        )
+                    with gr.Row():
+                        svi_ultravico_suppress_harmonics = gr.Checkbox(
+                            label="Suppress Harmonics",
+                            value=False,
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
+                        )
+                        svi_ultravico_beta = gr.Slider(
+                            minimum=0.1, maximum=1.0, step=0.05,
+                            label="Beta (Harmonic Decay)",
+                            value=0.6,
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
+                        )
+                        svi_ultravico_gamma = gr.Number(
+                            label="Gamma (Harmonic Window)",
+                            value=4,
+                            minimum=1,
+                            maximum=20,
+                            step=1,
+                            info="Frames around harmonic peaks to suppress"
+                        )
+
         # HoloCine Tab - Multi-Shot Scenecut Video Generation
         with gr.Tab(id=15, label="HoloCine") as holocine_tab:
             with gr.Row():
@@ -12491,6 +13156,120 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== SVI (Stable-Video-Infinity) Event Handlers =====
+    svi_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+    svi_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[svi_seed])
+
+    # TeaCache visibility toggle
+    svi_tea_cache_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[svi_tea_cache_enabled],
+        outputs=[svi_tea_cache_controls]
+    )
+
+    # Sliding window visibility toggle
+    svi_sliding_window_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[svi_sliding_window_enabled],
+        outputs=[svi_sliding_window_controls]
+    )
+
+    # SVI LoRA refresh
+    svi_lora_refresh_outputs_list = []
+    for i in range(len(svi_lora_weights)):
+        svi_lora_refresh_outputs_list.extend([svi_lora_weights[i], svi_lora_multipliers[i]])
+
+    svi_lora_refresh_btn.click(
+        fn=refresh_8_loras,
+        inputs=[svi_lora_folder],
+        outputs=svi_lora_refresh_outputs_list
+    )
+
+    # SVI Model refresh
+    def refresh_svi_models(folder: str):
+        """Refresh model dropdowns for SVI"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_clip_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    svi_refresh_models_btn.click(
+        fn=refresh_svi_models,
+        inputs=[svi_model_folder],
+        outputs=[svi_dit_low_noise_path, svi_dit_high_noise_path, svi_clip_path, svi_vae_path, svi_t5_path]
+    )
+
+    # SVI Generate button
+    svi_generate_btn.click(
+        fn=svi_batch_handler,
+        inputs=[
+            # Multi-clip prompts (8 prompts)
+            svi_prompt1, svi_prompt2, svi_prompt3, svi_prompt4,
+            svi_prompt5, svi_prompt6, svi_prompt7, svi_prompt8,
+            svi_negative_prompt,
+            svi_input_image,
+            svi_anchor_image,
+            # SVI settings
+            svi_num_clips,
+            svi_overlap_frames,
+            svi_lora_format,
+            # TeaCache settings
+            svi_tea_cache_enabled,
+            svi_tea_cache_l1_thresh,
+            svi_tea_cache_start_step,
+            svi_tea_cache_end_ratio,
+            # CFG merge
+            svi_cfg_merge,
+            # Sliding window
+            svi_sliding_window_enabled,
+            svi_sliding_window_size,
+            svi_sliding_window_stride,
+            # Generation parameters
+            svi_width,
+            svi_height,
+            svi_frame_num,
+            svi_fps,
+            svi_seed,
+            svi_sample_solver,
+            svi_sample_steps,
+            svi_flow_shift,
+            svi_sample_guide_scale,
+            svi_dual_dit_boundary,
+            svi_batch_size,
+            svi_save_path,
+            # Model Paths & Performance
+            svi_attn_mode,
+            svi_mixed_dtype,
+            svi_block_swap,
+            svi_fp8,
+            svi_fp8_scaled,
+            svi_fp8_prescaled,
+            svi_fp8_fast,
+            svi_fp8_t5,
+            svi_dit_low_noise_path,
+            svi_dit_high_noise_path,
+            svi_clip_path,
+            svi_vae_path,
+            svi_t5_path,
+            # LoRAs
+            svi_lora_folder,
+            *svi_lora_weights,
+            *svi_lora_multipliers,
+            *svi_lora_apply_low,
+            *svi_lora_apply_high,
+            # Previews
+            svi_enable_preview,
+            svi_preview_steps,
+            svi_vae_fp32,
+            svi_compile,
+        ],
+        outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text],
+        queue=True
     )
 
     # ===== HoloCine Button Handlers =====
