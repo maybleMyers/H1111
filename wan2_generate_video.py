@@ -5936,7 +5936,6 @@ def main():
             clean_memory_on_device(args.device)
             
             # Give GPU time to free memory
-            import time
             time.sleep(0.5)
             torch.cuda.empty_cache()
         
