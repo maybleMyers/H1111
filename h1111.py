@@ -1061,12 +1061,12 @@ def svi_batch_handler(
                 # Input images
                 "image_path": os.path.basename(image_path) if image_path else None,
                 "anchor_image": os.path.basename(anchor_image_path) if anchor_image_path else "same as input",
-                # End images (new feature)
-                "end_images": [os.path.basename(img) if img else None for img in end_image_list[:effective_num_clips]],
-                "has_end_images": has_end_images,
-                # V2V settings (new feature)
-                "v2v_source": os.path.basename(v2v_source_video) if has_v2v_source else None,
-                "v2v_strength": v2v_strength if has_v2v_source else None,
+                # End images (not implemented in SVI tab)
+                "end_images": None,
+                "has_end_images": False,
+                # V2V settings (not implemented in SVI tab)
+                "v2v_source": None,
+                "v2v_strength": None,
                 # SVI clip settings
                 "num_clips": effective_num_clips,
                 "overlap_frames": overlap_frames,
