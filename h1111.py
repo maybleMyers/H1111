@@ -757,6 +757,10 @@ def svi_batch_handler(
     negative_prompt: str,
     image_path: str,
     anchor_image_path: str,
+    # Video extension
+    extend_video_path: str,
+    extend_frames_to_check: int,
+    extend_prepend: bool,
     # SVI settings
     num_clips: int,
     overlap_frames: int,
@@ -832,8 +836,10 @@ def svi_batch_handler(
         yield [], [], "Error: At least one prompt is required.", ""
         return
 
-    if not image_path:
-        yield [], [], "Error: Input image is required for SVI mode.", ""
+    # Video extension mode or standard image input
+    is_video_extension = extend_video_path and os.path.exists(extend_video_path)
+    if not is_video_extension and not image_path:
+        yield [], [], "Error: Input image is required (or provide a video to extend).", ""
         return
 
     # Determine effective number of clips
@@ -863,7 +869,6 @@ def svi_batch_handler(
             sys.executable, "wan2_generate_video.py",
             "--task", "i2v-A14B",  # SVI is always i2v
             "--prompt", prompt_list[0],  # First prompt
-            "--image_path", str(image_path),
             "--video_size", str(height), str(width),
             "--video_length", str(frame_num),
             "--fps", str(fps),
@@ -883,6 +888,17 @@ def svi_batch_handler(
             "--clip", os.path.join("wan", clip_path),
         ]
 
+        # Video extension mode or standard image input
+        if is_video_extension:
+            command.extend(["--svi_extend_video", str(extend_video_path)])
+            command.extend(["--svi_extend_frames_to_check", str(int(extend_frames_to_check))])
+            if not extend_prepend:
+                command.append("--no_svi_extend_prepend")
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--svi_extend_anchor", str(anchor_image_path)])
+        else:
+            command.extend(["--image_path", str(image_path)])
+
         # SVI multi-clip options
         if effective_num_clips > 1:
             command.extend(["--num_clips", str(effective_num_clips)])
@@ -892,15 +908,14 @@ def svi_batch_handler(
             command.extend(prompt_list[:effective_num_clips])
 
         # SVI mode and anchor image
-        # Always enable SVI mode for multi-clip generation
         command.append("--svi_mode")
 
-        # Anchor image: use provided anchor or fall back to input image
-        if anchor_image_path and os.path.exists(anchor_image_path):
-            command.extend(["--anchor_image", str(anchor_image_path)])
-        else:
-            # Use input image as anchor (default SVI behavior)
-            command.extend(["--anchor_image", str(image_path)])
+        # Anchor image for non-extension mode
+        if not is_video_extension:
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--anchor_image", str(anchor_image_path)])
+            else:
+                command.extend(["--anchor_image", str(image_path)])
 
         # SVI LoRA format conversion
         if svi_lora:
@@ -9138,6 +9153,22 @@ with gr.Blocks(
                         svi_input_image = gr.Image(label="Input Image (Required)", type="filepath")
                         svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath")
 
+                    # Video Extension Mode
+                    with gr.Accordion("Video Extension (Extend Existing Video)", open=False):
+                        gr.Markdown("Extend an existing video by finding the best transition frame and generating new clips from it.")
+                        svi_extend_video = gr.Video(label="Video to Extend", sources=["upload"])
+                        with gr.Row():
+                            svi_extend_frames_to_check = gr.Slider(
+                                minimum=1, maximum=100, step=1, value=30,
+                                label="Frames to Check",
+                                info="Analyze last N frames to find sharpest transition point (1 = use last frame)"
+                            )
+                            svi_extend_prepend = gr.Checkbox(
+                                label="Prepend Original",
+                                value=True,
+                                info="Include original video before extension"
+                            )
+
                     # SVI-specific settings
                     gr.Markdown("### SVI Multi-Clip Settings")
                     with gr.Row():
@@ -13274,6 +13305,10 @@ with gr.Blocks(
             svi_negative_prompt,
             svi_input_image,
             svi_anchor_image,
+            # Video extension
+            svi_extend_video,
+            svi_extend_frames_to_check,
+            svi_extend_prepend,
             # SVI settings
             svi_num_clips,
             svi_overlap_frames,
