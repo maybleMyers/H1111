@@ -4309,27 +4309,12 @@ def generate_svi_video_extension(
     anchor_image_path: Optional[str] = None,
     prepend_original: bool = True,
 ) -> torch.Tensor:
-    """Extend an existing video using SVI multi-clip generation.
-
-    Args:
-        args: Command line arguments
-        input_video_path: Path to the video to extend
-        num_clips: Number of new clips to generate
-        prompts: Optional list of prompts (one per clip)
-        overlap_frames: Number of overlapping frames between clips
-        frames_to_check: Number of frames from the end to analyze for transition point
-        anchor_image_path: Optional path to anchor image (default: first frame of input video)
-        prepend_original: If True, prepend original video to extension
-
-    Returns:
-        torch.Tensor: Extended video tensor [1, C, F, H, W]
-    """
     import tempfile
     import shutil
 
     logger.info(f"=== Starting SVI Video Extension ===")
     logger.info(f"Input video: {input_video_path}")
-    logger.info(f"Clips to generate: {num_clips}, Prepend original: {prepend_original}")
+    logger.info(f"Clips to generate: {num_clips}, Overlap: {overlap_frames}, Prepend: {prepend_original}")
 
     if not os.path.exists(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
@@ -4337,7 +4322,6 @@ def generate_svi_video_extension(
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # Find best transition frame
         best_frame_idx = extract_best_transition_frame(input_video_path, frames_to_check=frames_to_check)
 
         cap = cv2.VideoCapture(input_video_path)
@@ -4346,7 +4330,6 @@ def generate_svi_video_extension(
         if best_frame_idx < 0:
             best_frame_idx = total_frames - 1
 
-        # Extract transition frame as starting image
         cap.set(cv2.CAP_PROP_POS_FRAMES, best_frame_idx)
         ret, transition_frame = cap.read()
         if not ret:
@@ -4356,7 +4339,6 @@ def generate_svi_video_extension(
         cv2.imwrite(start_image_path, transition_frame)
         logger.info(f"Transition frame {best_frame_idx} saved to: {start_image_path}")
 
-        # Get or extract anchor image
         if anchor_image_path and os.path.exists(anchor_image_path):
             anchor_path = anchor_image_path
             logger.info(f"Using provided anchor: {anchor_path}")
@@ -4371,7 +4353,6 @@ def generate_svi_video_extension(
 
         cap.release()
 
-        # Load original video for prepending
         original_video_tensor = None
         if prepend_original:
             logger.info(f"Loading original frames 0 to {best_frame_idx}...")
@@ -4381,15 +4362,13 @@ def generate_svi_video_extension(
             original_video_tensor = torch.stack([
                 torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
                 for f in original_frames
-            ], dim=0).unsqueeze(0).permute(0, 2, 1, 3, 4)
-            logger.info(f"Original video shape: {original_video_tensor.shape}")
+            ], dim=0).unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch.float32)
+            logger.info(f"Original video tensor shape: {original_video_tensor.shape}")
 
-        # Set up for SVI generation
         args.image_path = start_image_path
         args.anchor_image = anchor_path
         args.svi_mode = True
 
-        # Generate extension
         extension_tensor = generate_svi_multi_clip(
             args=args,
             initial_image_path=start_image_path,
@@ -4397,12 +4376,12 @@ def generate_svi_video_extension(
             prompts=prompts,
             overlap_frames=overlap_frames,
         )
-        logger.info(f"Extension shape: {extension_tensor.shape}")
+        logger.info(f"Extension tensor shape: {extension_tensor.shape}")
 
-        # Concatenate
         if prepend_original and original_video_tensor is not None:
-            extension_without_first = extension_tensor[:, :, 1:, :, :]
-            final_video = torch.cat([original_video_tensor, extension_without_first], dim=2)
+            extension_without_overlap = extension_tensor[:, :, overlap_frames:, :, :]
+            final_video = torch.cat([original_video_tensor, extension_without_overlap], dim=2)
+            logger.info(f"Concatenated: {original_video_tensor.shape[2]} + {extension_without_overlap.shape[2]} = {final_video.shape[2]} frames")
         else:
             final_video = extension_tensor
 
