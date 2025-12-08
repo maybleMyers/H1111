@@ -900,12 +900,12 @@ def svi_batch_handler(
             command.extend(["--image_path", str(image_path)])
 
         # SVI multi-clip options
-        if effective_num_clips > 1:
+        if is_video_extension or effective_num_clips > 1:
             command.extend(["--num_clips", str(effective_num_clips)])
             command.extend(["--overlap_frames", str(overlap_frames)])
-            # Add prompt list for multi-clip
-            command.append("--prompt_list")
-            command.extend(prompt_list[:effective_num_clips])
+            if effective_num_clips > 1:
+                command.append("--prompt_list")
+                command.extend(prompt_list[:effective_num_clips])
 
         # SVI mode and anchor image
         command.append("--svi_mode")

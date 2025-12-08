@@ -5831,11 +5831,10 @@ def main():
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
 
         # === SVI Multi-Clip Generation ===
-        # Handle SVI multi-clip mode: generate multiple clips and concatenate
+        is_svi_extend = getattr(args, 'svi_extend_video', None) is not None
         is_svi_multi_clip = (
-            getattr(args, 'num_clips', 1) > 1 and
-            args.image_path is not None and
-            "i2v" in args.task
+            (getattr(args, 'num_clips', 1) > 1 and args.image_path is not None and "i2v" in args.task)
+            or is_svi_extend
         )
 
         if is_svi_multi_clip:
