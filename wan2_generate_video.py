@@ -4357,7 +4357,7 @@ def generate_svi_video_extension(
         if prepend_original:
             logger.info(f"Loading original frames 0 to {best_frame_idx}...")
             original_frames = hv_load_video(
-                input_video_path, 0, best_frame_idx + 1, bucket_reso=tuple(args.video_size)
+                input_video_path, 0, best_frame_idx + 1, bucket_reso=(args.video_size[1], args.video_size[0])
             )
             original_video_tensor = torch.stack([
                 torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
