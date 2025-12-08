@@ -10224,6 +10224,7 @@ with gr.Blocks(
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
+                send_to_svi_btn = gr.Button("Send to SVI", variant="primary")
                 
 
 
@@ -13734,6 +13735,36 @@ with gr.Blocks(
         outputs=None
     ).then(
         fn=change_to_tab_two, inputs=None, outputs=[tabs]
+    )
+
+    # Send to SVI tab handler
+    def change_to_svi_tab():
+        return gr.Tabs(selected=16)
+
+    def handle_send_to_svi_tab(metadata: dict, video_path: str) -> Tuple[str, str, int, int, int, int, str]:
+        """Handle video transfer from Video Info to SVI tab for video extension"""
+        if not video_path:
+            return "No video selected", None, 832, 480, 81, 16, ""
+
+        # Get video info
+        video_info = get_video_info(video_path)
+        width = video_info.get('width', 832)
+        height = video_info.get('height', 480)
+        fps = int(video_info.get('fps', 16))
+
+        # Get prompt from metadata if available
+        prompt = ""
+        if metadata:
+            prompt = metadata.get("prompt", "")
+
+        return "Video ready for SVI extension", video_path, width, height, 81, fps, prompt
+
+    send_to_svi_btn.click(
+        fn=handle_send_to_svi_tab,
+        inputs=[metadata_output, video_input],
+        outputs=[status, svi_extend_video, svi_width, svi_height, svi_frame_num, svi_fps, svi_prompt1]
+    ).then(
+        fn=change_to_svi_tab, inputs=None, outputs=[tabs]
     )
 
     # Handler for sending selected video from Video2Video gallery to input
