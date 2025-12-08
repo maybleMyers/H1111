@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
+SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -9152,6 +9153,7 @@ with gr.Blocks(
                     with gr.Row():
                         svi_input_image = gr.Image(label="Input Image (Required)", type="filepath")
                         svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath")
+                    svi_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
 
                     # Video Extension Mode
                     with gr.Accordion("Video Extension (Extend Existing Video)", open=False):
@@ -9241,7 +9243,7 @@ with gr.Blocks(
                         svi_calc_width_btn = gr.Button("←")
                         svi_height = gr.Number(label="Height", value=480, step=32, interactive=True)
                     svi_frame_num = gr.Slider(minimum=9, maximum=241, step=4, label="Frames Per Clip", value=81, info="Frame count for each individual clip (4n+1)")
-                    svi_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    svi_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=15)
                     svi_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     svi_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
                     svi_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5)
@@ -9388,6 +9390,10 @@ with gr.Blocks(
                         interactive=True
                     )
                 svi_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    svi_save_defaults_btn = gr.Button("Save Defaults")
+                    svi_load_defaults_btn = gr.Button("Load Defaults")
+                    svi_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
             with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
                 gr.Markdown("""
@@ -13296,6 +13302,47 @@ with gr.Blocks(
         outputs=[svi_dit_low_noise_path, svi_dit_high_noise_path, svi_clip_path, svi_vae_path, svi_t5_path]
     )
 
+    # SVI Image/Video dimension handlers
+    svi_input_image.change(
+        fn=update_wanx_image_dimensions,
+        inputs=[svi_input_image],
+        outputs=[svi_original_dims, svi_width, svi_height]
+    )
+
+    def update_svi_video_dimensions(video_path):
+        """Extract video dimensions and update UI for SVI extension"""
+        if not video_path:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        info = get_video_info(video_path)
+        if info:
+            dims_str = f"{info['width']}x{info['height']}"
+            return (
+                gr.update(value=dims_str),
+                gr.update(value=info['width']),
+                gr.update(value=info['height']),
+                gr.update(value=info['fps'])
+            )
+        return gr.update(), gr.update(), gr.update(), gr.update()
+
+    svi_extend_video.change(
+        fn=update_svi_video_dimensions,
+        inputs=[svi_extend_video],
+        outputs=[svi_original_dims, svi_width, svi_height, svi_fps]
+    )
+
+    # SVI Width/height calculation buttons
+    svi_calc_width_btn.click(
+        fn=calculate_wanx_width,
+        inputs=[svi_height, svi_original_dims],
+        outputs=[svi_width]
+    )
+
+    svi_calc_height_btn.click(
+        fn=calculate_wanx_height,
+        inputs=[svi_width, svi_original_dims],
+        outputs=[svi_height]
+    )
+
     # SVI Generate button
     svi_generate_btn.click(
         fn=svi_batch_handler,
@@ -13366,6 +13413,144 @@ with gr.Blocks(
         ],
         outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text],
         queue=True
+    )
+
+    # ===== SVI Save/Load Defaults =====
+    svi_ui_default_components_ORDERED_LIST = [
+        svi_model_folder,
+        svi_dit_low_noise_path,
+        svi_dit_high_noise_path,
+        svi_clip_path,
+        svi_vae_path,
+        svi_t5_path,
+        svi_attn_mode,
+        svi_block_swap,
+        svi_fp8,
+        svi_fp8_scaled,
+        svi_fp8_prescaled,
+        svi_fp8_fast,
+        svi_fp8_t5,
+        svi_mixed_dtype,
+        svi_vae_fp32,
+        svi_compile,
+        svi_lora_folder,
+    ] + svi_lora_weights + svi_lora_multipliers + svi_lora_apply_low + svi_lora_apply_high
+
+    svi_ui_default_keys = [
+        "svi_model_folder",
+        "svi_dit_low_noise_path",
+        "svi_dit_high_noise_path",
+        "svi_clip_path",
+        "svi_vae_path",
+        "svi_t5_path",
+        "svi_attn_mode",
+        "svi_block_swap",
+        "svi_fp8",
+        "svi_fp8_scaled",
+        "svi_fp8_prescaled",
+        "svi_fp8_fast",
+        "svi_fp8_t5",
+        "svi_mixed_dtype",
+        "svi_vae_fp32",
+        "svi_compile",
+        "svi_lora_folder",
+    ] + [f"svi_lora_weight_{i+1}" for i in range(8)] + \
+        [f"svi_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"svi_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"svi_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_svi_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(svi_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(SVI_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "SVI defaults saved successfully."
+        except Exception as e:
+            return f"Error saving SVI defaults: {e}"
+
+    def load_svi_defaults(request: gr.Request):
+        lora_folder = "lora"
+        lora_choices = get_lora_options(lora_folder)
+
+        # Check for SVI loras in the lora folder
+        svi_high_noise_lora = "SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0.safetensors"
+        svi_low_noise_lora = "SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0.safetensors"
+        has_svi_high_lora = svi_high_noise_lora in lora_choices
+        has_svi_low_lora = svi_low_noise_lora in lora_choices
+
+        if not os.path.exists(SVI_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(svi_ui_default_keys) + ["No defaults file found."]
+            else:
+                # Initial load: auto-detect SVI loras
+                updates = [gr.update()] * len(svi_ui_default_keys)
+                # If SVI loras are available, set them up automatically
+                if has_svi_high_lora or has_svi_low_lora:
+                    lora_start_idx = 17  # Index where lora_weights start
+                    apply_low_start_idx = 17 + 8 + 8  # After weights and multipliers
+                    apply_high_start_idx = 17 + 8 + 8 + 8  # After apply_low
+
+                    if has_svi_low_lora:
+                        updates[lora_start_idx] = gr.update(choices=lora_choices, value=svi_low_noise_lora)
+                        updates[apply_low_start_idx] = gr.update(value=True)
+                        updates[apply_high_start_idx] = gr.update(value=False)
+                    if has_svi_high_lora:
+                        updates[lora_start_idx + 1] = gr.update(choices=lora_choices, value=svi_high_noise_lora)
+                        updates[apply_low_start_idx + 1] = gr.update(value=False)
+                        updates[apply_high_start_idx + 1] = gr.update(value=True)
+                return updates + [""]
+
+        try:
+            with open(SVI_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(svi_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        # Update lora folder from settings
+        lora_folder = loaded_settings.get("svi_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(svi_ui_default_keys):
+            component = svi_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["SVI defaults loaded successfully."]
+
+    svi_save_defaults_btn.click(
+        fn=save_svi_defaults,
+        inputs=svi_ui_default_components_ORDERED_LIST,
+        outputs=[svi_defaults_status]
+    )
+    svi_load_defaults_btn.click(
+        fn=load_svi_defaults,
+        inputs=None,
+        outputs=svi_ui_default_components_ORDERED_LIST + [svi_defaults_status]
+    )
+
+    def initial_load_svi_defaults():
+        results_and_status = load_svi_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_svi_defaults,
+        inputs=None,
+        outputs=svi_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====
