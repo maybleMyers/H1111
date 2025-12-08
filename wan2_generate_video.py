@@ -2103,8 +2103,8 @@ def optimize_model(
         logger.info("torch.compile enabled via function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True)")
         # Enable persistent disk caching for compiled kernels
         try:
-            import torch._inductor.config
-            torch._inductor.config.fx_graph_cache = True
+            from torch._inductor import config as inductor_config
+            inductor_config.fx_graph_cache = True
             logger.info("Inductor disk cache enabled - compiled kernels will be cached for faster subsequent runs")
         except (ImportError, AttributeError):
             logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
