@@ -754,9 +754,15 @@ def svi_batch_handler(
     # Multi-clip prompts
     prompt1: str, prompt2: str, prompt3: str, prompt4: str,
     prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    # End images for each clip (optional - guides generation toward target frames)
+    end_image1: str, end_image2: str, end_image3: str, end_image4: str,
+    end_image5: str, end_image6: str, end_image7: str, end_image8: str,
     negative_prompt: str,
     image_path: str,
     anchor_image_path: str,
+    # V2V source video (optional)
+    v2v_source_video: str,
+    v2v_strength: float,
     # SVI settings
     num_clips: int,
     overlap_frames: int,
@@ -827,6 +833,20 @@ def svi_batch_handler(
     for p in [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]:
         if p and p.strip():
             prompt_list.append(p.strip())
+
+    # Collect end images into a list (only valid paths)
+    end_image_list = []
+    for img in [end_image1, end_image2, end_image3, end_image4, end_image5, end_image6, end_image7, end_image8]:
+        if img and os.path.isfile(img):
+            end_image_list.append(img)
+        else:
+            end_image_list.append(None)  # Placeholder for clips without end image
+
+    # Check if any end images are provided
+    has_end_images = any(img is not None for img in end_image_list)
+
+    # Check if V2V source is provided
+    has_v2v_source = v2v_source_video and os.path.isfile(v2v_source_video)
 
     if not prompt_list:
         yield [], [], "Error: At least one prompt is required.", ""
@@ -905,6 +925,21 @@ def svi_batch_handler(
         # SVI LoRA format conversion
         if svi_lora:
             command.append("--svi_lora")
+
+        # End images for SVI (guides generation toward target frames)
+        if has_end_images:
+            # Filter to only include valid end images for the effective clips
+            valid_end_images = [img for img in end_image_list[:effective_num_clips] if img is not None]
+            if valid_end_images:
+                command.append("--svi_end_image_list")
+                command.extend(valid_end_images)
+                print(f"SVI: Using {len(valid_end_images)} end images to guide clip generation")
+
+        # V2V source video for SVI refinement
+        if has_v2v_source:
+            command.extend(["--svi_v2v_source", str(v2v_source_video)])
+            command.extend(["--svi_v2v_strength", str(v2v_strength)])
+            print(f"SVI: V2V mode enabled with source {v2v_source_video}, strength {v2v_strength}")
 
         # TeaCache options
         if tea_cache_enabled and tea_cache_l1_thresh > 0:
@@ -1050,21 +1085,71 @@ def svi_batch_handler(
         return_code = process.wait()
 
         if return_code == 0 and current_video_file_for_item:
+            # Comprehensive metadata with all settings
             params_for_meta = {
+                # Model info
                 "model_type": "SVI (Stable-Video-Infinity)",
+                "task": "i2v-A14B",
+                # Prompts
                 "prompts": prompt_list[:effective_num_clips],
                 "negative_prompt": negative_prompt,
+                # Input images
                 "image_path": os.path.basename(image_path) if image_path else None,
-                "anchor_image": os.path.basename(anchor_image_path) if anchor_image_path else None,
+                "anchor_image": os.path.basename(anchor_image_path) if anchor_image_path else "same as input",
+                # End images (new feature)
+                "end_images": [os.path.basename(img) if img else None for img in end_image_list[:effective_num_clips]],
+                "has_end_images": has_end_images,
+                # V2V settings (new feature)
+                "v2v_source": os.path.basename(v2v_source_video) if has_v2v_source else None,
+                "v2v_strength": v2v_strength if has_v2v_source else None,
+                # SVI clip settings
                 "num_clips": effective_num_clips,
                 "overlap_frames": overlap_frames,
-                "width": width, "height": height, "frame_num": frame_num, "fps": fps,
-                "seed": current_seed, "sample_solver": sample_solver, "sample_steps": sample_steps,
-                "flow_shift": flow_shift, "guidance_scale": sample_guide_scale,
+                "svi_lora_format": svi_lora,
+                # Generation parameters
+                "width": width,
+                "height": height,
+                "frames_per_clip": frame_num,
+                "total_frames_approx": frame_num + (effective_num_clips - 1) * (frame_num - overlap_frames),
+                "fps": fps,
+                "seed": current_seed,
+                "sample_solver": sample_solver,
+                "sample_steps": sample_steps,
+                "flow_shift": flow_shift,
+                "guidance_scale": sample_guide_scale,
                 "dual_dit_boundary": dual_dit_boundary,
+                # Acceleration settings
                 "tea_cache_enabled": tea_cache_enabled,
+                "tea_cache_l1_thresh": tea_cache_l1_thresh if tea_cache_enabled else None,
+                "tea_cache_start_step": tea_cache_start_step if tea_cache_enabled else None,
+                "tea_cache_end_ratio": tea_cache_end_ratio if tea_cache_enabled else None,
                 "cfg_merge": cfg_merge,
                 "sliding_window_enabled": sliding_window_enabled,
+                "sliding_window_size": sliding_window_size if sliding_window_enabled else None,
+                "sliding_window_stride": sliding_window_stride if sliding_window_enabled else None,
+                # Model paths
+                "dit_low_noise": dit_low_noise_path,
+                "dit_high_noise": dit_high_noise_path,
+                "clip_model": clip_path,
+                "vae_model": vae_path,
+                "t5_model": t5_path,
+                # Performance settings
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "fp8": fp8,
+                "fp8_scaled": fp8_scaled,
+                "fp8_prescaled": fp8_prescaled,
+                "fp8_fast": fp8_fast,
+                "fp8_t5": fp8_t5,
+                "mixed_dtype": mixed_dtype,
+                "vae_fp32": vae_fp32,
+                "compile_enabled": compile_enabled,
+                # LoRA settings
+                "lora_folder": lora_folder,
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult],
+                "lora_apply_low": [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low],
+                "lora_apply_high": [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high, lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high],
             }
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
@@ -9026,40 +9111,72 @@ with gr.Blocks(
             gr.Markdown("""
             ## SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
             Generate long, consistent videos by chaining multiple clips. Each clip uses the last frame of the previous clip as input.
-            **Features:** Multi-clip streaming • Anchor padding for consistency • Per-clip prompts • TeaCache acceleration
+            **Features:** Multi-clip streaming • Anchor padding • Per-clip prompts • End frame guidance • V2V refinement • TeaCache
             """)
+
+            # Clip Prompts and End Images - Two Column Layout per Accordion
+            with gr.Accordion("Clip Prompts & End Images (1-4)", open=True):
+                gr.Markdown("*Optional **End Image** guides each clip toward a target frame*")
+                with gr.Row():
+                    # Column 1: Clips 1-2
+                    with gr.Column():
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt1 = gr.Textbox(
+                                    label="Clip 1 Prompt (Required)", lines=2, scale=3,
+                                    value="A woman walks through a sunlit garden, her dress flowing in the breeze."
+                                )
+                                svi_end_image1 = gr.Image(label="End 1", type="filepath", scale=1, height=80)
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt2 = gr.Textbox(
+                                    label="Clip 2 Prompt", lines=2, scale=3,
+                                    value="She pauses to smell a beautiful red rose, smiling softly."
+                                )
+                                svi_end_image2 = gr.Image(label="End 2", type="filepath", scale=1, height=80)
+                    # Column 2: Clips 3-4
+                    with gr.Column():
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt3 = gr.Textbox(
+                                    label="Clip 3 Prompt", lines=2, scale=3,
+                                    value="A butterfly lands on her outstretched hand."
+                                )
+                                svi_end_image3 = gr.Image(label="End 3", type="filepath", scale=1, height=80)
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt4 = gr.Textbox(
+                                    label="Clip 4 Prompt", lines=2, scale=3,
+                                    value="She continues walking deeper into the garden."
+                                )
+                                svi_end_image4 = gr.Image(label="End 4", type="filepath", scale=1, height=80)
+
+            with gr.Accordion("Additional Clips (5-8)", open=False):
+                with gr.Row():
+                    # Column 1: Clips 5-6
+                    with gr.Column():
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt5 = gr.Textbox(label="Clip 5 Prompt", lines=2, scale=3, value="")
+                                svi_end_image5 = gr.Image(label="End 5", type="filepath", scale=1, height=80)
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt6 = gr.Textbox(label="Clip 6 Prompt", lines=2, scale=3, value="")
+                                svi_end_image6 = gr.Image(label="End 6", type="filepath", scale=1, height=80)
+                    # Column 2: Clips 7-8
+                    with gr.Column():
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt7 = gr.Textbox(label="Clip 7 Prompt", lines=2, scale=3, value="")
+                                svi_end_image7 = gr.Image(label="End 7", type="filepath", scale=1, height=80)
+                        with gr.Group():
+                            with gr.Row():
+                                svi_prompt8 = gr.Textbox(label="Clip 8 Prompt", lines=2, scale=3, value="")
+                                svi_end_image8 = gr.Image(label="End 8", type="filepath", scale=1, height=80)
+
             with gr.Row():
                 with gr.Column(scale=4):
-                    # Multi-prompt inputs for SVI
-                    with gr.Accordion("Clip Prompts (Up to 8 clips)", open=True):
-                        svi_prompt1 = gr.Textbox(
-                            label="Clip 1 Prompt (Required)",
-                            value="A woman walks through a sunlit garden, her dress flowing in the breeze.",
-                            lines=3,
-                            info="First clip - always required"
-                        )
-                        svi_prompt2 = gr.Textbox(
-                            label="Clip 2 Prompt",
-                            value="She pauses to smell a beautiful red rose, smiling softly.",
-                            lines=2
-                        )
-                        svi_prompt3 = gr.Textbox(
-                            label="Clip 3 Prompt",
-                            value="A butterfly lands on her outstretched hand.",
-                            lines=2
-                        )
-                        svi_prompt4 = gr.Textbox(
-                            label="Clip 4 Prompt",
-                            value="She continues walking deeper into the garden.",
-                            lines=2
-                        )
-                    with gr.Accordion("Additional Clip Prompts (5-8)", open=False):
-                        svi_prompt5 = gr.Textbox(label="Clip 5 Prompt", value="", lines=2)
-                        svi_prompt6 = gr.Textbox(label="Clip 6 Prompt", value="", lines=2)
-                        svi_prompt7 = gr.Textbox(label="Clip 7 Prompt", value="", lines=2)
-                        svi_prompt8 = gr.Textbox(label="Clip 8 Prompt", value="", lines=2)
                     svi_negative_prompt = gr.Textbox(
-                        scale=3,
                         label="Negative Prompt",
                         value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
                         lines=2,
@@ -9078,8 +9195,19 @@ with gr.Blocks(
                 with gr.Column():
                     # Input images for SVI
                     with gr.Row():
-                        svi_input_image = gr.Image(label="Input Image (Required - Starting image for first clip)", type="filepath")
-                        svi_anchor_image = gr.Image(label="Anchor Image (Optional - Defaults to input image)", type="filepath")
+                        svi_input_image = gr.Image(label="Input Image (Required)", type="filepath")
+                        svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath")
+
+                    # V2V Source (Optional - for refining existing video)
+                    with gr.Accordion("Video-to-Video Refinement (Optional)", open=False):
+                        gr.Markdown("*Upload a source video to refine/denoise while maintaining SVI consistency*")
+                        with gr.Row():
+                            svi_v2v_source = gr.Video(label="V2V Source Video", sources=["upload"])
+                            svi_v2v_strength = gr.Slider(
+                                minimum=0.1, maximum=1.0, step=0.05, value=0.75,
+                                label="V2V Strength",
+                                info="Lower = preserve more of source (0.5-0.8 recommended)"
+                            )
 
                     # SVI-specific settings
                     gr.Markdown("### SVI Multi-Clip Settings")
@@ -9091,7 +9219,8 @@ with gr.Blocks(
 
                     svi_lora_format = gr.Checkbox(
                         label="SVI LoRA Format Conversion",
-                        value=False,
+                        value=True,
+                        visible=False,
                         info="Auto-convert SVI/DiffSynth format LoRA keys to Kohya format"
                     )
 
@@ -9155,7 +9284,7 @@ with gr.Blocks(
                     svi_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
                     svi_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
                     svi_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
-                    svi_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                    svi_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5)
                     svi_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
                     svi_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
                     with gr.Row():
@@ -13213,9 +13342,15 @@ with gr.Blocks(
             # Multi-clip prompts (8 prompts)
             svi_prompt1, svi_prompt2, svi_prompt3, svi_prompt4,
             svi_prompt5, svi_prompt6, svi_prompt7, svi_prompt8,
+            # End images for each clip (8 end images)
+            svi_end_image1, svi_end_image2, svi_end_image3, svi_end_image4,
+            svi_end_image5, svi_end_image6, svi_end_image7, svi_end_image8,
             svi_negative_prompt,
             svi_input_image,
             svi_anchor_image,
+            # V2V source video (optional)
+            svi_v2v_source,
+            svi_v2v_strength,
             # SVI settings
             svi_num_clips,
             svi_overlap_frames,

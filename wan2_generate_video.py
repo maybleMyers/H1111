@@ -789,6 +789,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlap_frames", type=int, default=1,
                        help="Number of overlapping frames between clips for smooth transitions (SVI mode).")
 
+    # SVI End Image Support - Guide each clip toward a target ending frame
+    parser.add_argument("--svi_end_images_dir", type=str, default=None,
+                       help="Directory containing end images for SVI clips (named 0.png, 1.png, etc. or sorted alphabetically). "
+                            "Each clip will be guided toward its corresponding end image.")
+    parser.add_argument("--svi_end_image_list", type=str, nargs="*", default=None,
+                       help="List of end image paths for SVI clips. One per clip. If fewer than num_clips, remaining clips have no end image.")
+
+    # SVI Video-to-Video Support - Refine/denoise existing video while generating
+    parser.add_argument("--svi_v2v_source", type=str, default=None,
+                       help="Source video for SVI video-to-video mode. The video will be split into clips and refined.")
+    parser.add_argument("--svi_v2v_strength", type=float, default=0.75,
+                       help="Denoising strength for SVI V2V mode (0.0-1.0). Lower values preserve more of source. Default: 0.75")
+
     # SVI LoRA format support
     parser.add_argument("--svi_lora", action="store_true",
                        help="Convert SVI/DiffSynth format LoRA keys to Kohya format before loading.")
@@ -4167,6 +4180,9 @@ def generate_svi_multi_clip(
     num_clips: int,
     prompts: Optional[list] = None,
     overlap_frames: int = 1,
+    end_images: Optional[List[str]] = None,
+    v2v_source_frames: Optional[List[np.ndarray]] = None,
+    v2v_strength: float = 0.75,
 ) -> torch.Tensor:
     """Generate multi-clip streaming video using SVI (Stable-Video-Infinity) approach.
 
@@ -4176,6 +4192,8 @@ def generate_svi_multi_clip(
        - Use last frame of previous clip as new input image
        - Use original image as anchor for cross-clip consistency
        - Optionally use different prompts per clip for storytelling
+       - Optionally guide each clip toward an end image (first-last-frame-to-video)
+       - Optionally refine from source video frames (video-to-video mode)
 
     Args:
         args: Command line arguments
@@ -4183,6 +4201,10 @@ def generate_svi_multi_clip(
         num_clips: Number of clips to generate
         prompts: Optional list of prompts (one per clip). If None or shorter, uses args.prompt.
         overlap_frames: Number of overlapping frames between clips for smooth transitions
+        end_images: Optional list of end image paths (one per clip). Guides generation toward target frames.
+        v2v_source_frames: Optional list of numpy arrays containing source video frames for V2V refinement.
+                          Should be organized as frames for each clip segment.
+        v2v_strength: Denoising strength for V2V mode (0.0-1.0). Lower preserves more of source.
 
     Returns:
         torch.Tensor: Combined video tensor [1, C, F, H, W]
@@ -4194,12 +4216,20 @@ def generate_svi_multi_clip(
     logger.info(f"Starting SVI multi-clip generation: {num_clips} clips from {initial_image_path}")
     logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
 
+    if end_images:
+        logger.info(f"End images provided for {len(end_images)} clips (guides generation toward target frames)")
+    if v2v_source_frames:
+        logger.info(f"V2V source frames provided for refinement with strength {v2v_strength}")
+
     # Store original values
     original_image_path = args.image_path
     original_prompt = args.prompt
     original_anchor_image = getattr(args, 'anchor_image', None)
     original_svi_mode = getattr(args, 'svi_mode', False)
     original_seed = args.seed  # Store original seed for per-clip variation
+    original_end_image_path = getattr(args, 'end_image_path', None)
+    original_video_path = getattr(args, 'video_path', None)
+    original_strength = getattr(args, 'strength', 0.75)
 
     # Create temp directory for intermediate outputs
     temp_dir = tempfile.mkdtemp()
@@ -4233,6 +4263,37 @@ def generate_svi_multi_clip(
             # Set input image
             args.image_path = current_input_image
             logger.info(f"Clip {clip_idx + 1} input image: {args.image_path}")
+
+            # Set end image for this clip if provided (enables first-last-frame-to-video)
+            if end_images and clip_idx < len(end_images) and end_images[clip_idx]:
+                args.end_image_path = end_images[clip_idx]
+                logger.info(f"Clip {clip_idx + 1} end image: {args.end_image_path} (guiding toward target frame)")
+            else:
+                args.end_image_path = None  # No end image - standard generation
+
+            # Handle V2V source if provided
+            # Note: V2V mode requires saving source frames to temp video/images
+            # For now, we skip V2V in the generation call and just use I2V with optional end_image
+            # Full V2V integration would require more complex frame handling
+            if v2v_source_frames and clip_idx < len(v2v_source_frames):
+                # Save source frames for this clip as temp video
+                clip_frames = v2v_source_frames[clip_idx]
+                if clip_frames is not None and len(clip_frames) > 0:
+                    temp_v2v_path = os.path.join(temp_dir, f"v2v_source_clip_{clip_idx}.mp4")
+                    # Save frames as video
+                    height, width = clip_frames[0].shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(temp_v2v_path, fourcc, args.fps, (width, height))
+                    for frame in clip_frames:
+                        out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    out.release()
+                    args.video_path = temp_v2v_path
+                    args.strength = v2v_strength
+                    logger.info(f"Clip {clip_idx + 1} V2V source: {temp_v2v_path} with strength {v2v_strength}")
+                else:
+                    args.video_path = None
+            else:
+                args.video_path = None
 
             # Generate clip
             clip_latent = generate(args)
@@ -4278,6 +4339,9 @@ def generate_svi_multi_clip(
         args.anchor_image = original_anchor_image
         args.svi_mode = original_svi_mode
         args.seed = original_seed  # Restore original seed
+        args.end_image_path = original_end_image_path
+        args.video_path = original_video_path
+        args.strength = original_strength
 
         # Cleanup temp directory
         if os.path.exists(temp_dir):
@@ -5746,6 +5810,76 @@ def main():
             else:
                 logger.info(f"Using single prompt for all clips: {args.prompt}")
 
+            # Parse end images for SVI (guides each clip toward target frame)
+            end_images = None
+            if getattr(args, 'svi_end_images_dir', None) is not None:
+                # Load end images from directory (sorted alphabetically or by number)
+                end_images_dir = args.svi_end_images_dir
+                if os.path.isdir(end_images_dir):
+                    end_image_files = glob_images(end_images_dir)
+                    if end_image_files:
+                        end_images = end_image_files[:args.num_clips]  # Limit to num_clips
+                        logger.info(f"Loaded {len(end_images)} end images from directory: {end_images_dir}")
+                    else:
+                        logger.warning(f"No images found in end images directory: {end_images_dir}")
+                else:
+                    logger.warning(f"End images directory not found: {end_images_dir}")
+            elif getattr(args, 'svi_end_image_list', None) is not None and len(args.svi_end_image_list) > 0:
+                # Use explicit list of end image paths
+                end_images = []
+                for img_path in args.svi_end_image_list:
+                    if os.path.isfile(img_path):
+                        end_images.append(img_path)
+                    else:
+                        end_images.append(None)  # Placeholder for missing images
+                        logger.warning(f"End image not found: {img_path}")
+                logger.info(f"Using {len([e for e in end_images if e])} end images from list")
+
+            if end_images:
+                logger.info("End images will guide generation toward target frames (first-last-frame-to-video)")
+
+            # Parse V2V source video for SVI refinement mode
+            v2v_source_frames = None
+            v2v_strength = getattr(args, 'svi_v2v_strength', 0.75)
+            if getattr(args, 'svi_v2v_source', None) is not None:
+                v2v_source_path = args.svi_v2v_source
+                if os.path.isfile(v2v_source_path):
+                    logger.info(f"Loading V2V source video: {v2v_source_path}")
+                    # Load the source video
+                    source_frames_np, total_source_frames = load_video(
+                        v2v_source_path, 0, None, bucket_reso=tuple(args.video_size)
+                    )
+                    if source_frames_np and len(source_frames_np) > 0:
+                        # Split source frames into clips
+                        frames_per_clip = args.video_length
+                        overlap = args.overlap_frames
+                        v2v_source_frames = []
+
+                        for clip_idx in range(args.num_clips):
+                            if clip_idx == 0:
+                                start_frame = 0
+                            else:
+                                # Account for overlap
+                                start_frame = clip_idx * (frames_per_clip - overlap)
+
+                            end_frame = start_frame + frames_per_clip
+                            if end_frame > len(source_frames_np):
+                                # Pad with last frame if not enough source frames
+                                clip_frames = source_frames_np[start_frame:]
+                                while len(clip_frames) < frames_per_clip:
+                                    clip_frames.append(source_frames_np[-1])
+                            else:
+                                clip_frames = source_frames_np[start_frame:end_frame]
+
+                            v2v_source_frames.append(clip_frames)
+                            logger.info(f"V2V clip {clip_idx + 1}: frames {start_frame}-{min(end_frame, len(source_frames_np))} ({len(clip_frames)} frames)")
+
+                        logger.info(f"V2V source split into {len(v2v_source_frames)} clips with strength {v2v_strength}")
+                    else:
+                        logger.warning(f"Failed to load frames from V2V source: {v2v_source_path}")
+                else:
+                    logger.warning(f"V2V source video not found: {v2v_source_path}")
+
             # Generate multi-clip video (returns pixel tensor [1, C, F, H, W])
             final_video_tensor = generate_svi_multi_clip(
                 args,
@@ -5753,6 +5887,9 @@ def main():
                 num_clips=args.num_clips,
                 prompts=prompts,
                 overlap_frames=args.overlap_frames,
+                end_images=end_images,
+                v2v_source_frames=v2v_source_frames,
+                v2v_strength=v2v_strength,
             )
 
             # Save the multi-clip video directly (it's already in pixel space)
