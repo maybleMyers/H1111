@@ -545,7 +545,11 @@ def wan22_batch_handler(
                 command.extend(["--extend_video", str(input_video)])
                 command.extend(["--extend_frames", str(extend_frames)])
                 command.extend(["--frames_to_check", str(frames_to_check)])
-                
+
+                # Add ending image for video extension if provided
+                if end_image_path:
+                    command.extend(["--end_image_path", str(end_image_path)])
+
                 # Force i2v-A14B task for extension
                 if "i2v" not in task:
                     yield [], None, f"Warning: Extension mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""

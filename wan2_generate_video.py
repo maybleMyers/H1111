@@ -4089,6 +4089,7 @@ def generate_extended_video_i2v_based(
     original_image_path = args.image_path
     original_video_length = args.video_length
     original_extend_video = args.extend_video
+    original_end_image_path = getattr(args, 'end_image_path', None)
 
     try:
         # Main loop to generate the requested number of new sections
@@ -4131,6 +4132,14 @@ def generate_extended_video_i2v_based(
             args.video_length = original_video_length  # This is the length of one new section
             args.extend_video = None  # Prevent infinite recursion
 
+            # Only use end_image on the final section to guide toward target frame
+            is_last_section = (i == num_new_sections - 1)
+            if original_end_image_path and is_last_section:
+                args.end_image_path = original_end_image_path
+                logger.info(f"Section {i+1}: Using end image to guide toward target frame")
+            else:
+                args.end_image_path = None
+
             # Generate the new chunk as a latent tensor by calling the main generate function
             new_chunk_latent = generate(args)
             os.unlink(temp_image_path)
@@ -4160,6 +4169,7 @@ def generate_extended_video_i2v_based(
         args.image_path = original_image_path
         args.video_length = original_video_length
         args.extend_video = original_extend_video
+        args.end_image_path = original_end_image_path
 
         # Clean up the temporary directory and all its contents
         if os.path.exists(temp_dir):
