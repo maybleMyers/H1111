@@ -427,6 +427,7 @@ def wan22_batch_handler(
     prompt: str,
     negative_prompt: str,
     image_path: str,
+    end_image_path: str,
     task: str,
     width: int,
     height: int,
@@ -559,6 +560,9 @@ def wan22_batch_handler(
                     command.append("--v2v_use_i2v")
         elif "i2v" in task and image_path:
             command.extend(["--image_path", str(image_path)])
+            # Add ending image for i2v mode if provided
+            if end_image_path:
+                command.extend(["--end_image_path", str(end_image_path)])
 
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
@@ -8774,7 +8778,14 @@ with gr.Blocks(
                 with gr.Column():
                     wan22_input_image = gr.Image(label="Input Image (for i2v tasks)", type="filepath")
                     wan22_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
-                    
+
+                    with gr.Accordion("Ending Image (Optional)", open=False):
+                        gr.Markdown("Target frame to guide generation toward. Works with i2v-A14B model.")
+                        wan22_end_image = gr.Image(
+                            label="End Image (for i2v-A14B)",
+                            type="filepath"
+                        )
+
                     # V2V controls
                     wan22_enable_v2v = gr.Checkbox(
                         label="Enable Video-to-Video (V2V) Mode", 
@@ -13160,6 +13171,7 @@ with gr.Blocks(
             wan22_prompt,
             wan22_negative_prompt,
             wan22_input_image,
+            wan22_end_image,
             wan22_task,
             wan22_width,
             wan22_height,
