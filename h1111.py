@@ -475,7 +475,7 @@ def wan22_batch_handler(
     # Compile options
     compile_enabled: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
-    enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,  # Extension parameters
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
@@ -545,6 +545,8 @@ def wan22_batch_handler(
                 command.extend(["--extend_video", str(input_video)])
                 command.extend(["--extend_frames", str(extend_frames)])
                 command.extend(["--frames_to_check", str(frames_to_check)])
+                if trim_tail_frames > 0:
+                    command.extend(["--trim_tail_frames", str(int(trim_tail_frames))])
 
                 # Add ending image for video extension if provided
                 if end_image_path:
@@ -8825,6 +8827,14 @@ with gr.Blocks(
                                 step=1,
                                 info="Number of frames from the end to analyze for the best transition point"
                             )
+                            wan22_trim_tail_frames = gr.Number(
+                                label="Trim Tail Frames",
+                                value=0,
+                                minimum=0,
+                                maximum=20,
+                                step=1,
+                                info="Number of frames to trim from end of each generated section (removes poor transition frames)"
+                            )
                         with gr.Row(visible=False) as wan22_extension_info:
                             wan22_extension_summary = gr.HTML(
                                 value="<p><i>Extension will intelligently find the best transition frame and generate smooth video chunks.</i></p>",
@@ -13228,6 +13238,7 @@ with gr.Blocks(
             wan22_enable_extension,
             wan22_extend_frames,
             wan22_frames_to_check,
+            wan22_trim_tail_frames,
             # Context Windows arguments
             wan22_use_context_windows,
             wan22_context_length,

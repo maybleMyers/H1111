@@ -725,6 +725,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
     parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
     parser.add_argument("--frames_to_check", type=int, default=30, help="Number of frames from the end to analyze for best transition point (clean i2v-based extension)")
+    parser.add_argument("--trim_tail_frames", type=int, default=0, help="Number of frames to trim from end of each generated section (removes poor end-frame transitions)")
     parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
     # Model selection for extension
     parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
@@ -4155,7 +4156,14 @@ def generate_extended_video_i2v_based(
             # Skip the first frame of the new chunk as it's a repeat of the start image.
             final_video_tensor = torch.cat([base_video_tensor, decoded_chunk[:, :, 1:, :, :]], dim=2)
 
-            # 7. Update current_video_path for the next iteration by saving the new longer video
+            # 7. Trim tail frames if specified (removes poor end-frame transitions)
+            trim_tail_frames = getattr(args, 'trim_tail_frames', 0)
+            if trim_tail_frames > 0 and final_video_tensor.shape[2] > trim_tail_frames:
+                original_frames = final_video_tensor.shape[2]
+                final_video_tensor = final_video_tensor[:, :, :-trim_tail_frames, :, :]
+                logger.info(f"Section {i+1}: Trimmed {trim_tail_frames} tail frames ({original_frames} -> {final_video_tensor.shape[2]} frames)")
+
+            # 8. Update current_video_path for the next iteration by saving the new longer video
             if i < num_new_sections - 1: # No need to save the very last intermediate video
                 temp_video_filename = f"intermediate_section_{i+1}.mp4"
                 current_video_path = os.path.join(temp_dir, temp_video_filename)
