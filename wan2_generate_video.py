@@ -725,7 +725,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extend_video", type=str, default=None, help="Path to video to extend using multitalk-style iterative generation")
     parser.add_argument("--extend_frames", type=int, default=200, help="Total number of frames to generate when extending video")
     parser.add_argument("--frames_to_check", type=int, default=30, help="Number of frames from the end to analyze for best transition point (clean i2v-based extension)")
-    parser.add_argument("--trim_tail_frames", type=int, default=0, help="Number of frames to trim from end of each generated section (removes poor end-frame transitions)")
     parser.add_argument("--motion_frames", type=int, default=25, help="Number of frames to use for motion conditioning in each chunk")
     # Model selection for extension
     parser.add_argument("--force_low_noise", action="store_true", help="Force use of low noise model for video extension")
@@ -5676,7 +5675,8 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     logger.info(f"Decoded video shape: {videos.shape}")
 
     # Post-processing: trim tail frames, convert to float32 CPU, scale to [0, 1]
-    if args.trim_tail_frames > 0:
+    # Skip trim here if video extension is enabled - extension handles trimming after concatenation
+    if args.trim_tail_frames > 0 and not getattr(args, 'extend_video', None):
         logger.info(f"Trimming last {args.trim_tail_frames} frames.")
         videos = videos[:, :, : -args.trim_tail_frames, :, :]
 
