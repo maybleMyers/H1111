@@ -5525,25 +5525,18 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: Use SDEdit-style noise injection (like T2V)
+        # V2V with I2V model: Direct noise blending approach
+        # strength directly controls noise amount: 0.2 = 20% noise, 80% clean
         # PLUS keep 'y' conditioning for temporal coherence
-        # This hybrid approach preserves the first frame exactly while maintaining motion
 
-        # Calculate timestep to start from based on strength
-        init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
-        init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
-        init_timestep = timesteps[init_timestep_idx]
-
-        # Store clean video latents and noise (like T2V V2V)
+        # Store clean video latents and noise
         v2v_noise = latent.clone()  # latent is pure noise from prepare_v2v_i2v_inputs
         v2v_clean = video_latents.to(latent.device).to(latent.dtype)
 
-        # SDEdit: Add noise to clean video at starting timestep
-        latent = scheduler.add_noise(
-            original_samples=v2v_clean,
-            noise=v2v_noise,
-            timesteps=torch.tensor([init_timestep], device=device)
-        )
+        # Direct noise blend: strength controls how much noise vs clean
+        # strength=0.2 means 20% noise, 80% clean video (sharper result)
+        # This gives more intuitive control than scheduler.add_noise at timestep level
+        latent = (1.0 - args.strength) * v2v_clean + args.strength * v2v_noise
 
         # CRITICAL: First frame is UNDENOISED (clean latent, no noise)
         # This preserves the first frame exactly
@@ -5553,16 +5546,17 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         else:
             latent[:, 0:1, :, :] = first_frame_clean
 
-        # Skip early timesteps
-        timesteps = timesteps[init_timestep_idx:]
+        # Use all steps specified by --infer_steps (no skipping)
+        # This gives full control: strength for noise, infer_steps for quality
+        # timesteps remains unchanged - use all steps
 
         # Store for per-step anchor frame restoration (enables external anchoring)
         inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
         # NOTE: Do NOT set "_v2v_is_i2v_model" = True - we WANT external anchoring
 
-        logger.info(f"V2V-I2V: Using SDEdit-style noise injection (hybrid approach)")
+        logger.info(f"V2V-I2V: Direct noise blend (strength={args.strength:.2f} -> {args.strength*100:.0f}% noise)")
         logger.info(f"V2V-I2V: First frame UNDENOISED (clean latent preserved)")
-        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f}, using {len(timesteps)} timesteps")
+        logger.info(f"V2V-I2V: Using all {len(timesteps)} timesteps from --infer_steps")
 
     elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
         # Standard V2V (T2V model): SDEdit-style noise injection with anchor
