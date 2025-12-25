@@ -3713,10 +3713,20 @@ def run_sampling(
             if "_image_latent" in arg_c and "_ti2v_mask2" in arg_c:
                 image_latent = arg_c["_image_latent"].to(latent_storage_device)
                 ti2v_mask2 = arg_c["_ti2v_mask2"]
-                
+
                 # Apply mask-based conditioning using stored masks: latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
+
+            # 6. Apply video conditioning for V2V (per-step re-mixing)
+            # Blend source video latent with current denoised latent at each step
+            if "_v2v_video_latents" in arg_c:
+                v2v_video_latents = arg_c["_v2v_video_latents"].to(latent.device).to(latent.dtype)
+                preservation_weight = arg_c["_v2v_preservation_weight"]
+
+                # Constant preservation weight throughout all timesteps
+                # Re-mix: blend source video latent with current latent
+                latent = preservation_weight * v2v_video_latents + (1.0 - preservation_weight) * latent
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -5455,28 +5465,24 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if (is_v2v or is_v2v_i2v) and args.strength < 1.0:
-        # Calculate how many steps to skip based on strength
-        init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
-        init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
-        
-        # Get the actual timestep value
-        init_timestep = timesteps[init_timestep_idx]
-        
-        # Use scheduler's add_noise method to properly add noise
-        # This applies the correct alpha_t and sigma_t scaling
-        latent = scheduler.add_noise(
-            original_samples=video_latents,
-            noise=latent,  # This is pure noise
-            timesteps=torch.tensor([init_timestep], device=device)
-        )
-        
-        # Skip the early timesteps
-        timesteps = timesteps[init_timestep_idx:]
-        
-        logger.info(f"V2V: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
-        logger.info(f"Using {len(timesteps)} timesteps for V2V sampling")
-    else:
-         logger.info(f"Using full {len(timesteps)} timesteps for sampling.")
+        # V2V Re-Mixing Strategy
+        # Instead of timestep skipping, we:
+        # 1. Start with pure noise (latent already is noise)
+        # 2. Run ALL timesteps
+        # 3. Re-mix at each step with preservation weight
+
+        v2v_preservation_weight = 1.0 - args.strength
+
+        # Store video latents and preservation weight for use in sampling loop
+        inputs[0]["_v2v_video_latents"] = video_latents.to(latent.device).to(latent.dtype)
+        inputs[0]["_v2v_preservation_weight"] = v2v_preservation_weight
+
+        logger.info(f"V2V: Using per-step re-mixing with preservation_weight={v2v_preservation_weight:.3f}")
+        logger.info(f"V2V: Running ALL {len(timesteps)} timesteps (no skipping)")
+
+        # DO NOT modify timesteps or latent - run all timesteps from pure noise
+
+    logger.info(f"Using {len(timesteps)} timesteps for sampling.")
     previewer = None
     if LatentPreviewer is not None and args.preview is not None and args.preview > 0:
         logger.info(f"Initializing Latent Previewer (every {args.preview} steps)...")
