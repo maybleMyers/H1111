@@ -2570,17 +2570,17 @@ def prepare_i2v_inputs(
                 # FLF MODE: Build complete pixel sequence [start, zeros, end] and encode together
                 # This matches Wan2GP's approach for better temporal coherence
 
-                # Calculate number of zero frames needed in between
-                # Total frames = frames (for non-looped with end image, we add 1 extra)
-                if using_looped_with_end:
-                    total_pixel_frames = frames  # Replace last frame
-                    zero_frames_count = frames - 2  # Between start and end
-                else:
-                    total_pixel_frames = frames + 1  # Add extra frame for end
-                    zero_frames_count = frames - 1  # Between start and end
+                # CRITICAL: Calculate target pixel frames to match noise dimensions
+                # Noise was created with lat_f_effective latent frames
+                # We need pixel_frames such that: (pixel_frames - 1) // stride + 1 = lat_f_effective
+                # => pixel_frames = (lat_f_effective - 1) * stride + 1
+                target_pixel_frames = (lat_f_effective - 1) * vae_stride_t + 1
+                zero_frames_count = target_pixel_frames - 2  # Minus 1 for start and 1 for end
 
                 if zero_frames_count < 0:
                     zero_frames_count = 0
+
+                logger.info(f"FLF: lat_f_effective={lat_f_effective}, target_pixel_frames={target_pixel_frames}, zero_frames={zero_frames_count}")
 
                 # Build complete pixel sequence: [start_frame, zero_frames, end_frame]
                 zero_frames = torch.zeros(
@@ -2590,11 +2590,11 @@ def prepare_i2v_inputs(
 
                 # Concatenate: [C, 1, H, W] + [C, zeros, H, W] + [C, 1, H, W] = [C, total_frames, H, W]
                 enc_sequence = torch.cat([img_resized, zero_frames, end_img_resized], dim=1)
-                logger.info(f"FLF joint encoding: Built pixel sequence with {total_pixel_frames} frames (1 start + {zero_frames_count} zeros + 1 end)")
+                logger.info(f"FLF joint encoding: Built pixel sequence with {enc_sequence.shape[1]} frames (1 start + {zero_frames_count} zeros + 1 end)")
 
                 # Encode the complete sequence together (better temporal coherence)
                 y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
-                logger.info(f"FLF joint VAE encoding complete. Latent shape: {y_latent.shape}")
+                logger.info(f"FLF joint VAE encoding complete. Latent shape: {y_latent.shape}, expected lat_f={lat_f_effective}")
 
                 del zero_frames, enc_sequence
             else:
@@ -2643,11 +2643,11 @@ def prepare_i2v_inputs(
 
         if has_end_image:
             # FLF mask: first frame = 1, middle = 0, last frame = 1
-            # Build in frame space first (before temporal interleaving)
+            # Use the same target_pixel_frames as the VAE encoding for consistency
             if using_looped_with_end:
-                frame_count_for_mask = frames  # Same as total frames
+                frame_count_for_mask = (lat_f_effective - 1) * config.vae_stride[0] + 1
             else:
-                frame_count_for_mask = frames + 1  # Extra frame for end
+                frame_count_for_mask = (lat_f_effective - 1) * config.vae_stride[0] + 1
 
             # Create mask in frame space [1, F, H, W]
             msk_frames = torch.ones(1, frame_count_for_mask, lat_h, lat_w, device=device, dtype=vae.dtype)
@@ -2670,7 +2670,7 @@ def prepare_i2v_inputs(
             msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
             msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
 
-            logger.info(f"FLF mask constructed with temporal interleaving. Shape: {msk.shape}")
+            logger.info(f"FLF mask constructed with temporal interleaving. Shape: {msk.shape}, expected lat_f={lat_f_effective}")
         else:
             # Standard mask: only first frame is conditioned
             msk_frames = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
