@@ -2392,21 +2392,21 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare Model Input Arguments for FunControl
-        y_for_model = y[0] # Shape becomes [32, F, H, W]
-        # A14B models don't have img_emb layer, so don't pass clip_fea
-        use_clip_fea = clip_context if not ("A14B" in args.task) else None
-        
+        y_for_model = y[0]  # Shape becomes [32, F, H, W]
+        # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
+        use_clip_fea = clip_context  # Always pass CLIP features
+
         arg_c = {
             "context": context,
             "clip_fea": use_clip_fea,
             "seq_len": seq_len,
-            "y": [y_for_model], # Pass the 4D tensor in the list
+            "y": [y_for_model],
         }
         arg_null = {
             "context": context_null,
             "clip_fea": use_clip_fea,
             "seq_len": seq_len,
-            "y": [y_for_model], # Pass the 4D tensor in the list
+            "y": [y_for_model],
         }
         
         if fun_ref_latent is not None:
@@ -2510,16 +2510,31 @@ def prepare_i2v_inputs(
         gc.collect()
         logger.info("Unloaded T5 model from memory")
 
-        # load CLIP model & encode image
+        # load CLIP model & encode image(s) - DUAL CLIP for FLF support
         clip = load_clip_model(args, config, device)
         clip.model.to(device)
-        logger.info(f"Encoding image to CLIP context")
+        logger.info(f"Encoding image(s) to CLIP context")
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-            # Use the [-1, 1] tensor directly if clip.visual expects that format
-            # clip_context = clip.visual([img_tensor[:, None, :, :]]).squeeze(1) # Original had [img_tensor[:, None, :, :]] which adds frame dim
-            # Use unsqueeze(1) which seems more consistent with other parts
-            clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Add Frame dim
-        logger.info(f"CLIP Encoding complete")
+            # Encode start image
+            clip_context_start = clip.visual([img_tensor.unsqueeze(1)])  # [1, 257, 1280]
+
+            # DUAL CLIP: Encode end image if provided
+            if has_end_image and end_img is not None:
+                end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
+                clip_context_end = clip.visual([end_img_tensor.unsqueeze(1)])  # [1, 257, 1280]
+
+                # Combine start and end CLIP features
+                # Option 1: Concatenate (514 tokens) - preserves both images' info
+                # Option 2: Average (257 tokens) - simpler, works with standard model
+                # Using average for compatibility with standard i2v model weights
+                clip_context = (clip_context_start + clip_context_end) / 2.0
+                logger.info(f"Dual CLIP encoding complete (start + end averaged). Shape: {clip_context.shape}")
+                del end_img_tensor, clip_context_start, clip_context_end
+            else:
+                clip_context = clip_context_start
+                logger.info(f"Single CLIP encoding complete. Shape: {clip_context.shape}")
+                del clip_context_start
+
         del clip
         clean_memory_on_device(device)
         # Always unload to save memory
@@ -2544,81 +2559,149 @@ def prepare_i2v_inputs(
             end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device) # [-1, 1], CHW
             end_img_resized = end_img_resized.unsqueeze(1) # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #5: Mask Shape ---
-        msk = torch.zeros(4, lat_f_effective, lat_h, lat_w, device=device, dtype=vae.dtype) # Use adjusted frame dim
-        msk[:, 0] = 1 # Mask first frame
-        if has_end_image:
-            msk[:, -1] = 1 # Mask last frame (the lat_f+1'th frame)
+        # --- FLF IMPROVED: Joint VAE Encoding and Proper Mask Construction ---
+        # Following Wan2GP's approach for better first-last-frame transitions
 
-        # Encode image(s) using VAE (Padded Method)
+        # Encode image(s) using VAE with JOINT encoding (Wan2GP style)
         with accelerator.autocast(), torch.no_grad():
-            # Pad the *start* image tensor temporally before encoding
-            # Calculate padding needed to reach base frame count (before adding end frame)
-            padding_frames_needed = frames - 1 # Number of frames to generate *after* the first
-            if padding_frames_needed < 0: padding_frames_needed = 0
-
-            img_padded = img_resized # Start with [C, 1, H, W]
-            if padding_frames_needed > 0:
-                 # === SVI ANCHOR MECHANISM ===
-                 # If anchor_image is specified, use it for padding instead of zeros
-                 # This enables cross-clip consistency in SVI mode
-                 anchor_tensor = None
-                 if getattr(args, 'anchor_image', None) is not None:
-                     try:
-                         anchor_img = Image.open(args.anchor_image).convert("RGB")
-                         anchor_cv2 = np.array(anchor_img)
-                         anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
-                         anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
-                         anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)  # [-1, 1], CHW
-                         logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
-                     except Exception as e:
-                         logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
-                         anchor_tensor = None
-                 elif getattr(args, 'svi_mode', False):
-                     # In SVI mode without explicit anchor, use the input image as anchor
-                     anchor_tensor = img_resized.squeeze(1)  # Remove frame dim to get [C, H, W]
-                     logger.info("SVI mode: Using input image as anchor for frame padding")
-
-                 # Create padding tensor [C, padding_frames_needed, H, W]
-                 if anchor_tensor is not None:
-                     # Repeat anchor image for all padding frames (SVI anchor padding)
-                     padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
-                     logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
-                 else:
-                     # Standard behavior: use zeros for padding
-                     padding_tensor = torch.zeros(
-                         img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
-                         device=device, dtype=img_resized.dtype
-                     )
-                 # Concatenate along frame dimension (dim=1)
-                 img_padded = torch.cat([img_resized, padding_tensor], dim=1)
-                 # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
-
-            # Encode the padded start image tensor. VAE output matches latent frame count.
-            # vae.encode expects [C, F, H, W]
-            y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
+            vae_stride_t = config.vae_stride[0]  # Temporal stride (typically 4)
 
             if has_end_image and end_img_resized is not None:
-                 # Encode the single end frame
-                 y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
+                # FLF MODE: Build complete pixel sequence [start, zeros, end] and encode together
+                # This matches Wan2GP's approach for better temporal coherence
 
-                 if using_looped_with_end:
-                     # For looped mode: REPLACE last frame instead of concatenating
-                     y_latent_combined = y_latent_base.clone()  # Clone to avoid modifying original
-                     y_latent_combined[:, -1:, :, :] = y_end  # Replace last frame
-                     logger.info("Looped mode: Replaced last frame with end image")
-                 else:
-                     # For non-looped mode: CONCATENATE as extra frame (original behavior)
-                     y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W]
+                # Calculate number of zero frames needed in between
+                # Total frames = frames (for non-looped with end image, we add 1 extra)
+                if using_looped_with_end:
+                    total_pixel_frames = frames  # Replace last frame
+                    zero_frames_count = frames - 2  # Between start and end
+                else:
+                    total_pixel_frames = frames + 1  # Add extra frame for end
+                    zero_frames_count = frames - 1  # Between start and end
+
+                if zero_frames_count < 0:
+                    zero_frames_count = 0
+
+                # Build complete pixel sequence: [start_frame, zero_frames, end_frame]
+                zero_frames = torch.zeros(
+                    img_resized.shape[0], zero_frames_count, target_height, target_width,
+                    device=device, dtype=img_resized.dtype
+                )
+
+                # Concatenate: [C, 1, H, W] + [C, zeros, H, W] + [C, 1, H, W] = [C, total_frames, H, W]
+                enc_sequence = torch.cat([img_resized, zero_frames, end_img_resized], dim=1)
+                logger.info(f"FLF joint encoding: Built pixel sequence with {total_pixel_frames} frames (1 start + {zero_frames_count} zeros + 1 end)")
+
+                # Encode the complete sequence together (better temporal coherence)
+                y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                logger.info(f"FLF joint VAE encoding complete. Latent shape: {y_latent.shape}")
+
+                del zero_frames, enc_sequence
             else:
-                 y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
+                # Standard single-image mode (no end frame)
+                # Use original padding approach for backwards compatibility
+                padding_frames_needed = frames - 1
+                if padding_frames_needed < 0:
+                    padding_frames_needed = 0
 
-        # Concatenate mask and the combined latent
-        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
-        y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
-        # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
+                img_padded = img_resized
+                if padding_frames_needed > 0:
+                    # === SVI ANCHOR MECHANISM ===
+                    anchor_tensor = None
+                    if getattr(args, 'anchor_image', None) is not None:
+                        try:
+                            anchor_img = Image.open(args.anchor_image).convert("RGB")
+                            anchor_cv2 = np.array(anchor_img)
+                            anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
+                            anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
+                            anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)
+                            logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
+                        except Exception as e:
+                            logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
+                            anchor_tensor = None
+                    elif getattr(args, 'svi_mode', False):
+                        anchor_tensor = img_resized.squeeze(1)
+                        logger.info("SVI mode: Using input image as anchor for frame padding")
 
-        logger.info(f"Standard I2V conditioning 'y' constructed. Shape: {y.shape}")
+                    if anchor_tensor is not None:
+                        padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
+                        logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
+                    else:
+                        padding_tensor = torch.zeros(
+                            img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                            device=device, dtype=img_resized.dtype
+                        )
+                    img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+
+                y_latent = vae.encode([img_padded])[0]
+
+        # --- FLF IMPROVED: Proper Mask Construction with Temporal Interleaving ---
+        # Build mask in FRAME space first, then apply temporal interleaving (Wan2GP style)
+
+        # Get actual latent frame count from encoded latent
+        actual_lat_f = y_latent.shape[1]
+
+        if has_end_image:
+            # FLF mask: first frame = 1, middle = 0, last frame = 1
+            # Build in frame space first (before temporal interleaving)
+            if using_looped_with_end:
+                frame_count_for_mask = frames  # Same as total frames
+            else:
+                frame_count_for_mask = frames + 1  # Extra frame for end
+
+            # Create mask in frame space [1, F, H, W]
+            msk_frames = torch.ones(1, frame_count_for_mask, lat_h, lat_w, device=device, dtype=vae.dtype)
+            msk_frames[:, 1:-1] = 0  # Middle frames = 0 (to be generated)
+            # First and last frames remain 1 (conditioning)
+
+            # Apply temporal interleaving for VAE stride (matches Wan2GP)
+            # First frame repeated 4x, middle frames as-is, last frame repeated 4x
+            msk_interleaved = torch.cat([
+                msk_frames[:, 0:1].repeat(1, 4, 1, 1),   # First frame x4
+                msk_frames[:, 1:-1],                      # Middle frames
+                msk_frames[:, -1:].repeat(1, 4, 1, 1),   # Last frame x4
+            ], dim=1)
+
+            # Reshape to [4, lat_f, H, W] format expected by model
+            # msk_interleaved shape: [1, F_interleaved, H, W]
+            # Need to reshape to [4, lat_f, H, W]
+            interleaved_len = msk_interleaved.shape[1]
+            lat_f_from_mask = interleaved_len // 4
+            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
+
+            logger.info(f"FLF mask constructed with temporal interleaving. Shape: {msk.shape}")
+        else:
+            # Standard mask: only first frame is conditioned
+            msk_frames = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
+            msk_frames[:, 1:] = 0  # All except first = 0
+
+            # Apply temporal interleaving
+            msk_interleaved = torch.cat([
+                msk_frames[:, 0:1].repeat(1, 4, 1, 1),  # First frame x4
+                msk_frames[:, 1:],                       # Rest
+            ], dim=1)
+
+            interleaved_len = msk_interleaved.shape[1]
+            lat_f_from_mask = interleaved_len // 4
+            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
+
+        # Ensure mask and latent have matching dimensions
+        if msk.shape[1] != y_latent.shape[1]:
+            logger.warning(f"Mask/latent dimension mismatch: mask={msk.shape}, latent={y_latent.shape}. Adjusting mask.")
+            # Adjust mask to match latent dimensions
+            if msk.shape[1] > y_latent.shape[1]:
+                msk = msk[:, :y_latent.shape[1], :, :]
+            else:
+                # Pad mask with zeros
+                pad_size = y_latent.shape[1] - msk.shape[1]
+                msk = torch.cat([msk, torch.zeros(4, pad_size, lat_h, lat_w, device=device, dtype=msk.dtype)], dim=1)
+
+        # Concatenate mask and latent for final 'y' tensor
+        y = torch.cat([msk, y_latent], dim=0)  # Shape [4+16, lat_f, H, W] = [20, lat_f, H, W]
+
+        logger.info(f"FLF conditioning 'y' constructed. Shape: {y.shape}")
         logger.info(f"Image encoding complete")
 
         # Move VAE back
@@ -2626,20 +2709,21 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare model input arguments for Standard I2V
-        # A14B models don't have img_emb layer, so don't pass clip_fea
-        use_clip_fea = clip_context if not ("A14B" in args.task) else None
-        
+        # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
+        # The dual CLIP encoding (start + end averaged) provides better FLF guidance
+        use_clip_fea = clip_context  # Always pass CLIP features for i2v models
+
         arg_c = {
-            "context": context, # Model expects batch dim? Assuming yes.
+            "context": context,
             "clip_fea": use_clip_fea,
-            "seq_len": max_seq_len, # Use original seq len calculation
-            "y": [y], # Use the 'original method' y
+            "seq_len": max_seq_len,
+            "y": [y],
         }
         arg_null = {
             "context": context_null,
             "clip_fea": use_clip_fea,
             "seq_len": max_seq_len,
-            "y": [y], # Use the 'original method' y
+            "y": [y],
         }
 
         # Return noise, context, context_null, y (for debugging), (arg_c, arg_null)
@@ -3153,8 +3237,8 @@ def prepare_v2v_i2v_inputs(
     y = torch.concat([msk, cond_latent], dim=0)
 
     # Prepare model input arguments
-    # A14B models don't have img_emb layer, so don't pass clip_fea
-    use_clip_fea = clip_context if not ("A14B" in args.task) else None
+    # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
+    use_clip_fea = clip_context  # Always pass CLIP features
 
     arg_c = {
         "context": context,
@@ -3941,23 +4025,23 @@ def prepare_video_extension_inputs(
     clean_memory_on_device(device)
     
     # Prepare model arguments
-    # A14B models don't have img_emb layer
-    use_clip_fea = clip_context if not ("A14B" in args.task) else None
-    
+    # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
+    use_clip_fea = clip_context  # Always pass CLIP features
+
     arg_c = {
         "context": context,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     arg_text_dropped = {
         "context": context_text_dropped,
         "clip_fea": use_clip_fea,  # Keep CLIP for text-dropped
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     arg_null = {
         "context": context_null,
         "clip_fea": use_clip_fea,  # Keep CLIP for unconditional too
