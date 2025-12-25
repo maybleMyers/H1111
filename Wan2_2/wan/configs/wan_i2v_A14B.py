@@ -9,8 +9,8 @@ from .shared_config import wan_shared_cfg
 i2v_A14B = EasyDict(__name__='Config: Wan I2V A14B')
 i2v_A14B.update(wan_shared_cfg)
 
-# Model type identification - CORRECTED based on layer analysis
-i2v_A14B.i2v = False  # No separate image embedding layers, uses input channel conditioning
+# Model type identification - i2v models use CLIP through img_emb layer
+i2v_A14B.i2v = True  # Enable CLIP embedding via img_emb layer
 
 i2v_A14B.t5_checkpoint = 'models_t5_umt5-xxl-enc-bf16.pth'
 i2v_A14B.t5_tokenizer = 'google/umt5-xxl'
