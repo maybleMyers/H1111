@@ -3777,39 +3777,25 @@ def run_sampling(
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
 
-            # 6. Apply video conditioning for V2V (per-step re-mixing) - for T2V models
-            # Blend source video latent with current denoised latent at each step
-            if "_v2v_video_latents" in arg_c:
-                v2v_video_latents = arg_c["_v2v_video_latents"].to(latent.device).to(latent.dtype)
-                preservation_weight = arg_c["_v2v_preservation_weight"]
+            # 6. V2V: Restore ANCHOR frames only after scheduler step
+            # Non-anchor frames follow normal denoising trajectory (scheduler handles them)
+            # Anchor frames (first, optionally last) are restored to prevent drift
+            # This ensures consistent start/end frames throughout the video
+            if "_v2v_first_frame_latent" in arg_c:
+                first_frame_latent = arg_c["_v2v_first_frame_latent"].to(latent.device).to(latent.dtype)
+                has_last_frame = "_v2v_last_frame_latent" in arg_c
+                if has_last_frame:
+                    last_frame_latent = arg_c["_v2v_last_frame_latent"].to(latent.device).to(latent.dtype)
 
-                # Constant preservation weight throughout all timesteps
-                # Re-mix: blend source video latent with current latent
-                latent = preservation_weight * v2v_video_latents + (1.0 - preservation_weight) * latent
-
-            # 7. Re-anchor first frame for V2V with I2V model
-            # This ensures the first frame stays consistent with the conditioning throughout denoising
-            if "_i2v_first_frame_latent" in arg_c:
-                first_frame_latent = arg_c["_i2v_first_frame_latent"].to(latent.device).to(latent.dtype)
-                # Replace first frame of latent with the clean encoded first frame
+                # HARD ANCHOR: Restore anchor frames (prevents drift during denoising)
                 if latent.dim() == 5:
-                    # [B, C, F, H, W] - with batch dimension
                     latent[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)
+                    if has_last_frame:
+                        latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
                 else:
-                    # [C, F, H, W] - without batch dimension
                     latent[:, 0:1, :, :] = first_frame_latent
-
-            # 8. Re-anchor last frame for V2V with I2V model (when end image provided)
-            # This ensures the last frame stays consistent with end conditioning throughout denoising
-            if "_i2v_last_frame_latent" in arg_c:
-                last_frame_latent = arg_c["_i2v_last_frame_latent"].to(latent.device).to(latent.dtype)
-                # Replace last frame of latent with the clean encoded last frame
-                if latent.dim() == 5:
-                    # [B, C, F, H, W] - with batch dimension
-                    latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
-                else:
-                    # [C, F, H, W] - without batch dimension
-                    latent[:, -1:, :, :] = last_frame_latent
+                    if has_last_frame:
+                        latent[:, -1:, :, :] = last_frame_latent
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -5548,10 +5534,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: Use noise injection with frame anchoring
-        # The I2V model expects:
-        # 1. y parameter with conditioning frames (already set in prepare_v2v_i2v_inputs)
-        # 2. Latent with anchor frames clean, rest noised from source video
+        # V2V with I2V model: Kandinsky-style flow-matched conditioning
+        # Key insight from Kandinsky: non-anchor frames use timestep-aware mixing
+        # At each step t: frame = (1 - t_norm) * clean + t_norm * noise
 
         # Calculate timestep to start from based on strength
         init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
@@ -5568,51 +5553,77 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         if has_end_image:
             last_frame_latent = cond_latent[:, -1:, :, :]  # [16, 1, lat_h, lat_w]
 
-        # Add noise to source video latents
-        noised_video = scheduler.add_noise(
-            original_samples=video_latents,
-            noise=latent,  # latent is pure noise at this point
+        # Store clean video latents and noise
+        v2v_noise = latent.clone()  # Store the pure noise
+        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
+
+        # Use scheduler.add_noise for proper noise schedule (respects shift parameter)
+        # This ensures the noise level matches the scheduler's training distribution
+        latent = scheduler.add_noise(
+            original_samples=v2v_clean,
+            noise=v2v_noise,
             timesteps=torch.tensor([init_timestep], device=device)
         )
 
-        # Anchor the conditioning frames: replace with clean encoded frames
-        if noised_video.dim() == 5:
-            noised_video[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)  # Keep first frame clean
+        # First frame is HARD ANCHOR (always clean, no noise)
+        if latent.dim() == 5:
+            latent[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)
             if has_end_image:
-                noised_video[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)  # Keep last frame clean
+                latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
         else:
-            noised_video[:, 0:1, :, :] = first_frame_latent  # Keep first frame clean
+            latent[:, 0:1, :, :] = first_frame_latent
             if has_end_image:
-                noised_video[:, -1:, :, :] = last_frame_latent  # Keep last frame clean
+                latent[:, -1:, :, :] = last_frame_latent
 
-        latent = noised_video
+        # Skip the early timesteps (start from init_timestep)
+        timesteps = timesteps[init_timestep_idx:]
+
+        # Store for per-step anchor frame restoration
+        inputs[0]["_v2v_first_frame_latent"] = first_frame_latent
+        if has_end_image:
+            inputs[0]["_v2v_last_frame_latent"] = last_frame_latent
+
+        anchor_info = "first frame" + (" and last frame" if has_end_image else "")
+        logger.info(f"V2V-I2V: Using scheduler.add_noise for proper noise injection")
+        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f} (step {init_timestep_idx})")
+        logger.info(f"V2V-I2V: Anchored {anchor_info}, using {len(timesteps)} timesteps")
+
+    elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
+        # Standard V2V (T2V model): SDEdit-style noise injection with anchor
+        # Add noise at starting timestep, then denoise with first frame anchored
+
+        # Calculate timestep to start from based on strength
+        init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
+        init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
+        init_timestep = timesteps[init_timestep_idx]
+
+        # Store clean video latents and noise
+        v2v_noise = latent.clone()  # Store the pure noise
+        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
+
+        # Use scheduler.add_noise for proper noise schedule (respects shift parameter)
+        latent = scheduler.add_noise(
+            original_samples=v2v_clean,
+            noise=v2v_noise,
+            timesteps=torch.tensor([init_timestep], device=device)
+        )
+
+        # First frame is HARD ANCHOR (preserve original exactly)
+        first_frame_clean = v2v_clean[:, :, 0:1, :, :] if v2v_clean.dim() == 5 else v2v_clean[:, 0:1, :, :]
+        if latent.dim() == 5:
+            latent[:, :, 0:1, :, :] = first_frame_clean
+        else:
+            latent[:, 0:1, :, :] = first_frame_clean
 
         # Skip the early timesteps
         timesteps = timesteps[init_timestep_idx:]
 
-        # Store for per-step frame re-anchoring
-        inputs[0]["_i2v_first_frame_latent"] = first_frame_latent
-        if has_end_image:
-            inputs[0]["_i2v_last_frame_latent"] = last_frame_latent
+        # Store for per-step anchor frame restoration
+        inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
 
-        anchor_info = "first frame" + (" and last frame" if has_end_image else "")
-        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
-        logger.info(f"V2V-I2V: Anchored {anchor_info}, using {len(timesteps)} timesteps")
-
-    elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
-        # Standard V2V (T2V model): Use per-step re-mixing
-        # This approach works better for T2V models which don't have frame-specific conditioning
-
-        v2v_preservation_weight = 1.0 - args.strength
-
-        # Store video latents and preservation weight for use in sampling loop
-        inputs[0]["_v2v_video_latents"] = video_latents.to(latent.device).to(latent.dtype)
-        inputs[0]["_v2v_preservation_weight"] = v2v_preservation_weight
-
-        logger.info(f"V2V: Using per-step re-mixing with preservation_weight={v2v_preservation_weight:.3f}")
-        logger.info(f"V2V: Running ALL {len(timesteps)} timesteps (no skipping)")
-
-        # DO NOT modify timesteps or latent - run all timesteps from pure noise
+        logger.info(f"V2V: Using scheduler.add_noise for proper noise injection")
+        logger.info(f"V2V: Starting from timestep {init_timestep.item():.0f} (step {init_timestep_idx})")
+        logger.info(f"V2V: First frame anchored, using {len(timesteps)} timesteps")
 
     logger.info(f"Using {len(timesteps)} timesteps for sampling.")
     previewer = None
