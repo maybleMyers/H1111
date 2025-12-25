@@ -2393,8 +2393,9 @@ def prepare_i2v_inputs(
 
         # Prepare Model Input Arguments for FunControl
         y_for_model = y[0]  # Shape becomes [32, F, H, W]
-        # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
-        use_clip_fea = clip_context  # Always pass CLIP features
+        # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+        # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+        use_clip_fea = clip_context if config.i2v else None
 
         arg_c = {
             "context": context,
@@ -2705,9 +2706,9 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare model input arguments for Standard I2V
-        # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
-        # The dual CLIP encoding (start + end averaged) provides better FLF guidance
-        use_clip_fea = clip_context  # Always pass CLIP features for i2v models
+        # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+        # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+        use_clip_fea = clip_context if config.i2v else None
 
         arg_c = {
             "context": context,
@@ -3233,8 +3234,9 @@ def prepare_v2v_i2v_inputs(
     y = torch.concat([msk, cond_latent], dim=0)
 
     # Prepare model input arguments
-    # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
-    use_clip_fea = clip_context  # Always pass CLIP features
+    # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+    # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+    use_clip_fea = clip_context if config.i2v else None
 
     arg_c = {
         "context": context,
@@ -4019,10 +4021,11 @@ def prepare_video_extension_inputs(
     # Move VAE back to CPU/cache
     vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
     clean_memory_on_device(device)
-    
+
     # Prepare model arguments
-    # FLF FIX: A14B models DO use CLIP via img_emb layer - enable for all i2v models
-    use_clip_fea = clip_context  # Always pass CLIP features
+    # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+    # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+    use_clip_fea = clip_context if config.i2v else None
 
     arg_c = {
         "context": context,
@@ -4033,7 +4036,7 @@ def prepare_video_extension_inputs(
 
     arg_text_dropped = {
         "context": context_text_dropped,
-        "clip_fea": use_clip_fea,  # Keep CLIP for text-dropped
+        "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
