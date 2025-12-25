@@ -2570,17 +2570,16 @@ def prepare_i2v_inputs(
                 # FLF MODE: Build complete pixel sequence [start, zeros, end] and encode together
                 # This matches Wan2GP's approach for better temporal coherence
 
-                # CRITICAL: Calculate target pixel frames to match noise dimensions
-                # Noise was created with lat_f_effective latent frames
-                # We need pixel_frames such that: (pixel_frames - 1) // stride + 1 = lat_f_effective
-                # => pixel_frames = (lat_f_effective - 1) * stride + 1
-                target_pixel_frames = (lat_f_effective - 1) * vae_stride_t + 1
+                # CRITICAL: Use Wan2GP's frame count formula for FLF mode
+                # Wan2GP: frame_num = (lat_f - 2) * stride + 2 when add_frames_for_end_image
+                # This gives exactly the right latent frames with any_end_frame VAE encoding
+                target_pixel_frames = (lat_f_effective - 2) * vae_stride_t + 2
                 zero_frames_count = target_pixel_frames - 2  # Minus 1 for start and 1 for end
 
                 if zero_frames_count < 0:
                     zero_frames_count = 0
 
-                logger.info(f"FLF: lat_f_effective={lat_f_effective}, target_pixel_frames={target_pixel_frames}, zero_frames={zero_frames_count}")
+                logger.info(f"FLF (Wan2GP style): lat_f_effective={lat_f_effective}, target_pixel_frames={target_pixel_frames}, zero_frames={zero_frames_count}")
 
                 # Build complete pixel sequence: [start_frame, zero_frames, end_frame]
                 zero_frames = torch.zeros(
@@ -2592,8 +2591,8 @@ def prepare_i2v_inputs(
                 enc_sequence = torch.cat([img_resized, zero_frames, end_img_resized], dim=1)
                 logger.info(f"FLF joint encoding: Built pixel sequence with {enc_sequence.shape[1]} frames (1 start + {zero_frames_count} zeros + 1 end)")
 
-                # Encode the complete sequence together (better temporal coherence)
-                y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                # Encode with any_end_frame=True for special FLF temporal chunking (Wan2GP style)
+                y_latent = vae.encode([enc_sequence], any_end_frame=True)[0]  # Shape [C', lat_f, H, W]
                 logger.info(f"FLF joint VAE encoding complete. Latent shape: {y_latent.shape}, expected lat_f={lat_f_effective}")
 
                 del zero_frames, enc_sequence
@@ -2643,19 +2642,19 @@ def prepare_i2v_inputs(
 
         if has_end_image:
             # FLF mask: first frame = 1, middle = 0, last frame = 1
-            # Use the same target_pixel_frames as the VAE encoding for consistency
-            if using_looped_with_end:
-                frame_count_for_mask = (lat_f_effective - 1) * config.vae_stride[0] + 1
-            else:
-                frame_count_for_mask = (lat_f_effective - 1) * config.vae_stride[0] + 1
+            # Use same frame count formula as VAE encoding (Wan2GP style)
+            frame_count_for_mask = (lat_f_effective - 2) * config.vae_stride[0] + 2
 
             # Create mask in frame space [1, F, H, W]
             msk_frames = torch.ones(1, frame_count_for_mask, lat_h, lat_w, device=device, dtype=vae.dtype)
             msk_frames[:, 1:-1] = 0  # Middle frames = 0 (to be generated)
             # First and last frames remain 1 (conditioning)
 
-            # Apply temporal interleaving for VAE stride (matches Wan2GP)
+            # Apply temporal interleaving for VAE stride (Wan2GP style)
             # First frame repeated 4x, middle frames as-is, last frame repeated 4x
+            # Result: 4 + (frame_count - 2) + 4 = frame_count + 6
+            # For frame_count = (lat_f - 2) * 4 + 2 = lat_f * 4 - 6
+            # Interleaved = lat_f * 4 - 6 + 6 = lat_f * 4 ✓
             msk_interleaved = torch.cat([
                 msk_frames[:, 0:1].repeat(1, 4, 1, 1),   # First frame x4
                 msk_frames[:, 1:-1],                      # Middle frames
@@ -2663,11 +2662,8 @@ def prepare_i2v_inputs(
             ], dim=1)
 
             # Reshape to [4, lat_f, H, W] format expected by model
-            # msk_interleaved shape: [1, F_interleaved, H, W]
-            # Need to reshape to [4, lat_f, H, W]
-            interleaved_len = msk_interleaved.shape[1]
-            lat_f_from_mask = interleaved_len // 4
-            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
+            # msk_interleaved shape: [1, lat_f * 4, H, W]
+            msk = msk_interleaved.view(1, lat_f_effective, 4, lat_h, lat_w)
             msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
 
             logger.info(f"FLF mask constructed with temporal interleaving. Shape: {msk.shape}, expected lat_f={lat_f_effective}")

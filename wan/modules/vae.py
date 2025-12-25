@@ -519,11 +519,15 @@ class WanVAE_(nn.Module):
         x_recon = self.decode(z)
         return x_recon, mu, log_var
 
-    def encode(self, x, scale):
+    def encode(self, x, scale, any_end_frame=False):
         self.clear_cache()
         ## cache
         t = x.shape[2]
-        iter_ = 1 + (t - 1) // 4
+        # FLF support: any_end_frame uses special temporal chunking (Wan2GP style)
+        if any_end_frame:
+            iter_ = 2 + (t - 2) // 4  # First frame, middle chunks of 4, last frame
+        else:
+            iter_ = 1 + (t - 1) // 4  # Standard: first frame, then chunks of 4
         # ## 对encode输入的x，按时间拆分为1、4、4、4....
 
         # if self.cache_device is None:
@@ -531,6 +535,12 @@ class WanVAE_(nn.Module):
             self._enc_conv_idx = [0]
             if i == 0:
                 out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+            elif any_end_frame and i == iter_ - 1:
+                # FLF: Encode last frame separately with no cache (like Wan2GP)
+                out_ = self.encoder(
+                    x[:, :, -1:, :, :], feat_cache=None, feat_idx=self._enc_conv_idx
+                )
+                out = torch.cat([out, out_], 2)
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
@@ -742,12 +752,13 @@ class WanVAE:
         if dtype is not None:
             self.to_dtype(dtype)
 
-    def encode(self, videos):
+    def encode(self, videos, any_end_frame=False):
         """
         videos: A list of videos each with shape [C, T, H, W].
+        any_end_frame: If True, use special FLF temporal chunking (first, middle, last)
         """
         with torch.amp.autocast('cuda', dtype=self.dtype):
-            return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
+            return [self.model.encode(u.unsqueeze(0), self.scale, any_end_frame=any_end_frame).float().squeeze(0) for u in videos]
 
     def decode(self, zs):
         with torch.amp.autocast('cuda', dtype=self.dtype):
