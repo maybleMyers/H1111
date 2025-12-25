@@ -2990,15 +2990,20 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
 
 def prepare_v2v_i2v_inputs(
-    args: argparse.Namespace, 
-    config, 
-    accelerator: Accelerator, 
-    device: torch.device, 
+    args: argparse.Namespace,
+    config,
+    accelerator: Accelerator,
+    device: torch.device,
     vae: WanVAE,
     video_frames_np: List[np.ndarray]  # Pass in loaded video frames
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
-    """Prepare V2V inputs for i2v models (combines V2V video encoding with I2V conditioning).
-    
+    """Prepare V2V inputs for i2v models (combines V2V video encoding with proper I2V conditioning).
+
+    Uses the official I2V conditioning format:
+    - Mask with proper temporal interleaving
+    - First frame (or provided image) encoded through VAE with zero padding
+    - Optional end frame conditioning
+
     Args:
         args: command line arguments
         config: model configuration
@@ -3006,39 +3011,52 @@ def prepare_v2v_i2v_inputs(
         device: device to use
         vae: VAE model instance
         video_frames_np: List of video frames as numpy arrays (HWC, 0-255)
-        
+
     Returns:
         Tuple containing noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
     """
     if vae is None:
         raise ValueError("VAE must be provided for V2V-I2V input preparation.")
-        
-    logger.info("Preparing V2V inputs for i2v model (with CLIP conditioning)")
-    
+
+    logger.info("Preparing V2V inputs for i2v model (with proper I2V conditioning)")
+
     # Get dimensions from args
     height, width = args.video_size
     frames = args.video_length
-    
-    # Convert frames to tensor and encode to latents
+
+    # Convert frames to tensor and encode to latents (for V2V re-mixing)
     video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))  # [F,H,W,C]
     video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
     video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
-    
-    # Encode video to latents
+
+    # Encode video to latents (for V2V re-mixing during sampling)
     video_latents = encode_video_to_latents(video_tensor, vae, device, vae.dtype, args)
     logger.info(f"Encoded video to latents: {video_latents.shape}")
-    
-    # Extract first frame for CLIP conditioning (i2v requirement)
-    first_frame_np = video_frames_np[0]  # HWC, 0-255
-    first_frame_pil = Image.fromarray(first_frame_np)
-    
+
+    # Determine which image to use for I2V conditioning
+    # Priority: args.image_path > first frame of video
+    if args.image_path is not None:
+        logger.info(f"Using provided input image for I2V conditioning: {args.image_path}")
+        cond_image_pil = Image.open(args.image_path).convert("RGB")
+        cond_image_pil = cond_image_pil.resize((width, height), Image.LANCZOS)
+    else:
+        logger.info("Using first frame of input video for I2V conditioning")
+        cond_image_pil = Image.fromarray(video_frames_np[0])
+
+    # Check for end image conditioning
+    has_end_image = args.end_image_path is not None
+    if has_end_image:
+        logger.info(f"Using provided end image for I2V conditioning: {args.end_image_path}")
+        end_image_pil = Image.open(args.end_image_path).convert("RGB")
+        end_image_pil = end_image_pil.resize((width, height), Image.LANCZOS)
+
     # Calculate dimensions from latents
     _, _, lat_f, lat_h, lat_w = video_latents.shape
     seq_len = (lat_h * lat_w) // (config.patch_size[1] * config.patch_size[2]) * lat_f
-    
+
     # Configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
-    
+
     # Set seed
     seed = args.seed
     if not args.cpu_noise:
@@ -3046,11 +3064,11 @@ def prepare_v2v_i2v_inputs(
         seed_g.manual_seed(seed)
     else:
         seed_g = torch.manual_seed(seed)
-    
+
     # Load text encoder and encode prompts
     text_encoder = load_text_encoder(args, config, device)
     text_encoder.model.to(device)
-    
+
     with torch.no_grad():
         if args.fp8_t5:
             with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
@@ -3059,33 +3077,33 @@ def prepare_v2v_i2v_inputs(
         else:
             context = text_encoder([args.prompt], device)
             context_null = text_encoder([n_prompt], device)
-    
+
     # Free text encoder
     del text_encoder
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
     gc.collect()
     logger.info("Unloaded T5 model from memory")
-    
-    # Load CLIP model and encode first frame
+
+    # Load CLIP model and encode conditioning image
     clip = load_clip_model(args, config, device)
     clip.model.to(device)
-    
-    # Convert first frame for CLIP
-    img_tensor_clip = TF.to_tensor(first_frame_pil).sub_(0.5).div_(0.5).to(device)  # CHW, [-1, 1]
-    
+
+    # Convert conditioning image for CLIP
+    img_tensor_clip = TF.to_tensor(cond_image_pil).sub_(0.5).div_(0.5).to(device)  # CHW, [-1, 1]
+
     with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
         clip_context = clip.visual([img_tensor_clip.unsqueeze(1)])  # Add Frame dim
-    
-    logger.info("Encoded first frame with CLIP for i2v conditioning")
-    
+
+    logger.info("Encoded conditioning image with CLIP for i2v")
+
     # Free CLIP model
     del clip
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
     gc.collect()
     logger.info("Unloaded CLIP model from memory")
-    
+
     # Generate noise matching video latents shape
     noise = torch.randn(
         video_latents.shape,  # [B, C', F', H', W']
@@ -3094,34 +3112,74 @@ def prepare_v2v_i2v_inputs(
         generator=seed_g
     )
     noise = noise.to(device)
-    
+
+    # === Prepare proper I2V 'y' tensor (mask + encoded conditioning frame) ===
+    # Following official image2video.py implementation
+
+    # Create mask with proper temporal interleaving (official format)
+    # msk shape: [1, F, lat_h, lat_w] -> [4, lat_f, lat_h, lat_w]
+    msk = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
+    msk[:, 1:] = 0  # First frame = 1, rest = 0
+
+    # Apply temporal interleaving for VAE temporal stride (repeat first frame 4 times, then append rest)
+    msk = torch.concat([
+        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+    ], dim=1)
+    # Reshape: [1, F+3, lat_h, lat_w] -> [1, lat_f, 4, lat_h, lat_w] -> [4, lat_f, lat_h, lat_w]
+    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+    msk = msk.transpose(1, 2)[0]  # [4, lat_f, lat_h, lat_w]
+
+    # If we have end image, also mark the last frame
+    if has_end_image:
+        msk[:, -1] = 1  # Also condition on last frame
+        logger.info("Mask configured for both start and end frame conditioning")
+
+    # Encode conditioning frame(s) through VAE with zero padding
+    # Convert conditioning image to tensor: [C, 1, H, W]
+    cond_img_tensor = TF.to_tensor(cond_image_pil).unsqueeze(1)  # [3, 1, H, W]
+
+    if has_end_image:
+        # Create tensor with start frame, zeros, and end frame
+        end_img_tensor = TF.to_tensor(end_image_pil).unsqueeze(1)  # [3, 1, H, W]
+        zeros_middle = torch.zeros(3, frames - 2, height, width)
+        cond_video_tensor = torch.cat([cond_img_tensor, zeros_middle, end_img_tensor], dim=1)  # [3, F, H, W]
+    else:
+        # Create tensor with start frame and zeros for remaining frames
+        zeros_rest = torch.zeros(3, frames - 1, height, width)
+        cond_video_tensor = torch.cat([cond_img_tensor, zeros_rest], dim=1)  # [3, F, H, W]
+
+    # Scale to [-1, 1] and encode through VAE
+    cond_video_tensor = cond_video_tensor * 2.0 - 1.0  # [0,1] -> [-1,1]
+    cond_video_tensor = cond_video_tensor.unsqueeze(0).to(device)  # [1, 3, F, H, W]
+
+    with torch.no_grad():
+        vae.to_device(device)
+        cond_latent = vae.encode([cond_video_tensor.squeeze(0)])[0]  # [C', lat_f, lat_h, lat_w]
+
+    logger.info(f"Encoded conditioning frame(s) to latents: {cond_latent.shape}")
+
+    # Concatenate mask with encoded conditioning latent to create 'y'
+    # y shape: [4 + C', lat_f, lat_h, lat_w] = [4 + 16, lat_f, lat_h, lat_w] = [20, lat_f, lat_h, lat_w]
+    y = torch.concat([msk, cond_latent], dim=0)
+
     # Prepare model input arguments
     # A14B models don't have img_emb layer, so don't pass clip_fea
     use_clip_fea = clip_context if not ("A14B" in args.task) else None
-    
-    # For i2v models, we need to prepare 'y' tensor (mask + latent)
-    # For V2V with i2v, we want to preserve the first frame and generate the rest
-    # This is like standard I2V where the first frame is given
-    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
-    msk[:, 0] = 1  # Mask (preserve) the first frame only
-    
-    # Concatenate mask with video latents to create 'y'
-    y = torch.cat([msk, video_latents.squeeze(0)], dim=0)  # [4+C', F', H', W']
-    
+
     arg_c = {
         "context": context,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],  # i2v models expect y as a list
     }
-    
+
     arg_null = {
         "context": context_null,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     return noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
 
 
