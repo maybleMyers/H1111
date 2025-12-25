@@ -5525,30 +5525,44 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: Use PURE NOISE like regular I2V
-        # The I2V model was trained on pure noise with conditioning via 'y' parameter
-        # For V2V, we put the ENTIRE source video in 'y' (done in prepare_v2v_i2v_inputs)
-        # The mask in 'y' controls how much the model follows the source video
+        # V2V with I2V model: Use SDEdit-style noise injection (like T2V)
+        # PLUS keep 'y' conditioning for temporal coherence
+        # This hybrid approach preserves the first frame exactly while maintaining motion
 
         # Calculate timestep to start from based on strength
-        # strength controls how many timesteps to skip (more strength = more generation freedom)
         init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
         init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
+        init_timestep = timesteps[init_timestep_idx]
 
-        # IMPORTANT: Start with PURE NOISE (like regular I2V)
-        # The 'y' parameter contains the encoded source video for conditioning
-        # DO NOT add noise to video - the model expects pure noise input
-        # latent is already pure noise from prepare_v2v_i2v_inputs
+        # Store clean video latents and noise (like T2V V2V)
+        v2v_noise = latent.clone()  # latent is pure noise from prepare_v2v_i2v_inputs
+        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
 
-        # Skip the early timesteps (start from init_timestep)
+        # SDEdit: Add noise to clean video at starting timestep
+        latent = scheduler.add_noise(
+            original_samples=v2v_clean,
+            noise=v2v_noise,
+            timesteps=torch.tensor([init_timestep], device=device)
+        )
+
+        # CRITICAL: First frame is UNDENOISED (clean latent, no noise)
+        # This preserves the first frame exactly
+        first_frame_clean = v2v_clean[:, :, 0:1, :, :] if v2v_clean.dim() == 5 else v2v_clean[:, 0:1, :, :]
+        if latent.dim() == 5:
+            latent[:, :, 0:1, :, :] = first_frame_clean
+        else:
+            latent[:, 0:1, :, :] = first_frame_clean
+
+        # Skip early timesteps
         timesteps = timesteps[init_timestep_idx:]
 
-        # Mark this as I2V mode so run_sampling knows NOT to do external anchoring
-        inputs[0]["_v2v_is_i2v_model"] = True
+        # Store for per-step anchor frame restoration (enables external anchoring)
+        inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
+        # NOTE: Do NOT set "_v2v_is_i2v_model" = True - we WANT external anchoring
 
-        logger.info(f"V2V-I2V: Starting with PURE NOISE (like regular I2V)")
-        logger.info(f"V2V-I2V: Source video conditioning via 'y' parameter with strength-based mask")
-        logger.info(f"V2V-I2V: Skipping {init_timestep_idx} steps, using {len(timesteps)} timesteps")
+        logger.info(f"V2V-I2V: Using SDEdit-style noise injection (hybrid approach)")
+        logger.info(f"V2V-I2V: First frame UNDENOISED (clean latent preserved)")
+        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f}, using {len(timesteps)} timesteps")
 
     elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
         # Standard V2V (T2V model): SDEdit-style noise injection with anchor
