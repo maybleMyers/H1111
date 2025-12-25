@@ -3171,6 +3171,7 @@ def prepare_v2v_i2v_inputs(
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],  # i2v models expect y as a list
+        "_has_end_image": has_end_image,  # For end-frame anchoring
     }
 
     arg_null = {
@@ -3776,7 +3777,7 @@ def run_sampling(
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
 
-            # 6. Apply video conditioning for V2V (per-step re-mixing)
+            # 6. Apply video conditioning for V2V (per-step re-mixing) - for T2V models
             # Blend source video latent with current denoised latent at each step
             if "_v2v_video_latents" in arg_c:
                 v2v_video_latents = arg_c["_v2v_video_latents"].to(latent.device).to(latent.dtype)
@@ -3785,6 +3786,30 @@ def run_sampling(
                 # Constant preservation weight throughout all timesteps
                 # Re-mix: blend source video latent with current latent
                 latent = preservation_weight * v2v_video_latents + (1.0 - preservation_weight) * latent
+
+            # 7. Re-anchor first frame for V2V with I2V model
+            # This ensures the first frame stays consistent with the conditioning throughout denoising
+            if "_i2v_first_frame_latent" in arg_c:
+                first_frame_latent = arg_c["_i2v_first_frame_latent"].to(latent.device).to(latent.dtype)
+                # Replace first frame of latent with the clean encoded first frame
+                if latent.dim() == 5:
+                    # [B, C, F, H, W] - with batch dimension
+                    latent[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)
+                else:
+                    # [C, F, H, W] - without batch dimension
+                    latent[:, 0:1, :, :] = first_frame_latent
+
+            # 8. Re-anchor last frame for V2V with I2V model (when end image provided)
+            # This ensures the last frame stays consistent with end conditioning throughout denoising
+            if "_i2v_last_frame_latent" in arg_c:
+                last_frame_latent = arg_c["_i2v_last_frame_latent"].to(latent.device).to(latent.dtype)
+                # Replace last frame of latent with the clean encoded last frame
+                if latent.dim() == 5:
+                    # [B, C, F, H, W] - with batch dimension
+                    latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
+                else:
+                    # [C, F, H, W] - without batch dimension
+                    latent[:, -1:, :, :] = last_frame_latent
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -5522,12 +5547,61 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask1"] = ti2v_mask1
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
-    if (is_v2v or is_v2v_i2v) and args.strength < 1.0:
-        # V2V Re-Mixing Strategy
-        # Instead of timestep skipping, we:
-        # 1. Start with pure noise (latent already is noise)
-        # 2. Run ALL timesteps
-        # 3. Re-mix at each step with preservation weight
+    if is_v2v_i2v and args.strength < 1.0:
+        # V2V with I2V model: Use noise injection with frame anchoring
+        # The I2V model expects:
+        # 1. y parameter with conditioning frames (already set in prepare_v2v_i2v_inputs)
+        # 2. Latent with anchor frames clean, rest noised from source video
+
+        # Calculate timestep to start from based on strength
+        init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
+        init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
+        init_timestep = timesteps[init_timestep_idx]
+
+        # Get the encoded frames from the conditioning (stored in y)
+        # y has shape [20, lat_f, lat_h, lat_w] = [mask(4) + latent(16), lat_f, lat_h, lat_w]
+        y_tensor = inputs[0]["y"][0]  # [20, lat_f, lat_h, lat_w]
+        cond_latent = y_tensor[4:, :, :, :]  # Extract latent part [16, lat_f, lat_h, lat_w]
+        first_frame_latent = cond_latent[:, 0:1, :, :]  # [16, 1, lat_h, lat_w]
+
+        has_end_image = inputs[0].get("_has_end_image", False)
+        if has_end_image:
+            last_frame_latent = cond_latent[:, -1:, :, :]  # [16, 1, lat_h, lat_w]
+
+        # Add noise to source video latents
+        noised_video = scheduler.add_noise(
+            original_samples=video_latents,
+            noise=latent,  # latent is pure noise at this point
+            timesteps=torch.tensor([init_timestep], device=device)
+        )
+
+        # Anchor the conditioning frames: replace with clean encoded frames
+        if noised_video.dim() == 5:
+            noised_video[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)  # Keep first frame clean
+            if has_end_image:
+                noised_video[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)  # Keep last frame clean
+        else:
+            noised_video[:, 0:1, :, :] = first_frame_latent  # Keep first frame clean
+            if has_end_image:
+                noised_video[:, -1:, :, :] = last_frame_latent  # Keep last frame clean
+
+        latent = noised_video
+
+        # Skip the early timesteps
+        timesteps = timesteps[init_timestep_idx:]
+
+        # Store for per-step frame re-anchoring
+        inputs[0]["_i2v_first_frame_latent"] = first_frame_latent
+        if has_end_image:
+            inputs[0]["_i2v_last_frame_latent"] = last_frame_latent
+
+        anchor_info = "first frame" + (" and last frame" if has_end_image else "")
+        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
+        logger.info(f"V2V-I2V: Anchored {anchor_info}, using {len(timesteps)} timesteps")
+
+    elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
+        # Standard V2V (T2V model): Use per-step re-mixing
+        # This approach works better for T2V models which don't have frame-specific conditioning
 
         v2v_preservation_weight = 1.0 - args.strength
 
