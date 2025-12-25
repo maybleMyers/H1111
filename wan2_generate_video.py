@@ -2460,12 +2460,17 @@ def prepare_i2v_inputs(
                                   has_end_image)
 
         # For looped videos: place end image at last frame (no extra frame)
-        # For non-looped: add end image as extra frame (original behavior)
+        # For Wan 2.2 (config.i2v=False): end image doesn't add extra frame, uses standard encoding
+        # For Wan 2.1 (config.i2v=True): add end image as extra frame (original behavior)
         if using_looped_with_end:
             lat_f_effective = lat_f_base  # Keep same frame count for looped videos
             logger.info("Looped mode: End image will replace last frame instead of adding extra frame")
+        elif has_end_image and not config.i2v:
+            # Wan 2.2 FLF: end image is part of standard encoding, no extra frame
+            lat_f_effective = lat_f_base
+            logger.info("Wan 2.2 FLF mode: End image uses standard encoding (no extra frame)")
         else:
-            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Original behavior
+            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Wan 2.1 behavior
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #2: Sequence Length ---
         max_seq_len = math.ceil(lat_f_effective * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
@@ -2568,19 +2573,16 @@ def prepare_i2v_inputs(
             vae_stride_t = config.vae_stride[0]  # Temporal stride (typically 4)
 
             if has_end_image and end_img_resized is not None:
-                # FLF MODE: Build complete pixel sequence [start, zeros, end] and encode together
-                # This matches Wan2GP's approach for better temporal coherence
+                # FLF MODE for Wan 2.2: Simpler approach matching Wan2GP
+                # Wan 2.2 does NOT use special any_end_frame encoding or end frame x4 interleaving
+                # Just build [start, zeros, end] and encode normally
 
-                # CRITICAL: Use Wan2GP's frame count formula for FLF mode
-                # Wan2GP: frame_num = (lat_f - 2) * stride + 2 when add_frames_for_end_image
-                # This gives exactly the right latent frames with any_end_frame VAE encoding
-                target_pixel_frames = (lat_f_effective - 2) * vae_stride_t + 2
-                zero_frames_count = target_pixel_frames - 2  # Minus 1 for start and 1 for end
-
+                # Use standard frame count (same as non-FLF)
+                zero_frames_count = frames - 2  # Minus 1 for start and 1 for end
                 if zero_frames_count < 0:
                     zero_frames_count = 0
 
-                logger.info(f"FLF (Wan2GP style): lat_f_effective={lat_f_effective}, target_pixel_frames={target_pixel_frames}, zero_frames={zero_frames_count}")
+                logger.info(f"FLF (Wan 2.2 style): frames={frames}, zero_frames={zero_frames_count}")
 
                 # Build complete pixel sequence: [start_frame, zero_frames, end_frame]
                 zero_frames = torch.zeros(
@@ -2592,9 +2594,9 @@ def prepare_i2v_inputs(
                 enc_sequence = torch.cat([img_resized, zero_frames, end_img_resized], dim=1)
                 logger.info(f"FLF joint encoding: Built pixel sequence with {enc_sequence.shape[1]} frames (1 start + {zero_frames_count} zeros + 1 end)")
 
-                # Encode with any_end_frame=True for special FLF temporal chunking (Wan2GP style)
-                y_latent = vae.encode([enc_sequence], any_end_frame=True)[0]  # Shape [C', lat_f, H, W]
-                logger.info(f"FLF joint VAE encoding complete. Latent shape: {y_latent.shape}, expected lat_f={lat_f_effective}")
+                # Wan 2.2: Use STANDARD VAE encoding (any_end_frame=False)
+                y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                logger.info(f"FLF VAE encoding complete. Latent shape: {y_latent.shape}")
 
                 del zero_frames, enc_sequence
             else:
@@ -2642,32 +2644,47 @@ def prepare_i2v_inputs(
         actual_lat_f = y_latent.shape[1]
 
         if has_end_image:
-            # FLF mask: first frame = 1, middle = 0, last frame = 1
-            # Use same frame count formula as VAE encoding (Wan2GP style)
-            frame_count_for_mask = (lat_f_effective - 2) * config.vae_stride[0] + 2
+            # FLF mask for Wan 2.2: first frame = 1, middle = 0, last frame = 1
+            # Use same frame count as VAE encoding (standard `frames` parameter)
+            frame_count_for_mask = frames
 
             # Create mask in frame space [1, F, H, W]
             msk_frames = torch.ones(1, frame_count_for_mask, lat_h, lat_w, device=device, dtype=vae.dtype)
             msk_frames[:, 1:-1] = 0  # Middle frames = 0 (to be generated)
             # First and last frames remain 1 (conditioning)
 
-            # Apply temporal interleaving for VAE stride (Wan2GP style)
-            # First frame repeated 4x, middle frames as-is, last frame repeated 4x
-            # Result: 4 + (frame_count - 2) + 4 = frame_count + 6
-            # For frame_count = (lat_f - 2) * 4 + 2 = lat_f * 4 - 6
-            # Interleaved = lat_f * 4 - 6 + 6 = lat_f * 4 ✓
+            # Wan 2.2 style: Simple interleaving - only first frame x4, rest as-is
+            # This matches how Wan2GP handles i2v_2_2 models (no special end frame treatment)
             msk_interleaved = torch.cat([
                 msk_frames[:, 0:1].repeat(1, 4, 1, 1),   # First frame x4
-                msk_frames[:, 1:-1],                      # Middle frames
-                msk_frames[:, -1:].repeat(1, 4, 1, 1),   # Last frame x4
+                msk_frames[:, 1:],                        # Rest (including last, no x4)
             ], dim=1)
 
             # Reshape to [4, lat_f, H, W] format expected by model
-            # msk_interleaved shape: [1, lat_f * 4, H, W]
-            msk = msk_interleaved.view(1, lat_f_effective, 4, lat_h, lat_w)
+            # Use actual latent frame count from VAE encoding (not lat_f_effective which may have +1)
+            interleaved_len = msk_interleaved.shape[1]
+            lat_f_from_mask = interleaved_len // 4
+
+            # Verify mask aligns with VAE output
+            if lat_f_from_mask != actual_lat_f:
+                logger.warning(f"Mask/latent frame mismatch: mask gives {lat_f_from_mask}, VAE gives {actual_lat_f}. Using VAE count.")
+                # Adjust interleaved mask to match VAE output
+                target_interleaved = actual_lat_f * 4
+                if interleaved_len > target_interleaved:
+                    msk_interleaved = msk_interleaved[:, :target_interleaved]
+                else:
+                    # Pad with zeros
+                    pad_needed = target_interleaved - interleaved_len
+                    msk_interleaved = torch.cat([
+                        msk_interleaved,
+                        torch.zeros(1, pad_needed, lat_h, lat_w, device=device, dtype=msk_interleaved.dtype)
+                    ], dim=1)
+                lat_f_from_mask = actual_lat_f
+
+            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
             msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
 
-            logger.info(f"FLF mask constructed with temporal interleaving. Shape: {msk.shape}, expected lat_f={lat_f_effective}")
+            logger.info(f"FLF mask (Wan 2.2 style). Shape: {msk.shape}, lat_f={lat_f_from_mask}")
         else:
             # Standard mask: only first frame is conditioned
             msk_frames = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
