@@ -3401,6 +3401,24 @@ def run_sampling(
         # Latent should be [B, C, F, H, W] or [C, F, H, W]
         latent_on_device = latent.to(device)
 
+        # V2V-I2V: Flow-matching style injection (like Wan2GP)
+        # At each step until injection cutoff: latent = sigma * noise + (1 - sigma) * source
+        if "_v2v_i2v_source_latents" in arg_c and i <= arg_c.get("_v2v_i2v_injection_step", -1):
+            sigma = t.item() / 1000.0  # Flow matching: sigma = t / 1000
+            source_latents = arg_c["_v2v_i2v_source_latents"].to(device)
+            noise_latents = arg_c["_v2v_i2v_noise"].to(device)
+
+            # Flow-matching blend: x_t = sigma * noise + (1 - sigma) * x_0
+            latent_on_device = sigma * noise_latents + (1.0 - sigma) * source_latents
+
+            # Anchor first frame to clean latent (no noise)
+            if "_v2v_first_frame_latent" in arg_c:
+                first_frame = arg_c["_v2v_first_frame_latent"].to(device)
+                if latent_on_device.dim() == 5:
+                    latent_on_device[:, :, 0:1, :, :] = first_frame
+                else:
+                    latent_on_device[:, 0:1, :, :] = first_frame
+
         # FIX: Check if latent_on_device has too many dimensions and fix it
         # The model expects input x as a list of tensors with shape [C, F, H, W]
         # This adjustment seems specific to a potential bug elsewhere, keep it if needed.
@@ -5525,38 +5543,33 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: Direct noise blending approach
-        # strength directly controls noise amount: 0.2 = 20% noise, 80% clean
-        # PLUS keep 'y' conditioning for temporal coherence
+        # V2V with I2V model: Flow-matching style injection (like Wan2GP)
+        # At each step, inject: latent = sigma * noise + (1 - sigma) * source_latents
+        # where sigma = t / 1000, until the injection cutoff step
 
-        # Store clean video latents and noise
+        # Store clean video latents and pure noise for per-step injection
         v2v_noise = latent.clone()  # latent is pure noise from prepare_v2v_i2v_inputs
         v2v_clean = video_latents.to(latent.device).to(latent.dtype)
 
-        # Direct noise blend: strength controls how much noise vs clean
-        # strength=0.2 means 20% noise, 80% clean video (sharper result)
-        # This gives more intuitive control than scheduler.add_noise at timestep level
-        latent = (1.0 - args.strength) * v2v_clean + args.strength * v2v_noise
+        # Calculate injection cutoff step from strength (like Wan2GP)
+        # strength=0.2 -> injection until step 80 (out of 100), then free denoising for 20 steps
+        injection_denoising_step = int(round(args.infer_steps * (1.0 - args.strength)))
 
-        # CRITICAL: First frame is UNDENOISED (clean latent, no noise)
-        # This preserves the first frame exactly
+        # Store first frame clean latent for anchoring
         first_frame_clean = v2v_clean[:, :, 0:1, :, :] if v2v_clean.dim() == 5 else v2v_clean[:, 0:1, :, :]
-        if latent.dim() == 5:
-            latent[:, :, 0:1, :, :] = first_frame_clean
-        else:
-            latent[:, 0:1, :, :] = first_frame_clean
 
-        # Use all steps specified by --infer_steps (no skipping)
-        # This gives full control: strength for noise, infer_steps for quality
-        # timesteps remains unchanged - use all steps
-
-        # Store for per-step anchor frame restoration (enables external anchoring)
+        # Store tensors for per-step flow-matching injection in sampling loop
+        inputs[0]["_v2v_i2v_source_latents"] = v2v_clean
+        inputs[0]["_v2v_i2v_noise"] = v2v_noise
+        inputs[0]["_v2v_i2v_injection_step"] = injection_denoising_step
         inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
-        # NOTE: Do NOT set "_v2v_is_i2v_model" = True - we WANT external anchoring
 
-        logger.info(f"V2V-I2V: Direct noise blend (strength={args.strength:.2f} -> {args.strength*100:.0f}% noise)")
-        logger.info(f"V2V-I2V: First frame UNDENOISED (clean latent preserved)")
-        logger.info(f"V2V-I2V: Using all {len(timesteps)} timesteps from --infer_steps")
+        # Do NOT skip timesteps - run all steps, injection happens inside the loop
+        # timesteps remains unchanged
+
+        logger.info(f"V2V-I2V: Flow-matching injection (strength={args.strength:.2f})")
+        logger.info(f"V2V-I2V: Injection until step {injection_denoising_step}, then free denoising")
+        logger.info(f"V2V-I2V: First frame anchored, using all {len(timesteps)} timesteps")
 
     elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
         # Standard V2V (T2V model): SDEdit-style noise injection with anchor
