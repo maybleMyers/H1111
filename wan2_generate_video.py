@@ -3113,13 +3113,24 @@ def prepare_v2v_i2v_inputs(
     )
     noise = noise.to(device)
 
-    # === Prepare proper I2V 'y' tensor (mask + encoded conditioning frame) ===
-    # Following official image2video.py implementation
+    # === Prepare proper I2V 'y' tensor for V2V ===
+    # Key difference from regular I2V: We use the ENTIRE source video as conditioning
+    # The mask controls how much the model should follow the source video
+    # mask=1 means "use this frame from conditioning", mask=0 means "generate freely"
 
-    # Create mask with proper temporal interleaving (official format)
-    # msk shape: [1, F, lat_h, lat_w] -> [4, lat_f, lat_h, lat_w]
+    # For V2V: Use the already-encoded video_latents as conditioning
+    # video_latents shape: [1, 16, lat_f, lat_h, lat_w]
+    cond_latent = video_latents.squeeze(0).to(device)  # [16, lat_f, lat_h, lat_w]
+
+    # Create mask based on strength
+    # strength=0.0 -> mask=1.0 (full conditioning, preserve video)
+    # strength=1.0 -> mask=0.0 (no conditioning, like regular I2V first-frame only)
+    v2v_strength = args.strength if hasattr(args, 'strength') else 0.5
+
+    # Create base mask - for V2V, we condition on ALL frames with strength-based weight
+    # First frame always gets full conditioning (mask=1), rest get (1 - strength)
     msk = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
-    msk[:, 1:] = 0  # First frame = 1, rest = 0
+    msk[:, 1:] = 1.0 - v2v_strength  # Other frames get partial conditioning based on strength
 
     # Apply temporal interleaving for VAE temporal stride (repeat first frame 4 times, then append rest)
     msk = torch.concat([
@@ -3129,34 +3140,13 @@ def prepare_v2v_i2v_inputs(
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]  # [4, lat_f, lat_h, lat_w]
 
-    # If we have end image, also mark the last frame
+    # If we have end image, mark last frame with full conditioning
     if has_end_image:
-        msk[:, -1] = 1  # Also condition on last frame
-        logger.info("Mask configured for both start and end frame conditioning")
+        msk[:, -1] = 1  # Last frame gets full conditioning
+        logger.info("Mask configured for start (full) and end (full) frame conditioning")
 
-    # Encode conditioning frame(s) through VAE with zero padding
-    # Convert conditioning image to tensor: [C, 1, H, W]
-    cond_img_tensor = TF.to_tensor(cond_image_pil).unsqueeze(1)  # [3, 1, H, W]
-
-    if has_end_image:
-        # Create tensor with start frame, zeros, and end frame
-        end_img_tensor = TF.to_tensor(end_image_pil).unsqueeze(1)  # [3, 1, H, W]
-        zeros_middle = torch.zeros(3, frames - 2, height, width)
-        cond_video_tensor = torch.cat([cond_img_tensor, zeros_middle, end_img_tensor], dim=1)  # [3, F, H, W]
-    else:
-        # Create tensor with start frame and zeros for remaining frames
-        zeros_rest = torch.zeros(3, frames - 1, height, width)
-        cond_video_tensor = torch.cat([cond_img_tensor, zeros_rest], dim=1)  # [3, F, H, W]
-
-    # Scale to [-1, 1] and encode through VAE
-    cond_video_tensor = cond_video_tensor * 2.0 - 1.0  # [0,1] -> [-1,1]
-    cond_video_tensor = cond_video_tensor.unsqueeze(0).to(device)  # [1, 3, F, H, W]
-
-    with torch.no_grad():
-        vae.to_device(device)
-        cond_latent = vae.encode([cond_video_tensor.squeeze(0)])[0]  # [C', lat_f, lat_h, lat_w]
-
-    logger.info(f"Encoded conditioning frame(s) to latents: {cond_latent.shape}")
+    logger.info(f"V2V mask: first_frame=1.0, other_frames={1.0 - v2v_strength:.2f}")
+    logger.info(f"Using encoded source video as conditioning: {cond_latent.shape}")
 
     # Concatenate mask with encoded conditioning latent to create 'y'
     # y shape: [4 + C', lat_f, lat_h, lat_w] = [4 + 16, lat_f, lat_h, lat_w] = [20, lat_f, lat_h, lat_w]
@@ -5535,31 +5525,20 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: SDEdit-style noise injection
-        # IMPORTANT: The I2V model handles first-frame conditioning internally via 'y' parameter
-        # We should NOT externally anchor frames - this would conflict with model's internal conditioning
-        # The 'y' parameter already contains mask + encoded first frame for model to use
+        # V2V with I2V model: Use PURE NOISE like regular I2V
+        # The I2V model was trained on pure noise with conditioning via 'y' parameter
+        # For V2V, we put the ENTIRE source video in 'y' (done in prepare_v2v_i2v_inputs)
+        # The mask in 'y' controls how much the model follows the source video
 
         # Calculate timestep to start from based on strength
+        # strength controls how many timesteps to skip (more strength = more generation freedom)
         init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
         init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
-        init_timestep = timesteps[init_timestep_idx]
 
-        # Store clean video latents and noise
-        v2v_noise = latent.clone()  # Store the pure noise
-        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
-
-        # Use scheduler.add_noise for proper noise schedule (respects shift parameter)
-        # This ensures the noise level matches the scheduler's training distribution
-        latent = scheduler.add_noise(
-            original_samples=v2v_clean,
-            noise=v2v_noise,
-            timesteps=torch.tensor([init_timestep], device=device)
-        )
-
-        # DO NOT anchor frames externally for I2V model!
-        # The model's internal 'y' conditioning handles first-frame preservation
-        # External anchoring would conflict with model's predictions and cause artifacts
+        # IMPORTANT: Start with PURE NOISE (like regular I2V)
+        # The 'y' parameter contains the encoded source video for conditioning
+        # DO NOT add noise to video - the model expects pure noise input
+        # latent is already pure noise from prepare_v2v_i2v_inputs
 
         # Skip the early timesteps (start from init_timestep)
         timesteps = timesteps[init_timestep_idx:]
@@ -5567,10 +5546,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Mark this as I2V mode so run_sampling knows NOT to do external anchoring
         inputs[0]["_v2v_is_i2v_model"] = True
 
-        logger.info(f"V2V-I2V: Using scheduler.add_noise for proper noise injection")
-        logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f} (step {init_timestep_idx})")
-        logger.info(f"V2V-I2V: Model handles first-frame via 'y' parameter (no external anchoring)")
-        logger.info(f"V2V-I2V: Using {len(timesteps)} timesteps")
+        logger.info(f"V2V-I2V: Starting with PURE NOISE (like regular I2V)")
+        logger.info(f"V2V-I2V: Source video conditioning via 'y' parameter with strength-based mask")
+        logger.info(f"V2V-I2V: Skipping {init_timestep_idx} steps, using {len(timesteps)} timesteps")
 
     elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
         # Standard V2V (T2V model): SDEdit-style noise injection with anchor
