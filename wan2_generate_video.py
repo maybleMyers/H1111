@@ -3777,11 +3777,12 @@ def run_sampling(
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
 
-            # 6. V2V: Restore ANCHOR frames only after scheduler step
-            # Non-anchor frames follow normal denoising trajectory (scheduler handles them)
-            # Anchor frames (first, optionally last) are restored to prevent drift
-            # This ensures consistent start/end frames throughout the video
-            if "_v2v_first_frame_latent" in arg_c:
+            # 6. V2V: Restore ANCHOR frames only after scheduler step (T2V models only)
+            # For I2V models, the model handles first-frame conditioning internally via 'y' parameter
+            # External anchoring would conflict with the model's predictions
+            # For T2V models, we need external anchoring since there's no 'y' conditioning
+            is_i2v_model = arg_c.get("_v2v_is_i2v_model", False)
+            if "_v2v_first_frame_latent" in arg_c and not is_i2v_model:
                 first_frame_latent = arg_c["_v2v_first_frame_latent"].to(latent.device).to(latent.dtype)
                 has_last_frame = "_v2v_last_frame_latent" in arg_c
                 if has_last_frame:
@@ -5534,24 +5535,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
     if is_v2v_i2v and args.strength < 1.0:
-        # V2V with I2V model: Kandinsky-style flow-matched conditioning
-        # Key insight from Kandinsky: non-anchor frames use timestep-aware mixing
-        # At each step t: frame = (1 - t_norm) * clean + t_norm * noise
+        # V2V with I2V model: SDEdit-style noise injection
+        # IMPORTANT: The I2V model handles first-frame conditioning internally via 'y' parameter
+        # We should NOT externally anchor frames - this would conflict with model's internal conditioning
+        # The 'y' parameter already contains mask + encoded first frame for model to use
 
         # Calculate timestep to start from based on strength
         init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
         init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
         init_timestep = timesteps[init_timestep_idx]
-
-        # Get the encoded frames from the conditioning (stored in y)
-        # y has shape [20, lat_f, lat_h, lat_w] = [mask(4) + latent(16), lat_f, lat_h, lat_w]
-        y_tensor = inputs[0]["y"][0]  # [20, lat_f, lat_h, lat_w]
-        cond_latent = y_tensor[4:, :, :, :]  # Extract latent part [16, lat_f, lat_h, lat_w]
-        first_frame_latent = cond_latent[:, 0:1, :, :]  # [16, 1, lat_h, lat_w]
-
-        has_end_image = inputs[0].get("_has_end_image", False)
-        if has_end_image:
-            last_frame_latent = cond_latent[:, -1:, :, :]  # [16, 1, lat_h, lat_w]
 
         # Store clean video latents and noise
         v2v_noise = latent.clone()  # Store the pure noise
@@ -5565,28 +5557,20 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             timesteps=torch.tensor([init_timestep], device=device)
         )
 
-        # First frame is HARD ANCHOR (always clean, no noise)
-        if latent.dim() == 5:
-            latent[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)
-            if has_end_image:
-                latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
-        else:
-            latent[:, 0:1, :, :] = first_frame_latent
-            if has_end_image:
-                latent[:, -1:, :, :] = last_frame_latent
+        # DO NOT anchor frames externally for I2V model!
+        # The model's internal 'y' conditioning handles first-frame preservation
+        # External anchoring would conflict with model's predictions and cause artifacts
 
         # Skip the early timesteps (start from init_timestep)
         timesteps = timesteps[init_timestep_idx:]
 
-        # Store for per-step anchor frame restoration
-        inputs[0]["_v2v_first_frame_latent"] = first_frame_latent
-        if has_end_image:
-            inputs[0]["_v2v_last_frame_latent"] = last_frame_latent
+        # Mark this as I2V mode so run_sampling knows NOT to do external anchoring
+        inputs[0]["_v2v_is_i2v_model"] = True
 
-        anchor_info = "first frame" + (" and last frame" if has_end_image else "")
         logger.info(f"V2V-I2V: Using scheduler.add_noise for proper noise injection")
         logger.info(f"V2V-I2V: Starting from timestep {init_timestep.item():.0f} (step {init_timestep_idx})")
-        logger.info(f"V2V-I2V: Anchored {anchor_info}, using {len(timesteps)} timesteps")
+        logger.info(f"V2V-I2V: Model handles first-frame via 'y' parameter (no external anchoring)")
+        logger.info(f"V2V-I2V: Using {len(timesteps)} timesteps")
 
     elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
         # Standard V2V (T2V model): SDEdit-style noise injection with anchor
