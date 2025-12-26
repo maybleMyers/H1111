@@ -6526,8 +6526,9 @@ def save_output(
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
 
+    # Generate base_name for latent/images output (video uses --output_filename directly)
+    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
     seed = args.seed
     # Get dimensions from the *decoded* video tensor
     batch_size, channels, video_length, height, width = video_tensor.shape
@@ -6598,7 +6599,13 @@ def save_output(
 
     # --- Save Video or Images ---
     if args.output_type == "video" or args.output_type == "both":
-        video_path = os.path.join(save_path, f"{base_name}.mp4")
+        # Use --output_filename if provided (for queue system coordination), otherwise generate from base_name
+        if getattr(args, 'output_filename', None):
+            video_path = args.output_filename
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        else:
+            video_path = os.path.join(save_path, f"{base_name}.mp4")
         # save_videos_grid expects [B, T, H, W, C], need to permute and rescale if needed
         # Input video_tensor is [B, C, T, H, W], range [0, 1]
         # save_videos_grid handles the rescale flag correctly if input is [0,1]
@@ -6729,7 +6736,12 @@ def main():
 
             # Save the video
             if args.output_type in ("video", "both"):
-                video_path = os.path.join(args.save_path, f"{output_base}.mp4")
+                # Use --output_filename if provided (for queue system coordination), otherwise generate from output_base
+                if getattr(args, 'output_filename', None):
+                    video_path = args.output_filename
+                    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+                else:
+                    video_path = os.path.join(args.save_path, f"{output_base}.mp4")
                 save_videos_grid(final_video_tensor, video_path, fps=args.fps, rescale=False)
                 logger.info(f"SVI multi-clip video saved to: {video_path}")
 
