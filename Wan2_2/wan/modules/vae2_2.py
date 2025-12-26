@@ -1063,3 +1063,212 @@ class Wan2_2_VAE:
         self.model.to(dtype=dtype)
         self.scale[0] = self.scale[0].to(dtype)  # mean
         self.scale[1] = self.scale[1].to(dtype)  # 1/std
+
+    def _blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors vertically with linear interpolation."""
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def _blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors horizontally with linear interpolation."""
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def spatial_tiled_decode(self, zs, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+        Adapted from Wan2GP's spatial_tiled_decode implementation.
+        Memory-efficient: keeps decoded tiles on CPU until final assembly.
+
+        Args:
+            zs: List of latent tensors [C, F, H, W]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+                      Use 256 for >=8GB VRAM, 128 for <8GB VRAM
+
+        Returns:
+            List of decoded video tensors [C, F, H, W]
+        """
+        try:
+            if not isinstance(zs, list):
+                raise TypeError("zs should be a list")
+
+            results = []
+            for z in zs:
+                device = z.device
+                dtype = z.dtype
+
+                # z: [C, F, H, W] -> add batch dim -> [1, C, F, H, W]
+                z_batch = z.unsqueeze(0)
+
+                tile_latent_min_size = tile_size // 8  # Convert pixel size to latent size
+                tile_overlap_factor = 0.25
+
+                # Apply inverse scale transform (same as in model.decode)
+                scale = self.scale
+                if isinstance(scale[0], torch.Tensor):
+                    z_scaled = z_batch / scale[1].view(1, -1, 1, 1, 1) + scale[0].view(1, -1, 1, 1, 1)
+                else:
+                    z_scaled = z_batch / scale[1] + scale[0]
+
+                # Move to CPU to free GPU memory
+                z_scaled_cpu = z_scaled.cpu()
+                del z_batch, z_scaled
+                torch.cuda.empty_cache()
+
+                # Calculate overlap and blend parameters
+                overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))  # 75% step
+                tile_sample_min_size = tile_size
+                blend_extent = int(tile_sample_min_size * tile_overlap_factor)  # 25% blend region
+                row_limit = tile_sample_min_size - blend_extent
+
+                h_latent, w_latent = z_scaled_cpu.shape[-2], z_scaled_cpu.shape[-1]
+
+                # Decode tiles with overlap - keep decoded tiles on CPU
+                rows = []
+                for i in range(0, h_latent, overlap_size):
+                    row = []
+                    for j in range(0, w_latent, overlap_size):
+                        # Move tile to GPU for decoding
+                        tile = z_scaled_cpu[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size].to(device)
+
+                        # Decode this tile
+                        self.model.clear_cache()
+                        iter_ = tile.shape[2]
+                        x = self.model.conv2(tile)
+                        del tile
+                        torch.cuda.empty_cache()
+
+                        with amp.autocast(dtype=self.dtype):
+                            for frame_idx in range(iter_):
+                                self.model._conv_idx = [0]
+                                if frame_idx == 0:
+                                    out = self.model.decoder(
+                                        x[:, :, frame_idx:frame_idx + 1, :, :],
+                                        feat_cache=self.model._feat_map,
+                                        feat_idx=self.model._conv_idx,
+                                        first_chunk=True,
+                                    )
+                                else:
+                                    out_ = self.model.decoder(
+                                        x[:, :, frame_idx:frame_idx + 1, :, :],
+                                        feat_cache=self.model._feat_map,
+                                        feat_idx=self.model._conv_idx,
+                                    )
+                                    out = torch.cat([out, out_], 2)
+                                    del out_
+
+                            decoded = unpatchify(out, patch_size=2)
+                        self.model.clear_cache()
+
+                        # Move decoded tile to CPU immediately
+                        decoded_cpu = decoded.cpu()
+                        del out, x, decoded
+                        torch.cuda.empty_cache()
+
+                        row.append(decoded_cpu)
+                    rows.append(row)
+
+                del z_scaled_cpu
+
+                # Blend tiles together on CPU
+                result_rows = []
+                for i, row in enumerate(rows):
+                    result_row = []
+                    for j, tile in enumerate(row):
+                        if i > 0:
+                            tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                        if j > 0:
+                            tile = self._blend_h(row[j - 1], tile, blend_extent)
+                        result_row.append(tile[:, :, :, :row_limit, :row_limit])
+                    result_rows.append(torch.cat(result_row, dim=-1))
+
+                decoded_full = torch.cat(result_rows, dim=-2)
+
+                # Clamp and remove batch dim: [1, C, F, H, W] -> [C, F, H, W]
+                decoded_full = decoded_full.float().clamp_(-1, 1).squeeze(0)
+                # Move back to original device
+                results.append(decoded_full.to(device=device, dtype=dtype))
+
+                del rows, result_rows
+                torch.cuda.empty_cache()
+
+            return results
+
+        except TypeError as e:
+            logging.info(e)
+            return None
+
+    def spatial_tiled_encode(self, videos, tile_size=256):
+        """
+        Encode videos using spatial tiling to reduce memory usage.
+        Fallback method for when normal encode causes OOM.
+
+        Args:
+            videos: List of video tensors [C, F, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+
+        Returns:
+            List of encoded latent tensors [C, F, H//8, W//8]
+        """
+        try:
+            if not isinstance(videos, list):
+                raise TypeError("videos should be a list")
+
+            results = []
+            for v in videos:
+                # v: [C, F, H, W] -> add batch dim -> [1, C, F, H, W]
+                v_batch = v.unsqueeze(0)
+
+                tile_sample_min_size = tile_size
+                tile_latent_min_size = tile_size // 8
+                tile_overlap_factor = 0.25
+
+                overlap_size = int(tile_sample_min_size * (1 - tile_overlap_factor))
+                blend_extent = int(tile_latent_min_size * tile_overlap_factor)
+                row_limit = tile_latent_min_size - blend_extent
+
+                h_pixels, w_pixels = v_batch.shape[-2], v_batch.shape[-1]
+
+                # Split video into tiles and encode them separately
+                rows = []
+                for i in range(0, h_pixels, overlap_size):
+                    row = []
+                    for j in range(0, w_pixels, overlap_size):
+                        tile = v_batch[:, :, :, i:i + tile_sample_min_size, j:j + tile_sample_min_size]
+
+                        # Encode this tile using the internal model
+                        with amp.autocast(dtype=self.dtype):
+                            encoded_tile = self.model.encode(tile, self.scale)
+
+                        row.append(encoded_tile)
+                        torch.cuda.empty_cache()
+                    rows.append(row)
+
+                # Blend tiles together
+                result_rows = []
+                for i, row in enumerate(rows):
+                    result_row = []
+                    for j, tile in enumerate(row):
+                        if i > 0:
+                            tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                        if j > 0:
+                            tile = self._blend_h(row[j - 1], tile, blend_extent)
+                        result_row.append(tile[:, :, :, :row_limit, :row_limit])
+                    result_rows.append(torch.cat(result_row, dim=-1))
+
+                mu = torch.cat(result_rows, dim=-2)
+                # Remove batch dim: [1, C, F, H, W] -> [C, F, H, W]
+                results.append(mu.float().squeeze(0))
+
+                del rows, result_rows, v_batch
+                torch.cuda.empty_cache()
+
+            return results
+
+        except TypeError as e:
+            logging.info(e)
+            return None

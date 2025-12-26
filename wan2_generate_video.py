@@ -248,6 +248,319 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+# ========================= Stop Signal Checking for Queue System =========================
+
+def check_stop_signals(output_filename: str):
+    """Check for stop signal files and return action if found.
+
+    Used by the queue system to enable graceful stopping during inference.
+    Signal file: {output_filename}.stop_decode - Stop and decode current latents
+
+    Args:
+        output_filename: The output video filename used as base for signal files
+
+    Returns:
+        str or None: "decode" or None if no signal found
+    """
+    if output_filename is None:
+        return None
+
+    stop_decode_file = output_filename + ".stop_decode"
+
+    if os.path.exists(stop_decode_file):
+        try:
+            os.remove(stop_decode_file)
+        except:
+            pass
+        return "decode"
+
+    return None
+
+
+# ========================= SVI (Stable-Video-Infinity) Utility Functions =========================
+
+def convert_svi_lora_keys(svi_state_dict: dict, verbose: bool = True) -> dict:
+    """Convert SVI/DiffSynth LoRA keys to Kohya/Musubi format.
+
+    SVI format:  blocks.0.self_attn.q.lora_up.weight / blocks.0.self_attn.q.lora_A.weight
+                 blocks.0.self_attn.q.lora_down.default.weight (with .default suffix)
+    Target:      lora_unet_blocks_0_self_attn_q.lora_up.weight / lora_unet_blocks_0_self_attn_q.lora_down.weight
+
+    Args:
+        svi_state_dict: State dict with SVI/DiffSynth format LoRA keys
+        verbose: Whether to log conversion details
+
+    Returns:
+        Converted state dict with Kohya format keys
+    """
+    converted = {}
+    converted_count = 0
+    skipped_count = 0
+
+    for key, value in svi_state_dict.items():
+        new_key = key
+
+        # Detect SVI format: keys start with 'blocks.' and contain '.lora_' patterns
+        if key.startswith('blocks.') and '.lora_' in key:
+            # Handle lora_A/lora_B naming (SVI/DiffSynth style)
+            if '.lora_A.' in key:
+                new_key = key.replace('.lora_A.', '.lora_down.')
+            elif '.lora_B.' in key:
+                new_key = key.replace('.lora_B.', '.lora_up.')
+            # lora_up/lora_down are already correct naming
+
+            # Remove .default. from keys (SVI LoRA uses .lora_down.default.weight format)
+            # Convert to standard .lora_down.weight format
+            new_key = new_key.replace('.default.weight', '.weight')
+            new_key = new_key.replace('.default.bias', '.bias')
+
+            # Convert dot notation to underscore and add prefix
+            # e.g., blocks.0.self_attn.q.lora_up.weight -> lora_unet_blocks_0_self_attn_q.lora_up.weight
+            parts = new_key.split('.')
+            # Find the split point (lora_up or lora_down)
+            for i, part in enumerate(parts):
+                if part in ('lora_up', 'lora_down'):
+                    module_path = '_'.join(parts[:i])  # everything before lora_up/down
+                    lora_part = '.'.join(parts[i:])    # lora_up.weight or lora_down.weight
+                    new_key = f"lora_unet_{module_path}.{lora_part}"
+                    break
+
+            converted_count += 1
+        elif '.lora_' in key:
+            # Non-blocks keys with LoRA (handle other possible module prefixes)
+            skipped_count += 1
+            if verbose:
+                logger.debug(f"Skipping non-block LoRA key: {key}")
+        else:
+            # Non-LoRA keys (alpha, etc.) - keep as-is but also add prefix if needed
+            if key.startswith('blocks.') and 'alpha' in key:
+                # Convert alpha keys too
+                parts = key.split('.')
+                for i, part in enumerate(parts):
+                    if 'alpha' in part:
+                        module_path = '_'.join(parts[:i])
+                        alpha_part = '.'.join(parts[i:])
+                        new_key = f"lora_unet_{module_path}.{alpha_part}"
+                        break
+                converted_count += 1
+            else:
+                skipped_count += 1
+
+        converted[new_key] = value
+
+    if verbose:
+        logger.info(f"SVI LoRA conversion: {converted_count} keys converted, {skipped_count} keys kept as-is")
+        if converted_count > 0:
+            sample_keys = list(converted.keys())[:3]
+            logger.info(f"Sample converted keys: {sample_keys}")
+
+    return converted
+
+
+def detect_svi_lora_format(state_dict: dict) -> bool:
+    """Detect if a state dict uses SVI/DiffSynth LoRA format.
+
+    Args:
+        state_dict: LoRA state dict to check
+
+    Returns:
+        True if SVI format detected, False otherwise
+    """
+    for key in state_dict.keys():
+        # SVI format indicators:
+        # 1. Keys start with 'blocks.' (not 'lora_unet_blocks_')
+        # 2. Contains '.lora_A.' or '.lora_B.' or '.lora_up.' or '.lora_down.'
+        # 3. May contain '.default.weight' suffix (SVI-specific pattern)
+        if key.startswith('blocks.') and '.lora_' in key:
+            return True
+        # Also detect by .default.weight pattern which is SVI-specific
+        if '.default.weight' in key and '.lora_' in key:
+            return True
+    return False
+
+
+class TeaCacheManager:
+    """Manages TeaCache feature caching for accelerated inference.
+
+    TeaCache caches intermediate DiT block outputs when the L1 difference
+    from the previous step is below a threshold, skipping redundant computations.
+    """
+
+    def __init__(self, l1_thresh: float = 0.1, start_step: int = 2, end_ratio: float = 0.8):
+        """Initialize TeaCache manager.
+
+        Args:
+            l1_thresh: L1 threshold for cache hit. Lower = more aggressive caching.
+            start_step: Start caching after this step (allow model to "warm up").
+            end_ratio: Stop caching after this ratio of total steps.
+        """
+        self.l1_thresh = l1_thresh
+        self.start_step = start_step
+        self.end_ratio = end_ratio
+        self.cache = {}
+        self.prev_features = None
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.enabled = True
+
+    def reset(self):
+        """Reset cache state for new generation."""
+        self.cache = {}
+        self.prev_features = None
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def should_cache(self, step: int, total_steps: int) -> bool:
+        """Check if caching should be active for this step."""
+        if not self.enabled or self.l1_thresh is None:
+            return False
+        if step < self.start_step:
+            return False
+        if step > int(total_steps * self.end_ratio):
+            return False
+        return True
+
+    def check_cache(self, features: torch.Tensor, step: int, total_steps: int) -> tuple:
+        """Check if cached features can be reused.
+
+        Args:
+            features: Current intermediate features
+            step: Current denoising step
+            total_steps: Total number of steps
+
+        Returns:
+            Tuple of (use_cache: bool, cached_output: Optional[Tensor])
+        """
+        if not self.should_cache(step, total_steps):
+            self.prev_features = features.clone()
+            return False, None
+
+        if self.prev_features is None:
+            self.prev_features = features.clone()
+            self.cache_misses += 1
+            return False, None
+
+        # Calculate L1 difference
+        l1_diff = (features - self.prev_features).abs().mean().item()
+
+        if l1_diff < self.l1_thresh and 'output' in self.cache:
+            self.cache_hits += 1
+            return True, self.cache['output']
+        else:
+            self.cache_misses += 1
+            self.prev_features = features.clone()
+            return False, None
+
+    def store_cache(self, output: torch.Tensor):
+        """Store output in cache for potential reuse."""
+        self.cache['output'] = output.clone()
+
+    def get_stats(self) -> dict:
+        """Get cache hit/miss statistics."""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0
+        return {
+            'hits': self.cache_hits,
+            'misses': self.cache_misses,
+            'total': total,
+            'hit_rate': hit_rate
+        }
+
+
+class SVISlidingWindowDenoiser:
+    """Sliding window denoiser for temporal consistency in long videos.
+
+    Processes video in overlapping temporal windows, blending the results
+    for smooth transitions and memory efficiency.
+    """
+
+    def __init__(self, window_size: int, stride: int = None):
+        """Initialize sliding window denoiser.
+
+        Args:
+            window_size: Size of each temporal window in latent frames
+            stride: Stride between windows. Defaults to window_size // 2.
+        """
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+
+    def get_windows(self, num_frames: int) -> list:
+        """Calculate window positions for the given number of frames.
+
+        Args:
+            num_frames: Total number of latent frames
+
+        Returns:
+            List of (start, end) tuples for each window
+        """
+        windows = []
+        start = 0
+        while start < num_frames:
+            end = min(start + self.window_size, num_frames)
+            windows.append((start, end))
+            if end >= num_frames:
+                break
+            start += self.stride
+        return windows
+
+    def blend_windows(self, window_outputs: list, window_positions: list, num_frames: int) -> torch.Tensor:
+        """Blend overlapping window outputs with linear interpolation.
+
+        Args:
+            window_outputs: List of output tensors from each window
+            window_positions: List of (start, end) tuples
+            num_frames: Total number of frames in output
+
+        Returns:
+            Blended output tensor
+        """
+        if len(window_outputs) == 1:
+            return window_outputs[0]
+
+        # Get output shape from first window
+        sample = window_outputs[0]
+        device = sample.device
+        dtype = sample.dtype
+
+        # Initialize output and weight accumulator
+        output_shape = list(sample.shape)
+        output_shape[1] = num_frames  # Adjust frame dimension
+        output = torch.zeros(output_shape, device=device, dtype=dtype)
+        weights = torch.zeros(num_frames, device=device, dtype=torch.float32)
+
+        for window_out, (start, end) in zip(window_outputs, window_positions):
+            window_len = end - start
+
+            # Create blending weights (linear ramp at edges)
+            blend = torch.ones(window_len, device=device, dtype=torch.float32)
+
+            # Ramp up at start (if not first window)
+            if start > 0:
+                ramp_len = min(self.window_size - self.stride, window_len // 2)
+                if ramp_len > 0:
+                    blend[:ramp_len] = torch.linspace(0, 1, ramp_len, device=device)
+
+            # Ramp down at end (if not last window)
+            if end < num_frames:
+                ramp_len = min(self.window_size - self.stride, window_len // 2)
+                if ramp_len > 0:
+                    blend[-ramp_len:] = torch.linspace(1, 0, ramp_len, device=device)
+
+            # Apply weighted contribution
+            blend_expanded = blend.view(1, -1, 1, 1)  # [1, F, 1, 1] for broadcasting
+            output[:, start:end] += window_out[:, :window_len] * blend_expanded
+            weights[start:end] += blend
+
+        # Normalize by total weights
+        weights = weights.clamp(min=1e-6)
+        output = output / weights.view(1, -1, 1, 1)
+
+        return output
+
+
+# ========================= End SVI Utility Functions =========================
+
+
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Wan 2.2 inference script with new model architecture support")
@@ -452,10 +765,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
     parser.add_argument("--motion_noise_ratio", type=float, default=0.3, 
                        help="Noise ratio for motion frames in extension (0.0-1.0, lower=less noise/more preservation)")
-    parser.add_argument("--color_match", type=str, default="hm", 
+    parser.add_argument("--color_match", type=str, default="hm",
                        choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
                        help="Color matching method for video extension (default: histogram matching)")
-    
+
+    # Video Join arguments - join two videos with generated transition
+    parser.add_argument("--video_join", type=str, default=None, help="Path to input video for video join (uses FLF to create transition)")
+    parser.add_argument("--ending_video", type=str, default=None, help="Path to ending video to join with input video")
+    parser.add_argument("--join_frames_input", type=int, default=30, help="Number of frames from end of input video to check for best transition frame")
+    parser.add_argument("--join_frames_ending", type=int, default=30, help="Number of frames from start of ending video to check for best transition frame")
+
     # Context Windows Arguments
     parser.add_argument("--use_context_windows", action="store_true", 
                        help="Enable sliding context windows for long video generation")
@@ -489,6 +808,68 @@ def parse_args() -> argparse.Namespace:
                        help="UltraViCo: Decay factor for harmonic risk positions (only with --ultravico_suppress_harmonics). Default: 0.6")
     parser.add_argument("--ultravico_gamma", type=int, default=4,
                        help="UltraViCo: Number of frames around harmonic peaks to suppress. Default: 4")
+
+    # ========================= SVI (Stable-Video-Infinity) Arguments =========================
+    # Anchor mechanism for cross-clip consistency
+    parser.add_argument("--anchor_image", type=str, default=None,
+                       help="Path to anchor image for SVI cross-clip consistency. Fills non-first frames with anchor instead of zeros.")
+    parser.add_argument("--svi_mode", action="store_true",
+                       help="Enable SVI mode for multi-clip streaming video generation with anchor padding.")
+
+    # Multi-clip streaming generation
+    parser.add_argument("--num_clips", type=int, default=1,
+                       help="Number of clips to generate for multi-clip streaming (SVI mode). Each clip uses last frame of previous clip as input.")
+    parser.add_argument("--prompt_list", type=str, nargs="*", default=None,
+                       help="List of prompts for multi-clip generation. One prompt per clip. If fewer prompts than clips, last prompt is repeated.")
+    parser.add_argument("--overlap_frames", type=int, default=1,
+                       help="Number of overlapping frames between clips for smooth transitions (SVI mode).")
+    parser.add_argument("--num_motion_latent", type=int, default=1,
+                       help="Number of latent frames from previous clip for motion context (SVI Pro mode). 0=disable latent passing, use image-only chaining.")
+    parser.add_argument("--num_motion_frame", type=int, default=1,
+                       help="Number of frames to look back from previous clip for next input image (SVI Pro mode). Default: 1 (last frame only).")
+    parser.add_argument("--seed_multiplier", type=int, default=42,
+                       help="Seed multiplier for per-clip variation (seed = base_seed + clip_idx * multiplier). Default: 42.")
+
+    # SVI LoRA format support
+    parser.add_argument("--svi_lora", action="store_true",
+                       help="Convert SVI/DiffSynth format LoRA keys to Kohya format before loading.")
+
+    # TeaCache acceleration
+    parser.add_argument("--tea_cache_l1_thresh", type=float, default=None,
+                       help="TeaCache L1 threshold for feature caching acceleration. Recommended: 0.05-0.15. None disables TeaCache.")
+    parser.add_argument("--tea_cache_start_step", type=int, default=2,
+                       help="TeaCache: Start caching after this many steps. Default: 2")
+    parser.add_argument("--tea_cache_end_ratio", type=float, default=0.8,
+                       help="TeaCache: Stop caching after this ratio of total steps. Default: 0.8")
+
+    # CFG merge for efficiency
+    parser.add_argument("--cfg_merge", action="store_true",
+                       help="Merge conditional and unconditional predictions in a single forward pass (2x batch). Faster but uses more VRAM.")
+
+    # Temporal sliding window for denoising
+    parser.add_argument("--svi_sliding_window_size", type=int, default=None,
+                       help="SVI sliding window size in latent frames for temporal denoising. None disables sliding window.")
+    parser.add_argument("--svi_sliding_window_stride", type=int, default=None,
+                       help="SVI sliding window stride in latent frames. Defaults to window_size // 2 if not specified.")
+
+    # SVI Video Extension - Extend existing video using SVI multi-clip
+    parser.add_argument("--svi_extend_video", type=str, default=None,
+                       help="Path to video to extend using SVI. Auto-detects best transition frame and generates continuation.")
+    parser.add_argument("--svi_extend_frames_to_check", type=int, default=30,
+                       help="Number of frames from the end to analyze for best transition point. Default: 30")
+    parser.add_argument("--svi_extend_anchor", type=str, default=None,
+                       help="Anchor image for SVI extension. If not specified, uses first frame of input video.")
+    parser.add_argument("--svi_extend_prepend", action="store_true", default=True,
+                       help="Prepend original video (up to transition frame) to the extension. Default: True")
+    parser.add_argument("--no_svi_extend_prepend", action="store_false", dest="svi_extend_prepend",
+                       help="Only output the extension, not the original video.")
+    # ========================= End SVI Arguments =========================
+
+    # ========================= Queue System Arguments =========================
+    parser.add_argument("--output_filename", type=str, default=None,
+                       help="Output filename for signal file coordination with queue system. "
+                            "Used to create signal files like {output_filename}.stop_decode")
+    # ========================= End Queue System Arguments =========================
 
     args = parser.parse_args()
 
@@ -1428,23 +1809,28 @@ def load_dit_model(
     
     if args.lora_weight is not None and len(args.lora_weight) > 0:
         lora_weights_list_low = []
-        
+
         for i, lora_path in enumerate(args.lora_weight):
             logger.info(f"Loading LoRA weight from: {lora_path}")
             lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
-            
+
+            # SVI LoRA format conversion: auto-detect or force with --svi_lora
+            if getattr(args, 'svi_lora', False) or detect_svi_lora_format(lora_sd):
+                logger.info(f"Detected SVI/DiffSynth LoRA format, converting keys...")
+                lora_sd = convert_svi_lora_keys(lora_sd, verbose=True)
+
             # Apply include/exclude patterns if specified
             include_pattern = None
             exclude_pattern = None
-            
+
             if args.include_patterns is not None and i < len(args.include_patterns):
                 include_pattern = args.include_patterns[i]
             if args.exclude_patterns is not None and i < len(args.exclude_patterns):
                 exclude_pattern = args.exclude_patterns[i]
-            
+
             if include_pattern or exclude_pattern:
                 lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
-            
+
             lora_weights_list_low.append(lora_sd)
         
         # Set up multipliers
@@ -1456,23 +1842,28 @@ def load_dit_model(
     # Load high noise model LoRA weights if specified
     if hasattr(args, 'lora_weight_high') and args.lora_weight_high is not None and len(args.lora_weight_high) > 0:
         lora_weights_list_high = []
-        
+
         for i, lora_path in enumerate(args.lora_weight_high):
             logger.info(f"Loading LoRA weight for high noise model from: {lora_path}")
             lora_sd = load_file(lora_path, device="cpu")  # Load to CPU for efficiency
-            
+
+            # SVI LoRA format conversion: auto-detect or force with --svi_lora
+            if getattr(args, 'svi_lora', False) or detect_svi_lora_format(lora_sd):
+                logger.info(f"Detected SVI/DiffSynth LoRA format for high noise LoRA, converting keys...")
+                lora_sd = convert_svi_lora_keys(lora_sd, verbose=True)
+
             # Apply include/exclude patterns if specified
             include_pattern = None
             exclude_pattern = None
-            
+
             if hasattr(args, 'include_patterns_high') and args.include_patterns_high is not None and i < len(args.include_patterns_high):
                 include_pattern = args.include_patterns_high[i]
             if hasattr(args, 'exclude_patterns_high') and args.exclude_patterns_high is not None and i < len(args.exclude_patterns_high):
                 exclude_pattern = args.exclude_patterns_high[i]
-            
+
             if include_pattern or exclude_pattern:
                 lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
-            
+
             lora_weights_list_high.append(lora_sd)
         
         # Set up multipliers
@@ -1758,8 +2149,8 @@ def optimize_model(
         logger.info("torch.compile enabled via function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True)")
         # Enable persistent disk caching for compiled kernels
         try:
-            import torch._inductor.config
-            torch._inductor.config.fx_graph_cache = True
+            from torch._inductor import config as inductor_config
+            inductor_config.fx_graph_cache = True
             logger.info("Inductor disk cache enabled - compiled kernels will be cached for faster subsequent runs")
         except (ImportError, AttributeError):
             logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
@@ -2048,21 +2439,22 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare Model Input Arguments for FunControl
-        y_for_model = y[0] # Shape becomes [32, F, H, W]
-        # A14B models don't have img_emb layer, so don't pass clip_fea
-        use_clip_fea = clip_context if not ("A14B" in args.task) else None
-        
+        y_for_model = y[0]  # Shape becomes [32, F, H, W]
+        # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+        # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+        use_clip_fea = clip_context if config.i2v else None
+
         arg_c = {
             "context": context,
             "clip_fea": use_clip_fea,
             "seq_len": seq_len,
-            "y": [y_for_model], # Pass the 4D tensor in the list
+            "y": [y_for_model],
         }
         arg_null = {
             "context": context_null,
             "clip_fea": use_clip_fea,
             "seq_len": seq_len,
-            "y": [y_for_model], # Pass the 4D tensor in the list
+            "y": [y_for_model],
         }
         
         if fun_ref_latent is not None:
@@ -2115,12 +2507,17 @@ def prepare_i2v_inputs(
                                   has_end_image)
 
         # For looped videos: place end image at last frame (no extra frame)
-        # For non-looped: add end image as extra frame (original behavior)
+        # For Wan 2.2 (config.i2v=False): end image doesn't add extra frame, uses standard encoding
+        # For Wan 2.1 (config.i2v=True): add end image as extra frame (original behavior)
         if using_looped_with_end:
             lat_f_effective = lat_f_base  # Keep same frame count for looped videos
             logger.info("Looped mode: End image will replace last frame instead of adding extra frame")
+        elif has_end_image and not config.i2v:
+            # Wan 2.2 FLF: end image is part of standard encoding, no extra frame
+            lat_f_effective = lat_f_base
+            logger.info("Wan 2.2 FLF mode: End image uses standard encoding (no extra frame)")
         else:
-            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Original behavior
+            lat_f_effective = lat_f_base + (1 if has_end_image else 0)  # Wan 2.1 behavior
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #2: Sequence Length ---
         max_seq_len = math.ceil(lat_f_effective * lat_h * lat_w / (config.patch_size[1] * config.patch_size[2]))
@@ -2166,16 +2563,31 @@ def prepare_i2v_inputs(
         gc.collect()
         logger.info("Unloaded T5 model from memory")
 
-        # load CLIP model & encode image
+        # load CLIP model & encode image(s) - DUAL CLIP for FLF support
         clip = load_clip_model(args, config, device)
         clip.model.to(device)
-        logger.info(f"Encoding image to CLIP context")
+        logger.info(f"Encoding image(s) to CLIP context")
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
-            # Use the [-1, 1] tensor directly if clip.visual expects that format
-            # clip_context = clip.visual([img_tensor[:, None, :, :]]).squeeze(1) # Original had [img_tensor[:, None, :, :]] which adds frame dim
-            # Use unsqueeze(1) which seems more consistent with other parts
-            clip_context = clip.visual([img_tensor.unsqueeze(1)]) # Add Frame dim
-        logger.info(f"CLIP Encoding complete")
+            # Encode start image
+            clip_context_start = clip.visual([img_tensor.unsqueeze(1)])  # [1, 257, 1280]
+
+            # DUAL CLIP: Encode end image if provided
+            if has_end_image and end_img is not None:
+                end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
+                clip_context_end = clip.visual([end_img_tensor.unsqueeze(1)])  # [1, 257, 1280]
+
+                # Combine start and end CLIP features
+                # Option 1: Concatenate (514 tokens) - preserves both images' info
+                # Option 2: Average (257 tokens) - simpler, works with standard model
+                # Using average for compatibility with standard i2v model weights
+                clip_context = (clip_context_start + clip_context_end) / 2.0
+                logger.info(f"Dual CLIP encoding complete (start + end averaged). Shape: {clip_context.shape}")
+                del end_img_tensor, clip_context_start, clip_context_end
+            else:
+                clip_context = clip_context_start
+                logger.info(f"Single CLIP encoding complete. Shape: {clip_context.shape}")
+                del clip_context_start
+
         del clip
         clean_memory_on_device(device)
         # Always unload to save memory
@@ -2200,55 +2612,292 @@ def prepare_i2v_inputs(
             end_img_resized = TF.to_tensor(end_img_resized_np).sub_(0.5).div_(0.5).to(device) # [-1, 1], CHW
             end_img_resized = end_img_resized.unsqueeze(1) # Add frame dimension -> CFHW, Shape [C, 1, H, W]
 
-        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #5: Mask Shape ---
-        msk = torch.zeros(4, lat_f_effective, lat_h, lat_w, device=device, dtype=vae.dtype) # Use adjusted frame dim
-        msk[:, 0] = 1 # Mask first frame
-        if has_end_image:
-            msk[:, -1] = 1 # Mask last frame (the lat_f+1'th frame)
+        # --- FLF IMPROVED: Joint VAE Encoding and Proper Mask Construction ---
+        # Following Wan2GP's approach for better first-last-frame transitions
 
-        # Encode image(s) using VAE (Padded Method)
+        # Encode image(s) using VAE with JOINT encoding (Wan2GP style)
         with accelerator.autocast(), torch.no_grad():
-            # Pad the *start* image tensor temporally before encoding
-            # Calculate padding needed to reach base frame count (before adding end frame)
-            padding_frames_needed = frames - 1 # Number of frames to generate *after* the first
-            if padding_frames_needed < 0: padding_frames_needed = 0
-
-            img_padded = img_resized # Start with [C, 1, H, W]
-            if padding_frames_needed > 0:
-                 # Create padding tensor [C, padding_frames_needed, H, W]
-                 padding_tensor = torch.zeros(
-                     img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
-                     device=device, dtype=img_resized.dtype
-                 )
-                 # Concatenate along frame dimension (dim=1)
-                 img_padded = torch.cat([img_resized, padding_tensor], dim=1)
-                 # Shape should now be [C, 1 + padding_frames_needed, H, W] = [C, frames, H, W]
-
-            # Encode the padded start image tensor. VAE output matches latent frame count.
-            # vae.encode expects [C, F, H, W]
-            y_latent_base = vae.encode([img_padded])[0] # Shape [C', lat_f_base, H, W]
+            vae_stride_t = config.vae_stride[0]  # Temporal stride (typically 4)
 
             if has_end_image and end_img_resized is not None:
-                 # Encode the single end frame
-                 y_end = vae.encode([end_img_resized])[0] # Shape [C', 1, H, W]
+                # FLF MODE for Wan 2.2: Simpler approach matching Wan2GP
+                # Wan 2.2 does NOT use special any_end_frame encoding or end frame x4 interleaving
+                # Just build [start, zeros, end] and encode normally
 
-                 if using_looped_with_end:
-                     # For looped mode: REPLACE last frame instead of concatenating
-                     y_latent_combined = y_latent_base.clone()  # Clone to avoid modifying original
-                     y_latent_combined[:, -1:, :, :] = y_end  # Replace last frame
-                     logger.info("Looped mode: Replaced last frame with end image")
-                 else:
-                     # For non-looped mode: CONCATENATE as extra frame (original behavior)
-                     y_latent_combined = torch.cat([y_latent_base, y_end], dim=1) # Shape [C', lat_f_base + 1, H, W]
+                # Use standard frame count (same as non-FLF)
+                zero_frames_count = frames - 2  # Minus 1 for start and 1 for end
+                if zero_frames_count < 0:
+                    zero_frames_count = 0
+
+                logger.info(f"FLF (Wan 2.2 style): frames={frames}, zero_frames={zero_frames_count}")
+
+                # Build complete pixel sequence: [start_frame, zero_frames, end_frame]
+                zero_frames = torch.zeros(
+                    img_resized.shape[0], zero_frames_count, target_height, target_width,
+                    device=device, dtype=img_resized.dtype
+                )
+
+                # Concatenate: [C, 1, H, W] + [C, zeros, H, W] + [C, 1, H, W] = [C, total_frames, H, W]
+                enc_sequence = torch.cat([img_resized, zero_frames, end_img_resized], dim=1)
+                logger.info(f"FLF joint encoding: Built pixel sequence with {enc_sequence.shape[1]} frames (1 start + {zero_frames_count} zeros + 1 end)")
+
+                # Wan 2.2: Use STANDARD VAE encoding (any_end_frame=False)
+                # Encode with OOM fallback to tiled encode
+                try:
+                    y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                        logger.warning(f"VAE encode OOM (FLF), falling back to spatial tiled encode: {e}")
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        if hasattr(vae, 'spatial_tiled_encode'):
+                            try:
+                                free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                                tile_size = 256 if free_mem >= 4000 else 128
+                            except:
+                                tile_size = 128
+                            logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                            y_latent = vae.spatial_tiled_encode([enc_sequence], tile_size=tile_size)[0]
+                        else:
+                            raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                    else:
+                        raise
+                logger.info(f"FLF VAE encoding complete. Latent shape: {y_latent.shape}")
+
+                del zero_frames, enc_sequence
             else:
-                 y_latent_combined = y_latent_base # Shape [C', lat_f_base, H, W] = [C', lat_f_effective, H, W]
+                # Standard single-image mode (no end frame)
+                # Check for SVI Pro latent conditioning
+                prev_last_latent = getattr(args, '_prev_last_latent', None)
+                num_motion_latent = getattr(args, '_num_motion_latent', 0)
+                svi_mode_active = getattr(args, 'svi_mode', False)
 
-        # Concatenate mask and the combined latent
-        # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #6: Final 'y' Tensor ---
-        y = torch.cat([msk, y_latent_combined], dim=0) # Shape [4+C', lat_f_effective, H, W]
-        # y = y.unsqueeze(0) # Add batch dimension? Check model input requirements. Assume model forward handles list/batching.
+                # Use SVI Pro approach (latent-space) when:
+                # 1. We have prev_last_latent (subsequent clips), OR
+                # 2. SVI mode is active with num_motion_latent > 0 (first clip in Pro mode)
+                use_svi_pro_latent = (prev_last_latent is not None and num_motion_latent > 0) or \
+                                     (svi_mode_active and num_motion_latent > 0)
 
-        logger.info(f"Standard I2V conditioning 'y' constructed. Shape: {y.shape}")
+                if use_svi_pro_latent:
+                    # === SVI PRO: LATENT-SPACE CONDITIONING ===
+                    # Construct y_latent directly in latent space: anchor + motion_latent + padding
+                    # For first clip: anchor + zeros (no motion latent)
+                    # For subsequent clips: anchor + motion_latent + zeros
+                    is_first_clip = (prev_last_latent is None)
+                    if is_first_clip:
+                        logger.info(f"SVI Pro latent conditioning: First clip - using anchor + zero padding")
+                    else:
+                        logger.info(f"SVI Pro latent conditioning: Using prev_last_latent with {num_motion_latent} motion frames")
+
+                    # Calculate total latent frames needed
+                    total_latent_frames = (frames - 1) // 4 + 1
+
+                    # Encode anchor image to latent (always the original first image in SVI)
+                    anchor_tensor = None
+                    if getattr(args, 'anchor_image', None) is not None:
+                        try:
+                            anchor_img = Image.open(args.anchor_image).convert("RGB")
+                            anchor_cv2 = np.array(anchor_img)
+                            anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
+                            anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
+                            anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)
+                            logger.info(f"SVI Pro: Loaded anchor image {args.anchor_image}")
+                        except Exception as e:
+                            logger.warning(f"Failed to load anchor image: {e}. Using input image as anchor.")
+                            anchor_tensor = img_resized.squeeze(1)
+                    else:
+                        anchor_tensor = img_resized.squeeze(1)
+
+                    # Encode anchor to latent [C, 1, lat_h, lat_w]
+                    anchor_for_encode = anchor_tensor.unsqueeze(1)  # [C, 1, H, W]
+                    try:
+                        anchor_latent = vae.encode([anchor_for_encode])[0]  # [16, 1, lat_h, lat_w]
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                            logger.warning(f"Anchor encode OOM, using spatial tiled encode")
+                            torch.cuda.empty_cache()
+                            if hasattr(vae, 'spatial_tiled_encode'):
+                                anchor_latent = vae.spatial_tiled_encode([anchor_for_encode], tile_size=128)[0]
+                            else:
+                                raise
+                        else:
+                            raise
+
+                    logger.info(f"SVI Pro: anchor_latent shape: {anchor_latent.shape}")
+
+                    if is_first_clip:
+                        # First clip: anchor + zero padding (allows motion generation)
+                        padding_size = total_latent_frames - anchor_latent.shape[1]
+                        padding = torch.zeros(
+                            anchor_latent.shape[0], padding_size, anchor_latent.shape[2], anchor_latent.shape[3],
+                            dtype=anchor_latent.dtype, device=device
+                        )
+                        y_latent = torch.cat([anchor_latent, padding], dim=1)
+                        logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, padding={padding_size})")
+                    else:
+                        # Subsequent clips: anchor + motion_latent + zero padding
+                        # Get motion latent from previous clip (last N frames)
+                        # prev_last_latent is [C, F, lat_h, lat_w] from previous clip
+                        motion_latent = prev_last_latent[:, -num_motion_latent:].to(device=device, dtype=anchor_latent.dtype)
+                        logger.info(f"SVI Pro: motion_latent shape: {motion_latent.shape}")
+
+                        # Calculate padding size
+                        padding_size = total_latent_frames - anchor_latent.shape[1] - motion_latent.shape[1]
+                        if padding_size < 0:
+                            logger.warning(f"SVI Pro: padding_size negative ({padding_size}), adjusting motion_latent")
+                            # Reduce motion latent frames if too many
+                            motion_latent = motion_latent[:, :total_latent_frames - anchor_latent.shape[1]]
+                            padding_size = 0
+
+                        # Create zero padding in latent space
+                        if padding_size > 0:
+                            padding = torch.zeros(
+                                anchor_latent.shape[0], padding_size, anchor_latent.shape[2], anchor_latent.shape[3],
+                                dtype=anchor_latent.dtype, device=device
+                            )
+                            # SVI Pro y_latent: anchor + motion + padding
+                            y_latent = torch.cat([anchor_latent, motion_latent, padding], dim=1)
+                        else:
+                            y_latent = torch.cat([anchor_latent, motion_latent], dim=1)
+
+                        logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, motion={motion_latent.shape[1]}, padding={padding_size})")
+
+                else:
+                    # === STANDARD / SVI 2.0 (NON-PRO): PIXEL-SPACE PADDING ===
+                    # Use original padding approach for backwards compatibility
+                    padding_frames_needed = frames - 1
+                    if padding_frames_needed < 0:
+                        padding_frames_needed = 0
+
+                    img_padded = img_resized
+                    if padding_frames_needed > 0:
+                        # === SVI ANCHOR MECHANISM ===
+                        anchor_tensor = None
+                        if getattr(args, 'anchor_image', None) is not None:
+                            try:
+                                anchor_img = Image.open(args.anchor_image).convert("RGB")
+                                anchor_cv2 = np.array(anchor_img)
+                                anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
+                                anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
+                                anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)
+                                logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
+                            except Exception as e:
+                                logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
+                                anchor_tensor = None
+                        elif getattr(args, 'svi_mode', False):
+                            anchor_tensor = img_resized.squeeze(1)
+                            logger.info("SVI mode: Using input image as anchor for frame padding")
+
+                        if anchor_tensor is not None:
+                            padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
+                            logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
+                        else:
+                            padding_tensor = torch.zeros(
+                                img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                                device=device, dtype=img_resized.dtype
+                            )
+                        img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+
+                    # Encode with OOM fallback to tiled encode
+                    try:
+                        y_latent = vae.encode([img_padded])[0]
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                            logger.warning(f"VAE encode OOM, falling back to spatial tiled encode: {e}")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            if hasattr(vae, 'spatial_tiled_encode'):
+                                try:
+                                    free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                                    tile_size = 256 if free_mem >= 4000 else 128
+                                except:
+                                    tile_size = 128
+                                logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                                y_latent = vae.spatial_tiled_encode([img_padded], tile_size=tile_size)[0]
+                            else:
+                                raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                        else:
+                            raise
+
+        # --- FLF IMPROVED: Proper Mask Construction with Temporal Interleaving ---
+        # Build mask in FRAME space first, then apply temporal interleaving (Wan2GP style)
+
+        # Get actual latent frame count from encoded latent
+        actual_lat_f = y_latent.shape[1]
+
+        if has_end_image:
+            # FLF mask for Wan 2.2: first frame = 1, middle = 0, last frame = 1
+            # Use same frame count as VAE encoding (standard `frames` parameter)
+            frame_count_for_mask = frames
+
+            # Create mask in frame space [1, F, H, W]
+            msk_frames = torch.ones(1, frame_count_for_mask, lat_h, lat_w, device=device, dtype=vae.dtype)
+            msk_frames[:, 1:-1] = 0  # Middle frames = 0 (to be generated)
+            # First and last frames remain 1 (conditioning)
+
+            # Wan 2.2 style: Simple interleaving - only first frame x4, rest as-is
+            # This matches how Wan2GP handles i2v_2_2 models (no special end frame treatment)
+            msk_interleaved = torch.cat([
+                msk_frames[:, 0:1].repeat(1, 4, 1, 1),   # First frame x4
+                msk_frames[:, 1:],                        # Rest (including last, no x4)
+            ], dim=1)
+
+            # Reshape to [4, lat_f, H, W] format expected by model
+            # Use actual latent frame count from VAE encoding (not lat_f_effective which may have +1)
+            interleaved_len = msk_interleaved.shape[1]
+            lat_f_from_mask = interleaved_len // 4
+
+            # Verify mask aligns with VAE output
+            if lat_f_from_mask != actual_lat_f:
+                logger.warning(f"Mask/latent frame mismatch: mask gives {lat_f_from_mask}, VAE gives {actual_lat_f}. Using VAE count.")
+                # Adjust interleaved mask to match VAE output
+                target_interleaved = actual_lat_f * 4
+                if interleaved_len > target_interleaved:
+                    msk_interleaved = msk_interleaved[:, :target_interleaved]
+                else:
+                    # Pad with zeros
+                    pad_needed = target_interleaved - interleaved_len
+                    msk_interleaved = torch.cat([
+                        msk_interleaved,
+                        torch.zeros(1, pad_needed, lat_h, lat_w, device=device, dtype=msk_interleaved.dtype)
+                    ], dim=1)
+                lat_f_from_mask = actual_lat_f
+
+            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
+
+            logger.info(f"FLF mask (Wan 2.2 style). Shape: {msk.shape}, lat_f={lat_f_from_mask}")
+        else:
+            # Standard mask: only first frame is conditioned
+            msk_frames = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
+            msk_frames[:, 1:] = 0  # All except first = 0
+
+            # Apply temporal interleaving
+            msk_interleaved = torch.cat([
+                msk_frames[:, 0:1].repeat(1, 4, 1, 1),  # First frame x4
+                msk_frames[:, 1:],                       # Rest
+            ], dim=1)
+
+            interleaved_len = msk_interleaved.shape[1]
+            lat_f_from_mask = interleaved_len // 4
+            msk = msk_interleaved.view(1, lat_f_from_mask, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, lat_f, H, W]
+
+        # Ensure mask and latent have matching dimensions
+        if msk.shape[1] != y_latent.shape[1]:
+            logger.warning(f"Mask/latent dimension mismatch: mask={msk.shape}, latent={y_latent.shape}. Adjusting mask.")
+            # Adjust mask to match latent dimensions
+            if msk.shape[1] > y_latent.shape[1]:
+                msk = msk[:, :y_latent.shape[1], :, :]
+            else:
+                # Pad mask with zeros
+                pad_size = y_latent.shape[1] - msk.shape[1]
+                msk = torch.cat([msk, torch.zeros(4, pad_size, lat_h, lat_w, device=device, dtype=msk.dtype)], dim=1)
+
+        # Concatenate mask and latent for final 'y' tensor
+        y = torch.cat([msk, y_latent], dim=0)  # Shape [4+16, lat_f, H, W] = [20, lat_f, H, W]
+
+        logger.info(f"FLF conditioning 'y' constructed. Shape: {y.shape}")
         logger.info(f"Image encoding complete")
 
         # Move VAE back
@@ -2256,20 +2905,21 @@ def prepare_i2v_inputs(
         clean_memory_on_device(device)
 
         # Prepare model input arguments for Standard I2V
-        # A14B models don't have img_emb layer, so don't pass clip_fea
-        use_clip_fea = clip_context if not ("A14B" in args.task) else None
-        
+        # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+        # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+        use_clip_fea = clip_context if config.i2v else None
+
         arg_c = {
-            "context": context, # Model expects batch dim? Assuming yes.
+            "context": context,
             "clip_fea": use_clip_fea,
-            "seq_len": max_seq_len, # Use original seq len calculation
-            "y": [y], # Use the 'original method' y
+            "seq_len": max_seq_len,
+            "y": [y],
         }
         arg_null = {
             "context": context_null,
             "clip_fea": use_clip_fea,
             "seq_len": max_seq_len,
-            "y": [y], # Use the 'original method' y
+            "y": [y],
         }
 
         # Return noise, context, context_null, y (for debugging), (arg_c, arg_null)
@@ -2512,7 +3162,26 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae: WanVAE, device: tor
         video_single = video_tensor[i] # Shape [C, F, H, W]
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype): # Use VAE's internal dtype for autocast
             # vae.encode expects a list containing the tensor
-            encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
+            # Encode with OOM fallback to tiled encode
+            try:
+                encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE encode OOM (V2V), falling back to spatial tiled encode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    if hasattr(vae, 'spatial_tiled_encode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                        encoded_latent = vae.spatial_tiled_encode([video_single], tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                else:
+                    raise
             latents_list.append(encoded_latent)
 
     # Stack results back into a batch
@@ -2620,15 +3289,20 @@ def prepare_v2v_inputs(args: argparse.Namespace, config, accelerator: Accelerato
 
 
 def prepare_v2v_i2v_inputs(
-    args: argparse.Namespace, 
-    config, 
-    accelerator: Accelerator, 
-    device: torch.device, 
+    args: argparse.Namespace,
+    config,
+    accelerator: Accelerator,
+    device: torch.device,
     vae: WanVAE,
     video_frames_np: List[np.ndarray]  # Pass in loaded video frames
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
-    """Prepare V2V inputs for i2v models (combines V2V video encoding with I2V conditioning).
-    
+    """Prepare V2V inputs for i2v models (combines V2V video encoding with proper I2V conditioning).
+
+    Uses the official I2V conditioning format:
+    - Mask with proper temporal interleaving
+    - First frame (or provided image) encoded through VAE with zero padding
+    - Optional end frame conditioning
+
     Args:
         args: command line arguments
         config: model configuration
@@ -2636,39 +3310,52 @@ def prepare_v2v_i2v_inputs(
         device: device to use
         vae: VAE model instance
         video_frames_np: List of video frames as numpy arrays (HWC, 0-255)
-        
+
     Returns:
         Tuple containing noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
     """
     if vae is None:
         raise ValueError("VAE must be provided for V2V-I2V input preparation.")
-        
-    logger.info("Preparing V2V inputs for i2v model (with CLIP conditioning)")
-    
+
+    logger.info("Preparing V2V inputs for i2v model (with proper I2V conditioning)")
+
     # Get dimensions from args
     height, width = args.video_size
     frames = args.video_length
-    
-    # Convert frames to tensor and encode to latents
+
+    # Convert frames to tensor and encode to latents (for V2V re-mixing)
     video_tensor = torch.from_numpy(np.stack(video_frames_np, axis=0))  # [F,H,W,C]
     video_tensor = video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], [0,1]
     video_tensor = video_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [1,C,F,H,W]
-    
-    # Encode video to latents
+
+    # Encode video to latents (for V2V re-mixing during sampling)
     video_latents = encode_video_to_latents(video_tensor, vae, device, vae.dtype, args)
     logger.info(f"Encoded video to latents: {video_latents.shape}")
-    
-    # Extract first frame for CLIP conditioning (i2v requirement)
-    first_frame_np = video_frames_np[0]  # HWC, 0-255
-    first_frame_pil = Image.fromarray(first_frame_np)
-    
+
+    # Determine which image to use for I2V conditioning
+    # Priority: args.image_path > first frame of video
+    if args.image_path is not None:
+        logger.info(f"Using provided input image for I2V conditioning: {args.image_path}")
+        cond_image_pil = Image.open(args.image_path).convert("RGB")
+        cond_image_pil = cond_image_pil.resize((width, height), Image.LANCZOS)
+    else:
+        logger.info("Using first frame of input video for I2V conditioning")
+        cond_image_pil = Image.fromarray(video_frames_np[0])
+
+    # Check for end image conditioning
+    has_end_image = args.end_image_path is not None
+    if has_end_image:
+        logger.info(f"Using provided end image for I2V conditioning: {args.end_image_path}")
+        end_image_pil = Image.open(args.end_image_path).convert("RGB")
+        end_image_pil = end_image_pil.resize((width, height), Image.LANCZOS)
+
     # Calculate dimensions from latents
     _, _, lat_f, lat_h, lat_w = video_latents.shape
     seq_len = (lat_h * lat_w) // (config.patch_size[1] * config.patch_size[2]) * lat_f
-    
+
     # Configure negative prompt
     n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
-    
+
     # Set seed
     seed = args.seed
     if not args.cpu_noise:
@@ -2676,11 +3363,11 @@ def prepare_v2v_i2v_inputs(
         seed_g.manual_seed(seed)
     else:
         seed_g = torch.manual_seed(seed)
-    
+
     # Load text encoder and encode prompts
     text_encoder = load_text_encoder(args, config, device)
     text_encoder.model.to(device)
-    
+
     with torch.no_grad():
         if args.fp8_t5:
             with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
@@ -2689,33 +3376,33 @@ def prepare_v2v_i2v_inputs(
         else:
             context = text_encoder([args.prompt], device)
             context_null = text_encoder([n_prompt], device)
-    
+
     # Free text encoder
     del text_encoder
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
     gc.collect()
     logger.info("Unloaded T5 model from memory")
-    
-    # Load CLIP model and encode first frame
+
+    # Load CLIP model and encode conditioning image
     clip = load_clip_model(args, config, device)
     clip.model.to(device)
-    
-    # Convert first frame for CLIP
-    img_tensor_clip = TF.to_tensor(first_frame_pil).sub_(0.5).div_(0.5).to(device)  # CHW, [-1, 1]
-    
+
+    # Convert conditioning image for CLIP
+    img_tensor_clip = TF.to_tensor(cond_image_pil).sub_(0.5).div_(0.5).to(device)  # CHW, [-1, 1]
+
     with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
         clip_context = clip.visual([img_tensor_clip.unsqueeze(1)])  # Add Frame dim
-    
-    logger.info("Encoded first frame with CLIP for i2v conditioning")
-    
+
+    logger.info("Encoded conditioning image with CLIP for i2v")
+
     # Free CLIP model
     del clip
     clean_memory_on_device(device)
     torch.cuda.empty_cache()
     gc.collect()
     logger.info("Unloaded CLIP model from memory")
-    
+
     # Generate noise matching video latents shape
     noise = torch.randn(
         video_latents.shape,  # [B, C', F', H', W']
@@ -2724,34 +3411,66 @@ def prepare_v2v_i2v_inputs(
         generator=seed_g
     )
     noise = noise.to(device)
-    
+
+    # === Prepare proper I2V 'y' tensor for V2V ===
+    # Key difference from regular I2V: We use the ENTIRE source video as conditioning
+    # The mask controls how much the model should follow the source video
+    # mask=1 means "use this frame from conditioning", mask=0 means "generate freely"
+
+    # For V2V: Use the already-encoded video_latents as conditioning
+    # video_latents shape: [1, 16, lat_f, lat_h, lat_w]
+    cond_latent = video_latents.squeeze(0).to(device)  # [16, lat_f, lat_h, lat_w]
+
+    # Create mask based on strength
+    # strength=0.0 -> mask=1.0 (full conditioning, preserve video)
+    # strength=1.0 -> mask=0.0 (no conditioning, like regular I2V first-frame only)
+    v2v_strength = args.strength if hasattr(args, 'strength') else 0.5
+
+    # Create base mask - for V2V, we condition on ALL frames with strength-based weight
+    # First frame always gets full conditioning (mask=1), rest get (1 - strength)
+    msk = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
+    msk[:, 1:] = 1.0 - v2v_strength  # Other frames get partial conditioning based on strength
+
+    # Apply temporal interleaving for VAE temporal stride (repeat first frame 4 times, then append rest)
+    msk = torch.concat([
+        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+    ], dim=1)
+    # Reshape: [1, F+3, lat_h, lat_w] -> [1, lat_f, 4, lat_h, lat_w] -> [4, lat_f, lat_h, lat_w]
+    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+    msk = msk.transpose(1, 2)[0]  # [4, lat_f, lat_h, lat_w]
+
+    # If we have end image, mark last frame with full conditioning
+    if has_end_image:
+        msk[:, -1] = 1  # Last frame gets full conditioning
+        logger.info("Mask configured for start (full) and end (full) frame conditioning")
+
+    logger.info(f"V2V mask: first_frame=1.0, other_frames={1.0 - v2v_strength:.2f}")
+    logger.info(f"Using encoded source video as conditioning: {cond_latent.shape}")
+
+    # Concatenate mask with encoded conditioning latent to create 'y'
+    # y shape: [4 + C', lat_f, lat_h, lat_w] = [4 + 16, lat_f, lat_h, lat_w] = [20, lat_f, lat_h, lat_w]
+    y = torch.concat([msk, cond_latent], dim=0)
+
     # Prepare model input arguments
-    # A14B models don't have img_emb layer, so don't pass clip_fea
-    use_clip_fea = clip_context if not ("A14B" in args.task) else None
-    
-    # For i2v models, we need to prepare 'y' tensor (mask + latent)
-    # For V2V with i2v, we want to preserve the first frame and generate the rest
-    # This is like standard I2V where the first frame is given
-    msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
-    msk[:, 0] = 1  # Mask (preserve) the first frame only
-    
-    # Concatenate mask with video latents to create 'y'
-    y = torch.cat([msk, video_latents.squeeze(0)], dim=0)  # [4+C', F', H', W']
-    
+    # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+    # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+    use_clip_fea = clip_context if config.i2v else None
+
     arg_c = {
         "context": context,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],  # i2v models expect y as a list
+        "_has_end_image": has_end_image,  # For end-frame anchoring
     }
-    
+
     arg_null = {
         "context": context_null,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     return noise, context, context_null, clip_context, video_latents, (arg_c, arg_null)
 
 
@@ -2978,9 +3697,34 @@ def run_sampling(
 
     logger.info(f"Starting sampling loop for {num_timesteps} steps.")
     for i, t in enumerate(tqdm(timesteps)):
+        # Check for stop signal from queue system
+        if hasattr(args, 'output_filename') and args.output_filename:
+            stop_action = check_stop_signals(args.output_filename)
+            if stop_action == "decode":
+                logger.info(f"Stop signal received at step {i}/{num_timesteps} - will decode current latents")
+                break  # Exit loop, will decode whatever latent state we have
+
         # Prepare input for the model (move latent to compute device)
         # Latent should be [B, C, F, H, W] or [C, F, H, W]
         latent_on_device = latent.to(device)
+
+        # V2V-I2V: Flow-matching style injection (like Wan2GP)
+        # At each step until injection cutoff: latent = sigma * noise + (1 - sigma) * source
+        if "_v2v_i2v_source_latents" in arg_c and i <= arg_c.get("_v2v_i2v_injection_step", -1):
+            sigma = t.item() / 1000.0  # Flow matching: sigma = t / 1000
+            source_latents = arg_c["_v2v_i2v_source_latents"].to(device)
+            noise_latents = arg_c["_v2v_i2v_noise"].to(device)
+
+            # Flow-matching blend: x_t = sigma * noise + (1 - sigma) * x_0
+            latent_on_device = sigma * noise_latents + (1.0 - sigma) * source_latents
+
+            # Anchor first frame to clean latent (no noise)
+            if "_v2v_first_frame_latent" in arg_c:
+                first_frame = arg_c["_v2v_first_frame_latent"].to(device)
+                if latent_on_device.dim() == 5:
+                    latent_on_device[:, :, 0:1, :, :] = first_frame
+                else:
+                    latent_on_device[:, 0:1, :, :] = first_frame
 
         # FIX: Check if latent_on_device has too many dimensions and fix it
         # The model expects input x as a list of tensors with shape [C, F, H, W]
@@ -3343,10 +4087,31 @@ def run_sampling(
             if "_image_latent" in arg_c and "_ti2v_mask2" in arg_c:
                 image_latent = arg_c["_image_latent"].to(latent_storage_device)
                 ti2v_mask2 = arg_c["_ti2v_mask2"]
-                
+
                 # Apply mask-based conditioning using stored masks: latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
                 # This matches the official implementation exactly
                 latent = (1. - ti2v_mask2[0]) * image_latent + ti2v_mask2[0] * latent
+
+            # 6. V2V: Restore ANCHOR frames only after scheduler step (T2V models only)
+            # For I2V models, the model handles first-frame conditioning internally via 'y' parameter
+            # External anchoring would conflict with the model's predictions
+            # For T2V models, we need external anchoring since there's no 'y' conditioning
+            is_i2v_model = arg_c.get("_v2v_is_i2v_model", False)
+            if "_v2v_first_frame_latent" in arg_c and not is_i2v_model:
+                first_frame_latent = arg_c["_v2v_first_frame_latent"].to(latent.device).to(latent.dtype)
+                has_last_frame = "_v2v_last_frame_latent" in arg_c
+                if has_last_frame:
+                    last_frame_latent = arg_c["_v2v_last_frame_latent"].to(latent.device).to(latent.dtype)
+
+                # HARD ANCHOR: Restore anchor frames (prevents drift during denoising)
+                if latent.dim() == 5:
+                    latent[:, :, 0:1, :, :] = first_frame_latent.unsqueeze(0)
+                    if has_last_frame:
+                        latent[:, :, -1:, :, :] = last_frame_latent.unsqueeze(0)
+                else:
+                    latent[:, 0:1, :, :] = first_frame_latent
+                    if has_last_frame:
+                        latent[:, -1:, :, :] = last_frame_latent
 
             # --- Latent Preview Call ---
             # Preview the state *after* step 'i' is completed
@@ -3465,10 +4230,28 @@ def prepare_video_extension_inputs(
     else:
         padded_frames = cond_frames[:, :frame_num]
     
-    # Encode conditioning frames with VAE
+    # Encode conditioning frames with VAE (with OOM fallback)
     vae.to_device(device)
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-        y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+        try:
+            y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                logger.warning(f"VAE encode OOM (T2V inputs), falling back to spatial tiled encode: {e}")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                if hasattr(vae, 'spatial_tiled_encode'):
+                    try:
+                        free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                        tile_size = 256 if free_mem >= 4000 else 128
+                    except:
+                        tile_size = 128
+                    logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                    y_latent = vae.spatial_tiled_encode([padded_frames], tile_size=tile_size)[0]
+                else:
+                    raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+            else:
+                raise
     
     # Create mask for conditioning frames
     motion_frames_latent_num = (cond_f - 1) // config.vae_stride[0] + 1
@@ -3481,25 +4264,26 @@ def prepare_video_extension_inputs(
     # Move VAE back to CPU/cache
     vae.to_device(args.vae_cache_cpu if args.vae_cache_cpu else "cpu")
     clean_memory_on_device(device)
-    
+
     # Prepare model arguments
-    # A14B models don't have img_emb layer
-    use_clip_fea = clip_context if not ("A14B" in args.task) else None
-    
+    # Only pass CLIP features if model has img_emb layer (config.i2v = True)
+    # Wan 2.2 A14B uses input channel conditioning instead of CLIP embedding
+    use_clip_fea = clip_context if config.i2v else None
+
     arg_c = {
         "context": context,
         "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     arg_text_dropped = {
         "context": context_text_dropped,
-        "clip_fea": use_clip_fea,  # Keep CLIP for text-dropped
+        "clip_fea": use_clip_fea,
         "seq_len": seq_len,
         "y": [y],
     }
-    
+
     arg_null = {
         "context": context_null,
         "clip_fea": use_clip_fea,  # Keep CLIP for unconditional too
@@ -3719,6 +4503,7 @@ def generate_extended_video_i2v_based(
     original_image_path = args.image_path
     original_video_length = args.video_length
     original_extend_video = args.extend_video
+    original_end_image_path = getattr(args, 'end_image_path', None)
 
     try:
         # Main loop to generate the requested number of new sections
@@ -3761,6 +4546,14 @@ def generate_extended_video_i2v_based(
             args.video_length = original_video_length  # This is the length of one new section
             args.extend_video = None  # Prevent infinite recursion
 
+            # Only use end_image on the final section to guide toward target frame
+            is_last_section = (i == num_new_sections - 1)
+            if original_end_image_path and is_last_section:
+                args.end_image_path = original_end_image_path
+                logger.info(f"Section {i+1}: Using end image to guide toward target frame")
+            else:
+                args.end_image_path = None
+
             # Generate the new chunk as a latent tensor by calling the main generate function
             new_chunk_latent = generate(args)
             os.unlink(temp_image_path)
@@ -3776,7 +4569,14 @@ def generate_extended_video_i2v_based(
             # Skip the first frame of the new chunk as it's a repeat of the start image.
             final_video_tensor = torch.cat([base_video_tensor, decoded_chunk[:, :, 1:, :, :]], dim=2)
 
-            # 7. Update current_video_path for the next iteration by saving the new longer video
+            # 7. Trim tail frames if specified (removes poor end-frame transitions)
+            trim_tail_frames = getattr(args, 'trim_tail_frames', 0)
+            if trim_tail_frames > 0 and final_video_tensor.shape[2] > trim_tail_frames:
+                original_frames = final_video_tensor.shape[2]
+                final_video_tensor = final_video_tensor[:, :, :-trim_tail_frames, :, :]
+                logger.info(f"Section {i+1}: Trimmed {trim_tail_frames} tail frames ({original_frames} -> {final_video_tensor.shape[2]} frames)")
+
+            # 8. Update current_video_path for the next iteration by saving the new longer video
             if i < num_new_sections - 1: # No need to save the very last intermediate video
                 temp_video_filename = f"intermediate_section_{i+1}.mp4"
                 current_video_path = os.path.join(temp_dir, temp_video_filename)
@@ -3790,6 +4590,7 @@ def generate_extended_video_i2v_based(
         args.image_path = original_image_path
         args.video_length = original_video_length
         args.extend_video = original_extend_video
+        args.end_image_path = original_end_image_path
 
         # Clean up the temporary directory and all its contents
         if os.path.exists(temp_dir):
@@ -3801,6 +4602,450 @@ def generate_extended_video_i2v_based(
 
     logger.info(f"Final extended video generated with shape: {final_video_tensor.shape}")
     return final_video_tensor
+
+
+def extract_best_transition_frame_from_start(video_path: str, frames_to_check: int = 30) -> int:
+    """Extract the sharpest frame from the first N frames for smooth transition"""
+    import cv2
+
+    logger.info(f"Extracting best transition frame from first {frames_to_check} frames of {video_path}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("Failed to open video file")
+        return 0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    end_frame = min(total_frames, frames_to_check)
+
+    best_frame_idx = 0
+    max_sharpness = -1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    for frame_idx in range(end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Calculate sharpness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+
+    cap.release()
+
+    logger.info(f"Best transition frame from start: {best_frame_idx} with sharpness {max_sharpness:.2f}")
+    return best_frame_idx
+
+
+def generate_video_join(
+    args: argparse.Namespace,
+    input_video_path: str,
+    ending_video_path: str,
+    join_frames_input: int = 30,
+    join_frames_ending: int = 30,
+) -> torch.Tensor:
+    """
+    Join two videos by generating a transition between them using FLF (First-Last-Frame).
+
+    1. Extract best transition frame from end of input video
+    2. Extract best transition frame from start of ending video
+    3. Generate transition using FLF (start frame -> end frame)
+    4. Concatenate: input_video + transition + ending_video
+
+    Args:
+        args: Command line arguments
+        input_video_path: Path to the input video
+        ending_video_path: Path to the ending video
+        join_frames_input: Number of frames from end of input to check
+        join_frames_ending: Number of frames from start of ending to check
+
+    Returns:
+        torch.Tensor: Joined video tensor [1, C, F, H, W]
+    """
+    import tempfile
+    import cv2
+    import shutil
+    import time
+
+    logger.info(f"Starting video join: {input_video_path} -> {ending_video_path}")
+    logger.info(f"Checking {join_frames_input} frames from input end, {join_frames_ending} frames from ending start")
+    logger.info(f"Transition length: {args.video_length} frames")
+
+    # Create a temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp()
+
+    # Store original arguments
+    original_image_path = args.image_path
+    original_video_length = args.video_length
+    original_video_join = args.video_join
+    original_end_image_path = getattr(args, 'end_image_path', None)
+
+    try:
+        # 1. Extract best transition frame from end of input video
+        best_input_frame_idx = extract_best_transition_frame(input_video_path, frames_to_check=join_frames_input)
+
+        # 2. Extract best transition frame from start of ending video
+        best_ending_frame_idx = extract_best_transition_frame_from_start(ending_video_path, frames_to_check=join_frames_ending)
+
+        # 3. Load input video up to the best transition frame
+        if best_input_frame_idx > 0:
+            input_video_frames_np, _ = load_video(
+                input_video_path, 0, best_input_frame_idx + 1, bucket_reso=tuple(args.video_size)
+            )
+        else:
+            # Fallback: use all frames if extraction fails
+            logger.warning("Could not find sharp frame in input video. Using all frames.")
+            input_video_frames_np, _ = load_video(
+                input_video_path, 0, None, bucket_reso=tuple(args.video_size)
+            )
+
+        if not input_video_frames_np:
+            raise ValueError(f"Failed to load input video frames from {input_video_path}")
+
+        # Convert input video to tensor
+        input_video_tensor = torch.from_numpy(np.stack(input_video_frames_np, axis=0))
+        input_video_tensor = input_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+        input_video_tensor = input_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+        logger.info(f"Input video loaded with {input_video_tensor.shape[2]} frames")
+
+        # 4. Load ending video from best transition frame onwards
+        ending_video_frames_np, _ = load_video(
+            ending_video_path, best_ending_frame_idx, None, bucket_reso=tuple(args.video_size)
+        )
+
+        if not ending_video_frames_np:
+            raise ValueError(f"Failed to load ending video frames from {ending_video_path}")
+
+        # Convert ending video to tensor
+        ending_video_tensor = torch.from_numpy(np.stack(ending_video_frames_np, axis=0))
+        ending_video_tensor = ending_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+        ending_video_tensor = ending_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+        logger.info(f"Ending video loaded with {ending_video_tensor.shape[2]} frames")
+
+        # 5. Get the last frame of input video (start image for FLF)
+        last_input_frame_np = (input_video_tensor[0, :, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 6. Get the first frame of ending video (end image for FLF)
+        first_ending_frame_np = (ending_video_tensor[0, :, 0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 7. Save both frames temporarily
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_start:
+            cv2.imwrite(tmp_start.name, cv2.cvtColor(last_input_frame_np, cv2.COLOR_RGB2BGR))
+            temp_start_image = tmp_start.name
+
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_end:
+            cv2.imwrite(tmp_end.name, cv2.cvtColor(first_ending_frame_np, cv2.COLOR_RGB2BGR))
+            temp_end_image = tmp_end.name
+
+        logger.info(f"Saved start frame to {temp_start_image}")
+        logger.info(f"Saved end frame to {temp_end_image}")
+
+        # 8. Generate transition using FLF
+        args.image_path = temp_start_image
+        args.end_image_path = temp_end_image
+        args.video_join = None  # Prevent infinite recursion
+
+        logger.info(f"Generating FLF transition with {args.video_length} frames...")
+        transition_latent = generate(args)
+
+        # Clean up temp images
+        os.unlink(temp_start_image)
+        os.unlink(temp_end_image)
+
+        if transition_latent is None:
+            raise RuntimeError("Failed to generate transition video")
+
+        # 9. Decode transition from latent to pixel space
+        transition_video = decode_latent(transition_latent, args, WAN_CONFIGS[args.task])  # [B, C, F, H, W]
+        logger.info(f"Transition decoded with shape: {transition_video.shape}")
+
+        # 10. Concatenate: input_video + transition (skip first frame) + ending_video (skip first frame)
+        # Skip first frame of transition (it's duplicate of input's last frame)
+        # Skip first frame of ending (it's duplicate of transition's last frame / was used as end image)
+        final_video = torch.cat([
+            input_video_tensor,
+            transition_video[:, :, 1:-1, :, :],  # Skip first and last frames (duplicates)
+            ending_video_tensor[:, :, 1:, :, :]  # Skip first frame (duplicate of transition end)
+        ], dim=2)
+
+        logger.info(f"Video join complete! Final shape: {final_video.shape}")
+        logger.info(f"  Input: {input_video_tensor.shape[2]} frames")
+        logger.info(f"  Transition: {transition_video.shape[2] - 2} frames (excluding duplicates)")
+        logger.info(f"  Ending: {ending_video_tensor.shape[2] - 1} frames (excluding duplicate)")
+
+        return final_video
+
+    finally:
+        # Restore original arguments
+        args.image_path = original_image_path
+        args.video_length = original_video_length
+        args.video_join = original_video_join
+        args.end_image_path = original_end_image_path
+
+        # Clean up temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+
+def generate_svi_multi_clip(
+    args: argparse.Namespace,
+    initial_image_path: str,
+    num_clips: int,
+    prompts: Optional[list] = None,
+    overlap_frames: int = 1,
+    num_motion_latent: int = 1,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
+) -> torch.Tensor:
+    """Generate multi-clip streaming video using SVI Pro (Stable-Video-Infinity) approach.
+
+    This implements the SVI Pro algorithm for generating consistent long videos:
+    1. Generate first clip from initial image
+    2. For each subsequent clip:
+       - Use frame from previous clip as new input image (controlled by num_motion_frame)
+       - Use original image as anchor for cross-clip consistency
+       - Pass prev_last_latent for latent-based motion conditioning (Pro mode)
+       - Optionally use different prompts per clip for storytelling
+
+    Args:
+        args: Command line arguments
+        initial_image_path: Path to the starting image
+        num_clips: Number of clips to generate
+        prompts: Optional list of prompts (one per clip). If None or shorter, uses args.prompt.
+        overlap_frames: Number of overlapping frames between clips for smooth transitions
+        num_motion_latent: Number of latent frames from previous clip for motion context (0=disable)
+        num_motion_frame: Frame offset from end of clip to use as next input (1=last frame, 4=4th from last)
+        seed_multiplier: Multiplier for per-clip seed variation (seed = base + clip_idx * multiplier)
+
+    Returns:
+        torch.Tensor: Combined video tensor [1, C, F, H, W]
+    """
+    import tempfile
+    import shutil
+    import time
+
+    logger.info(f"Starting SVI Pro multi-clip generation: {num_clips} clips from {initial_image_path}")
+    logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
+    logger.info(f"SVI Pro mode: num_motion_latent={num_motion_latent}, num_motion_frame={num_motion_frame}, seed_multiplier={seed_multiplier}")
+
+    # Store original values
+    original_image_path = args.image_path
+    original_prompt = args.prompt
+    original_anchor_image = getattr(args, 'anchor_image', None)
+    original_svi_mode = getattr(args, 'svi_mode', False)
+    original_seed = args.seed  # Store original seed for per-clip variation
+    original_prev_last_latent = getattr(args, '_prev_last_latent', None)
+    original_num_motion_latent = getattr(args, '_num_motion_latent', 0)
+
+    # Create temp directory for intermediate outputs
+    temp_dir = tempfile.mkdtemp()
+    all_clips = []
+    current_input_image = initial_image_path
+    anchor_image = initial_image_path  # SVI anchor: always the original image
+
+    # SVI Pro: Track latent for passing between clips
+    prev_last_latent = None
+
+    try:
+        # Enable SVI mode for anchor padding
+        args.svi_mode = True
+        args.anchor_image = anchor_image
+
+        for clip_idx in range(num_clips):
+            logger.info(f"=== Generating clip {clip_idx + 1}/{num_clips} ===")
+
+            # SVI: Vary seed per clip for different motion (following SVI Pro reference implementation)
+            # seed = base_seed + clip_idx * seed_multiplier pattern from Stable-Video-Infinity
+            clip_seed = original_seed + clip_idx * seed_multiplier
+            args.seed = clip_seed
+            logger.info(f"Clip {clip_idx + 1} seed: {clip_seed} (base: {original_seed}, offset: {clip_idx * seed_multiplier})")
+
+            # Set prompt for this clip
+            if prompts and clip_idx < len(prompts):
+                args.prompt = prompts[clip_idx]
+                logger.info(f"Clip {clip_idx + 1} prompt: {args.prompt}")
+            elif prompts and len(prompts) > 0:
+                # Use last prompt if we've run out
+                args.prompt = prompts[-1]
+            # else: use original args.prompt
+
+            # Set input image
+            args.image_path = current_input_image
+            logger.info(f"Clip {clip_idx + 1} input image: {args.image_path}")
+
+            # SVI Pro: Pass latent context for motion conditioning
+            args._prev_last_latent = prev_last_latent
+            args._num_motion_latent = num_motion_latent
+            if prev_last_latent is not None:
+                logger.info(f"Clip {clip_idx + 1} using prev_last_latent with shape: {prev_last_latent.shape}")
+
+            # Generate clip
+            clip_latent = generate(args)
+            if clip_latent is None:
+                raise RuntimeError(f"Failed to generate clip {clip_idx + 1}")
+
+            # SVI Pro: Store latent for next clip (BEFORE decoding)
+            if num_motion_latent > 0:
+                prev_last_latent = clip_latent.squeeze(0).detach()  # [C, F, H, W]
+                logger.info(f"Stored prev_last_latent with shape: {prev_last_latent.shape}")
+
+            # Decode latent to pixels
+            from Wan2_2.wan.configs import WAN_CONFIGS as WAN22_CONFIGS
+            cfg = WAN22_CONFIGS[args.task]
+            clip_tensor = decode_latent(clip_latent, args, cfg)  # [1, C, F, H, W], range [0, 1]
+            logger.info(f"Clip {clip_idx + 1} generated with shape: {clip_tensor.shape}")
+
+            # Store clip (skip first frame for non-first clips to avoid duplication)
+            if clip_idx == 0:
+                all_clips.append(clip_tensor)
+            else:
+                # Skip first `overlap_frames` frames to avoid duplication
+                all_clips.append(clip_tensor[:, :, overlap_frames:, :, :])
+
+            # Extract frame for next clip input (controlled by num_motion_frame)
+            # num_motion_frame=1 means last frame, num_motion_frame=4 means 4th from last
+            if clip_idx < num_clips - 1:
+                frame_idx = -min(num_motion_frame, clip_tensor.shape[2])  # Ensure we don't go out of bounds
+                motion_frame = clip_tensor[0, :, frame_idx, :, :]  # [C, H, W]
+                motion_frame_np = (motion_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+                # Save motion frame as temp image
+                temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_motion_frame.png")
+                cv2.imwrite(temp_image_path, cv2.cvtColor(motion_frame_np, cv2.COLOR_RGB2BGR))
+                current_input_image = temp_image_path
+                logger.info(f"Saved frame {frame_idx} to {temp_image_path} for next clip input (num_motion_frame={num_motion_frame})")
+
+            # Brief pause between clips
+            time.sleep(0.5)
+
+        # Concatenate all clips
+        logger.info(f"Concatenating {len(all_clips)} clips...")
+        final_video = torch.cat(all_clips, dim=2)  # Concatenate along frame dimension
+        logger.info(f"Final SVI video shape: {final_video.shape}")
+
+    finally:
+        # Restore original values
+        args.image_path = original_image_path
+        args.prompt = original_prompt
+        args.anchor_image = original_anchor_image
+        args.svi_mode = original_svi_mode
+        args.seed = original_seed
+        args._prev_last_latent = original_prev_last_latent
+        args._num_motion_latent = original_num_motion_latent
+
+        # Cleanup temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temp directory: {temp_dir}")
+
+    return final_video
+
+
+def generate_svi_video_extension(
+    args: argparse.Namespace,
+    input_video_path: str,
+    num_clips: int,
+    prompts: Optional[list] = None,
+    overlap_frames: int = 1,
+    frames_to_check: int = 30,
+    anchor_image_path: Optional[str] = None,
+    prepend_original: bool = True,
+    num_motion_latent: int = 1,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
+) -> torch.Tensor:
+    import tempfile
+    import shutil
+
+    logger.info(f"=== Starting SVI Video Extension ===")
+    logger.info(f"Input video: {input_video_path}")
+    logger.info(f"Clips to generate: {num_clips}, Overlap: {overlap_frames}, Prepend: {prepend_original}")
+
+    if not os.path.exists(input_video_path):
+        raise FileNotFoundError(f"Input video not found: {input_video_path}")
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        best_frame_idx = extract_best_transition_frame(input_video_path, frames_to_check=frames_to_check)
+
+        cap = cv2.VideoCapture(input_video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if best_frame_idx < 0:
+            best_frame_idx = total_frames - 1
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, best_frame_idx)
+        ret, transition_frame = cap.read()
+        if not ret:
+            raise RuntimeError(f"Failed to read frame {best_frame_idx}")
+
+        start_image_path = os.path.join(temp_dir, "transition_frame.png")
+        cv2.imwrite(start_image_path, transition_frame)
+        logger.info(f"Transition frame {best_frame_idx} saved to: {start_image_path}")
+
+        if anchor_image_path and os.path.exists(anchor_image_path):
+            anchor_path = anchor_image_path
+            logger.info(f"Using provided anchor: {anchor_path}")
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, first_frame = cap.read()
+            if not ret:
+                raise RuntimeError("Failed to read first frame for anchor")
+            anchor_path = os.path.join(temp_dir, "anchor_frame.png")
+            cv2.imwrite(anchor_path, first_frame)
+            logger.info(f"Using first frame as anchor: {anchor_path}")
+
+        cap.release()
+
+        original_video_tensor = None
+        if prepend_original:
+            logger.info(f"Loading original frames 0 to {best_frame_idx}...")
+            original_frames = hv_load_video(
+                input_video_path, 0, best_frame_idx + 1, bucket_reso=(args.video_size[1], args.video_size[0])
+            )
+            original_video_tensor = torch.stack([
+                torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
+                for f in original_frames
+            ], dim=0).unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch.float32)
+            logger.info(f"Original video tensor shape: {original_video_tensor.shape}")
+
+        args.image_path = start_image_path
+        args.anchor_image = anchor_path
+        args.svi_mode = True
+
+        extension_tensor = generate_svi_multi_clip(
+            args=args,
+            initial_image_path=start_image_path,
+            num_clips=num_clips,
+            prompts=prompts,
+            overlap_frames=overlap_frames,
+            num_motion_latent=num_motion_latent,
+            num_motion_frame=num_motion_frame,
+            seed_multiplier=seed_multiplier,
+        )
+        logger.info(f"Extension tensor shape: {extension_tensor.shape}")
+
+        if prepend_original and original_video_tensor is not None:
+            extension_without_overlap = extension_tensor[:, :, overlap_frames:, :, :]
+            final_video = torch.cat([original_video_tensor, extension_without_overlap], dim=2)
+            logger.info(f"Concatenated: {original_video_tensor.shape[2]} + {extension_without_overlap.shape[2]} = {final_video.shape[2]} frames")
+        else:
+            final_video = extension_tensor
+
+        logger.info(f"=== SVI Extension Complete: {final_video.shape[2]} total frames ===")
+        return final_video
+
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 
 def generate_extended_video(
     args: argparse.Namespace,
@@ -3929,10 +5174,28 @@ def generate_extended_video(
         cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
         cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W], move to device
         
-        # Encode conditioning frames to latent
+        # Encode conditioning frames to latent (with OOM fallback)
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            cond_latent = vae.encode([cond_frames])[0]
+            try:
+                cond_latent = vae.encode([cond_frames])[0]
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE encode OOM (extend_video), falling back to spatial tiled encode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    if hasattr(vae, 'spatial_tiled_encode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                        cond_latent = vae.spatial_tiled_encode([cond_frames], tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                else:
+                    raise
         
         # Prepare inputs for this chunk
         chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)
@@ -3964,10 +5227,30 @@ def generate_extended_video(
             model_manager=model_manager
         )
         
-        # Decode the generated latent
+        # Decode the generated latent with OOM fallback to tiled decode
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
+            latent_list = [final_latent.squeeze(0)]
+            try:
+                decoded_chunk = vae.decode(latent_list)[0]
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE decode OOM in extend_video, falling back to spatial tiled decode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        decoded_chunk = vae.spatial_tiled_decode(latent_list, tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_decode not available") from e
+                else:
+                    raise
         
         if args.color_match != "disabled":
             try:
@@ -4106,19 +5389,44 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     is_fun_control = args.control_path is not None and cfg.is_fun_control
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
     is_extension = args.extend_video is not None
+    is_video_join = args.video_join is not None and args.ending_video is not None
     is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
 
-    if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
+    if is_video_join: logger.info(f"Running Video Join: {args.video_join} -> {args.ending_video}")
+    elif is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_ti2v: logger.info(f"Running Text+Image-to-Video (TI2V) inference")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
     elif is_fun_control: logger.info(f"Running Text-to-Video with Fun-Control") # Note: FunControl can also be I2V if image_path is given
     elif is_extension: logger.info(f"Running Video Extension (multitalk-style) to {args.extend_frames} frames")
-    else: 
+    else:
         if args.task == "ti2v-5B" and args.image_path is None:
             logger.info(f"Running Text-to-Video (T2V) inference for ti2v-5B (no image provided)")
         else:
             logger.info(f"Running Text-to-Video (T2V) inference")
+
+    # === Log SVI Features Status ===
+    svi_features_active = []
+    if getattr(args, 'svi_mode', False):
+        svi_features_active.append("SVI mode (anchor padding)")
+    if getattr(args, 'anchor_image', None) is not None:
+        svi_features_active.append(f"Anchor image: {args.anchor_image}")
+    if getattr(args, 'tea_cache_l1_thresh', None) is not None:
+        svi_features_active.append(f"TeaCache (L1 thresh: {args.tea_cache_l1_thresh})")
+    if getattr(args, 'cfg_merge', False):
+        svi_features_active.append("CFG merge (batched)")
+    if getattr(args, 'svi_sliding_window_size', None) is not None:
+        stride = args.svi_sliding_window_stride or (args.svi_sliding_window_size // 2)
+        svi_features_active.append(f"Sliding window (size: {args.svi_sliding_window_size}, stride: {stride})")
+    if getattr(args, 'svi_lora', False):
+        svi_features_active.append("SVI LoRA format conversion")
+
+    if svi_features_active:
+        logger.info("=" * 50)
+        logger.info("SVI (Stable-Video-Infinity) Features Active:")
+        for feature in svi_features_active:
+            logger.info(f"  - {feature}")
+        logger.info("=" * 50)
 
     # --- Data Types ---
     # Default to fp16 for new Wan2.2 models, detect from checkpoint if available
@@ -4184,10 +5492,28 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
 
+    # Handle video join mode - must be before extension as it takes priority
+    if is_video_join:
+        logger.info(f"Joining videos: {args.video_join} + generated transition + {args.ending_video}")
+        try:
+            joined_video = generate_video_join(
+                args,
+                args.video_join,
+                args.ending_video,
+                args.join_frames_input,
+                args.join_frames_ending
+            )
+            return joined_video  # Return the joined video directly
+        except Exception as e:
+            logger.error(f"Video join failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
     # Handle video extension mode
     if is_extension:
         logger.info(f"Extending video from {args.extend_video} to {args.extend_frames} frames")
-        
+
         # Use clean i2v-based extension approach (much better than multitalk-style)
         # This approach extracts the best frame and generates smooth extensions
         try:
@@ -4823,29 +6149,73 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         inputs[0]["_ti2v_mask1"] = ti2v_mask1
         inputs[0]["_ti2v_mask2"] = ti2v_mask2
 
-    if (is_v2v or is_v2v_i2v) and args.strength < 1.0:
-        # Calculate how many steps to skip based on strength
+    if is_v2v_i2v and args.strength < 1.0:
+        # V2V with I2V model: Flow-matching style injection (like Wan2GP)
+        # At each step, inject: latent = sigma * noise + (1 - sigma) * source_latents
+        # where sigma = t / 1000, until the injection cutoff step
+
+        # Store clean video latents and pure noise for per-step injection
+        v2v_noise = latent.clone()  # latent is pure noise from prepare_v2v_i2v_inputs
+        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
+
+        # Calculate injection cutoff step from strength (like Wan2GP)
+        # strength=0.2 -> injection until step 80 (out of 100), then free denoising for 20 steps
+        injection_denoising_step = int(round(args.infer_steps * (1.0 - args.strength)))
+
+        # Store first frame clean latent for anchoring
+        first_frame_clean = v2v_clean[:, :, 0:1, :, :] if v2v_clean.dim() == 5 else v2v_clean[:, 0:1, :, :]
+
+        # Store tensors for per-step flow-matching injection in sampling loop
+        inputs[0]["_v2v_i2v_source_latents"] = v2v_clean
+        inputs[0]["_v2v_i2v_noise"] = v2v_noise
+        inputs[0]["_v2v_i2v_injection_step"] = injection_denoising_step
+        inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
+
+        # Do NOT skip timesteps - run all steps, injection happens inside the loop
+        # timesteps remains unchanged
+
+        logger.info(f"V2V-I2V: Flow-matching injection (strength={args.strength:.2f})")
+        logger.info(f"V2V-I2V: Injection until step {injection_denoising_step}, then free denoising")
+        logger.info(f"V2V-I2V: First frame anchored, using all {len(timesteps)} timesteps")
+
+    elif is_v2v and not is_v2v_i2v and args.strength < 1.0:
+        # Standard V2V (T2V model): SDEdit-style noise injection with anchor
+        # Add noise at starting timestep, then denoise with first frame anchored
+
+        # Calculate timestep to start from based on strength
         init_timestep_idx = int(args.infer_steps * (1.0 - args.strength))
         init_timestep_idx = min(init_timestep_idx, args.infer_steps - 1)
-        
-        # Get the actual timestep value
         init_timestep = timesteps[init_timestep_idx]
-        
-        # Use scheduler's add_noise method to properly add noise
-        # This applies the correct alpha_t and sigma_t scaling
+
+        # Store clean video latents and noise
+        v2v_noise = latent.clone()  # Store the pure noise
+        v2v_clean = video_latents.to(latent.device).to(latent.dtype)
+
+        # Use scheduler.add_noise for proper noise schedule (respects shift parameter)
         latent = scheduler.add_noise(
-            original_samples=video_latents,
-            noise=latent,  # This is pure noise
+            original_samples=v2v_clean,
+            noise=v2v_noise,
             timesteps=torch.tensor([init_timestep], device=device)
         )
-        
+
+        # First frame is HARD ANCHOR (preserve original exactly)
+        first_frame_clean = v2v_clean[:, :, 0:1, :, :] if v2v_clean.dim() == 5 else v2v_clean[:, 0:1, :, :]
+        if latent.dim() == 5:
+            latent[:, :, 0:1, :, :] = first_frame_clean
+        else:
+            latent[:, 0:1, :, :] = first_frame_clean
+
         # Skip the early timesteps
         timesteps = timesteps[init_timestep_idx:]
-        
-        logger.info(f"V2V: Starting from timestep {init_timestep.item():.0f} (skipping {init_timestep_idx} steps)")
-        logger.info(f"Using {len(timesteps)} timesteps for V2V sampling")
-    else:
-         logger.info(f"Using full {len(timesteps)} timesteps for sampling.")
+
+        # Store for per-step anchor frame restoration
+        inputs[0]["_v2v_first_frame_latent"] = first_frame_clean
+
+        logger.info(f"V2V: Using scheduler.add_noise for proper noise injection")
+        logger.info(f"V2V: Starting from timestep {init_timestep.item():.0f} (step {init_timestep_idx})")
+        logger.info(f"V2V: First frame anchored, using {len(timesteps)} timesteps")
+
+    logger.info(f"Using {len(timesteps)} timesteps for sampling.")
     previewer = None
     if LatentPreviewer is not None and args.preview is not None and args.preview > 0:
         logger.info(f"Initializing Latent Previewer (every {args.preview} steps)...")
@@ -4983,6 +6353,25 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     """
     device = torch.device(args.device)
 
+    # Clean up DiT model to free GPU memory for VAE decode
+    import gc
+    dit_attrs = ['_model', '_dit', '_dit_low', '_dit_high', 'model', 'dit']
+    for attr in dit_attrs:
+        if hasattr(args, attr) and getattr(args, attr) is not None:
+            dit_model = getattr(args, attr)
+            if hasattr(dit_model, 'to'):
+                try:
+                    dit_model.to('cpu')
+                    logger.info(f"Moved {attr} to CPU to free GPU memory for VAE decode")
+                except:
+                    pass
+            del dit_model
+            setattr(args, attr, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    clean_memory_on_device(device)
+
     # Load VAE model or use the one from the generation pipeline
     vae = None
     if hasattr(args, "_vae") and args._vae is not None:
@@ -5010,14 +6399,51 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure latent is on the correct device and expected dtype for VAE
     latent_decode = latent.to(device=device, dtype=vae.dtype)
 
-    # Handle different VAE decode APIs
+    # Handle different VAE decode APIs with OOM fallback to tiled decoding
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
         if hasattr(vae, 'model') and hasattr(vae, 'scale'):
             # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
             # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
             latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
-            decoded_list = vae.decode(latent_list)
+
+            try:
+                # Try normal decode first
+                decoded_list = vae.decode(latent_list)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    # OOM occurred - fall back to tiled decode
+                    logger.warning(f"VAE decode OOM, falling back to spatial tiled decode: {e}")
+
+                    # Aggressive memory cleanup before retry
+                    import gc
+                    # Move latent to CPU to free GPU memory
+                    latent_list_cpu = [l.cpu() for l in latent_list]
+                    del latent_list
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    # Check if tiled decode is available
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        # Determine tile size based on available VRAM
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)  # MB
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128  # Conservative default
+
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}, free VRAM: {free_mem:.0f}MB")
+                        # Move latent back to device for tiled decode (it will manage memory internally)
+                        latent_list = [l.to(device) for l in latent_list_cpu]
+                        del latent_list_cpu
+                        gc.collect()
+                        decoded_list = vae.spatial_tiled_decode(latent_list, tile_size=tile_size)
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_decode not available") from e
+                else:
+                    raise  # Re-raise non-OOM errors
+
             if decoded_list and len(decoded_list) > 0:
                 # Stack list back into batch dimension: [1, C, F, H, W]
                 videos = torch.stack(decoded_list, dim=0)
@@ -5025,7 +6451,31 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
                 raise RuntimeError("VAE decoding failed or returned empty list.")
         else:
             # Original WanVAE type - handles tensor input directly
-            decoded_list = vae.decode(latent_decode)
+            try:
+                decoded_list = vae.decode(latent_decode)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE decode OOM with original WanVAE: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    # Check if tiled decode is available (may be added to WanVAE in future)
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        decoded_list = vae.spatial_tiled_decode(latent_decode, tile_size=tile_size)
+                    else:
+                        raise RuntimeError(
+                            "VAE OOM occurred. spatial_tiled_decode not available for this VAE type. "
+                            "Consider using Wan2_2_VAE or reducing video resolution."
+                        ) from e
+                else:
+                    raise
+
             if decoded_list and len(decoded_list) > 0:
                 videos = torch.stack(decoded_list, dim=0)
             else:
@@ -5044,7 +6494,8 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     logger.info(f"Decoded video shape: {videos.shape}")
 
     # Post-processing: trim tail frames, convert to float32 CPU, scale to [0, 1]
-    if args.trim_tail_frames > 0:
+    # Skip trim here if video extension is enabled - extension handles trimming after concatenation
+    if args.trim_tail_frames > 0 and not getattr(args, 'extend_video', None):
         logger.info(f"Trimming last {args.trim_tail_frames} frames.")
         videos = videos[:, :, : -args.trim_tail_frames, :, :]
 
@@ -5075,8 +6526,9 @@ def save_output(
     """
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
-    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
 
+    # Generate base_name for latent/images output (video uses --output_filename directly)
+    time_flag = datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S")
     seed = args.seed
     # Get dimensions from the *decoded* video tensor
     batch_size, channels, video_length, height, width = video_tensor.shape
@@ -5147,7 +6599,13 @@ def save_output(
 
     # --- Save Video or Images ---
     if args.output_type == "video" or args.output_type == "both":
-        video_path = os.path.join(save_path, f"{base_name}.mp4")
+        # Use --output_filename if provided (for queue system coordination), otherwise generate from base_name
+        if getattr(args, 'output_filename', None):
+            video_path = args.output_filename
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        else:
+            video_path = os.path.join(save_path, f"{base_name}.mp4")
         # save_videos_grid expects [B, T, H, W, C], need to permute and rescale if needed
         # Input video_tensor is [B, C, T, H, W], range [0, 1]
         # save_videos_grid handles the rescale flag correctly if input is [0,1]
@@ -5216,7 +6674,89 @@ def main():
         if mode_str == "V2V": logger.info(f"V2V Strength: {args.strength}")
         if "FunControl" in mode_str: logger.info(f"FunControl Weight: {args.control_weight}, Start: {args.control_start}, End: {args.control_end}, Falloff: {args.control_falloff_percentage}")
 
-        # Core generation pipeline
+        # === SVI Multi-Clip Generation ===
+        is_svi_extend = getattr(args, 'svi_extend_video', None) is not None
+        is_svi_multi_clip = (
+            (getattr(args, 'num_clips', 1) > 1 and args.image_path is not None and "i2v" in args.task)
+            or is_svi_extend
+        )
+
+        if is_svi_multi_clip:
+            logger.info("=" * 60)
+            logger.info("SVI MULTI-CLIP MODE ENABLED")
+            logger.info(f"Generating {args.num_clips} clips with {args.overlap_frames} frame overlap")
+            logger.info("=" * 60)
+
+            # Parse prompt list if provided
+            prompts = None
+            if getattr(args, 'prompt_list', None) is not None and len(args.prompt_list) > 0:
+                prompts = args.prompt_list
+                logger.info(f"Using {len(prompts)} prompts for multi-clip generation")
+            else:
+                logger.info(f"Using single prompt for all clips: {args.prompt}")
+
+            # Check for SVI video extension mode
+            if getattr(args, 'svi_extend_video', None) is not None:
+                logger.info("SVI Video Extension mode enabled")
+                final_video_tensor = generate_svi_video_extension(
+                    args,
+                    input_video_path=args.svi_extend_video,
+                    num_clips=args.num_clips,
+                    prompts=prompts,
+                    overlap_frames=args.overlap_frames,
+                    frames_to_check=getattr(args, 'svi_extend_frames_to_check', 30),
+                    anchor_image_path=getattr(args, 'svi_extend_anchor', None),
+                    prepend_original=getattr(args, 'svi_extend_prepend', True),
+                    num_motion_latent=getattr(args, 'num_motion_latent', 1),
+                    num_motion_frame=getattr(args, 'num_motion_frame', 1),
+                    seed_multiplier=getattr(args, 'seed_multiplier', 42),
+                )
+            else:
+                final_video_tensor = generate_svi_multi_clip(
+                    args,
+                    initial_image_path=args.image_path,
+                    num_clips=args.num_clips,
+                    prompts=prompts,
+                    overlap_frames=args.overlap_frames,
+                    num_motion_latent=getattr(args, 'num_motion_latent', 1),
+                    num_motion_frame=getattr(args, 'num_motion_frame', 1),
+                    seed_multiplier=getattr(args, 'seed_multiplier', 42),
+                )
+
+            # Save the multi-clip video directly (it's already in pixel space)
+            logger.info(f"SVI multi-clip video generated: {final_video_tensor.shape}")
+
+            # Update dimensions from the final video tensor
+            _, _, pixel_frames, pixel_height, pixel_width = final_video_tensor.shape
+
+            # Generate output filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+            output_base = f"svi_{args.task}_{timestamp}_{seed}"
+
+            # Save the video
+            if args.output_type in ("video", "both"):
+                # Use --output_filename if provided (for queue system coordination), otherwise generate from output_base
+                if getattr(args, 'output_filename', None):
+                    video_path = args.output_filename
+                    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+                else:
+                    video_path = os.path.join(args.save_path, f"{output_base}.mp4")
+                save_videos_grid(final_video_tensor, video_path, fps=args.fps, rescale=False)
+                logger.info(f"SVI multi-clip video saved to: {video_path}")
+
+            # Save as images if requested
+            if args.output_type in ("images", "both"):
+                image_dir = os.path.join(args.save_path, output_base)
+                os.makedirs(image_dir, exist_ok=True)
+                save_images_grid(final_video_tensor, image_dir, "frame", rescale=False, save_individually=True)
+                logger.info(f"SVI multi-clip frames saved to: {image_dir}")
+
+            logger.info("SVI multi-clip generation complete!")
+            return  # Exit after SVI multi-clip generation
+        # === End SVI Multi-Clip Generation ===
+
+        # Core generation pipeline (standard single-clip mode)
         generated_latent = generate(args) # Returns [B, C, F, H, W] or None
 
         if args.save_merged_model:
@@ -5227,14 +6767,25 @@ def main():
              logger.error("Generation failed or was skipped, exiting.")
              return
 
-        # Update dimensions based on the *actual* generated latent
-        # Latent shape might differ slightly from input request depending on VAE/model strides
-        _, lat_c, lat_f, lat_h, lat_w = generated_latent.shape
-        # Convert latent dimensions back to pixel dimensions for metadata/logging
-        pixel_height = lat_h * cfg.vae_stride[1]
-        pixel_width = lat_w * cfg.vae_stride[2]
-        pixel_frames = (lat_f - 1) * cfg.vae_stride[0] + 1
-        logger.info(f"Generation complete. Latent shape: {generated_latent.shape} -> Pixel Video: {pixel_height}x{pixel_width}@{pixel_frames}")
+        # Check if returned tensor is already decoded (pixel space) or still latent
+        is_pixel_space = (
+            (hasattr(args, 'extend_video') and args.extend_video is not None) or
+            (hasattr(args, 'video_join') and args.video_join is not None)
+        )
+
+        if is_pixel_space:
+            # Tensor is already in pixel space [B, C, F, H, W] with C=3
+            _, pixel_c, pixel_frames, pixel_height, pixel_width = generated_latent.shape
+            logger.info(f"Generation complete. Video shape: {generated_latent.shape} (already decoded)")
+        else:
+            # Update dimensions based on the *actual* generated latent
+            # Latent shape might differ slightly from input request depending on VAE/model strides
+            _, lat_c, lat_f, lat_h, lat_w = generated_latent.shape
+            # Convert latent dimensions back to pixel dimensions for metadata/logging
+            pixel_height = lat_h * cfg.vae_stride[1]
+            pixel_width = lat_w * cfg.vae_stride[2]
+            pixel_frames = (lat_f - 1) * cfg.vae_stride[0] + 1
+            logger.info(f"Generation complete. Latent shape: {generated_latent.shape} -> Pixel Video: {pixel_height}x{pixel_width}@{pixel_frames}")
         # Use these derived pixel dimensions for saving metadata
         height, width, video_length = pixel_height, pixel_width, pixel_frames
 
@@ -5377,22 +6928,25 @@ def main():
             clean_memory_on_device(args.device)
             
             # Give GPU time to free memory
-            import time
             time.sleep(0.5)
             torch.cuda.empty_cache()
         
         # Decode latent to video tensor [B, C, F, H, W], range [0, 1]
-        # Skip VAE decode for extension mode since it already returns decoded pixels
-        if hasattr(args, 'extend_video') and args.extend_video is not None:
-            logger.info("Extension mode detected - using already decoded video")
+        # Skip VAE decode for extension/video join modes since they already return decoded pixels
+        is_already_decoded = (
+            (hasattr(args, 'extend_video') and args.extend_video is not None) or
+            (hasattr(args, 'video_join') and args.video_join is not None)
+        )
+        if is_already_decoded:
+            logger.info("Extension/Video Join mode detected - using already decoded video")
             decoded_video = generated_latent  # Already decoded pixels
         else:
             decoded_video = decode_latent(generated_latent, args, cfg)
 
         # Save the output (latent and/or video/images)
-        # Don't save "latents" for extension mode since generated_latent contains pixels
+        # Don't save "latents" for extension/video join modes since generated_latent contains pixels
         latent_to_save = None
-        if not (hasattr(args, 'extend_video') and args.extend_video is not None):
+        if not is_already_decoded:
             latent_to_save = generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
         
         save_output(

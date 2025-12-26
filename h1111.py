@@ -33,8 +33,21 @@ stop_event = threading.Event()
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
+# Queue system imports
+from wan_job_queue import get_queue, JobQueue, JobStatus, Job
+from wan_worker import Worker
+
+# Queue system globals
+wan22_current_output_filename = None
+wan22_worker_thread = None
+wan22_worker_instance = None
+
+# SVI Queue system globals
+svi_current_output_filename = None
+
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
+SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -426,6 +439,7 @@ def wan22_batch_handler(
     prompt: str,
     negative_prompt: str,
     image_path: str,
+    end_image_path: str,
     task: str,
     width: int,
     height: int,
@@ -473,7 +487,8 @@ def wan22_batch_handler(
     # Compile options
     compile_enabled: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
-    enable_extension: bool, extend_frames: int, frames_to_check: int,  # Extension parameters
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,  # Extension parameters
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,  # Video Join parameters
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
@@ -536,14 +551,31 @@ def wan22_batch_handler(
         elif "ti2v-5B" in task:
             command.extend(["--dit", os.path.join("wan", dit_path)])
 
-        # Handle V2V vs Extension mode
+        # Handle V2V vs Extension vs Video Join mode
         if enable_v2v and input_video:
-            if enable_extension:
+            if enable_video_join and ending_video:
+                # Video Join mode - generate transition between two videos
+                command.extend(["--video_join", str(input_video)])
+                command.extend(["--ending_video", str(ending_video)])
+                command.extend(["--join_frames_input", str(int(join_frames_input))])
+                command.extend(["--join_frames_ending", str(int(join_frames_ending))])
+
+                # Force i2v-A14B task for video join
+                if "i2v" not in task:
+                    yield [], None, f"Warning: Video Join mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
+                    return
+            elif enable_extension:
                 # Use extension mode instead of regular V2V
                 command.extend(["--extend_video", str(input_video)])
                 command.extend(["--extend_frames", str(extend_frames)])
                 command.extend(["--frames_to_check", str(frames_to_check)])
-                
+                if trim_tail_frames > 0:
+                    command.extend(["--trim_tail_frames", str(int(trim_tail_frames))])
+
+                # Add ending image for video extension if provided
+                if end_image_path:
+                    command.extend(["--end_image_path", str(end_image_path)])
+
                 # Force i2v-A14B task for extension
                 if "i2v" not in task:
                     yield [], None, f"Warning: Extension mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
@@ -558,6 +590,9 @@ def wan22_batch_handler(
                     command.append("--v2v_use_i2v")
         elif "i2v" in task and image_path:
             command.extend(["--image_path", str(image_path)])
+            # Add ending image for i2v mode if provided
+            if end_image_path:
+                command.extend(["--end_image_path", str(end_image_path)])
 
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
@@ -747,6 +782,1473 @@ def wan22_batch_handler(
         time.sleep(0.2)
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
+
+
+# ========================= Wan2.2 Queue System Functions =========================
+
+def wan22_submit_to_queue(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    end_image_path: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    dynamic_model_loading: bool,
+    unload_text_encoders: bool,
+    vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
+) -> Tuple[str, List[str]]:
+    """Submit Wan2.2 generation job(s) to the queue.
+
+    Returns:
+        Tuple of (batch_id, list of job_ids)
+    """
+    global wan22_current_output_filename
+
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"wan22_{run_id}"
+
+        # Generate output filename for signal file coordination
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(save_path, f"wan22_{task}_{timestamp}_{current_seed}.mp4")
+        wan22_current_output_filename = output_filename
+
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", str(task),
+            "--prompt", str(prompt),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--output_filename", output_filename,  # For signal file coordination
+        ]
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Model Path Logic based on Task
+        if "A14B" in task:
+            command.extend(["--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+                          "--dit_high_noise", os.path.join("wan", dit_high_noise_path)])
+            if "i2v" in task:
+                command.extend(["--clip", os.path.join("wan", clip_path)])
+        elif "ti2v-5B" in task:
+            command.extend(["--dit", os.path.join("wan", dit_path)])
+
+        # Handle V2V vs Extension modes
+        if enable_v2v and input_video:
+            if enable_video_join and ending_video:
+                command.extend(["--video_join", input_video, "--ending_video", ending_video])
+                command.extend(["--join_frames_input", str(join_frames_input)])
+                command.extend(["--join_frames_ending", str(join_frames_ending)])
+            elif enable_extension:
+                command.extend(["--extend_video", input_video])
+                command.extend(["--video_length", str(extend_frames)])
+                if frames_to_check > 0:
+                    command.extend(["--extend_frames_to_check", str(frames_to_check)])
+            else:
+                command.extend(["--video_path", input_video, "--strength", str(v2v_strength)])
+                if v2v_low_noise_only:
+                    command.append("--v2v_low_noise_only")
+                if v2v_use_i2v:
+                    command.append("--v2v_use_i2v")
+        elif image_path:
+            command.extend(["--image_path", image_path])
+            if end_image_path:
+                command.extend(["--end_image_path", end_image_path])
+
+        if trim_tail_frames > 0:
+            command.extend(["--trim_tail_frames", str(trim_tail_frames)])
+
+        # Precision flags
+        if mixed_dtype:
+            command.append("--mixed_dtype")
+        if fp8:
+            command.append("--fp8")
+        if fp8_scaled:
+            command.append("--fp8_scaled")
+        if fp8_prescaled:
+            command.append("--fp8_prescaled")
+        if fp8_fast:
+            command.append("--fp8_fast")
+        if fp8_t5:
+            command.append("--fp8_t5")
+        if dynamic_model_loading:
+            command.append("--dynamic_loading")
+        if unload_text_encoders:
+            command.append("--unload_text_encoders")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        # Preview
+        if enable_preview:
+            command.extend(["--preview", str(max(1, preview_steps))])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # Context Windows
+        if use_context_windows:
+            command.append("--context_windows")
+            command.extend(["--context_length", str(context_length)])
+            command.extend(["--context_overlap", str(context_overlap)])
+            command.extend(["--context_schedule", str(context_schedule)])
+            command.extend(["--context_stride", str(context_stride)])
+            if context_closed_loop:
+                command.append("--context_closed_loop")
+            command.extend(["--context_fuse_method", str(context_fuse_method)])
+            if context_end_image:
+                command.extend(["--context_end_image", context_end_image])
+
+        # UltraViCo
+        if ultravico_enabled:
+            command.append("--ultravico")
+            command.extend(["--ultravico_alpha", str(ultravico_alpha)])
+            command.extend(["--ultravico_training_frames", str(int(ultravico_training_frames))])
+            if ultravico_suppress_harmonics:
+                command.append("--ultravico_suppress_harmonics")
+                command.extend(["--ultravico_beta", str(ultravico_beta)])
+                command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
+
+        # LoRA Handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high and "A14B" in task:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        if lora_weights_paths_high and "A14B" in task:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        # Create job parameters for metadata
+        parameters = {
+            "model_type": "Wan2.2",
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "task": task,
+            "width": width,
+            "height": height,
+            "frame_num": frame_num,
+            "fps": fps,
+            "seed": current_seed,
+            "sample_solver": sample_solver,
+            "sample_steps": sample_steps,
+            "flow_shift": flow_shift,
+            "guidance_scale": sample_guide_scale,
+            "save_path": save_path,
+        }
+
+        # Submit job to queue
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[Queue] Job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def wan22_generate_via_queue(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    end_image_path: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    dynamic_model_loading: bool,
+    unload_text_encoders: bool,
+    vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
+):
+    """Queue-based generation that returns immediately and uses Timer for polling.
+
+    Returns initial state with Timer active for polling.
+    """
+    # Submit jobs to queue
+    batch_id, job_ids = wan22_submit_to_queue(
+        prompt, negative_prompt, image_path, end_image_path, task, width, height,
+        frame_num, fps, base_seed, sample_solver, sample_steps, flow_shift,
+        sample_guide_scale, dual_dit_boundary, batch_size, save_path,
+        attn_mode, mixed_dtype, block_swap, fp8, fp8_scaled, fp8_prescaled,
+        fp8_fast, fp8_t5, dit_low_noise_path, dit_high_noise_path, clip_path,
+        dit_path, vae_path, t5_path, lora_folder,
+        lora1_str, lora2_str, lora3_str, lora4_str,
+        lora5_str, lora6_str, lora7_str, lora8_str,
+        lora1_mult, lora2_mult, lora3_mult, lora4_mult,
+        lora5_mult, lora6_mult, lora7_mult, lora8_mult,
+        lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low,
+        lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low,
+        lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high,
+        lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high,
+        enable_preview, preview_steps, dynamic_model_loading, unload_text_encoders, vae_fp32,
+        compile_enabled, enable_v2v, input_video, v2v_strength, v2v_low_noise_only, v2v_use_i2v,
+        enable_extension, extend_frames, frames_to_check, trim_tail_frames,
+        enable_video_join, ending_video, join_frames_input, join_frames_ending,
+        use_context_windows, context_length, context_overlap, context_schedule,
+        context_stride, context_closed_loop, context_fuse_method, context_end_image,
+        ultravico_enabled, ultravico_alpha, ultravico_training_frames,
+        ultravico_suppress_harmonics, ultravico_beta, ultravico_gamma
+    )
+
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+
+    # Return initial state: (videos, preview, status, progress, job_id, batch_id, timer_active)
+    return (
+        [],  # videos gallery
+        [],  # preview list
+        status_msg,  # status text
+        "Waiting for worker to start...",  # progress text
+        first_job_id,  # job_id state
+        batch_id,  # batch_id state
+        gr.Timer(value=2.0, active=True)  # start polling timer
+    )
+
+
+def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
+    """Poll the queue for job status updates.
+
+    Called by Timer to get live updates. Returns updated state.
+    """
+    queue = get_queue()
+
+    # Get all jobs in batch
+    jobs = []
+    if current_batch_id:
+        jobs = queue.get_batch_jobs(current_batch_id)
+    elif current_job_id:
+        job = queue.get_job(current_job_id)
+        if job:
+            jobs = [job]
+
+    # If no jobs found, try to find running job
+    if not jobs:
+        running_jobs = queue.get_running_jobs()
+        if running_jobs:
+            jobs = running_jobs
+            current_batch_id = jobs[0].batch_id or ""
+
+    all_videos = []
+    running_job = None
+    status_parts = []
+    completed_count = 0
+    failed_count = 0
+    preview_path = None
+
+    for job in jobs:
+        if job.status == JobStatus.COMPLETED.value:
+            completed_count += 1
+            if job.output_filename and os.path.exists(job.output_filename):
+                seed = job.parameters.get('seed', 'unknown')
+                all_videos.append((job.output_filename, f"Seed: {seed}"))
+        elif job.status == JobStatus.RUNNING.value:
+            running_job = job
+            if job.preview_path and os.path.exists(job.preview_path):
+                preview_path = job.preview_path
+        elif job.status == JobStatus.FAILED.value:
+            failed_count += 1
+            status_parts.append(f"Job {job.id} failed: {job.error_message[:50] if job.error_message else 'Unknown error'}")
+        elif job.status == JobStatus.CANCELLED.value:
+            status_parts.append(f"Job {job.id} cancelled")
+
+    total_jobs = len(jobs)
+    timer_active = False
+    progress_text = ""
+
+    if running_job:
+        timer_active = True
+        progress_text = running_job.progress_text or f"Progress: {running_job.progress:.0f}%"
+        status_parts.insert(0, f"Processing {completed_count + 1}/{total_jobs}")
+    elif completed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"All {total_jobs} generation(s) complete!")
+        progress_text = "Done"
+        timer_active = False
+    elif completed_count + failed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"Batch complete: {completed_count} succeeded, {failed_count} failed")
+        progress_text = "Done"
+        timer_active = False
+    elif total_jobs == 0:
+        status_parts.append("No jobs found - may still be initializing")
+        timer_active = True
+        progress_text = "Waiting..."
+    else:
+        # Still pending
+        pending = total_jobs - completed_count - failed_count
+        status_parts.insert(0, f"Pending: {pending} jobs")
+        timer_active = True
+        progress_text = "Waiting for worker..."
+
+    status_text = " | ".join(status_parts) if status_parts else "Processing..."
+
+    # Return: (videos, preview_list, status, progress, job_id, batch_id, timer)
+    return (
+        all_videos,
+        [preview_path] if preview_path else [],
+        status_text,
+        progress_text,
+        current_job_id,
+        current_batch_id,
+        gr.Timer(value=2.0, active=timer_active)
+    )
+
+
+def wan22_stop_queue_generation(current_batch_id: str):
+    """Cancel all jobs in the current batch and stop processing."""
+    global wan22_current_output_filename
+
+    queue = get_queue()
+
+    if current_batch_id:
+        cancelled_jobs = queue.cancel_batch(current_batch_id)
+        print(f"[Queue] Cancelled {len(cancelled_jobs)} jobs in batch {current_batch_id}")
+
+    # Return reset state
+    return (
+        [],  # videos
+        [],  # preview
+        "Generation cancelled",  # status
+        "Stopped",  # progress
+        "",  # job_id
+        "",  # batch_id
+        gr.Timer(value=2.0, active=False)  # stop timer
+    )
+
+
+def wan22_stop_and_decode():
+    """Create signal file to stop generation and decode current latents."""
+    global wan22_current_output_filename
+
+    if wan22_current_output_filename:
+        signal_file = wan22_current_output_filename + ".stop_decode"
+        try:
+            with open(signal_file, 'w') as f:
+                f.write('decode')
+            return "Stop & Decode signal sent..."
+        except Exception as e:
+            return f"Error creating signal file: {e}"
+    return "No active generation to stop"
+
+
+def start_wan22_worker():
+    """Start the background worker thread for processing Wan2.2 queue jobs."""
+    global wan22_worker_thread, wan22_worker_instance
+
+    if wan22_worker_thread is not None and wan22_worker_thread.is_alive():
+        print("[Worker] Wan2.2 worker already running")
+        return
+
+    queue = get_queue()
+    wan22_worker_instance = Worker(queue, poll_interval=2.0, use_signals=False)
+    wan22_worker_thread = threading.Thread(target=wan22_worker_instance.run, daemon=True)
+    wan22_worker_thread.start()
+    print("[Worker] Wan2.2 background worker started")
+
+# ========================= End Wan2.2 Queue System Functions =========================
+
+
+# ========================= SVI Queue System Functions =========================
+
+def svi_submit_to_queue(
+    # Multi-clip prompts
+    prompt1: str, prompt2: str, prompt3: str, prompt4: str,
+    prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    negative_prompt: str,
+    image_path: str,
+    anchor_image_path: str,
+    # Video extension
+    extend_video_path: str,
+    extend_frames_to_check: int,
+    extend_prepend: bool,
+    # SVI settings
+    num_clips: int,
+    overlap_frames: int,
+    num_motion_latent: int,
+    num_motion_frame: int,
+    seed_multiplier: int,
+    svi_lora: bool,
+    # TeaCache settings
+    tea_cache_enabled: bool,
+    tea_cache_l1_thresh: float,
+    tea_cache_start_step: int,
+    tea_cache_end_ratio: float,
+    # CFG merge
+    cfg_merge: bool,
+    # Sliding window
+    sliding_window_enabled: bool,
+    sliding_window_size: int,
+    sliding_window_stride: int,
+    # Generation parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    vae_fp32: bool,
+    compile_enabled: bool,
+) -> Tuple[str, List[str]]:
+    """Submit SVI generation job(s) to the queue.
+
+    Returns:
+        Tuple of (batch_id, list of job_ids)
+    """
+    global svi_current_output_filename
+
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"svi_{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    # Collect non-empty prompts into a list
+    prompt_list = []
+    for p in [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]:
+        if p and p.strip():
+            prompt_list.append(p.strip())
+
+    if not prompt_list:
+        print("[SVI Queue] Error: At least one prompt is required")
+        return batch_id, []
+
+    # Video extension mode or standard image input
+    is_video_extension = extend_video_path and os.path.exists(extend_video_path)
+    if not is_video_extension and not image_path:
+        print("[SVI Queue] Error: Input image is required (or provide a video to extend)")
+        return batch_id, []
+
+    # Determine effective number of clips
+    effective_num_clips = min(int(num_clips), max(1, len(prompt_list))) if num_clips > 0 else len(prompt_list)
+    if effective_num_clips < 1:
+        effective_num_clips = 1
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"svi_{run_id}"
+
+        # Generate output filename for signal file coordination
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(save_path, f"svi_{timestamp}_{current_seed}.mp4")
+        svi_current_output_filename = output_filename
+
+        # Build the command for wan2_generate_video.py with SVI options
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", "i2v-A14B",  # SVI is always i2v
+            "--prompt", prompt_list[0],  # First prompt
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path),
+            "--clip", os.path.join("wan", clip_path),
+            "--output_filename", output_filename,  # For signal file coordination
+        ]
+
+        # Video extension mode or standard image input
+        if is_video_extension:
+            command.extend(["--svi_extend_video", str(extend_video_path)])
+            command.extend(["--svi_extend_frames_to_check", str(int(extend_frames_to_check))])
+            if not extend_prepend:
+                command.append("--no_svi_extend_prepend")
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--svi_extend_anchor", str(anchor_image_path)])
+        else:
+            command.extend(["--image_path", str(image_path)])
+
+        # SVI multi-clip options
+        if is_video_extension or effective_num_clips > 1:
+            command.extend(["--num_clips", str(effective_num_clips)])
+            command.extend(["--overlap_frames", str(overlap_frames)])
+            # SVI Pro: motion latent passing
+            if num_motion_latent > 0:
+                command.extend(["--num_motion_latent", str(int(num_motion_latent))])
+            # SVI Pro: motion frame and seed multiplier
+            if num_motion_frame > 1:
+                command.extend(["--num_motion_frame", str(int(num_motion_frame))])
+            if seed_multiplier != 42:  # Only pass if different from default
+                command.extend(["--seed_multiplier", str(int(seed_multiplier))])
+            if effective_num_clips > 1:
+                command.append("--prompt_list")
+                command.extend(prompt_list[:effective_num_clips])
+
+        # SVI mode and anchor image
+        command.append("--svi_mode")
+
+        # Anchor image for non-extension mode
+        if not is_video_extension:
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--anchor_image", str(anchor_image_path)])
+            else:
+                command.extend(["--anchor_image", str(image_path)])
+
+        # SVI LoRA format conversion
+        if svi_lora:
+            command.append("--svi_lora")
+
+        # TeaCache options
+        if tea_cache_enabled and tea_cache_l1_thresh > 0:
+            command.extend(["--tea_cache_l1_thresh", str(tea_cache_l1_thresh)])
+            command.extend(["--tea_cache_start_step", str(tea_cache_start_step)])
+            command.extend(["--tea_cache_end_ratio", str(tea_cache_end_ratio)])
+
+        # CFG merge
+        if cfg_merge:
+            command.append("--cfg_merge")
+
+        # Sliding window
+        if sliding_window_enabled and sliding_window_size > 0:
+            command.extend(["--svi_sliding_window_size", str(sliding_window_size)])
+            if sliding_window_stride > 0:
+                command.extend(["--svi_sliding_window_stride", str(sliding_window_stride)])
+
+        # Negative prompt
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Performance options
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_prescaled: command.append("--fp8_prescaled")
+        if fp8_fast: command.append("--fp8_fast")
+        if mixed_dtype: command.append("--mixed_dtype")
+        if fp8_t5: command.append("--fp8_t5")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        if lora_weights_paths_high:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        # Create job parameters for metadata
+        parameters = {
+            "model_type": "SVI",
+            "prompt": prompt_list[0],
+            "prompts": prompt_list[:effective_num_clips],
+            "negative_prompt": negative_prompt,
+            "num_clips": effective_num_clips,
+            "width": width,
+            "height": height,
+            "frame_num": frame_num,
+            "fps": fps,
+            "seed": current_seed,
+            "sample_solver": sample_solver,
+            "sample_steps": sample_steps,
+            "flow_shift": flow_shift,
+            "guidance_scale": sample_guide_scale,
+            "save_path": save_path,
+            "is_video_extension": is_video_extension,
+        }
+
+        # Submit job to queue
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[SVI Queue] Job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def svi_generate_via_queue(
+    # Multi-clip prompts
+    prompt1: str, prompt2: str, prompt3: str, prompt4: str,
+    prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    negative_prompt: str,
+    image_path: str,
+    anchor_image_path: str,
+    # Video extension
+    extend_video_path: str,
+    extend_frames_to_check: int,
+    extend_prepend: bool,
+    # SVI settings
+    num_clips: int,
+    overlap_frames: int,
+    num_motion_latent: int,
+    num_motion_frame: int,
+    seed_multiplier: int,
+    svi_lora: bool,
+    # TeaCache settings
+    tea_cache_enabled: bool,
+    tea_cache_l1_thresh: float,
+    tea_cache_start_step: int,
+    tea_cache_end_ratio: float,
+    # CFG merge
+    cfg_merge: bool,
+    # Sliding window
+    sliding_window_enabled: bool,
+    sliding_window_size: int,
+    sliding_window_stride: int,
+    # Generation parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    vae_fp32: bool,
+    compile_enabled: bool,
+):
+    """Queue-based SVI generation that returns immediately and uses Timer for polling.
+
+    Returns initial state with Timer active for polling.
+    """
+    # Submit jobs to queue
+    batch_id, job_ids = svi_submit_to_queue(
+        prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8,
+        negative_prompt, image_path, anchor_image_path,
+        extend_video_path, extend_frames_to_check, extend_prepend,
+        num_clips, overlap_frames, num_motion_latent, num_motion_frame, seed_multiplier,
+        svi_lora, tea_cache_enabled, tea_cache_l1_thresh, tea_cache_start_step, tea_cache_end_ratio,
+        cfg_merge, sliding_window_enabled, sliding_window_size, sliding_window_stride,
+        width, height, frame_num, fps, base_seed, sample_solver, sample_steps,
+        flow_shift, sample_guide_scale, dual_dit_boundary, batch_size, save_path,
+        attn_mode, mixed_dtype, block_swap, fp8, fp8_scaled, fp8_prescaled, fp8_fast, fp8_t5,
+        dit_low_noise_path, dit_high_noise_path, clip_path, vae_path, t5_path,
+        lora_folder,
+        lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str,
+        lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult,
+        lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low,
+        lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low,
+        lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high,
+        lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high,
+        enable_preview, preview_steps, vae_fp32, compile_enabled
+    )
+
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued SVI batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+
+    # Return initial state: (videos, preview, status, progress, job_id, batch_id, timer_active)
+    return (
+        [],  # videos gallery
+        [],  # preview list
+        status_msg,  # status text
+        "Waiting for worker to start...",  # progress text
+        first_job_id,  # job_id state
+        batch_id,  # batch_id state
+        gr.Timer(value=2.0, active=True)  # start polling timer
+    )
+
+
+def svi_poll_active_job(current_job_id: str, current_batch_id: str):
+    """Poll the queue for SVI job status updates.
+
+    Called by Timer to get live updates. Returns updated state.
+    """
+    queue = get_queue()
+
+    # Get all jobs in batch
+    jobs = []
+    if current_batch_id:
+        jobs = queue.get_batch_jobs(current_batch_id)
+    elif current_job_id:
+        job = queue.get_job(current_job_id)
+        if job:
+            jobs = [job]
+
+    # If no jobs found, try to find running job with SVI batch_id prefix
+    if not jobs:
+        running_jobs = queue.get_running_jobs()
+        for rj in running_jobs:
+            if rj.batch_id and rj.batch_id.startswith("svi_"):
+                jobs = [rj]
+                current_batch_id = rj.batch_id or ""
+                break
+
+    all_videos = []
+    running_job = None
+    status_parts = []
+    completed_count = 0
+    failed_count = 0
+    preview_path = None
+
+    for job in jobs:
+        if job.status == JobStatus.COMPLETED.value:
+            completed_count += 1
+            if job.output_filename and os.path.exists(job.output_filename):
+                seed = job.parameters.get('seed', 'unknown')
+                clips = job.parameters.get('num_clips', 1)
+                all_videos.append((job.output_filename, f"Seed: {seed}, Clips: {clips}"))
+        elif job.status == JobStatus.RUNNING.value:
+            running_job = job
+            if job.preview_path and os.path.exists(job.preview_path):
+                preview_path = job.preview_path
+        elif job.status == JobStatus.FAILED.value:
+            failed_count += 1
+            status_parts.append(f"Job {job.id} failed: {job.error_message[:50] if job.error_message else 'Unknown error'}")
+        elif job.status == JobStatus.CANCELLED.value:
+            status_parts.append(f"Job {job.id} cancelled")
+
+    total_jobs = len(jobs)
+    timer_active = False
+    progress_text = ""
+
+    if running_job:
+        timer_active = True
+        progress_text = running_job.progress_text or f"Progress: {running_job.progress:.0f}%"
+        status_parts.insert(0, f"Processing SVI {completed_count + 1}/{total_jobs}")
+    elif completed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"All {total_jobs} SVI generation(s) complete!")
+        progress_text = "Done"
+        timer_active = False
+    elif completed_count + failed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"SVI batch complete: {completed_count} succeeded, {failed_count} failed")
+        progress_text = "Done"
+        timer_active = False
+    elif total_jobs == 0:
+        status_parts.append("No SVI jobs found - may still be initializing")
+        timer_active = True
+        progress_text = "Waiting..."
+    else:
+        # Still pending
+        pending = total_jobs - completed_count - failed_count
+        status_parts.insert(0, f"Pending: {pending} SVI jobs")
+        timer_active = True
+        progress_text = "Waiting for worker..."
+
+    status_text = " | ".join(status_parts) if status_parts else "Processing SVI..."
+
+    # Return: (videos, preview_list, status, progress, job_id, batch_id, timer)
+    return (
+        all_videos,
+        [preview_path] if preview_path else [],
+        status_text,
+        progress_text,
+        current_job_id,
+        current_batch_id,
+        gr.Timer(value=2.0, active=timer_active)
+    )
+
+
+def svi_stop_queue_generation(current_batch_id: str):
+    """Cancel all SVI jobs in the current batch and stop processing."""
+    global svi_current_output_filename
+
+    queue = get_queue()
+
+    if current_batch_id:
+        cancelled_jobs = queue.cancel_batch(current_batch_id)
+        print(f"[SVI Queue] Cancelled {len(cancelled_jobs)} jobs in batch {current_batch_id}")
+
+    # Return reset state
+    return (
+        [],  # videos
+        [],  # preview
+        "SVI generation cancelled",  # status
+        "Stopped",  # progress
+        "",  # job_id
+        "",  # batch_id
+        gr.Timer(value=2.0, active=False)  # stop timer
+    )
+
+
+def svi_stop_and_decode():
+    """Create signal file to stop SVI generation and decode current latents."""
+    global svi_current_output_filename
+
+    if svi_current_output_filename:
+        signal_file = svi_current_output_filename + ".stop_decode"
+        try:
+            with open(signal_file, 'w') as f:
+                f.write('decode')
+            return "SVI Stop & Decode signal sent..."
+        except Exception as e:
+            return f"Error creating signal file: {e}"
+    return "No active SVI generation to stop"
+
+# ========================= End SVI Queue System Functions =========================
+
+
+### SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+def svi_batch_handler(
+    # Multi-clip prompts
+    prompt1: str, prompt2: str, prompt3: str, prompt4: str,
+    prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    negative_prompt: str,
+    image_path: str,
+    anchor_image_path: str,
+    # Video extension
+    extend_video_path: str,
+    extend_frames_to_check: int,
+    extend_prepend: bool,
+    # SVI settings
+    num_clips: int,
+    overlap_frames: int,
+    num_motion_latent: int,
+    num_motion_frame: int,
+    seed_multiplier: int,
+    svi_lora: bool,
+    # TeaCache settings
+    tea_cache_enabled: bool,
+    tea_cache_l1_thresh: float,
+    tea_cache_start_step: int,
+    tea_cache_end_ratio: float,
+    # CFG merge
+    cfg_merge: bool,
+    # Sliding window
+    sliding_window_enabled: bool,
+    sliding_window_size: int,
+    sliding_window_stride: int,
+    # Generation parameters
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    vae_fp32: bool,
+    compile_enabled: bool,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    """SVI (Stable-Video-Infinity) multi-clip long video generation handler."""
+    global stop_event
+    stop_event.clear()
+
+    os.makedirs(save_path, exist_ok=True)
+    all_generated_videos = []
+
+    # Collect non-empty prompts into a list
+    prompt_list = []
+    for p in [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]:
+        if p and p.strip():
+            prompt_list.append(p.strip())
+
+    if not prompt_list:
+        yield [], [], "Error: At least one prompt is required.", ""
+        return
+
+    # Video extension mode or standard image input
+    is_video_extension = extend_video_path and os.path.exists(extend_video_path)
+    if not is_video_extension and not image_path:
+        yield [], [], "Error: Input image is required (or provide a video to extend).", ""
+        return
+
+    # Determine effective number of clips
+    effective_num_clips = min(int(num_clips), max(1, len(prompt_list))) if num_clips > 0 else len(prompt_list)
+    if effective_num_clips < 1:
+        effective_num_clips = 1
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, [], "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing SVI Batch {i+1}/{batch_size} (Seed: {current_seed}, Clips: {effective_num_clips})"
+        yield all_generated_videos.copy(), [], status_text, "Starting SVI generation..."
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"svi_{run_id}"
+
+        # Build the command for wan2_generate_video.py with SVI options
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", "i2v-A14B",  # SVI is always i2v
+            "--prompt", prompt_list[0],  # First prompt
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+            "--dit_high_noise", os.path.join("wan", dit_high_noise_path),
+            "--clip", os.path.join("wan", clip_path),
+        ]
+
+        # Video extension mode or standard image input
+        if is_video_extension:
+            command.extend(["--svi_extend_video", str(extend_video_path)])
+            command.extend(["--svi_extend_frames_to_check", str(int(extend_frames_to_check))])
+            if not extend_prepend:
+                command.append("--no_svi_extend_prepend")
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--svi_extend_anchor", str(anchor_image_path)])
+        else:
+            command.extend(["--image_path", str(image_path)])
+
+        # SVI multi-clip options
+        if is_video_extension or effective_num_clips > 1:
+            command.extend(["--num_clips", str(effective_num_clips)])
+            command.extend(["--overlap_frames", str(overlap_frames)])
+            # SVI Pro: motion latent passing
+            if num_motion_latent > 0:
+                command.extend(["--num_motion_latent", str(int(num_motion_latent))])
+            # SVI Pro: motion frame and seed multiplier
+            if num_motion_frame > 1:
+                command.extend(["--num_motion_frame", str(int(num_motion_frame))])
+            if seed_multiplier != 42:  # Only pass if different from default
+                command.extend(["--seed_multiplier", str(int(seed_multiplier))])
+            if effective_num_clips > 1:
+                command.append("--prompt_list")
+                command.extend(prompt_list[:effective_num_clips])
+
+        # SVI mode and anchor image
+        command.append("--svi_mode")
+
+        # Anchor image for non-extension mode
+        if not is_video_extension:
+            if anchor_image_path and os.path.exists(anchor_image_path):
+                command.extend(["--anchor_image", str(anchor_image_path)])
+            else:
+                command.extend(["--anchor_image", str(image_path)])
+
+        # SVI LoRA format conversion
+        if svi_lora:
+            command.append("--svi_lora")
+
+        # TeaCache options
+        if tea_cache_enabled and tea_cache_l1_thresh > 0:
+            command.extend(["--tea_cache_l1_thresh", str(tea_cache_l1_thresh)])
+            command.extend(["--tea_cache_start_step", str(tea_cache_start_step)])
+            command.extend(["--tea_cache_end_ratio", str(tea_cache_end_ratio)])
+
+        # CFG merge
+        if cfg_merge:
+            command.append("--cfg_merge")
+
+        # Sliding window
+        if sliding_window_enabled and sliding_window_size > 0:
+            command.extend(["--svi_sliding_window_size", str(sliding_window_size)])
+            if sliding_window_stride > 0:
+                command.extend(["--svi_sliding_window_stride", str(sliding_window_stride)])
+
+        # Negative prompt
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Performance options
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_prescaled: command.append("--fp8_prescaled")
+        if fp8_fast: command.append("--fp8_fast")
+        if mixed_dtype: command.append("--mixed_dtype")
+        if fp8_t5: command.append("--fp8_t5")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        if lora_weights_paths_high:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        # Execute subprocess
+        print(f"Running SVI Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+        current_clip_info = None
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, [], "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"SVI_SUBPROCESS: {line_strip}")
+
+            # Parse progress
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[([0-9:]+)<([0-9:]+)', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+            svi_saved_match = re.search(r"SVI multi-clip video saved to:\s*(.*\.mp4)", line_strip)
+            clip_match = re.search(r"=== Generating clip (\d+)/(\d+) ===", line_strip)
+
+            if svi_saved_match or video_saved_match:
+                found_path = (svi_saved_match or video_saved_match).group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+                current_clip_info = None
+            elif clip_match:
+                clip_idx = int(clip_match.group(1))
+                clip_total = int(clip_match.group(2))
+                current_clip_info = {"idx": clip_idx, "total": clip_total}
+                status_text = f"Batch {i+1}/{batch_size} - Clip {clip_idx}/{clip_total}"
+                progress_text_update = f"Generating clip {clip_idx}/{clip_total}..."
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_remaining = tqdm_match.group(4)
+                if current_clip_info:
+                    progress_text_update = f"Clip {current_clip_info['idx']}/{current_clip_info['total']} | Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                else:
+                    progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item:
+            # Comprehensive metadata with all settings
+            params_for_meta = {
+                # Model info
+                "model_type": "SVI (Stable-Video-Infinity)",
+                "task": "i2v-A14B",
+                # Prompts
+                "prompts": prompt_list[:effective_num_clips],
+                "negative_prompt": negative_prompt,
+                # Input images
+                "image_path": os.path.basename(image_path) if image_path else None,
+                "anchor_image": os.path.basename(anchor_image_path) if anchor_image_path else "same as input",
+                # End images (not implemented in SVI tab)
+                "end_images": None,
+                "has_end_images": False,
+                # V2V settings (not implemented in SVI tab)
+                "v2v_source": None,
+                "v2v_strength": None,
+                # SVI clip settings
+                "num_clips": effective_num_clips,
+                "overlap_frames": overlap_frames,
+                "svi_lora_format": svi_lora,
+                # Generation parameters
+                "width": width,
+                "height": height,
+                "frames_per_clip": frame_num,
+                "total_frames_approx": frame_num + (effective_num_clips - 1) * (frame_num - overlap_frames),
+                "fps": fps,
+                "seed": current_seed,
+                "sample_solver": sample_solver,
+                "sample_steps": sample_steps,
+                "flow_shift": flow_shift,
+                "guidance_scale": sample_guide_scale,
+                "dual_dit_boundary": dual_dit_boundary,
+                # Acceleration settings
+                "tea_cache_enabled": tea_cache_enabled,
+                "tea_cache_l1_thresh": tea_cache_l1_thresh if tea_cache_enabled else None,
+                "tea_cache_start_step": tea_cache_start_step if tea_cache_enabled else None,
+                "tea_cache_end_ratio": tea_cache_end_ratio if tea_cache_enabled else None,
+                "cfg_merge": cfg_merge,
+                "sliding_window_enabled": sliding_window_enabled,
+                "sliding_window_size": sliding_window_size if sliding_window_enabled else None,
+                "sliding_window_stride": sliding_window_stride if sliding_window_enabled else None,
+                # Model paths
+                "dit_low_noise": dit_low_noise_path,
+                "dit_high_noise": dit_high_noise_path,
+                "clip_model": clip_path,
+                "vae_model": vae_path,
+                "t5_model": t5_path,
+                # Performance settings
+                "attn_mode": attn_mode,
+                "block_swap": block_swap,
+                "fp8": fp8,
+                "fp8_scaled": fp8_scaled,
+                "fp8_prescaled": fp8_prescaled,
+                "fp8_fast": fp8_fast,
+                "fp8_t5": fp8_t5,
+                "mixed_dtype": mixed_dtype,
+                "vae_fp32": vae_fp32,
+                "compile_enabled": compile_enabled,
+                # LoRA settings
+                "lora_folder": lora_folder,
+                "lora_weights": [lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str],
+                "lora_multipliers": [lora1_mult, lora2_mult, lora3_mult, lora4_mult, lora5_mult, lora6_mult, lora7_mult, lora8_mult],
+                "lora_apply_low": [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low],
+                "lora_apply_high": [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high, lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high],
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+            all_generated_videos.append((current_video_file_for_item, f"SVI - Seed: {current_seed}, Clips: {effective_num_clips}"))
+            status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Batch {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, [], "SVI Batch complete.", ""
+
 
 ### HoloCine - Multi-Shot Video Generation
 def holocine_batch_handler(
@@ -8365,12 +9867,25 @@ with gr.Blocks(
             with gr.Row():
                 wan22_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
                 wan22_stop_btn = gr.Button("Stop Generation", variant="stop")
+                wan22_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            # Queue system state components
+            wan22_job_id_state = gr.State(value="")
+            wan22_batch_id_state = gr.State(value="")
+            wan22_poll_timer = gr.Timer(value=2.0, active=False)
             
             with gr.Row():
                 with gr.Column():
                     wan22_input_image = gr.Image(label="Input Image (for i2v tasks)", type="filepath")
                     wan22_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
-                    
+
+                    with gr.Accordion("Ending Image (Optional)", open=False):
+                        gr.Markdown("Target frame to guide generation toward. Works with i2v-A14B model.")
+                        wan22_end_image = gr.Image(
+                            label="End Image (for i2v-A14B)",
+                            type="filepath"
+                        )
+
                     # V2V controls
                     wan22_enable_v2v = gr.Checkbox(
                         label="Enable Video-to-Video (V2V) Mode", 
@@ -8406,12 +9921,50 @@ with gr.Blocks(
                                 step=1,
                                 info="Number of frames from the end to analyze for the best transition point"
                             )
+                            wan22_trim_tail_frames = gr.Number(
+                                label="Trim Tail Frames",
+                                value=0,
+                                minimum=0,
+                                maximum=20,
+                                step=1,
+                                info="Number of frames to trim from end of each generated section (removes poor transition frames)"
+                            )
                         with gr.Row(visible=False) as wan22_extension_info:
                             wan22_extension_summary = gr.HTML(
                                 value="<p><i>Extension will intelligently find the best transition frame and generate smooth video chunks.</i></p>",
                                 label="Extension Info"
                             )
-                    
+
+                        # Video Join Mode - joins two videos with generated transition
+                        wan22_enable_video_join = gr.Checkbox(
+                            label="Enable Video Join",
+                            value=False,
+                            info="Join input video to ending video by generating a transition between them"
+                        )
+                        with gr.Group(visible=False) as wan22_video_join_controls:
+                            wan22_ending_video = gr.Video(label="Ending Video", format="mp4")
+                            with gr.Row():
+                                wan22_join_frames_input = gr.Number(
+                                    label="Frames to Check (Input Video)",
+                                    value=30,
+                                    minimum=1,
+                                    maximum=100,
+                                    step=1,
+                                    info="Number of frames from end of input video to check for best transition"
+                                )
+                                wan22_join_frames_ending = gr.Number(
+                                    label="Frames to Check (Ending Video)",
+                                    value=30,
+                                    minimum=1,
+                                    maximum=100,
+                                    step=1,
+                                    info="Number of frames from start of ending video to check for best transition"
+                                )
+                            wan22_video_join_summary = gr.HTML(
+                                value="<p><i>Video Join will take the last frame from input video and first frame from ending video, generate a transition section between them, and concatenate all videos.</i></p>",
+                                label="Video Join Info"
+                            )
+
                     # Context Windows Controls
                     with gr.Accordion("Enable Sliding Context Windows", open=False):
                         wan22_use_context_windows = gr.Checkbox(
@@ -8675,6 +10228,377 @@ with gr.Blocks(
                             info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
                         )
                         wan22_ultravico_gamma = gr.Number(
+                            label="Gamma (Harmonic Window)",
+                            value=4,
+                            minimum=1,
+                            maximum=20,
+                            step=1,
+                            info="Frames around harmonic peaks to suppress"
+                        )
+
+        # SVI Tab (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+        with gr.Tab(id=16, label="SVI (Long Video)") as svi_tab:
+            gr.Markdown("""
+            ## SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
+            Generate long, consistent videos by chaining multiple clips. Each clip uses the last frame of the previous clip as input.
+            **Features:** Multi-clip streaming • Anchor padding • Per-clip prompts • TeaCache
+            """)
+
+            # Clip Prompts - Two Column Layout per Accordion
+            with gr.Accordion("Clip Prompts (1-4)", open=True):
+                with gr.Row():
+                    # Column 1: Clips 1-2
+                    with gr.Column():
+                        svi_prompt1 = gr.Textbox(
+                            label="Clip 1 Prompt (Required)", lines=2,
+                            value="A woman walks through a sunlit garden, her dress flowing in the breeze."
+                        )
+                        svi_prompt2 = gr.Textbox(
+                            label="Clip 2 Prompt", lines=2,
+                            value="She pauses to smell a beautiful red rose, smiling softly."
+                        )
+                    # Column 2: Clips 3-4
+                    with gr.Column():
+                        svi_prompt3 = gr.Textbox(
+                            label="Clip 3 Prompt", lines=2,
+                            value="A butterfly lands on her outstretched hand."
+                        )
+                        svi_prompt4 = gr.Textbox(
+                            label="Clip 4 Prompt", lines=2,
+                            value="She continues walking deeper into the garden."
+                        )
+
+            with gr.Accordion("Additional Clips (5-8)", open=False):
+                with gr.Row():
+                    # Column 1: Clips 5-6
+                    with gr.Column():
+                        svi_prompt5 = gr.Textbox(label="Clip 5 Prompt", lines=2, value="")
+                        svi_prompt6 = gr.Textbox(label="Clip 6 Prompt", lines=2, value="")
+                    # Column 2: Clips 7-8
+                    with gr.Column():
+                        svi_prompt7 = gr.Textbox(label="Clip 7 Prompt", lines=2, value="")
+                        svi_prompt8 = gr.Textbox(label="Clip 8 Prompt", lines=2, value="")
+
+            with gr.Row():
+                with gr.Column(scale=4):
+                    svi_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
+                        lines=2,
+                    )
+                with gr.Column(scale=1):
+                    svi_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    svi_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    svi_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="svi_progress_text")
+
+            # SVI Queue system state components
+            svi_job_id_state = gr.State(value="")
+            svi_batch_id_state = gr.State(value="")
+            svi_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                svi_generate_btn = gr.Button("Generate SVI Video", elem_classes="green-btn")
+                svi_stop_btn = gr.Button("Stop Generation", variant="stop")
+                svi_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            with gr.Row():
+                with gr.Column():
+                    # Input images for SVI
+                    with gr.Row():
+                        svi_input_image = gr.Image(label="Input Image (Required)", type="filepath")
+                        svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath")
+                    svi_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                    # Video Extension Mode
+                    with gr.Accordion("Video Extension (Extend Existing Video)", open=False):
+                        gr.Markdown("Extend an existing video by finding the best transition frame and generating new clips from it.")
+                        svi_extend_video = gr.Video(label="Video to Extend", sources=["upload"])
+                        with gr.Row():
+                            svi_extend_frames_to_check = gr.Slider(
+                                minimum=1, maximum=100, step=1, value=30,
+                                label="Frames to Check",
+                                info="Analyze last N frames to find sharpest transition point (1 = use last frame)"
+                            )
+                            svi_extend_prepend = gr.Checkbox(
+                                label="Prepend Original",
+                                value=True,
+                                info="Include original video before extension"
+                            )
+
+                    # SVI-specific settings
+                    gr.Markdown("### SVI Multi-Clip Settings")
+                    with gr.Row():
+                        svi_num_clips = gr.Slider(minimum=1, maximum=8, step=1, label="Number of Clips", value=4,
+                                                 info="How many clips to chain together")
+                        svi_overlap_frames = gr.Slider(minimum=0, maximum=16, step=1, label="Overlap Frames", value=1,
+                                                      info="Overlapping frames between clips")
+                        svi_num_motion_latent = gr.Slider(minimum=0, maximum=4, step=1, label="Motion Latent Frames", value=1,
+                                                          info="Latent frames from previous clip for motion context (SVI Pro mode, 0=image-only)")
+                    with gr.Row():
+                        svi_num_motion_frame = gr.Slider(minimum=1, maximum=8, step=1, label="Motion Frame Offset", value=1,
+                                                          info="Frame offset from end for next clip input (1=last frame)")
+                        svi_seed_multiplier = gr.Slider(minimum=1, maximum=200, step=1, label="Seed Multiplier", value=42,
+                                                         info="Per-clip seed variation (seed = base + clip * multiplier)")
+
+                    svi_lora_format = gr.Checkbox(
+                        label="SVI LoRA Format Conversion",
+                        value=True,
+                        visible=False,
+                        info="Auto-convert SVI/DiffSynth format LoRA keys to Kohya format"
+                    )
+
+                    # TeaCache Acceleration
+                    with gr.Accordion("TeaCache (Acceleration)", open=False):
+                        svi_tea_cache_enabled = gr.Checkbox(
+                            label="Enable TeaCache",
+                            value=False,
+                            info="Cache intermediate features for faster inference"
+                        )
+                        with gr.Group(visible=False) as svi_tea_cache_controls:
+                            svi_tea_cache_l1_thresh = gr.Slider(
+                                minimum=0.01, maximum=0.5, step=0.01,
+                                label="L1 Threshold", value=0.1,
+                                info="Lower = more aggressive caching (faster but may reduce quality)"
+                            )
+                            with gr.Row():
+                                svi_tea_cache_start_step = gr.Number(
+                                    label="Start Step", value=2, minimum=0, maximum=20,
+                                    info="Start caching after this step"
+                                )
+                                svi_tea_cache_end_ratio = gr.Slider(
+                                    minimum=0.5, maximum=1.0, step=0.05,
+                                    label="End Ratio", value=0.8,
+                                    info="Stop caching after this ratio of total steps"
+                                )
+
+                    # CFG Merge
+                    svi_cfg_merge = gr.Checkbox(
+                        label="CFG Merge (Batch cond+uncond)",
+                        value=False,
+                        info="Merge CFG in single forward pass (faster, uses more VRAM)"
+                    )
+
+                    # Sliding Window
+                    with gr.Accordion("Sliding Window (Temporal)", open=False):
+                        svi_sliding_window_enabled = gr.Checkbox(
+                            label="Enable Sliding Window",
+                            value=False,
+                            info="Process video in overlapping temporal windows"
+                        )
+                        with gr.Group(visible=False) as svi_sliding_window_controls:
+                            with gr.Row():
+                                svi_sliding_window_size = gr.Number(
+                                    label="Window Size", value=16, minimum=4, maximum=64,
+                                    info="Size in latent frames"
+                                )
+                                svi_sliding_window_stride = gr.Number(
+                                    label="Window Stride", value=8, minimum=1, maximum=32,
+                                    info="Stride between windows (0 = auto)"
+                                )
+
+                    gr.Markdown("### Generation Parameters")
+                    # Width and height inputs
+                    with gr.Row():
+                        svi_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        svi_calc_height_btn = gr.Button("→")
+                        svi_calc_width_btn = gr.Button("←")
+                        svi_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    svi_frame_num = gr.Slider(minimum=9, maximum=241, step=4, label="Frames Per Clip", value=81, info="Frame count for each individual clip (4n+1)")
+                    svi_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=15)
+                    svi_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    svi_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    svi_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5)
+                    svi_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%). Only for A14B models")
+                    svi_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        svi_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        svi_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    svi_output = gr.Gallery(
+                        label="Generated Videos (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_svi", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        svi_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        svi_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        svi_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="svi_preview_gallery"
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            svi_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            svi_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        svi_lora_weights = []
+                        svi_lora_multipliers = []
+                        svi_lora_apply_low = []
+                        svi_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                svi_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                svi_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                svi_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                svi_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                svi_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                svi_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                svi_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                svi_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    svi_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                    svi_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                with gr.Row():
+                    svi_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    svi_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    svi_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    svi_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                    svi_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    svi_dynamic_model_loading = gr.Checkbox(
+                        label="Dynamic Model Loading (A14B models only to lower RAM usages)",
+                        value=False, visible=False
+                    )
+                    svi_unload_text_encoders = gr.Checkbox(
+                        label="Unload Text Encoders after use (T5/CLIP) to save RAM",
+                        value=False, visible=False
+                    )
+                    svi_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    svi_vae_fp32 = gr.Checkbox(
+                        label="Use FP32 VAE (higher quality, more VRAM)",
+                        value=True,
+                    )
+                with gr.Row():
+                    svi_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
+                    )
+                with gr.Row():
+                    svi_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    svi_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    with gr.Group(visible=True) as svi_a14b_paths:
+                        svi_dit_low_noise_path = gr.Dropdown(
+                            label="DiT Low Noise Model (.safetensors)",
+                            choices=get_wan_of_low_noise_models("wan"),
+                            value=get_default_low_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        svi_dit_high_noise_path = gr.Dropdown(
+                            label="DiT High Noise Model (.safetensors)",
+                            choices=get_wan_of_high_noise_models("wan"),
+                            value=get_default_high_noise_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                        svi_clip_path = gr.Dropdown(
+                            label="CLIP Model (.pth, for i2v)",
+                            choices=get_wan_of_clip_models("wan"),
+                            value=get_default_clip_model("wan"),
+                            allow_custom_value=True,
+                            interactive=True,
+                            visible=True
+                        )
+                    with gr.Group(visible=False) as svi_ti2v5b_paths:
+                        svi_dit_path = gr.Dropdown(
+                            label="DiT Model (.safetensors, for ti2v-5B)",
+                            choices=get_wan_of_dit_models("wan"),
+                            value="Wan2.2-TI2V-5B_fp16.safetensors",
+                            allow_custom_value=True,
+                            interactive=True
+                        )
+                with gr.Row():
+                    svi_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    svi_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                svi_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    svi_save_defaults_btn = gr.Button("Save Defaults")
+                    svi_load_defaults_btn = gr.Button("Load Defaults")
+                    svi_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+
+            with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
+                gr.Markdown("""
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
+
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
+                """)
+                svi_ultravico_enabled = gr.Checkbox(
+                    label="Enable UltraViCo",
+                    value=False,
+                    info="Apply attention decay for long video generation"
+                )
+                with gr.Group(visible=False) as svi_ultravico_controls:
+                    with gr.Row():
+                        svi_ultravico_alpha = gr.Slider(
+                            minimum=0.5, maximum=1.0, step=0.01,
+                            label="Alpha (Decay Factor)",
+                            value=0.9,
+                            info="Decay for out-of-window attention (0.85-0.95 recommended). Lower = stronger decay."
+                        )
+                        svi_ultravico_training_frames = gr.Number(
+                            label="Training Frames",
+                            value=21,
+                            minimum=5,
+                            maximum=100,
+                            step=1,
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
+                        )
+                    with gr.Row():
+                        svi_ultravico_suppress_harmonics = gr.Checkbox(
+                            label="Suppress Harmonics",
+                            value=False,
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
+                        )
+                        svi_ultravico_beta = gr.Slider(
+                            minimum=0.1, maximum=1.0, step=0.05,
+                            label="Beta (Harmonic Decay)",
+                            value=0.6,
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
+                        )
+                        svi_ultravico_gamma = gr.Number(
                             label="Gamma (Harmonic Window)",
                             value=4,
                             minimum=1,
@@ -9468,6 +11392,7 @@ with gr.Blocks(
                 send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
                 send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
+                send_to_svi_btn = gr.Button("Send to SVI", variant="primary")
                 
 
 
@@ -12284,6 +14209,13 @@ with gr.Blocks(
         inputs=[wan22_enable_extension],
         outputs=[wan22_extension_controls]
     )
+
+    # Video Join visibility toggle
+    wan22_enable_video_join.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_video_join],
+        outputs=[wan22_video_join_controls]
+    )
     
     
     # Image input handling for wan22
@@ -12391,12 +14323,14 @@ with gr.Blocks(
         outputs=wan22_lora_apply_high
     )
 
+    # Queue-based generation handler
     wan22_generate_btn.click(
-        fn=wan22_batch_handler,
+        fn=wan22_generate_via_queue,
         inputs=[
             wan22_prompt,
             wan22_negative_prompt,
             wan22_input_image,
+            wan22_end_image,
             wan22_task,
             wan22_width,
             wan22_height,
@@ -12449,6 +14383,12 @@ with gr.Blocks(
             wan22_enable_extension,
             wan22_extend_frames,
             wan22_frames_to_check,
+            wan22_trim_tail_frames,
+            # Video Join arguments
+            wan22_enable_video_join,
+            wan22_ending_video,
+            wan22_join_frames_input,
+            wan22_join_frames_ending,
             # Context Windows arguments
             wan22_use_context_windows,
             wan22_context_length,
@@ -12466,8 +14406,33 @@ with gr.Blocks(
             wan22_ultravico_beta,
             wan22_ultravico_gamma,
         ],
-        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer],
         queue=True
+    )
+
+    # Timer polling for queue-based generation
+    wan22_poll_timer.tick(
+        fn=wan22_poll_active_job,
+        inputs=[wan22_job_id_state, wan22_batch_id_state],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer]
+    )
+
+    # Queue stop handler (cancels batch)
+    wan22_stop_btn.click(
+        fn=wan22_stop_queue_generation,
+        inputs=[wan22_batch_id_state],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer],
+        queue=False
+    )
+
+    # Stop & Decode handler (graceful stop with output)
+    wan22_stop_decode_btn.click(
+        fn=wan22_stop_and_decode,
+        outputs=[wan22_batch_progress],
+        queue=False
     )
 
     def handle_wan22_gallery_select(evt: gr.SelectData) -> int:
@@ -12491,6 +14456,329 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== SVI (Stable-Video-Infinity) Event Handlers =====
+    # Stop button - cancels queued/running jobs
+    svi_stop_btn.click(
+        fn=svi_stop_queue_generation,
+        inputs=[svi_batch_id_state],
+        outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text,
+                 svi_job_id_state, svi_batch_id_state, svi_poll_timer],
+        queue=False
+    )
+    # Stop & Decode button - sends signal to decode current latents
+    svi_stop_decode_btn.click(
+        fn=svi_stop_and_decode,
+        inputs=[],
+        outputs=[svi_batch_progress],
+        queue=False
+    )
+    svi_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[svi_seed])
+
+    # TeaCache visibility toggle
+    svi_tea_cache_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[svi_tea_cache_enabled],
+        outputs=[svi_tea_cache_controls]
+    )
+
+    # Sliding window visibility toggle
+    svi_sliding_window_enabled.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[svi_sliding_window_enabled],
+        outputs=[svi_sliding_window_controls]
+    )
+
+    # SVI LoRA refresh
+    svi_lora_refresh_outputs_list = []
+    for i in range(len(svi_lora_weights)):
+        svi_lora_refresh_outputs_list.extend([svi_lora_weights[i], svi_lora_multipliers[i]])
+
+    svi_lora_refresh_btn.click(
+        fn=refresh_8_loras,
+        inputs=[svi_lora_folder],
+        outputs=svi_lora_refresh_outputs_list
+    )
+
+    # SVI Model refresh
+    def refresh_svi_models(folder: str):
+        """Refresh model dropdowns for SVI"""
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_clip_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    svi_refresh_models_btn.click(
+        fn=refresh_svi_models,
+        inputs=[svi_model_folder],
+        outputs=[svi_dit_low_noise_path, svi_dit_high_noise_path, svi_clip_path, svi_vae_path, svi_t5_path]
+    )
+
+    # SVI Image/Video dimension handlers
+    svi_input_image.change(
+        fn=update_wanx_image_dimensions,
+        inputs=[svi_input_image],
+        outputs=[svi_original_dims, svi_width, svi_height]
+    )
+
+    def update_svi_video_dimensions(video_path):
+        """Extract video dimensions and update UI for SVI extension"""
+        if not video_path:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        info = get_video_info(video_path)
+        if info:
+            dims_str = f"{info['width']}x{info['height']}"
+            return (
+                gr.update(value=dims_str),
+                gr.update(value=info['width']),
+                gr.update(value=info['height']),
+                gr.update(value=info['fps'])
+            )
+        return gr.update(), gr.update(), gr.update(), gr.update()
+
+    svi_extend_video.change(
+        fn=update_svi_video_dimensions,
+        inputs=[svi_extend_video],
+        outputs=[svi_original_dims, svi_width, svi_height, svi_fps]
+    )
+
+    # SVI Width/height calculation buttons
+    svi_calc_width_btn.click(
+        fn=calculate_wanx_width,
+        inputs=[svi_height, svi_original_dims],
+        outputs=[svi_width]
+    )
+
+    svi_calc_height_btn.click(
+        fn=calculate_wanx_height,
+        inputs=[svi_width, svi_original_dims],
+        outputs=[svi_height]
+    )
+
+    # SVI Generate button (Queue-based)
+    svi_generate_btn.click(
+        fn=svi_generate_via_queue,
+        inputs=[
+            # Multi-clip prompts (8 prompts)
+            svi_prompt1, svi_prompt2, svi_prompt3, svi_prompt4,
+            svi_prompt5, svi_prompt6, svi_prompt7, svi_prompt8,
+            svi_negative_prompt,
+            svi_input_image,
+            svi_anchor_image,
+            # Video extension
+            svi_extend_video,
+            svi_extend_frames_to_check,
+            svi_extend_prepend,
+            # SVI settings
+            svi_num_clips,
+            svi_overlap_frames,
+            svi_num_motion_latent,
+            svi_num_motion_frame,
+            svi_seed_multiplier,
+            svi_lora_format,
+            # TeaCache settings
+            svi_tea_cache_enabled,
+            svi_tea_cache_l1_thresh,
+            svi_tea_cache_start_step,
+            svi_tea_cache_end_ratio,
+            # CFG merge
+            svi_cfg_merge,
+            # Sliding window
+            svi_sliding_window_enabled,
+            svi_sliding_window_size,
+            svi_sliding_window_stride,
+            # Generation parameters
+            svi_width,
+            svi_height,
+            svi_frame_num,
+            svi_fps,
+            svi_seed,
+            svi_sample_solver,
+            svi_sample_steps,
+            svi_flow_shift,
+            svi_sample_guide_scale,
+            svi_dual_dit_boundary,
+            svi_batch_size,
+            svi_save_path,
+            # Model Paths & Performance
+            svi_attn_mode,
+            svi_mixed_dtype,
+            svi_block_swap,
+            svi_fp8,
+            svi_fp8_scaled,
+            svi_fp8_prescaled,
+            svi_fp8_fast,
+            svi_fp8_t5,
+            svi_dit_low_noise_path,
+            svi_dit_high_noise_path,
+            svi_clip_path,
+            svi_vae_path,
+            svi_t5_path,
+            # LoRAs
+            svi_lora_folder,
+            *svi_lora_weights,
+            *svi_lora_multipliers,
+            *svi_lora_apply_low,
+            *svi_lora_apply_high,
+            # Previews
+            svi_enable_preview,
+            svi_preview_steps,
+            svi_vae_fp32,
+            svi_compile,
+        ],
+        outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text,
+                 svi_job_id_state, svi_batch_id_state, svi_poll_timer],
+        queue=True
+    )
+
+    # Timer polling for SVI queue-based generation
+    svi_poll_timer.tick(
+        fn=svi_poll_active_job,
+        inputs=[svi_job_id_state, svi_batch_id_state],
+        outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text,
+                 svi_job_id_state, svi_batch_id_state, svi_poll_timer]
+    )
+
+    # ===== SVI Save/Load Defaults =====
+    svi_ui_default_components_ORDERED_LIST = [
+        svi_model_folder,
+        svi_dit_low_noise_path,
+        svi_dit_high_noise_path,
+        svi_clip_path,
+        svi_vae_path,
+        svi_t5_path,
+        svi_attn_mode,
+        svi_block_swap,
+        svi_fp8,
+        svi_fp8_scaled,
+        svi_fp8_prescaled,
+        svi_fp8_fast,
+        svi_fp8_t5,
+        svi_mixed_dtype,
+        svi_vae_fp32,
+        svi_compile,
+        svi_lora_folder,
+    ] + svi_lora_weights + svi_lora_multipliers + svi_lora_apply_low + svi_lora_apply_high
+
+    svi_ui_default_keys = [
+        "svi_model_folder",
+        "svi_dit_low_noise_path",
+        "svi_dit_high_noise_path",
+        "svi_clip_path",
+        "svi_vae_path",
+        "svi_t5_path",
+        "svi_attn_mode",
+        "svi_block_swap",
+        "svi_fp8",
+        "svi_fp8_scaled",
+        "svi_fp8_prescaled",
+        "svi_fp8_fast",
+        "svi_fp8_t5",
+        "svi_mixed_dtype",
+        "svi_vae_fp32",
+        "svi_compile",
+        "svi_lora_folder",
+    ] + [f"svi_lora_weight_{i+1}" for i in range(8)] + \
+        [f"svi_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"svi_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"svi_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_svi_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(svi_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(SVI_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "SVI defaults saved successfully."
+        except Exception as e:
+            return f"Error saving SVI defaults: {e}"
+
+    def load_svi_defaults(request: gr.Request):
+        lora_folder = "lora"
+        lora_choices = get_lora_options(lora_folder)
+
+        # Check for SVI loras in the lora folder
+        svi_high_noise_lora = "SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0.safetensors"
+        svi_low_noise_lora = "SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0.safetensors"
+        has_svi_high_lora = svi_high_noise_lora in lora_choices
+        has_svi_low_lora = svi_low_noise_lora in lora_choices
+
+        if not os.path.exists(SVI_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(svi_ui_default_keys) + ["No defaults file found."]
+            else:
+                # Initial load: auto-detect SVI loras
+                updates = [gr.update()] * len(svi_ui_default_keys)
+                # If SVI loras are available, set them up automatically
+                if has_svi_high_lora or has_svi_low_lora:
+                    lora_start_idx = 17  # Index where lora_weights start
+                    apply_low_start_idx = 17 + 8 + 8  # After weights and multipliers
+                    apply_high_start_idx = 17 + 8 + 8 + 8  # After apply_low
+
+                    if has_svi_low_lora:
+                        updates[lora_start_idx] = gr.update(choices=lora_choices, value=svi_low_noise_lora)
+                        updates[apply_low_start_idx] = gr.update(value=True)
+                        updates[apply_high_start_idx] = gr.update(value=False)
+                    if has_svi_high_lora:
+                        updates[lora_start_idx + 1] = gr.update(choices=lora_choices, value=svi_high_noise_lora)
+                        updates[apply_low_start_idx + 1] = gr.update(value=False)
+                        updates[apply_high_start_idx + 1] = gr.update(value=True)
+                return updates + [""]
+
+        try:
+            with open(SVI_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(svi_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        # Update lora folder from settings
+        lora_folder = loaded_settings.get("svi_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(svi_ui_default_keys):
+            component = svi_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["SVI defaults loaded successfully."]
+
+    svi_save_defaults_btn.click(
+        fn=save_svi_defaults,
+        inputs=svi_ui_default_components_ORDERED_LIST,
+        outputs=[svi_defaults_status]
+    )
+    svi_load_defaults_btn.click(
+        fn=load_svi_defaults,
+        inputs=None,
+        outputs=svi_ui_default_components_ORDERED_LIST + [svi_defaults_status]
+    )
+
+    def initial_load_svi_defaults():
+        results_and_status = load_svi_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_svi_defaults,
+        inputs=None,
+        outputs=svi_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====
@@ -12860,6 +15148,36 @@ with gr.Blocks(
         outputs=None
     ).then(
         fn=change_to_tab_two, inputs=None, outputs=[tabs]
+    )
+
+    # Send to SVI tab handler
+    def change_to_svi_tab():
+        return gr.Tabs(selected=16)
+
+    def handle_send_to_svi_tab(metadata: dict, video_path: str) -> Tuple[str, str, int, int, int, int, str]:
+        """Handle video transfer from Video Info to SVI tab for video extension"""
+        if not video_path:
+            return "No video selected", None, 832, 480, 81, 16, ""
+
+        # Get video info
+        video_info = get_video_info(video_path)
+        width = video_info.get('width', 832)
+        height = video_info.get('height', 480)
+        fps = int(video_info.get('fps', 16))
+
+        # Get prompt from metadata if available
+        prompt = ""
+        if metadata:
+            prompt = metadata.get("prompt", "")
+
+        return "Video ready for SVI extension", video_path, width, height, 81, fps, prompt
+
+    send_to_svi_btn.click(
+        fn=handle_send_to_svi_tab,
+        inputs=[metadata_output, video_input],
+        outputs=[status, svi_extend_video, svi_width, svi_height, svi_frame_num, svi_fps, svi_prompt1]
+    ).then(
+        fn=change_to_svi_tab, inputs=None, outputs=[tabs]
     )
 
     # Handler for sending selected video from Video2Video gallery to input
@@ -13391,5 +15709,8 @@ if __name__ == "__main__":
     #    try: shutil.rmtree("temp_frames")
     #    except OSError as e: print(f"Error removing temp_frames: {e}")
     os.makedirs("temp_frames", exist_ok=True)
+
+    # Start the background worker thread for Wan2.2 queue processing
+    start_wan22_worker()
 
 demo.queue().launch(server_name="0.0.0.0", share=False)

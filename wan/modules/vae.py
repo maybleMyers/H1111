@@ -519,11 +519,15 @@ class WanVAE_(nn.Module):
         x_recon = self.decode(z)
         return x_recon, mu, log_var
 
-    def encode(self, x, scale):
+    def encode(self, x, scale, any_end_frame=False):
         self.clear_cache()
         ## cache
         t = x.shape[2]
-        iter_ = 1 + (t - 1) // 4
+        # FLF support: any_end_frame uses special temporal chunking (Wan2GP style)
+        if any_end_frame:
+            iter_ = 2 + (t - 2) // 4  # First frame, middle chunks of 4, last frame
+        else:
+            iter_ = 1 + (t - 1) // 4  # Standard: first frame, then chunks of 4
         # ## 对encode输入的x，按时间拆分为1、4、4、4....
 
         # if self.cache_device is None:
@@ -531,6 +535,12 @@ class WanVAE_(nn.Module):
             self._enc_conv_idx = [0]
             if i == 0:
                 out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+            elif any_end_frame and i == iter_ - 1:
+                # FLF: Encode last frame separately with no cache (like Wan2GP)
+                out_ = self.encoder(
+                    x[:, :, -1:, :, :], feat_cache=None, feat_idx=self._enc_conv_idx
+                )
+                out = torch.cat([out, out_], 2)
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
@@ -613,6 +623,161 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+
+    def _blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors vertically with linear interpolation."""
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def _blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors horizontally with linear interpolation."""
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def spatial_tiled_encode(self, x, scale, tile_size=256, any_end_frame=False):
+        """
+        Encode video using spatial tiling to reduce memory usage.
+
+        Args:
+            x: Video tensor [B, C, T, H, W]
+            scale: Scale factors [mean, 1/std]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+            any_end_frame: If True, use FLF temporal chunking
+
+        Returns:
+            Encoded latent tensor [B, C, T, H//8, W//8]
+        """
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = tile_size // 8
+        tile_overlap_factor = 0.25
+
+        overlap_size = int(tile_sample_min_size * (1 - tile_overlap_factor))
+        blend_extent = int(tile_latent_min_size * tile_overlap_factor)
+        row_limit = tile_latent_min_size - blend_extent
+
+        h_pixels, w_pixels = x.shape[-2], x.shape[-1]
+
+        # Split video into tiles and encode them separately
+        rows = []
+        for i in range(0, h_pixels, overlap_size):
+            row = []
+            for j in range(0, w_pixels, overlap_size):
+                tile = x[:, :, :, i:i + tile_sample_min_size, j:j + tile_sample_min_size]
+                # Encode this tile
+                encoded_tile = self.encode(tile, scale, any_end_frame=any_end_frame)
+                row.append(encoded_tile)
+                # Clear memory after each tile
+                torch.cuda.empty_cache()
+            rows.append(row)
+
+        # Blend tiles together
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # Blend with tile above
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                # Blend with tile to the left
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        mu = torch.cat(result_rows, dim=-2)
+        return mu
+
+    def spatial_tiled_decode(self, z, scale, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+
+        Args:
+            z: Latent tensor [B, C, T, H, W]
+            scale: Scale factors [mean, 1/std]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+
+        Returns:
+            Decoded video tensor [B, C, T, H*8, W*8]
+        """
+        device = z.device
+        dtype = z.dtype
+
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = tile_size // 8
+        tile_overlap_factor = 0.25
+
+        # Apply inverse scale transform
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+
+        # Move z to CPU to free GPU memory for decoding
+        z_cpu = z.cpu()
+        del z
+        torch.cuda.empty_cache()
+
+        overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))
+        blend_extent = int(tile_sample_min_size * tile_overlap_factor)
+        row_limit = tile_sample_min_size - blend_extent
+
+        h_latent, w_latent = z_cpu.shape[-2], z_cpu.shape[-1]
+
+        # Decode tiles with overlap - keep decoded tiles on CPU
+        rows = []
+        for i in range(0, h_latent, overlap_size):
+            row = []
+            for j in range(0, w_latent, overlap_size):
+                # Move tile to GPU for decoding
+                tile = z_cpu[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size].to(device)
+
+                # Decode this tile frame by frame
+                self.clear_cache()
+                iter_ = tile.shape[2]
+                x = self.conv2(tile)
+                del tile
+                torch.cuda.empty_cache()
+
+                for frame_idx in range(iter_):
+                    self._conv_idx = [0]
+                    if frame_idx == 0:
+                        out = self.decoder(x[:, :, frame_idx:frame_idx + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    else:
+                        out_ = self.decoder(x[:, :, frame_idx:frame_idx + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                        out = torch.cat([out, out_], 2)
+                        del out_
+                self.clear_cache()
+
+                # Move decoded tile to CPU immediately
+                out_cpu = out.cpu()
+                del out, x
+                torch.cuda.empty_cache()
+
+                row.append(out_cpu)
+            rows.append(row)
+
+        del z_cpu
+
+        # Blend tiles together on CPU
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        out = torch.cat(result_rows, dim=-2)
+
+        # Move final result back to original device
+        return out.to(device=device, dtype=dtype)
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
@@ -742,13 +907,55 @@ class WanVAE:
         if dtype is not None:
             self.to_dtype(dtype)
 
-    def encode(self, videos):
+    def encode(self, videos, any_end_frame=False):
         """
         videos: A list of videos each with shape [C, T, H, W].
+        any_end_frame: If True, use special FLF temporal chunking (first, middle, last)
         """
         with torch.amp.autocast('cuda', dtype=self.dtype):
-            return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
+            return [self.model.encode(u.unsqueeze(0), self.scale, any_end_frame=any_end_frame).float().squeeze(0) for u in videos]
 
     def decode(self, zs):
         with torch.amp.autocast('cuda', dtype=self.dtype):
             return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]
+
+    def spatial_tiled_encode(self, videos, tile_size=256, any_end_frame=False):
+        """
+        Encode videos using spatial tiling to reduce memory usage.
+        Fallback method for when normal encode causes OOM.
+
+        Args:
+            videos: A list of videos each with shape [C, T, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+            any_end_frame: If True, use FLF temporal chunking
+
+        Returns:
+            List of encoded latent tensors [C, T, H//8, W//8]
+        """
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [
+                self.model.spatial_tiled_encode(
+                    u.unsqueeze(0), self.scale, tile_size=tile_size, any_end_frame=any_end_frame
+                ).float().squeeze(0)
+                for u in videos
+            ]
+
+    def spatial_tiled_decode(self, zs, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+        Fallback method for when normal decode causes OOM.
+
+        Args:
+            zs: A list of latents each with shape [C, T, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+
+        Returns:
+            List of decoded video tensors [C, T, H*8, W*8]
+        """
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [
+                self.model.spatial_tiled_decode(
+                    u.unsqueeze(0), self.scale, tile_size=tile_size
+                ).float().clamp_(-1, 1).squeeze(0)
+                for u in zs
+            ]
