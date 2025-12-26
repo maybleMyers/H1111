@@ -33,6 +33,15 @@ stop_event = threading.Event()
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
+# Queue system imports
+from wan_job_queue import get_queue, JobQueue, JobStatus, Job
+from wan_worker import Worker
+
+# Queue system globals
+wan22_current_output_filename = None
+wan22_worker_thread = None
+wan22_worker_instance = None
+
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
@@ -770,6 +779,519 @@ def wan22_batch_handler(
         time.sleep(0.2)
         
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
+
+
+# ========================= Wan2.2 Queue System Functions =========================
+
+def wan22_submit_to_queue(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    end_image_path: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    dynamic_model_loading: bool,
+    unload_text_encoders: bool,
+    vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
+) -> Tuple[str, List[str]]:
+    """Submit Wan2.2 generation job(s) to the queue.
+
+    Returns:
+        Tuple of (batch_id, list of job_ids)
+    """
+    global wan22_current_output_filename
+
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"wan22_{run_id}"
+
+        # Generate output filename for signal file coordination
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(save_path, f"wan22_{task}_{timestamp}_{current_seed}.mp4")
+        wan22_current_output_filename = output_filename
+
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", str(task),
+            "--prompt", str(prompt),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--guidance_scale", str(sample_guide_scale),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--vae", os.path.join("wan", vae_path),
+            "--t5", os.path.join("wan", t5_path),
+            "--output_filename", output_filename,  # For signal file coordination
+        ]
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Model Path Logic based on Task
+        if "A14B" in task:
+            command.extend(["--dit_low_noise", os.path.join("wan", dit_low_noise_path),
+                          "--dit_high_noise", os.path.join("wan", dit_high_noise_path)])
+            if "i2v" in task:
+                command.extend(["--clip", os.path.join("wan", clip_path)])
+        elif "ti2v-5B" in task:
+            command.extend(["--dit", os.path.join("wan", dit_path)])
+
+        # Handle V2V vs Extension modes
+        if enable_v2v and input_video:
+            if enable_video_join and ending_video:
+                command.extend(["--video_join", input_video, "--ending_video", ending_video])
+                command.extend(["--join_frames_input", str(join_frames_input)])
+                command.extend(["--join_frames_ending", str(join_frames_ending)])
+            elif enable_extension:
+                command.extend(["--extend_video", input_video])
+                command.extend(["--video_length", str(extend_frames)])
+                if frames_to_check > 0:
+                    command.extend(["--extend_frames_to_check", str(frames_to_check)])
+            else:
+                command.extend(["--video_path", input_video, "--strength", str(v2v_strength)])
+                if v2v_low_noise_only:
+                    command.append("--v2v_low_noise_only")
+                if v2v_use_i2v:
+                    command.append("--v2v_use_i2v")
+        elif image_path:
+            command.extend(["--image_path", image_path])
+            if end_image_path:
+                command.extend(["--end_image_path", end_image_path])
+
+        if trim_tail_frames > 0:
+            command.extend(["--trim_tail_frames", str(trim_tail_frames)])
+
+        # Precision flags
+        if mixed_dtype:
+            command.append("--mixed_dtype")
+        if fp8:
+            command.append("--fp8")
+        if fp8_scaled:
+            command.append("--fp8_scaled")
+        if fp8_prescaled:
+            command.append("--fp8_prescaled")
+        if fp8_fast:
+            command.append("--fp8_fast")
+        if fp8_t5:
+            command.append("--fp8_t5")
+        if dynamic_model_loading:
+            command.append("--dynamic_loading")
+        if unload_text_encoders:
+            command.append("--unload_text_encoders")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        # Preview
+        if enable_preview:
+            command.extend(["--preview", str(max(1, preview_steps))])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # Context Windows
+        if use_context_windows:
+            command.append("--context_windows")
+            command.extend(["--context_length", str(context_length)])
+            command.extend(["--context_overlap", str(context_overlap)])
+            command.extend(["--context_schedule", str(context_schedule)])
+            command.extend(["--context_stride", str(context_stride)])
+            if context_closed_loop:
+                command.append("--context_closed_loop")
+            command.extend(["--context_fuse_method", str(context_fuse_method)])
+            if context_end_image:
+                command.extend(["--context_end_image", context_end_image])
+
+        # UltraViCo
+        if ultravico_enabled:
+            command.append("--ultravico")
+            command.extend(["--ultravico_alpha", str(ultravico_alpha)])
+            command.extend(["--ultravico_training_frames", str(int(ultravico_training_frames))])
+            if ultravico_suppress_harmonics:
+                command.append("--ultravico_suppress_harmonics")
+                command.extend(["--ultravico_beta", str(ultravico_beta)])
+                command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
+
+        # LoRA Handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high)
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high and "A14B" in task:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        if lora_weights_paths_high and "A14B" in task:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        # Create job parameters for metadata
+        parameters = {
+            "model_type": "Wan2.2",
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "task": task,
+            "width": width,
+            "height": height,
+            "frame_num": frame_num,
+            "fps": fps,
+            "seed": current_seed,
+            "sample_solver": sample_solver,
+            "sample_steps": sample_steps,
+            "flow_shift": flow_shift,
+            "guidance_scale": sample_guide_scale,
+            "save_path": save_path,
+        }
+
+        # Submit job to queue
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[Queue] Job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def wan22_generate_via_queue(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    end_image_path: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    sample_guide_scale: float,
+    dual_dit_boundary: float,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_prescaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    clip_path: str,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+    # Previews
+    enable_preview: bool,
+    preview_steps: int,
+    dynamic_model_loading: bool,
+    unload_text_encoders: bool,
+    vae_fp32: bool,
+    # Compile options
+    compile_enabled: bool,
+    enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,
+    enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,
+    # Context Windows parameters
+    use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
+    # UltraViCo parameters
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
+):
+    """Queue-based generation that returns immediately and uses Timer for polling.
+
+    Returns initial state with Timer active for polling.
+    """
+    # Submit jobs to queue
+    batch_id, job_ids = wan22_submit_to_queue(
+        prompt, negative_prompt, image_path, end_image_path, task, width, height,
+        frame_num, fps, base_seed, sample_solver, sample_steps, flow_shift,
+        sample_guide_scale, dual_dit_boundary, batch_size, save_path,
+        attn_mode, mixed_dtype, block_swap, fp8, fp8_scaled, fp8_prescaled,
+        fp8_fast, fp8_t5, dit_low_noise_path, dit_high_noise_path, clip_path,
+        dit_path, vae_path, t5_path, lora_folder,
+        lora1_str, lora2_str, lora3_str, lora4_str,
+        lora5_str, lora6_str, lora7_str, lora8_str,
+        lora1_mult, lora2_mult, lora3_mult, lora4_mult,
+        lora5_mult, lora6_mult, lora7_mult, lora8_mult,
+        lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low,
+        lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low,
+        lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high,
+        lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high,
+        enable_preview, preview_steps, dynamic_model_loading, unload_text_encoders, vae_fp32,
+        compile_enabled, enable_v2v, input_video, v2v_strength, v2v_low_noise_only, v2v_use_i2v,
+        enable_extension, extend_frames, frames_to_check, trim_tail_frames,
+        enable_video_join, ending_video, join_frames_input, join_frames_ending,
+        use_context_windows, context_length, context_overlap, context_schedule,
+        context_stride, context_closed_loop, context_fuse_method, context_end_image,
+        ultravico_enabled, ultravico_alpha, ultravico_training_frames,
+        ultravico_suppress_harmonics, ultravico_beta, ultravico_gamma
+    )
+
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+
+    # Return initial state: (videos, preview, status, progress, job_id, batch_id, timer_active)
+    return (
+        [],  # videos gallery
+        [],  # preview list
+        status_msg,  # status text
+        "Waiting for worker to start...",  # progress text
+        first_job_id,  # job_id state
+        batch_id,  # batch_id state
+        gr.Timer(value=2.0, active=True)  # start polling timer
+    )
+
+
+def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
+    """Poll the queue for job status updates.
+
+    Called by Timer to get live updates. Returns updated state.
+    """
+    queue = get_queue()
+
+    # Get all jobs in batch
+    jobs = []
+    if current_batch_id:
+        jobs = queue.get_batch_jobs(current_batch_id)
+    elif current_job_id:
+        job = queue.get_job(current_job_id)
+        if job:
+            jobs = [job]
+
+    # If no jobs found, try to find running job
+    if not jobs:
+        running_jobs = queue.get_running_jobs()
+        if running_jobs:
+            jobs = running_jobs
+            current_batch_id = jobs[0].batch_id or ""
+
+    all_videos = []
+    running_job = None
+    status_parts = []
+    completed_count = 0
+    failed_count = 0
+    preview_path = None
+
+    for job in jobs:
+        if job.status == JobStatus.COMPLETED.value:
+            completed_count += 1
+            if job.output_filename and os.path.exists(job.output_filename):
+                seed = job.parameters.get('seed', 'unknown')
+                all_videos.append((job.output_filename, f"Seed: {seed}"))
+        elif job.status == JobStatus.RUNNING.value:
+            running_job = job
+            if job.preview_path and os.path.exists(job.preview_path):
+                preview_path = job.preview_path
+        elif job.status == JobStatus.FAILED.value:
+            failed_count += 1
+            status_parts.append(f"Job {job.id} failed: {job.error_message[:50] if job.error_message else 'Unknown error'}")
+        elif job.status == JobStatus.CANCELLED.value:
+            status_parts.append(f"Job {job.id} cancelled")
+
+    total_jobs = len(jobs)
+    timer_active = False
+    progress_text = ""
+
+    if running_job:
+        timer_active = True
+        progress_text = running_job.progress_text or f"Progress: {running_job.progress:.0f}%"
+        status_parts.insert(0, f"Processing {completed_count + 1}/{total_jobs}")
+    elif completed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"All {total_jobs} generation(s) complete!")
+        progress_text = "Done"
+        timer_active = False
+    elif completed_count + failed_count == total_jobs and total_jobs > 0:
+        status_parts.insert(0, f"Batch complete: {completed_count} succeeded, {failed_count} failed")
+        progress_text = "Done"
+        timer_active = False
+    elif total_jobs == 0:
+        status_parts.append("No jobs found - may still be initializing")
+        timer_active = True
+        progress_text = "Waiting..."
+    else:
+        # Still pending
+        pending = total_jobs - completed_count - failed_count
+        status_parts.insert(0, f"Pending: {pending} jobs")
+        timer_active = True
+        progress_text = "Waiting for worker..."
+
+    status_text = " | ".join(status_parts) if status_parts else "Processing..."
+
+    # Return: (videos, preview_list, status, progress, job_id, batch_id, timer)
+    return (
+        all_videos,
+        [preview_path] if preview_path else [],
+        status_text,
+        progress_text,
+        current_job_id,
+        current_batch_id,
+        gr.Timer(value=2.0, active=timer_active)
+    )
+
+
+def wan22_stop_queue_generation(current_batch_id: str):
+    """Cancel all jobs in the current batch and stop processing."""
+    global wan22_current_output_filename
+
+    queue = get_queue()
+
+    if current_batch_id:
+        cancelled_jobs = queue.cancel_batch(current_batch_id)
+        print(f"[Queue] Cancelled {len(cancelled_jobs)} jobs in batch {current_batch_id}")
+
+    # Return reset state
+    return (
+        [],  # videos
+        [],  # preview
+        "Generation cancelled",  # status
+        "Stopped",  # progress
+        "",  # job_id
+        "",  # batch_id
+        gr.Timer(value=2.0, active=False)  # stop timer
+    )
+
+
+def wan22_stop_and_decode():
+    """Create signal file to stop generation and decode current latents."""
+    global wan22_current_output_filename
+
+    if wan22_current_output_filename:
+        signal_file = wan22_current_output_filename + ".stop_decode"
+        try:
+            with open(signal_file, 'w') as f:
+                f.write('decode')
+            return "Stop & Decode signal sent..."
+        except Exception as e:
+            return f"Error creating signal file: {e}"
+    return "No active generation to stop"
+
+
+def start_wan22_worker():
+    """Start the background worker thread for processing Wan2.2 queue jobs."""
+    global wan22_worker_thread, wan22_worker_instance
+
+    if wan22_worker_thread is not None and wan22_worker_thread.is_alive():
+        print("[Worker] Wan2.2 worker already running")
+        return
+
+    queue = get_queue()
+    wan22_worker_instance = Worker(queue, poll_interval=2.0, use_signals=False)
+    wan22_worker_thread = threading.Thread(target=wan22_worker_instance.run, daemon=True)
+    wan22_worker_thread.start()
+    print("[Worker] Wan2.2 background worker started")
+
+# ========================= End Wan2.2 Queue System Functions =========================
 
 
 ### SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
@@ -8791,6 +9313,12 @@ with gr.Blocks(
             with gr.Row():
                 wan22_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
                 wan22_stop_btn = gr.Button("Stop Generation", variant="stop")
+                wan22_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            # Queue system state components
+            wan22_job_id_state = gr.State(value="")
+            wan22_batch_id_state = gr.State(value="")
+            wan22_poll_timer = gr.Timer(value=2.0, active=False)
             
             with gr.Row():
                 with gr.Column():
@@ -13228,8 +13756,9 @@ with gr.Blocks(
         outputs=wan22_lora_apply_high
     )
 
+    # Queue-based generation handler
     wan22_generate_btn.click(
-        fn=wan22_batch_handler,
+        fn=wan22_generate_via_queue,
         inputs=[
             wan22_prompt,
             wan22_negative_prompt,
@@ -13310,8 +13839,33 @@ with gr.Blocks(
             wan22_ultravico_beta,
             wan22_ultravico_gamma,
         ],
-        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer],
         queue=True
+    )
+
+    # Timer polling for queue-based generation
+    wan22_poll_timer.tick(
+        fn=wan22_poll_active_job,
+        inputs=[wan22_job_id_state, wan22_batch_id_state],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer]
+    )
+
+    # Queue stop handler (cancels batch)
+    wan22_stop_btn.click(
+        fn=wan22_stop_queue_generation,
+        inputs=[wan22_batch_id_state],
+        outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
+                 wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer],
+        queue=False
+    )
+
+    # Stop & Decode handler (graceful stop with output)
+    wan22_stop_decode_btn.click(
+        fn=wan22_stop_and_decode,
+        outputs=[wan22_batch_progress],
+        queue=False
     )
 
     def handle_wan22_gallery_select(evt: gr.SelectData) -> int:
@@ -14562,5 +15116,8 @@ if __name__ == "__main__":
     #    try: shutil.rmtree("temp_frames")
     #    except OSError as e: print(f"Error removing temp_frames: {e}")
     os.makedirs("temp_frames", exist_ok=True)
+
+    # Start the background worker thread for Wan2.2 queue processing
+    start_wan22_worker()
 
 demo.queue().launch(server_name="0.0.0.0", share=False)

@@ -248,6 +248,35 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+# ========================= Stop Signal Checking for Queue System =========================
+
+def check_stop_signals(output_filename: str):
+    """Check for stop signal files and return action if found.
+
+    Used by the queue system to enable graceful stopping during inference.
+    Signal file: {output_filename}.stop_decode - Stop and decode current latents
+
+    Args:
+        output_filename: The output video filename used as base for signal files
+
+    Returns:
+        str or None: "decode" or None if no signal found
+    """
+    if output_filename is None:
+        return None
+
+    stop_decode_file = output_filename + ".stop_decode"
+
+    if os.path.exists(stop_decode_file):
+        try:
+            os.remove(stop_decode_file)
+        except:
+            pass
+        return "decode"
+
+    return None
+
+
 # ========================= SVI (Stable-Video-Infinity) Utility Functions =========================
 
 def convert_svi_lora_keys(svi_state_dict: dict, verbose: bool = True) -> dict:
@@ -829,6 +858,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_svi_extend_prepend", action="store_false", dest="svi_extend_prepend",
                        help="Only output the extension, not the original video.")
     # ========================= End SVI Arguments =========================
+
+    # ========================= Queue System Arguments =========================
+    parser.add_argument("--output_filename", type=str, default=None,
+                       help="Output filename for signal file coordination with queue system. "
+                            "Used to create signal files like {output_filename}.stop_decode")
+    # ========================= End Queue System Arguments =========================
 
     args = parser.parse_args()
 
@@ -3559,6 +3594,13 @@ def run_sampling(
 
     logger.info(f"Starting sampling loop for {num_timesteps} steps.")
     for i, t in enumerate(tqdm(timesteps)):
+        # Check for stop signal from queue system
+        if hasattr(args, 'output_filename') and args.output_filename:
+            stop_action = check_stop_signals(args.output_filename)
+            if stop_action == "decode":
+                logger.info(f"Stop signal received at step {i}/{num_timesteps} - will decode current latents")
+                break  # Exit loop, will decode whatever latent state we have
+
         # Prepare input for the model (move latent to compute device)
         # Latent should be [B, C, F, H, W] or [C, F, H, W]
         latent_on_device = latent.to(device)
