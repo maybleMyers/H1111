@@ -691,6 +691,77 @@ class WanVAE_(nn.Module):
         mu = torch.cat(result_rows, dim=-2)
         return mu
 
+    def spatial_tiled_decode(self, z, scale, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+
+        Args:
+            z: Latent tensor [B, C, T, H, W]
+            scale: Scale factors [mean, 1/std]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+
+        Returns:
+            Decoded video tensor [B, C, T, H*8, W*8]
+        """
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = tile_size // 8
+        tile_overlap_factor = 0.25
+
+        # Apply inverse scale transform
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+
+        overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))
+        blend_extent = int(tile_sample_min_size * tile_overlap_factor)
+        row_limit = tile_sample_min_size - blend_extent
+
+        h_latent, w_latent = z.shape[-2], z.shape[-1]
+
+        # Decode tiles with overlap
+        rows = []
+        for i in range(0, h_latent, overlap_size):
+            row = []
+            for j in range(0, w_latent, overlap_size):
+                tile = z[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size]
+
+                # Decode this tile frame by frame (like normal decode but without scale transform)
+                self.clear_cache()
+                iter_ = tile.shape[2]
+                x = self.conv2(tile)
+
+                for frame_idx in range(iter_):
+                    self._conv_idx = [0]
+                    if frame_idx == 0:
+                        out = self.decoder(x[:, :, frame_idx:frame_idx + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    else:
+                        out_ = self.decoder(x[:, :, frame_idx:frame_idx + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                        out = torch.cat([out, out_], 2)
+                self.clear_cache()
+
+                # Clear memory after each tile
+                del tile, x
+                torch.cuda.empty_cache()
+
+                row.append(out)
+            rows.append(row)
+
+        # Blend tiles together
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        out = torch.cat(result_rows, dim=-2)
+        return out
+
 
 def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     """
@@ -850,4 +921,24 @@ class WanVAE:
                     u.unsqueeze(0), self.scale, tile_size=tile_size, any_end_frame=any_end_frame
                 ).float().squeeze(0)
                 for u in videos
+            ]
+
+    def spatial_tiled_decode(self, zs, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+        Fallback method for when normal decode causes OOM.
+
+        Args:
+            zs: A list of latents each with shape [C, T, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+
+        Returns:
+            List of decoded video tensors [C, T, H*8, W*8]
+        """
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [
+                self.model.spatial_tiled_decode(
+                    u.unsqueeze(0), self.scale, tile_size=tile_size
+                ).float().clamp_(-1, 1).squeeze(0)
+                for u in zs
             ]
