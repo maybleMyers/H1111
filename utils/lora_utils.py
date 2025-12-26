@@ -264,8 +264,18 @@ def load_safetensors_with_lora_and_fp8(
                 up_key_direct = base_key + ".lora_up.weight"
                 alpha_key_direct = base_key + ".alpha"
 
-                # Try direct format first (for new MUSUBI LoRAs)
-                if down_key_direct in lora_weight_keys and up_key_direct in lora_weight_keys:
+                # LightX2V format: diffusion_model.blocks.0.cross_attn.k.lora_down.weight
+                down_key_lightx2v = "diffusion_model." + base_key + ".lora_down.weight"
+                up_key_lightx2v = "diffusion_model." + base_key + ".lora_up.weight"
+                alpha_key_lightx2v = "diffusion_model." + base_key + ".alpha"
+
+                # Try lightx2v format first (has diffusion_model. prefix)
+                if down_key_lightx2v in lora_weight_keys and up_key_lightx2v in lora_weight_keys:
+                    down_key = down_key_lightx2v
+                    up_key = up_key_lightx2v
+                    alpha_key = alpha_key_lightx2v
+                # Try direct format (for new MUSUBI LoRAs)
+                elif down_key_direct in lora_weight_keys and up_key_direct in lora_weight_keys:
                     # Use direct format
                     down_key = down_key_direct
                     up_key = up_key_direct
