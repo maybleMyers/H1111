@@ -2601,7 +2601,26 @@ def prepare_i2v_inputs(
                 logger.info(f"FLF joint encoding: Built pixel sequence with {enc_sequence.shape[1]} frames (1 start + {zero_frames_count} zeros + 1 end)")
 
                 # Wan 2.2: Use STANDARD VAE encoding (any_end_frame=False)
-                y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                # Encode with OOM fallback to tiled encode
+                try:
+                    y_latent = vae.encode([enc_sequence])[0]  # Shape [C', lat_f, H, W]
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                        logger.warning(f"VAE encode OOM (FLF), falling back to spatial tiled encode: {e}")
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        if hasattr(vae, 'spatial_tiled_encode'):
+                            try:
+                                free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                                tile_size = 256 if free_mem >= 4000 else 128
+                            except:
+                                tile_size = 128
+                            logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                            y_latent = vae.spatial_tiled_encode([enc_sequence], tile_size=tile_size)[0]
+                        else:
+                            raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                    else:
+                        raise
                 logger.info(f"FLF VAE encoding complete. Latent shape: {y_latent.shape}")
 
                 del zero_frames, enc_sequence
@@ -2641,7 +2660,26 @@ def prepare_i2v_inputs(
                         )
                     img_padded = torch.cat([img_resized, padding_tensor], dim=1)
 
-                y_latent = vae.encode([img_padded])[0]
+                # Encode with OOM fallback to tiled encode
+                try:
+                    y_latent = vae.encode([img_padded])[0]
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                        logger.warning(f"VAE encode OOM, falling back to spatial tiled encode: {e}")
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        if hasattr(vae, 'spatial_tiled_encode'):
+                            try:
+                                free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                                tile_size = 256 if free_mem >= 4000 else 128
+                            except:
+                                tile_size = 128
+                            logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                            y_latent = vae.spatial_tiled_encode([img_padded], tile_size=tile_size)[0]
+                        else:
+                            raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                    else:
+                        raise
 
         # --- FLF IMPROVED: Proper Mask Construction with Temporal Interleaving ---
         # Build mask in FRAME space first, then apply temporal interleaving (Wan2GP style)
@@ -2986,7 +3024,26 @@ def encode_video_to_latents(video_tensor: torch.Tensor, vae: WanVAE, device: tor
         video_single = video_tensor[i] # Shape [C, F, H, W]
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype): # Use VAE's internal dtype for autocast
             # vae.encode expects a list containing the tensor
-            encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
+            # Encode with OOM fallback to tiled encode
+            try:
+                encoded_latent = vae.encode([video_single])[0] # Returns tensor [C', F', H', W']
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE encode OOM (V2V), falling back to spatial tiled encode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    if hasattr(vae, 'spatial_tiled_encode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                        encoded_latent = vae.spatial_tiled_encode([video_single], tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                else:
+                    raise
             latents_list.append(encoded_latent)
 
     # Stack results back into a batch
@@ -4028,10 +4085,28 @@ def prepare_video_extension_inputs(
     else:
         padded_frames = cond_frames[:, :frame_num]
     
-    # Encode conditioning frames with VAE
+    # Encode conditioning frames with VAE (with OOM fallback)
     vae.to_device(device)
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-        y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+        try:
+            y_latent = vae.encode([padded_frames])[0]  # [C', lat_f, lat_h, lat_w]
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                logger.warning(f"VAE encode OOM (T2V inputs), falling back to spatial tiled encode: {e}")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                if hasattr(vae, 'spatial_tiled_encode'):
+                    try:
+                        free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                        tile_size = 256 if free_mem >= 4000 else 128
+                    except:
+                        tile_size = 128
+                    logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                    y_latent = vae.spatial_tiled_encode([padded_frames], tile_size=tile_size)[0]
+                else:
+                    raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+            else:
+                raise
     
     # Create mask for conditioning frames
     motion_frames_latent_num = (cond_f - 1) // config.vae_stride[0] + 1
@@ -4920,10 +4995,28 @@ def generate_extended_video(
         cond_frames = all_frames[-motion_frames:].clone()  # [F, C, H, W]
         cond_frames = cond_frames.permute(1, 0, 2, 3).to(device)  # [C, F, H, W], move to device
         
-        # Encode conditioning frames to latent
+        # Encode conditioning frames to latent (with OOM fallback)
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            cond_latent = vae.encode([cond_frames])[0]
+            try:
+                cond_latent = vae.encode([cond_frames])[0]
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE encode OOM (extend_video), falling back to spatial tiled encode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    if hasattr(vae, 'spatial_tiled_encode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                        cond_latent = vae.spatial_tiled_encode([cond_frames], tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                else:
+                    raise
         
         # Prepare inputs for this chunk
         chunk_frames = min(frames_per_chunk, total_frames - current_frame + motion_frames)

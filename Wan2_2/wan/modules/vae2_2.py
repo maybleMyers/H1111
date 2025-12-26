@@ -1190,3 +1190,74 @@ class Wan2_2_VAE:
         except TypeError as e:
             logging.info(e)
             return None
+
+    def spatial_tiled_encode(self, videos, tile_size=256):
+        """
+        Encode videos using spatial tiling to reduce memory usage.
+        Fallback method for when normal encode causes OOM.
+
+        Args:
+            videos: List of video tensors [C, F, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+
+        Returns:
+            List of encoded latent tensors [C, F, H//8, W//8]
+        """
+        try:
+            if not isinstance(videos, list):
+                raise TypeError("videos should be a list")
+
+            results = []
+            for v in videos:
+                # v: [C, F, H, W] -> add batch dim -> [1, C, F, H, W]
+                v_batch = v.unsqueeze(0)
+
+                tile_sample_min_size = tile_size
+                tile_latent_min_size = tile_size // 8
+                tile_overlap_factor = 0.25
+
+                overlap_size = int(tile_sample_min_size * (1 - tile_overlap_factor))
+                blend_extent = int(tile_latent_min_size * tile_overlap_factor)
+                row_limit = tile_latent_min_size - blend_extent
+
+                h_pixels, w_pixels = v_batch.shape[-2], v_batch.shape[-1]
+
+                # Split video into tiles and encode them separately
+                rows = []
+                for i in range(0, h_pixels, overlap_size):
+                    row = []
+                    for j in range(0, w_pixels, overlap_size):
+                        tile = v_batch[:, :, :, i:i + tile_sample_min_size, j:j + tile_sample_min_size]
+
+                        # Encode this tile using the internal model
+                        with amp.autocast(dtype=self.dtype):
+                            encoded_tile = self.model.encode(tile, self.scale)
+
+                        row.append(encoded_tile)
+                        torch.cuda.empty_cache()
+                    rows.append(row)
+
+                # Blend tiles together
+                result_rows = []
+                for i, row in enumerate(rows):
+                    result_row = []
+                    for j, tile in enumerate(row):
+                        if i > 0:
+                            tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                        if j > 0:
+                            tile = self._blend_h(row[j - 1], tile, blend_extent)
+                        result_row.append(tile[:, :, :, :row_limit, :row_limit])
+                    result_rows.append(torch.cat(result_row, dim=-1))
+
+                mu = torch.cat(result_rows, dim=-2)
+                # Remove batch dim: [1, C, F, H, W] -> [C, F, H, W]
+                results.append(mu.float().squeeze(0))
+
+                del rows, result_rows, v_batch
+                torch.cuda.empty_cache()
+
+            return results
+
+        except TypeError as e:
+            logging.info(e)
+            return None

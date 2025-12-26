@@ -624,6 +624,73 @@ class WanVAE_(nn.Module):
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
 
+    def _blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors vertically with linear interpolation."""
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def _blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors horizontally with linear interpolation."""
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def spatial_tiled_encode(self, x, scale, tile_size=256, any_end_frame=False):
+        """
+        Encode video using spatial tiling to reduce memory usage.
+
+        Args:
+            x: Video tensor [B, C, T, H, W]
+            scale: Scale factors [mean, 1/std]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+            any_end_frame: If True, use FLF temporal chunking
+
+        Returns:
+            Encoded latent tensor [B, C, T, H//8, W//8]
+        """
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = tile_size // 8
+        tile_overlap_factor = 0.25
+
+        overlap_size = int(tile_sample_min_size * (1 - tile_overlap_factor))
+        blend_extent = int(tile_latent_min_size * tile_overlap_factor)
+        row_limit = tile_latent_min_size - blend_extent
+
+        h_pixels, w_pixels = x.shape[-2], x.shape[-1]
+
+        # Split video into tiles and encode them separately
+        rows = []
+        for i in range(0, h_pixels, overlap_size):
+            row = []
+            for j in range(0, w_pixels, overlap_size):
+                tile = x[:, :, :, i:i + tile_sample_min_size, j:j + tile_sample_min_size]
+                # Encode this tile
+                encoded_tile = self.encode(tile, scale, any_end_frame=any_end_frame)
+                row.append(encoded_tile)
+                # Clear memory after each tile
+                torch.cuda.empty_cache()
+            rows.append(row)
+
+        # Blend tiles together
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # Blend with tile above
+                if i > 0:
+                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                # Blend with tile to the left
+                if j > 0:
+                    tile = self._blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        mu = torch.cat(result_rows, dim=-2)
+        return mu
+
 
 def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     """
@@ -763,3 +830,24 @@ class WanVAE:
     def decode(self, zs):
         with torch.amp.autocast('cuda', dtype=self.dtype):
             return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]
+
+    def spatial_tiled_encode(self, videos, tile_size=256, any_end_frame=False):
+        """
+        Encode videos using spatial tiling to reduce memory usage.
+        Fallback method for when normal encode causes OOM.
+
+        Args:
+            videos: A list of videos each with shape [C, T, H, W]
+            tile_size: Size of tiles in pixel space (256 for >=4GB free, 128 for less)
+            any_end_frame: If True, use FLF temporal chunking
+
+        Returns:
+            List of encoded latent tensors [C, T, H//8, W//8]
+        """
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            return [
+                self.model.spatial_tiled_encode(
+                    u.unsqueeze(0), self.scale, tile_size=tile_size, any_end_frame=any_end_frame
+                ).float().squeeze(0)
+                for u in videos
+            ]
