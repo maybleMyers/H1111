@@ -1309,6 +1309,7 @@ def svi_batch_handler(
     # SVI settings
     num_clips: int,
     overlap_frames: int,
+    num_motion_latent: int,
     svi_lora: bool,
     # TeaCache settings
     tea_cache_enabled: bool,
@@ -1448,6 +1449,9 @@ def svi_batch_handler(
         if is_video_extension or effective_num_clips > 1:
             command.extend(["--num_clips", str(effective_num_clips)])
             command.extend(["--overlap_frames", str(overlap_frames)])
+            # SVI Pro: motion latent passing
+            if num_motion_latent > 0:
+                command.extend(["--num_motion_latent", str(int(num_motion_latent))])
             if effective_num_clips > 1:
                 command.append("--prompt_list")
                 command.extend(prompt_list[:effective_num_clips])
@@ -9773,6 +9777,8 @@ with gr.Blocks(
                                                  info="How many clips to chain together")
                         svi_overlap_frames = gr.Slider(minimum=0, maximum=16, step=1, label="Overlap Frames", value=1,
                                                       info="Overlapping frames between clips")
+                        svi_num_motion_latent = gr.Slider(minimum=0, maximum=4, step=1, label="Motion Latent Frames", value=1,
+                                                          info="Latent frames from previous clip for motion context (SVI Pro mode, 0=image-only)")
 
                     svi_lora_format = gr.Checkbox(
                         label="SVI LoRA Format Conversion",
@@ -13995,6 +14001,7 @@ with gr.Blocks(
             # SVI settings
             svi_num_clips,
             svi_overlap_frames,
+            svi_num_motion_latent,
             svi_lora_format,
             # TeaCache settings
             svi_tea_cache_enabled,

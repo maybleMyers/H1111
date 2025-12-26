@@ -823,6 +823,8 @@ def parse_args() -> argparse.Namespace:
                        help="List of prompts for multi-clip generation. One prompt per clip. If fewer prompts than clips, last prompt is repeated.")
     parser.add_argument("--overlap_frames", type=int, default=1,
                        help="Number of overlapping frames between clips for smooth transitions (SVI mode).")
+    parser.add_argument("--num_motion_latent", type=int, default=1,
+                       help="Number of latent frames from previous clip for motion context (SVI Pro mode). 0=disable latent passing, use image-only chaining.")
 
     # SVI LoRA format support
     parser.add_argument("--svi_lora", action="store_true",
@@ -2661,14 +2663,21 @@ def prepare_i2v_inputs(
                 del zero_frames, enc_sequence
             else:
                 # Standard single-image mode (no end frame)
-                # Use original padding approach for backwards compatibility
-                padding_frames_needed = frames - 1
-                if padding_frames_needed < 0:
-                    padding_frames_needed = 0
+                # Check for SVI Pro latent conditioning
+                prev_last_latent = getattr(args, '_prev_last_latent', None)
+                num_motion_latent = getattr(args, '_num_motion_latent', 0)
+                use_svi_pro_latent = (prev_last_latent is not None and num_motion_latent > 0)
 
-                img_padded = img_resized
-                if padding_frames_needed > 0:
-                    # === SVI ANCHOR MECHANISM ===
+                if use_svi_pro_latent:
+                    # === SVI PRO: LATENT-SPACE CONDITIONING ===
+                    # Construct y_latent directly in latent space: anchor + motion_latent + padding
+                    # This avoids repeated VAE encode/decode cycles between clips
+                    logger.info(f"SVI Pro latent conditioning: Using prev_last_latent with {num_motion_latent} motion frames")
+
+                    # Calculate total latent frames needed
+                    total_latent_frames = (frames - 1) // 4 + 1
+
+                    # Encode anchor image to latent (always the original first image in SVI)
                     anchor_tensor = None
                     if getattr(args, 'anchor_image', None) is not None:
                         try:
@@ -2677,44 +2686,112 @@ def prepare_i2v_inputs(
                             anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
                             anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
                             anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)
-                            logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
+                            logger.info(f"SVI Pro: Loaded anchor image {args.anchor_image}")
                         except Exception as e:
-                            logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
-                            anchor_tensor = None
-                    elif getattr(args, 'svi_mode', False):
+                            logger.warning(f"Failed to load anchor image: {e}. Using input image as anchor.")
+                            anchor_tensor = img_resized.squeeze(1)
+                    else:
                         anchor_tensor = img_resized.squeeze(1)
-                        logger.info("SVI mode: Using input image as anchor for frame padding")
 
-                    if anchor_tensor is not None:
-                        padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
-                        logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
-                    else:
-                        padding_tensor = torch.zeros(
-                            img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
-                            device=device, dtype=img_resized.dtype
-                        )
-                    img_padded = torch.cat([img_resized, padding_tensor], dim=1)
-
-                # Encode with OOM fallback to tiled encode
-                try:
-                    y_latent = vae.encode([img_padded])[0]
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                    if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
-                        logger.warning(f"VAE encode OOM, falling back to spatial tiled encode: {e}")
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        if hasattr(vae, 'spatial_tiled_encode'):
-                            try:
-                                free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
-                                tile_size = 256 if free_mem >= 4000 else 128
-                            except:
-                                tile_size = 128
-                            logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
-                            y_latent = vae.spatial_tiled_encode([img_padded], tile_size=tile_size)[0]
+                    # Encode anchor to latent [C, 1, lat_h, lat_w]
+                    anchor_for_encode = anchor_tensor.unsqueeze(1)  # [C, 1, H, W]
+                    try:
+                        anchor_latent = vae.encode([anchor_for_encode])[0]  # [16, 1, lat_h, lat_w]
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                            logger.warning(f"Anchor encode OOM, using spatial tiled encode")
+                            torch.cuda.empty_cache()
+                            if hasattr(vae, 'spatial_tiled_encode'):
+                                anchor_latent = vae.spatial_tiled_encode([anchor_for_encode], tile_size=128)[0]
+                            else:
+                                raise
                         else:
-                            raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                            raise
+
+                    logger.info(f"SVI Pro: anchor_latent shape: {anchor_latent.shape}")
+
+                    # Get motion latent from previous clip (last N frames)
+                    # prev_last_latent is [C, F, lat_h, lat_w] from previous clip
+                    motion_latent = prev_last_latent[:, -num_motion_latent:].to(device=device, dtype=anchor_latent.dtype)
+                    logger.info(f"SVI Pro: motion_latent shape: {motion_latent.shape}")
+
+                    # Calculate padding size
+                    padding_size = total_latent_frames - anchor_latent.shape[1] - motion_latent.shape[1]
+                    if padding_size < 0:
+                        logger.warning(f"SVI Pro: padding_size negative ({padding_size}), adjusting motion_latent")
+                        # Reduce motion latent frames if too many
+                        motion_latent = motion_latent[:, :total_latent_frames - anchor_latent.shape[1]]
+                        padding_size = 0
+
+                    # Create zero padding in latent space
+                    if padding_size > 0:
+                        padding = torch.zeros(
+                            anchor_latent.shape[0], padding_size, anchor_latent.shape[2], anchor_latent.shape[3],
+                            dtype=anchor_latent.dtype, device=device
+                        )
+                        # SVI Pro y_latent: anchor + motion + padding
+                        y_latent = torch.cat([anchor_latent, motion_latent, padding], dim=1)
                     else:
-                        raise
+                        y_latent = torch.cat([anchor_latent, motion_latent], dim=1)
+
+                    logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, motion={motion_latent.shape[1]}, padding={padding_size})")
+
+                else:
+                    # === STANDARD / SVI 2.0 (NON-PRO): PIXEL-SPACE PADDING ===
+                    # Use original padding approach for backwards compatibility
+                    padding_frames_needed = frames - 1
+                    if padding_frames_needed < 0:
+                        padding_frames_needed = 0
+
+                    img_padded = img_resized
+                    if padding_frames_needed > 0:
+                        # === SVI ANCHOR MECHANISM ===
+                        anchor_tensor = None
+                        if getattr(args, 'anchor_image', None) is not None:
+                            try:
+                                anchor_img = Image.open(args.anchor_image).convert("RGB")
+                                anchor_cv2 = np.array(anchor_img)
+                                anchor_interpolation = cv2.INTER_AREA if target_height < anchor_cv2.shape[0] else cv2.INTER_CUBIC
+                                anchor_resized_np = cv2.resize(anchor_cv2, (target_width, target_height), interpolation=anchor_interpolation)
+                                anchor_tensor = TF.to_tensor(anchor_resized_np).sub_(0.5).div_(0.5).to(device)
+                                logger.info(f"SVI anchor mechanism: Using anchor image {args.anchor_image} for frame padding")
+                            except Exception as e:
+                                logger.warning(f"Failed to load anchor image: {e}. Using zeros for padding.")
+                                anchor_tensor = None
+                        elif getattr(args, 'svi_mode', False):
+                            anchor_tensor = img_resized.squeeze(1)
+                            logger.info("SVI mode: Using input image as anchor for frame padding")
+
+                        if anchor_tensor is not None:
+                            padding_tensor = anchor_tensor.unsqueeze(1).repeat(1, padding_frames_needed, 1, 1)
+                            logger.info(f"SVI anchor padding: {padding_frames_needed} frames filled with anchor")
+                        else:
+                            padding_tensor = torch.zeros(
+                                img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
+                                device=device, dtype=img_resized.dtype
+                            )
+                        img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+
+                    # Encode with OOM fallback to tiled encode
+                    try:
+                        y_latent = vae.encode([img_padded])[0]
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                            logger.warning(f"VAE encode OOM, falling back to spatial tiled encode: {e}")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            if hasattr(vae, 'spatial_tiled_encode'):
+                                try:
+                                    free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                                    tile_size = 256 if free_mem >= 4000 else 128
+                                except:
+                                    tile_size = 128
+                                logger.info(f"Using spatial tiled encode with tile_size={tile_size}")
+                                y_latent = vae.spatial_tiled_encode([img_padded], tile_size=tile_size)[0]
+                            else:
+                                raise RuntimeError("VAE OOM and spatial_tiled_encode not available") from e
+                        else:
+                            raise
 
         # --- FLF IMPROVED: Proper Mask Construction with Temporal Interleaving ---
         # Build mask in FRAME space first, then apply temporal interleaving (Wan2GP style)
@@ -4696,14 +4773,16 @@ def generate_svi_multi_clip(
     num_clips: int,
     prompts: Optional[list] = None,
     overlap_frames: int = 1,
+    num_motion_latent: int = 1,
 ) -> torch.Tensor:
-    """Generate multi-clip streaming video using SVI (Stable-Video-Infinity) approach.
+    """Generate multi-clip streaming video using SVI Pro (Stable-Video-Infinity) approach.
 
-    This implements the SVI algorithm for generating consistent long videos:
+    This implements the SVI Pro algorithm for generating consistent long videos:
     1. Generate first clip from initial image
     2. For each subsequent clip:
        - Use last frame of previous clip as new input image
        - Use original image as anchor for cross-clip consistency
+       - Pass prev_last_latent for latent-based motion conditioning (Pro mode)
        - Optionally use different prompts per clip for storytelling
 
     Args:
@@ -4712,6 +4791,7 @@ def generate_svi_multi_clip(
         num_clips: Number of clips to generate
         prompts: Optional list of prompts (one per clip). If None or shorter, uses args.prompt.
         overlap_frames: Number of overlapping frames between clips for smooth transitions
+        num_motion_latent: Number of latent frames from previous clip for motion context (0=disable)
 
     Returns:
         torch.Tensor: Combined video tensor [1, C, F, H, W]
@@ -4720,8 +4800,9 @@ def generate_svi_multi_clip(
     import shutil
     import time
 
-    logger.info(f"Starting SVI multi-clip generation: {num_clips} clips from {initial_image_path}")
+    logger.info(f"Starting SVI Pro multi-clip generation: {num_clips} clips from {initial_image_path}")
     logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
+    logger.info(f"SVI Pro mode: num_motion_latent={num_motion_latent}")
 
     # Store original values
     original_image_path = args.image_path
@@ -4729,12 +4810,17 @@ def generate_svi_multi_clip(
     original_anchor_image = getattr(args, 'anchor_image', None)
     original_svi_mode = getattr(args, 'svi_mode', False)
     original_seed = args.seed  # Store original seed for per-clip variation
+    original_prev_last_latent = getattr(args, '_prev_last_latent', None)
+    original_num_motion_latent = getattr(args, '_num_motion_latent', 0)
 
     # Create temp directory for intermediate outputs
     temp_dir = tempfile.mkdtemp()
     all_clips = []
     current_input_image = initial_image_path
     anchor_image = initial_image_path  # SVI anchor: always the original image
+
+    # SVI Pro: Track latent for passing between clips
+    prev_last_latent = None
 
     try:
         # Enable SVI mode for anchor padding
@@ -4763,10 +4849,21 @@ def generate_svi_multi_clip(
             args.image_path = current_input_image
             logger.info(f"Clip {clip_idx + 1} input image: {args.image_path}")
 
+            # SVI Pro: Pass latent context for motion conditioning
+            args._prev_last_latent = prev_last_latent
+            args._num_motion_latent = num_motion_latent
+            if prev_last_latent is not None:
+                logger.info(f"Clip {clip_idx + 1} using prev_last_latent with shape: {prev_last_latent.shape}")
+
             # Generate clip
             clip_latent = generate(args)
             if clip_latent is None:
                 raise RuntimeError(f"Failed to generate clip {clip_idx + 1}")
+
+            # SVI Pro: Store latent for next clip (BEFORE decoding)
+            if num_motion_latent > 0:
+                prev_last_latent = clip_latent.squeeze(0).detach()  # [C, F, H, W]
+                logger.info(f"Stored prev_last_latent with shape: {prev_last_latent.shape}")
 
             # Decode latent to pixels
             from Wan2_2.wan.configs import WAN_CONFIGS as WAN22_CONFIGS
@@ -4781,7 +4878,7 @@ def generate_svi_multi_clip(
                 # Skip first `overlap_frames` frames to avoid duplication
                 all_clips.append(clip_tensor[:, :, overlap_frames:, :, :])
 
-            # Extract last frame as input for next clip
+            # Extract last frame as input for next clip (still needed for CLIP encoder)
             if clip_idx < num_clips - 1:
                 last_frame = clip_tensor[0, :, -1, :, :]  # [C, H, W]
                 last_frame_np = (last_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -4807,6 +4904,8 @@ def generate_svi_multi_clip(
         args.anchor_image = original_anchor_image
         args.svi_mode = original_svi_mode
         args.seed = original_seed
+        args._prev_last_latent = original_prev_last_latent
+        args._num_motion_latent = original_num_motion_latent
 
         # Cleanup temp directory
         if os.path.exists(temp_dir):
@@ -4825,6 +4924,7 @@ def generate_svi_video_extension(
     frames_to_check: int = 30,
     anchor_image_path: Optional[str] = None,
     prepend_original: bool = True,
+    num_motion_latent: int = 1,
 ) -> torch.Tensor:
     import tempfile
     import shutil
@@ -4892,6 +4992,7 @@ def generate_svi_video_extension(
             num_clips=num_clips,
             prompts=prompts,
             overlap_frames=overlap_frames,
+            num_motion_latent=num_motion_latent,
         )
         logger.info(f"Extension tensor shape: {extension_tensor.shape}")
 
@@ -6563,6 +6664,7 @@ def main():
                     frames_to_check=getattr(args, 'svi_extend_frames_to_check', 30),
                     anchor_image_path=getattr(args, 'svi_extend_anchor', None),
                     prepend_original=getattr(args, 'svi_extend_prepend', True),
+                    num_motion_latent=getattr(args, 'num_motion_latent', 1),
                 )
             else:
                 final_video_tensor = generate_svi_multi_clip(
@@ -6571,6 +6673,7 @@ def main():
                     num_clips=args.num_clips,
                     prompts=prompts,
                     overlap_frames=args.overlap_frames,
+                    num_motion_latent=getattr(args, 'num_motion_latent', 1),
                 )
 
             # Save the multi-clip video directly (it's already in pixel space)
