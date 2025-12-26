@@ -4955,10 +4955,30 @@ def generate_extended_video(
             model_manager=model_manager
         )
         
-        # Decode the generated latent
+        # Decode the generated latent with OOM fallback to tiled decode
         vae.to_device(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
-            decoded_chunk = vae.decode([final_latent.squeeze(0)])[0]
+            latent_list = [final_latent.squeeze(0)]
+            try:
+                decoded_chunk = vae.decode(latent_list)[0]
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE decode OOM in extend_video, falling back to spatial tiled decode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        decoded_chunk = vae.spatial_tiled_decode(latent_list, tile_size=tile_size)[0]
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_decode not available") from e
+                else:
+                    raise
         
         if args.color_match != "disabled":
             try:
@@ -6088,14 +6108,40 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     # Ensure latent is on the correct device and expected dtype for VAE
     latent_decode = latent.to(device=device, dtype=vae.dtype)
 
-    # Handle different VAE decode APIs
+    # Handle different VAE decode APIs with OOM fallback to tiled decoding
     videos = None
     with torch.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
         if hasattr(vae, 'model') and hasattr(vae, 'scale'):
             # Wan2_2_VAE type - expects list of [C, F, H, W] tensors
             # Convert [1, 48, 21, 44, 80] -> list of [48, 21, 44, 80]
             latent_list = [latent_decode.squeeze(0)]  # Remove batch dim for list
-            decoded_list = vae.decode(latent_list)
+
+            try:
+                # Try normal decode first
+                decoded_list = vae.decode(latent_list)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    # OOM occurred - fall back to tiled decode
+                    logger.warning(f"VAE decode OOM, falling back to spatial tiled decode: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    # Check if tiled decode is available
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        # Determine tile size based on available VRAM
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)  # MB
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128  # Conservative default
+
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        decoded_list = vae.spatial_tiled_decode(latent_list, tile_size=tile_size)
+                    else:
+                        raise RuntimeError("VAE OOM and spatial_tiled_decode not available") from e
+                else:
+                    raise  # Re-raise non-OOM errors
+
             if decoded_list and len(decoded_list) > 0:
                 # Stack list back into batch dimension: [1, C, F, H, W]
                 videos = torch.stack(decoded_list, dim=0)
@@ -6103,7 +6149,31 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
                 raise RuntimeError("VAE decoding failed or returned empty list.")
         else:
             # Original WanVAE type - handles tensor input directly
-            decoded_list = vae.decode(latent_decode)
+            try:
+                decoded_list = vae.decode(latent_decode)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    logger.warning(f"VAE decode OOM with original WanVAE: {e}")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                    # Check if tiled decode is available (may be added to WanVAE in future)
+                    if hasattr(vae, 'spatial_tiled_decode'):
+                        try:
+                            free_mem = torch.cuda.mem_get_info()[0] / (1024 ** 2)
+                            tile_size = 256 if free_mem >= 4000 else 128
+                        except:
+                            tile_size = 128
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        decoded_list = vae.spatial_tiled_decode(latent_decode, tile_size=tile_size)
+                    else:
+                        raise RuntimeError(
+                            "VAE OOM occurred. spatial_tiled_decode not available for this VAE type. "
+                            "Consider using Wan2_2_VAE or reducing video resolution."
+                        ) from e
+                else:
+                    raise
+
             if decoded_list and len(decoded_list) > 0:
                 videos = torch.stack(decoded_list, dim=0)
             else:

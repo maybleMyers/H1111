@@ -1063,3 +1063,130 @@ class Wan2_2_VAE:
         self.model.to(dtype=dtype)
         self.scale[0] = self.scale[0].to(dtype)  # mean
         self.scale[1] = self.scale[1].to(dtype)  # 1/std
+
+    def _blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors vertically with linear interpolation."""
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def _blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        """Blend two tensors horizontally with linear interpolation."""
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def spatial_tiled_decode(self, zs, tile_size=256):
+        """
+        Decode latents using spatial tiling to reduce memory usage.
+        Adapted from Wan2GP's spatial_tiled_decode implementation.
+
+        Args:
+            zs: List of latent tensors [C, F, H, W]
+            tile_size: Size of tiles in pixel space (will be divided by 8 for latent space)
+                      Use 256 for >=8GB VRAM, 128 for <8GB VRAM
+
+        Returns:
+            List of decoded video tensors [C, F, H, W]
+        """
+        try:
+            if not isinstance(zs, list):
+                raise TypeError("zs should be a list")
+
+            results = []
+            for z in zs:
+                # z: [C, F, H, W] -> add batch dim -> [1, C, F, H, W]
+                z_batch = z.unsqueeze(0)
+
+                tile_latent_min_size = tile_size // 8  # Convert pixel size to latent size
+                tile_overlap_factor = 0.25
+
+                # Apply inverse scale transform (same as in model.decode)
+                scale = self.scale
+                if isinstance(scale[0], torch.Tensor):
+                    z_scaled = z_batch / scale[1].view(1, -1, 1, 1, 1) + scale[0].view(1, -1, 1, 1, 1)
+                else:
+                    z_scaled = z_batch / scale[1] + scale[0]
+
+                # Calculate overlap and blend parameters
+                overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))  # 75% step
+                # Output is 8x larger than latent (VAE upsamples by 8)
+                tile_sample_min_size = tile_size
+                blend_extent = int(tile_sample_min_size * tile_overlap_factor)  # 25% blend region
+                row_limit = tile_sample_min_size - blend_extent
+
+                h_latent, w_latent = z_scaled.shape[-2], z_scaled.shape[-1]
+
+                # Decode tiles with overlap
+                rows = []
+                for i in range(0, h_latent, overlap_size):
+                    row = []
+                    for j in range(0, w_latent, overlap_size):
+                        # Extract tile
+                        tile = z_scaled[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size]
+
+                        # Decode this tile using the internal model decode (without scale transform)
+                        # We need to bypass scale since we already applied it
+                        self.model.clear_cache()
+                        iter_ = tile.shape[2]
+                        x = self.model.conv2(tile)
+
+                        with amp.autocast(dtype=self.dtype):
+                            for frame_idx in range(iter_):
+                                self.model._conv_idx = [0]
+                                if frame_idx == 0:
+                                    out = self.model.decoder(
+                                        x[:, :, frame_idx:frame_idx + 1, :, :],
+                                        feat_cache=self.model._feat_map,
+                                        feat_idx=self.model._conv_idx,
+                                        first_chunk=True,
+                                    )
+                                else:
+                                    out_ = self.model.decoder(
+                                        x[:, :, frame_idx:frame_idx + 1, :, :],
+                                        feat_cache=self.model._feat_map,
+                                        feat_idx=self.model._conv_idx,
+                                    )
+                                    out = torch.cat([out, out_], 2)
+
+                            decoded = unpatchify(out, patch_size=2)
+                        self.model.clear_cache()
+
+                        # Clear intermediate tensors
+                        del tile, x, out
+                        torch.cuda.empty_cache()
+
+                        row.append(decoded)
+                    rows.append(row)
+
+                # Blend tiles together
+                result_rows = []
+                for i, row in enumerate(rows):
+                    result_row = []
+                    for j, tile in enumerate(row):
+                        # Blend with tile above
+                        if i > 0:
+                            tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
+                        # Blend with tile to the left
+                        if j > 0:
+                            tile = self._blend_h(row[j - 1], tile, blend_extent)
+                        result_row.append(tile[:, :, :, :row_limit, :row_limit])
+                    result_rows.append(torch.cat(result_row, dim=-1))
+
+                decoded_full = torch.cat(result_rows, dim=-2)
+
+                # Clamp and remove batch dim: [1, C, F, H, W] -> [C, F, H, W]
+                decoded_full = decoded_full.float().clamp_(-1, 1).squeeze(0)
+                results.append(decoded_full)
+
+                # Clean up
+                del rows, result_rows, z_batch, z_scaled
+                torch.cuda.empty_cache()
+
+            return results
+
+        except TypeError as e:
+            logging.info(e)
+            return None
