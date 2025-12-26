@@ -825,6 +825,10 @@ def parse_args() -> argparse.Namespace:
                        help="Number of overlapping frames between clips for smooth transitions (SVI mode).")
     parser.add_argument("--num_motion_latent", type=int, default=1,
                        help="Number of latent frames from previous clip for motion context (SVI Pro mode). 0=disable latent passing, use image-only chaining.")
+    parser.add_argument("--num_motion_frame", type=int, default=1,
+                       help="Number of frames to look back from previous clip for next input image (SVI Pro mode). Default: 1 (last frame only).")
+    parser.add_argument("--seed_multiplier", type=int, default=42,
+                       help="Seed multiplier for per-clip variation (seed = base_seed + clip_idx * multiplier). Default: 42.")
 
     # SVI LoRA format support
     parser.add_argument("--svi_lora", action="store_true",
@@ -2666,13 +2670,24 @@ def prepare_i2v_inputs(
                 # Check for SVI Pro latent conditioning
                 prev_last_latent = getattr(args, '_prev_last_latent', None)
                 num_motion_latent = getattr(args, '_num_motion_latent', 0)
-                use_svi_pro_latent = (prev_last_latent is not None and num_motion_latent > 0)
+                svi_mode_active = getattr(args, 'svi_mode', False)
+
+                # Use SVI Pro approach (latent-space) when:
+                # 1. We have prev_last_latent (subsequent clips), OR
+                # 2. SVI mode is active with num_motion_latent > 0 (first clip in Pro mode)
+                use_svi_pro_latent = (prev_last_latent is not None and num_motion_latent > 0) or \
+                                     (svi_mode_active and num_motion_latent > 0)
 
                 if use_svi_pro_latent:
                     # === SVI PRO: LATENT-SPACE CONDITIONING ===
                     # Construct y_latent directly in latent space: anchor + motion_latent + padding
-                    # This avoids repeated VAE encode/decode cycles between clips
-                    logger.info(f"SVI Pro latent conditioning: Using prev_last_latent with {num_motion_latent} motion frames")
+                    # For first clip: anchor + zeros (no motion latent)
+                    # For subsequent clips: anchor + motion_latent + zeros
+                    is_first_clip = (prev_last_latent is None)
+                    if is_first_clip:
+                        logger.info(f"SVI Pro latent conditioning: First clip - using anchor + zero padding")
+                    else:
+                        logger.info(f"SVI Pro latent conditioning: Using prev_last_latent with {num_motion_latent} motion frames")
 
                     # Calculate total latent frames needed
                     total_latent_frames = (frames - 1) // 4 + 1
@@ -2710,31 +2725,42 @@ def prepare_i2v_inputs(
 
                     logger.info(f"SVI Pro: anchor_latent shape: {anchor_latent.shape}")
 
-                    # Get motion latent from previous clip (last N frames)
-                    # prev_last_latent is [C, F, lat_h, lat_w] from previous clip
-                    motion_latent = prev_last_latent[:, -num_motion_latent:].to(device=device, dtype=anchor_latent.dtype)
-                    logger.info(f"SVI Pro: motion_latent shape: {motion_latent.shape}")
-
-                    # Calculate padding size
-                    padding_size = total_latent_frames - anchor_latent.shape[1] - motion_latent.shape[1]
-                    if padding_size < 0:
-                        logger.warning(f"SVI Pro: padding_size negative ({padding_size}), adjusting motion_latent")
-                        # Reduce motion latent frames if too many
-                        motion_latent = motion_latent[:, :total_latent_frames - anchor_latent.shape[1]]
-                        padding_size = 0
-
-                    # Create zero padding in latent space
-                    if padding_size > 0:
+                    if is_first_clip:
+                        # First clip: anchor + zero padding (allows motion generation)
+                        padding_size = total_latent_frames - anchor_latent.shape[1]
                         padding = torch.zeros(
                             anchor_latent.shape[0], padding_size, anchor_latent.shape[2], anchor_latent.shape[3],
                             dtype=anchor_latent.dtype, device=device
                         )
-                        # SVI Pro y_latent: anchor + motion + padding
-                        y_latent = torch.cat([anchor_latent, motion_latent, padding], dim=1)
+                        y_latent = torch.cat([anchor_latent, padding], dim=1)
+                        logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, padding={padding_size})")
                     else:
-                        y_latent = torch.cat([anchor_latent, motion_latent], dim=1)
+                        # Subsequent clips: anchor + motion_latent + zero padding
+                        # Get motion latent from previous clip (last N frames)
+                        # prev_last_latent is [C, F, lat_h, lat_w] from previous clip
+                        motion_latent = prev_last_latent[:, -num_motion_latent:].to(device=device, dtype=anchor_latent.dtype)
+                        logger.info(f"SVI Pro: motion_latent shape: {motion_latent.shape}")
 
-                    logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, motion={motion_latent.shape[1]}, padding={padding_size})")
+                        # Calculate padding size
+                        padding_size = total_latent_frames - anchor_latent.shape[1] - motion_latent.shape[1]
+                        if padding_size < 0:
+                            logger.warning(f"SVI Pro: padding_size negative ({padding_size}), adjusting motion_latent")
+                            # Reduce motion latent frames if too many
+                            motion_latent = motion_latent[:, :total_latent_frames - anchor_latent.shape[1]]
+                            padding_size = 0
+
+                        # Create zero padding in latent space
+                        if padding_size > 0:
+                            padding = torch.zeros(
+                                anchor_latent.shape[0], padding_size, anchor_latent.shape[2], anchor_latent.shape[3],
+                                dtype=anchor_latent.dtype, device=device
+                            )
+                            # SVI Pro y_latent: anchor + motion + padding
+                            y_latent = torch.cat([anchor_latent, motion_latent, padding], dim=1)
+                        else:
+                            y_latent = torch.cat([anchor_latent, motion_latent], dim=1)
+
+                        logger.info(f"SVI Pro: y_latent shape: {y_latent.shape} (anchor={anchor_latent.shape[1]}, motion={motion_latent.shape[1]}, padding={padding_size})")
 
                 else:
                     # === STANDARD / SVI 2.0 (NON-PRO): PIXEL-SPACE PADDING ===
@@ -4774,13 +4800,15 @@ def generate_svi_multi_clip(
     prompts: Optional[list] = None,
     overlap_frames: int = 1,
     num_motion_latent: int = 1,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
 ) -> torch.Tensor:
     """Generate multi-clip streaming video using SVI Pro (Stable-Video-Infinity) approach.
 
     This implements the SVI Pro algorithm for generating consistent long videos:
     1. Generate first clip from initial image
     2. For each subsequent clip:
-       - Use last frame of previous clip as new input image
+       - Use frame from previous clip as new input image (controlled by num_motion_frame)
        - Use original image as anchor for cross-clip consistency
        - Pass prev_last_latent for latent-based motion conditioning (Pro mode)
        - Optionally use different prompts per clip for storytelling
@@ -4792,6 +4820,8 @@ def generate_svi_multi_clip(
         prompts: Optional list of prompts (one per clip). If None or shorter, uses args.prompt.
         overlap_frames: Number of overlapping frames between clips for smooth transitions
         num_motion_latent: Number of latent frames from previous clip for motion context (0=disable)
+        num_motion_frame: Frame offset from end of clip to use as next input (1=last frame, 4=4th from last)
+        seed_multiplier: Multiplier for per-clip seed variation (seed = base + clip_idx * multiplier)
 
     Returns:
         torch.Tensor: Combined video tensor [1, C, F, H, W]
@@ -4802,7 +4832,7 @@ def generate_svi_multi_clip(
 
     logger.info(f"Starting SVI Pro multi-clip generation: {num_clips} clips from {initial_image_path}")
     logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
-    logger.info(f"SVI Pro mode: num_motion_latent={num_motion_latent}")
+    logger.info(f"SVI Pro mode: num_motion_latent={num_motion_latent}, num_motion_frame={num_motion_frame}, seed_multiplier={seed_multiplier}")
 
     # Store original values
     original_image_path = args.image_path
@@ -4830,11 +4860,11 @@ def generate_svi_multi_clip(
         for clip_idx in range(num_clips):
             logger.info(f"=== Generating clip {clip_idx + 1}/{num_clips} ===")
 
-            # SVI: Vary seed per clip for different motion (following SVI reference implementation)
-            # seed = clip_idx * seed_multiplier pattern from Stable-Video-Infinity
-            clip_seed = original_seed + clip_idx * 42
+            # SVI: Vary seed per clip for different motion (following SVI Pro reference implementation)
+            # seed = base_seed + clip_idx * seed_multiplier pattern from Stable-Video-Infinity
+            clip_seed = original_seed + clip_idx * seed_multiplier
             args.seed = clip_seed
-            logger.info(f"Clip {clip_idx + 1} seed: {clip_seed} (base: {original_seed}, offset: {clip_idx * 42})")
+            logger.info(f"Clip {clip_idx + 1} seed: {clip_seed} (base: {original_seed}, offset: {clip_idx * seed_multiplier})")
 
             # Set prompt for this clip
             if prompts and clip_idx < len(prompts):
@@ -4878,16 +4908,18 @@ def generate_svi_multi_clip(
                 # Skip first `overlap_frames` frames to avoid duplication
                 all_clips.append(clip_tensor[:, :, overlap_frames:, :, :])
 
-            # Extract last frame as input for next clip (still needed for CLIP encoder)
+            # Extract frame for next clip input (controlled by num_motion_frame)
+            # num_motion_frame=1 means last frame, num_motion_frame=4 means 4th from last
             if clip_idx < num_clips - 1:
-                last_frame = clip_tensor[0, :, -1, :, :]  # [C, H, W]
-                last_frame_np = (last_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                frame_idx = -min(num_motion_frame, clip_tensor.shape[2])  # Ensure we don't go out of bounds
+                motion_frame = clip_tensor[0, :, frame_idx, :, :]  # [C, H, W]
+                motion_frame_np = (motion_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-                # Save last frame as temp image
-                temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_last_frame.png")
-                cv2.imwrite(temp_image_path, cv2.cvtColor(last_frame_np, cv2.COLOR_RGB2BGR))
+                # Save motion frame as temp image
+                temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_motion_frame.png")
+                cv2.imwrite(temp_image_path, cv2.cvtColor(motion_frame_np, cv2.COLOR_RGB2BGR))
                 current_input_image = temp_image_path
-                logger.info(f"Saved last frame to {temp_image_path} for next clip input")
+                logger.info(f"Saved frame {frame_idx} to {temp_image_path} for next clip input (num_motion_frame={num_motion_frame})")
 
             # Brief pause between clips
             time.sleep(0.5)
@@ -4925,6 +4957,8 @@ def generate_svi_video_extension(
     anchor_image_path: Optional[str] = None,
     prepend_original: bool = True,
     num_motion_latent: int = 1,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
 ) -> torch.Tensor:
     import tempfile
     import shutil
@@ -4993,6 +5027,8 @@ def generate_svi_video_extension(
             prompts=prompts,
             overlap_frames=overlap_frames,
             num_motion_latent=num_motion_latent,
+            num_motion_frame=num_motion_frame,
+            seed_multiplier=seed_multiplier,
         )
         logger.info(f"Extension tensor shape: {extension_tensor.shape}")
 
@@ -6665,6 +6701,8 @@ def main():
                     anchor_image_path=getattr(args, 'svi_extend_anchor', None),
                     prepend_original=getattr(args, 'svi_extend_prepend', True),
                     num_motion_latent=getattr(args, 'num_motion_latent', 1),
+                    num_motion_frame=getattr(args, 'num_motion_frame', 1),
+                    seed_multiplier=getattr(args, 'seed_multiplier', 42),
                 )
             else:
                 final_video_tensor = generate_svi_multi_clip(
@@ -6674,6 +6712,8 @@ def main():
                     prompts=prompts,
                     overlap_frames=args.overlap_frames,
                     num_motion_latent=getattr(args, 'num_motion_latent', 1),
+                    num_motion_frame=getattr(args, 'num_motion_frame', 1),
+                    seed_multiplier=getattr(args, 'seed_multiplier', 42),
                 )
 
             # Save the multi-clip video directly (it's already in pixel space)

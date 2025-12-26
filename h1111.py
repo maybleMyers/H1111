@@ -1310,6 +1310,8 @@ def svi_batch_handler(
     num_clips: int,
     overlap_frames: int,
     num_motion_latent: int,
+    num_motion_frame: int,
+    seed_multiplier: int,
     svi_lora: bool,
     # TeaCache settings
     tea_cache_enabled: bool,
@@ -1452,6 +1454,11 @@ def svi_batch_handler(
             # SVI Pro: motion latent passing
             if num_motion_latent > 0:
                 command.extend(["--num_motion_latent", str(int(num_motion_latent))])
+            # SVI Pro: motion frame and seed multiplier
+            if num_motion_frame > 1:
+                command.extend(["--num_motion_frame", str(int(num_motion_frame))])
+            if seed_multiplier != 42:  # Only pass if different from default
+                command.extend(["--seed_multiplier", str(int(seed_multiplier))])
             if effective_num_clips > 1:
                 command.append("--prompt_list")
                 command.extend(prompt_list[:effective_num_clips])
@@ -9779,6 +9786,11 @@ with gr.Blocks(
                                                       info="Overlapping frames between clips")
                         svi_num_motion_latent = gr.Slider(minimum=0, maximum=4, step=1, label="Motion Latent Frames", value=1,
                                                           info="Latent frames from previous clip for motion context (SVI Pro mode, 0=image-only)")
+                    with gr.Row():
+                        svi_num_motion_frame = gr.Slider(minimum=1, maximum=8, step=1, label="Motion Frame Offset", value=1,
+                                                          info="Frame offset from end for next clip input (1=last frame)")
+                        svi_seed_multiplier = gr.Slider(minimum=1, maximum=200, step=1, label="Seed Multiplier", value=42,
+                                                         info="Per-clip seed variation (seed = base + clip * multiplier)")
 
                     svi_lora_format = gr.Checkbox(
                         label="SVI LoRA Format Conversion",
@@ -14002,6 +14014,8 @@ with gr.Blocks(
             svi_num_clips,
             svi_overlap_frames,
             svi_num_motion_latent,
+            svi_num_motion_frame,
+            svi_seed_multiplier,
             svi_lora_format,
             # TeaCache settings
             svi_tea_cache_enabled,
