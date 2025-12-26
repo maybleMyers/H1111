@@ -18,4 +18,4 @@ A cool thing to try are the mixed weight models, I preserved all the weights tha
 
 ### SVI Long Video generation
 
-Download loras from https://huggingface.co/vita-video-gen/svi-model/tree/main/version-2.0 and use them in the svi tab of the gui.
+Download loras from https://huggingface.co/vita-video-gen/svi-model/tree/main/version-2.0 and use them in the svi tab of the gui. Lightx latest i2v 10lora seems to work with cfg distill sampler.  wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/tree/main  
