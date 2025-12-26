@@ -736,10 +736,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--injection_strength", type=float, default=1.0, help="Strength of motion frame injection (0.0-1.0, 1.0=full replacement)")
     parser.add_argument("--motion_noise_ratio", type=float, default=0.3, 
                        help="Noise ratio for motion frames in extension (0.0-1.0, lower=less noise/more preservation)")
-    parser.add_argument("--color_match", type=str, default="hm", 
+    parser.add_argument("--color_match", type=str, default="hm",
                        choices=["disabled", "hm", "mkl", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"],
                        help="Color matching method for video extension (default: histogram matching)")
-    
+
+    # Video Join arguments - join two videos with generated transition
+    parser.add_argument("--video_join", type=str, default=None, help="Path to input video for video join (uses FLF to create transition)")
+    parser.add_argument("--ending_video", type=str, default=None, help="Path to ending video to join with input video")
+    parser.add_argument("--join_frames_input", type=int, default=30, help="Number of frames from end of input video to check for best transition frame")
+    parser.add_argument("--join_frames_ending", type=int, default=30, help="Number of frames from start of ending video to check for best transition frame")
+
     # Context Windows Arguments
     parser.add_argument("--use_context_windows", action="store_true", 
                        help="Enable sliding context windows for long video generation")
@@ -4378,6 +4384,195 @@ def generate_extended_video_i2v_based(
     return final_video_tensor
 
 
+def extract_best_transition_frame_from_start(video_path: str, frames_to_check: int = 30) -> int:
+    """Extract the sharpest frame from the first N frames for smooth transition"""
+    import cv2
+
+    logger.info(f"Extracting best transition frame from first {frames_to_check} frames of {video_path}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("Failed to open video file")
+        return 0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    end_frame = min(total_frames, frames_to_check)
+
+    best_frame_idx = 0
+    max_sharpness = -1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    for frame_idx in range(end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Calculate sharpness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+
+    cap.release()
+
+    logger.info(f"Best transition frame from start: {best_frame_idx} with sharpness {max_sharpness:.2f}")
+    return best_frame_idx
+
+
+def generate_video_join(
+    args: argparse.Namespace,
+    input_video_path: str,
+    ending_video_path: str,
+    join_frames_input: int = 30,
+    join_frames_ending: int = 30,
+) -> torch.Tensor:
+    """
+    Join two videos by generating a transition between them using FLF (First-Last-Frame).
+
+    1. Extract best transition frame from end of input video
+    2. Extract best transition frame from start of ending video
+    3. Generate transition using FLF (start frame -> end frame)
+    4. Concatenate: input_video + transition + ending_video
+
+    Args:
+        args: Command line arguments
+        input_video_path: Path to the input video
+        ending_video_path: Path to the ending video
+        join_frames_input: Number of frames from end of input to check
+        join_frames_ending: Number of frames from start of ending to check
+
+    Returns:
+        torch.Tensor: Joined video tensor [1, C, F, H, W]
+    """
+    import tempfile
+    import cv2
+    import shutil
+    import time
+
+    logger.info(f"Starting video join: {input_video_path} -> {ending_video_path}")
+    logger.info(f"Checking {join_frames_input} frames from input end, {join_frames_ending} frames from ending start")
+    logger.info(f"Transition length: {args.video_length} frames")
+
+    # Create a temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp()
+
+    # Store original arguments
+    original_image_path = args.image_path
+    original_video_length = args.video_length
+    original_video_join = args.video_join
+    original_end_image_path = getattr(args, 'end_image_path', None)
+
+    try:
+        # 1. Extract best transition frame from end of input video
+        best_input_frame_idx = extract_best_transition_frame(input_video_path, frames_to_check=join_frames_input)
+
+        # 2. Extract best transition frame from start of ending video
+        best_ending_frame_idx = extract_best_transition_frame_from_start(ending_video_path, frames_to_check=join_frames_ending)
+
+        # 3. Load input video up to the best transition frame
+        if best_input_frame_idx > 0:
+            input_video_frames_np, _ = load_video(
+                input_video_path, 0, best_input_frame_idx + 1, bucket_reso=tuple(args.video_size)
+            )
+        else:
+            # Fallback: use all frames if extraction fails
+            logger.warning("Could not find sharp frame in input video. Using all frames.")
+            input_video_frames_np, _ = load_video(
+                input_video_path, 0, None, bucket_reso=tuple(args.video_size)
+            )
+
+        if not input_video_frames_np:
+            raise ValueError(f"Failed to load input video frames from {input_video_path}")
+
+        # Convert input video to tensor
+        input_video_tensor = torch.from_numpy(np.stack(input_video_frames_np, axis=0))
+        input_video_tensor = input_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+        input_video_tensor = input_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+        logger.info(f"Input video loaded with {input_video_tensor.shape[2]} frames")
+
+        # 4. Load ending video from best transition frame onwards
+        ending_video_frames_np, _ = load_video(
+            ending_video_path, best_ending_frame_idx, None, bucket_reso=tuple(args.video_size)
+        )
+
+        if not ending_video_frames_np:
+            raise ValueError(f"Failed to load ending video frames from {ending_video_path}")
+
+        # Convert ending video to tensor
+        ending_video_tensor = torch.from_numpy(np.stack(ending_video_frames_np, axis=0))
+        ending_video_tensor = ending_video_tensor.permute(0, 3, 1, 2).float() / 255.0  # [F,C,H,W], range [0,1]
+        ending_video_tensor = ending_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)      # [1,C,F,H,W]
+        logger.info(f"Ending video loaded with {ending_video_tensor.shape[2]} frames")
+
+        # 5. Get the last frame of input video (start image for FLF)
+        last_input_frame_np = (input_video_tensor[0, :, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 6. Get the first frame of ending video (end image for FLF)
+        first_ending_frame_np = (ending_video_tensor[0, :, 0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 7. Save both frames temporarily
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_start:
+            cv2.imwrite(tmp_start.name, cv2.cvtColor(last_input_frame_np, cv2.COLOR_RGB2BGR))
+            temp_start_image = tmp_start.name
+
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=temp_dir) as tmp_end:
+            cv2.imwrite(tmp_end.name, cv2.cvtColor(first_ending_frame_np, cv2.COLOR_RGB2BGR))
+            temp_end_image = tmp_end.name
+
+        logger.info(f"Saved start frame to {temp_start_image}")
+        logger.info(f"Saved end frame to {temp_end_image}")
+
+        # 8. Generate transition using FLF
+        args.image_path = temp_start_image
+        args.end_image_path = temp_end_image
+        args.video_join = None  # Prevent infinite recursion
+
+        logger.info(f"Generating FLF transition with {args.video_length} frames...")
+        transition_latent = generate(args)
+
+        # Clean up temp images
+        os.unlink(temp_start_image)
+        os.unlink(temp_end_image)
+
+        if transition_latent is None:
+            raise RuntimeError("Failed to generate transition video")
+
+        # 9. Decode transition from latent to pixel space
+        transition_video = decode_latent(transition_latent, args, WAN_CONFIGS[args.task])  # [B, C, F, H, W]
+        logger.info(f"Transition decoded with shape: {transition_video.shape}")
+
+        # 10. Concatenate: input_video + transition (skip first frame) + ending_video (skip first frame)
+        # Skip first frame of transition (it's duplicate of input's last frame)
+        # Skip first frame of ending (it's duplicate of transition's last frame / was used as end image)
+        final_video = torch.cat([
+            input_video_tensor,
+            transition_video[:, :, 1:-1, :, :],  # Skip first and last frames (duplicates)
+            ending_video_tensor[:, :, 1:, :, :]  # Skip first frame (duplicate of transition end)
+        ], dim=2)
+
+        logger.info(f"Video join complete! Final shape: {final_video.shape}")
+        logger.info(f"  Input: {input_video_tensor.shape[2]} frames")
+        logger.info(f"  Transition: {transition_video.shape[2] - 2} frames (excluding duplicates)")
+        logger.info(f"  Ending: {ending_video_tensor.shape[2] - 1} frames (excluding duplicate)")
+
+        return final_video
+
+    finally:
+        # Restore original arguments
+        args.image_path = original_image_path
+        args.video_length = original_video_length
+        args.video_join = original_video_join
+        args.end_image_path = original_end_image_path
+
+        # Clean up temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+
 def generate_svi_multi_clip(
     args: argparse.Namespace,
     initial_image_path: str,
@@ -4902,9 +5097,11 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     is_fun_control = args.control_path is not None and cfg.is_fun_control
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
     is_extension = args.extend_video is not None
+    is_video_join = args.video_join is not None and args.ending_video is not None
     is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
 
-    if is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
+    if is_video_join: logger.info(f"Running Video Join: {args.video_join} -> {args.ending_video}")
+    elif is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_ti2v: logger.info(f"Running Text+Image-to-Video (TI2V) inference")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
     elif is_v2v_i2v: logger.info(f"Running Video-to-Video (V2V) using i2v model")
@@ -5003,10 +5200,28 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
 
+    # Handle video join mode - must be before extension as it takes priority
+    if is_video_join:
+        logger.info(f"Joining videos: {args.video_join} + generated transition + {args.ending_video}")
+        try:
+            joined_video = generate_video_join(
+                args,
+                args.video_join,
+                args.ending_video,
+                args.join_frames_input,
+                args.join_frames_ending
+            )
+            return joined_video  # Return the joined video directly
+        except Exception as e:
+            logger.error(f"Video join failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
     # Handle video extension mode
     if is_extension:
         logger.info(f"Extending video from {args.extend_video} to {args.extend_frames} frames")
-        
+
         # Use clean i2v-based extension approach (much better than multitalk-style)
         # This approach extracts the best frame and generates smooth extensions
         try:

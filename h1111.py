@@ -476,6 +476,7 @@ def wan22_batch_handler(
     compile_enabled: bool,
     enable_v2v: bool, input_video: str, v2v_strength: float, v2v_low_noise_only: bool, v2v_use_i2v: bool,  # V2V parameters
     enable_extension: bool, extend_frames: int, frames_to_check: int, trim_tail_frames: int,  # Extension parameters
+    enable_video_join: bool, ending_video: str, join_frames_input: int, join_frames_ending: int,  # Video Join parameters
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
@@ -538,9 +539,20 @@ def wan22_batch_handler(
         elif "ti2v-5B" in task:
             command.extend(["--dit", os.path.join("wan", dit_path)])
 
-        # Handle V2V vs Extension mode
+        # Handle V2V vs Extension vs Video Join mode
         if enable_v2v and input_video:
-            if enable_extension:
+            if enable_video_join and ending_video:
+                # Video Join mode - generate transition between two videos
+                command.extend(["--video_join", str(input_video)])
+                command.extend(["--ending_video", str(ending_video)])
+                command.extend(["--join_frames_input", str(int(join_frames_input))])
+                command.extend(["--join_frames_ending", str(int(join_frames_ending))])
+
+                # Force i2v-A14B task for video join
+                if "i2v" not in task:
+                    yield [], None, f"Warning: Video Join mode requires i2v-A14B task, but got {task}. Please change task to i2v-A14B.", ""
+                    return
+            elif enable_extension:
                 # Use extension mode instead of regular V2V
                 command.extend(["--extend_video", str(input_video)])
                 command.extend(["--extend_frames", str(extend_frames)])
@@ -8840,7 +8852,37 @@ with gr.Blocks(
                                 value="<p><i>Extension will intelligently find the best transition frame and generate smooth video chunks.</i></p>",
                                 label="Extension Info"
                             )
-                    
+
+                        # Video Join Mode - joins two videos with generated transition
+                        wan22_enable_video_join = gr.Checkbox(
+                            label="Enable Video Join",
+                            value=False,
+                            info="Join input video to ending video by generating a transition between them"
+                        )
+                        with gr.Group(visible=False) as wan22_video_join_controls:
+                            wan22_ending_video = gr.Video(label="Ending Video", format="mp4")
+                            with gr.Row():
+                                wan22_join_frames_input = gr.Number(
+                                    label="Frames to Check (Input Video)",
+                                    value=30,
+                                    minimum=1,
+                                    maximum=100,
+                                    step=1,
+                                    info="Number of frames from end of input video to check for best transition"
+                                )
+                                wan22_join_frames_ending = gr.Number(
+                                    label="Frames to Check (Ending Video)",
+                                    value=30,
+                                    minimum=1,
+                                    maximum=100,
+                                    step=1,
+                                    info="Number of frames from start of ending video to check for best transition"
+                                )
+                            wan22_video_join_summary = gr.HTML(
+                                value="<p><i>Video Join will take the last frame from input video and first frame from ending video, generate a transition section between them, and concatenate all videos.</i></p>",
+                                label="Video Join Info"
+                            )
+
                     # Context Windows Controls
                     with gr.Accordion("Enable Sliding Context Windows", open=False):
                         wan22_use_context_windows = gr.Checkbox(
@@ -13072,6 +13114,13 @@ with gr.Blocks(
         inputs=[wan22_enable_extension],
         outputs=[wan22_extension_controls]
     )
+
+    # Video Join visibility toggle
+    wan22_enable_video_join.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[wan22_enable_video_join],
+        outputs=[wan22_video_join_controls]
+    )
     
     
     # Image input handling for wan22
@@ -13239,6 +13288,11 @@ with gr.Blocks(
             wan22_extend_frames,
             wan22_frames_to_check,
             wan22_trim_tail_frames,
+            # Video Join arguments
+            wan22_enable_video_join,
+            wan22_ending_video,
+            wan22_join_frames_input,
+            wan22_join_frames_ending,
             # Context Windows arguments
             wan22_use_context_windows,
             wan22_context_length,
