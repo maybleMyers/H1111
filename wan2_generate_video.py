@@ -6377,14 +6377,25 @@ def main():
              logger.error("Generation failed or was skipped, exiting.")
              return
 
-        # Update dimensions based on the *actual* generated latent
-        # Latent shape might differ slightly from input request depending on VAE/model strides
-        _, lat_c, lat_f, lat_h, lat_w = generated_latent.shape
-        # Convert latent dimensions back to pixel dimensions for metadata/logging
-        pixel_height = lat_h * cfg.vae_stride[1]
-        pixel_width = lat_w * cfg.vae_stride[2]
-        pixel_frames = (lat_f - 1) * cfg.vae_stride[0] + 1
-        logger.info(f"Generation complete. Latent shape: {generated_latent.shape} -> Pixel Video: {pixel_height}x{pixel_width}@{pixel_frames}")
+        # Check if returned tensor is already decoded (pixel space) or still latent
+        is_pixel_space = (
+            (hasattr(args, 'extend_video') and args.extend_video is not None) or
+            (hasattr(args, 'video_join') and args.video_join is not None)
+        )
+
+        if is_pixel_space:
+            # Tensor is already in pixel space [B, C, F, H, W] with C=3
+            _, pixel_c, pixel_frames, pixel_height, pixel_width = generated_latent.shape
+            logger.info(f"Generation complete. Video shape: {generated_latent.shape} (already decoded)")
+        else:
+            # Update dimensions based on the *actual* generated latent
+            # Latent shape might differ slightly from input request depending on VAE/model strides
+            _, lat_c, lat_f, lat_h, lat_w = generated_latent.shape
+            # Convert latent dimensions back to pixel dimensions for metadata/logging
+            pixel_height = lat_h * cfg.vae_stride[1]
+            pixel_width = lat_w * cfg.vae_stride[2]
+            pixel_frames = (lat_f - 1) * cfg.vae_stride[0] + 1
+            logger.info(f"Generation complete. Latent shape: {generated_latent.shape} -> Pixel Video: {pixel_height}x{pixel_width}@{pixel_frames}")
         # Use these derived pixel dimensions for saving metadata
         height, width, video_length = pixel_height, pixel_width, pixel_frames
 
@@ -6531,17 +6542,21 @@ def main():
             torch.cuda.empty_cache()
         
         # Decode latent to video tensor [B, C, F, H, W], range [0, 1]
-        # Skip VAE decode for extension mode since it already returns decoded pixels
-        if hasattr(args, 'extend_video') and args.extend_video is not None:
-            logger.info("Extension mode detected - using already decoded video")
+        # Skip VAE decode for extension/video join modes since they already return decoded pixels
+        is_already_decoded = (
+            (hasattr(args, 'extend_video') and args.extend_video is not None) or
+            (hasattr(args, 'video_join') and args.video_join is not None)
+        )
+        if is_already_decoded:
+            logger.info("Extension/Video Join mode detected - using already decoded video")
             decoded_video = generated_latent  # Already decoded pixels
         else:
             decoded_video = decode_latent(generated_latent, args, cfg)
 
         # Save the output (latent and/or video/images)
-        # Don't save "latents" for extension mode since generated_latent contains pixels
+        # Don't save "latents" for extension/video join modes since generated_latent contains pixels
         latent_to_save = None
-        if not (hasattr(args, 'extend_video') and args.extend_video is not None):
+        if not is_already_decoded:
             latent_to_save = generated_latent if (args.output_type == "latent" or args.output_type == "both") else None
         
         save_output(
