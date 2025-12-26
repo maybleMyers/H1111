@@ -6216,6 +6216,25 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     """
     device = torch.device(args.device)
 
+    # Clean up DiT model to free GPU memory for VAE decode
+    import gc
+    dit_attrs = ['_model', '_dit', '_dit_low', '_dit_high', 'model', 'dit']
+    for attr in dit_attrs:
+        if hasattr(args, attr) and getattr(args, attr) is not None:
+            dit_model = getattr(args, attr)
+            if hasattr(dit_model, 'to'):
+                try:
+                    dit_model.to('cpu')
+                    logger.info(f"Moved {attr} to CPU to free GPU memory for VAE decode")
+                except:
+                    pass
+            del dit_model
+            setattr(args, attr, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    clean_memory_on_device(device)
+
     # Load VAE model or use the one from the generation pipeline
     vae = None
     if hasattr(args, "_vae") and args._vae is not None:
@@ -6258,6 +6277,13 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
                 if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
                     # OOM occurred - fall back to tiled decode
                     logger.warning(f"VAE decode OOM, falling back to spatial tiled decode: {e}")
+
+                    # Aggressive memory cleanup before retry
+                    import gc
+                    # Move latent to CPU to free GPU memory
+                    latent_list_cpu = [l.cpu() for l in latent_list]
+                    del latent_list
+                    gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
@@ -6270,7 +6296,11 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
                         except:
                             tile_size = 128  # Conservative default
 
-                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}")
+                        logger.info(f"Using spatial tiled decode with tile_size={tile_size}, free VRAM: {free_mem:.0f}MB")
+                        # Move latent back to device for tiled decode (it will manage memory internally)
+                        latent_list = [l.to(device) for l in latent_list_cpu]
+                        del latent_list_cpu
+                        gc.collect()
                         decoded_list = vae.spatial_tiled_decode(latent_list, tile_size=tile_size)
                     else:
                         raise RuntimeError("VAE OOM and spatial_tiled_decode not available") from e

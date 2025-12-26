@@ -1082,6 +1082,7 @@ class Wan2_2_VAE:
         """
         Decode latents using spatial tiling to reduce memory usage.
         Adapted from Wan2GP's spatial_tiled_decode implementation.
+        Memory-efficient: keeps decoded tiles on CPU until final assembly.
 
         Args:
             zs: List of latent tensors [C, F, H, W]
@@ -1097,6 +1098,9 @@ class Wan2_2_VAE:
 
             results = []
             for z in zs:
+                device = z.device
+                dtype = z.dtype
+
                 # z: [C, F, H, W] -> add batch dim -> [1, C, F, H, W]
                 z_batch = z.unsqueeze(0)
 
@@ -1110,28 +1114,33 @@ class Wan2_2_VAE:
                 else:
                     z_scaled = z_batch / scale[1] + scale[0]
 
+                # Move to CPU to free GPU memory
+                z_scaled_cpu = z_scaled.cpu()
+                del z_batch, z_scaled
+                torch.cuda.empty_cache()
+
                 # Calculate overlap and blend parameters
                 overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))  # 75% step
-                # Output is 8x larger than latent (VAE upsamples by 8)
                 tile_sample_min_size = tile_size
                 blend_extent = int(tile_sample_min_size * tile_overlap_factor)  # 25% blend region
                 row_limit = tile_sample_min_size - blend_extent
 
-                h_latent, w_latent = z_scaled.shape[-2], z_scaled.shape[-1]
+                h_latent, w_latent = z_scaled_cpu.shape[-2], z_scaled_cpu.shape[-1]
 
-                # Decode tiles with overlap
+                # Decode tiles with overlap - keep decoded tiles on CPU
                 rows = []
                 for i in range(0, h_latent, overlap_size):
                     row = []
                     for j in range(0, w_latent, overlap_size):
-                        # Extract tile
-                        tile = z_scaled[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size]
+                        # Move tile to GPU for decoding
+                        tile = z_scaled_cpu[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size].to(device)
 
-                        # Decode this tile using the internal model decode (without scale transform)
-                        # We need to bypass scale since we already applied it
+                        # Decode this tile
                         self.model.clear_cache()
                         iter_ = tile.shape[2]
                         x = self.model.conv2(tile)
+                        del tile
+                        torch.cuda.empty_cache()
 
                         with amp.autocast(dtype=self.dtype):
                             for frame_idx in range(iter_):
@@ -1150,26 +1159,28 @@ class Wan2_2_VAE:
                                         feat_idx=self.model._conv_idx,
                                     )
                                     out = torch.cat([out, out_], 2)
+                                    del out_
 
                             decoded = unpatchify(out, patch_size=2)
                         self.model.clear_cache()
 
-                        # Clear intermediate tensors
-                        del tile, x, out
+                        # Move decoded tile to CPU immediately
+                        decoded_cpu = decoded.cpu()
+                        del out, x, decoded
                         torch.cuda.empty_cache()
 
-                        row.append(decoded)
+                        row.append(decoded_cpu)
                     rows.append(row)
 
-                # Blend tiles together
+                del z_scaled_cpu
+
+                # Blend tiles together on CPU
                 result_rows = []
                 for i, row in enumerate(rows):
                     result_row = []
                     for j, tile in enumerate(row):
-                        # Blend with tile above
                         if i > 0:
                             tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
-                        # Blend with tile to the left
                         if j > 0:
                             tile = self._blend_h(row[j - 1], tile, blend_extent)
                         result_row.append(tile[:, :, :, :row_limit, :row_limit])
@@ -1179,10 +1190,10 @@ class Wan2_2_VAE:
 
                 # Clamp and remove batch dim: [1, C, F, H, W] -> [C, F, H, W]
                 decoded_full = decoded_full.float().clamp_(-1, 1).squeeze(0)
-                results.append(decoded_full)
+                # Move back to original device
+                results.append(decoded_full.to(device=device, dtype=dtype))
 
-                # Clean up
-                del rows, result_rows, z_batch, z_scaled
+                del rows, result_rows
                 torch.cuda.empty_cache()
 
             return results

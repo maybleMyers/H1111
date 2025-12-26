@@ -703,6 +703,9 @@ class WanVAE_(nn.Module):
         Returns:
             Decoded video tensor [B, C, T, H*8, W*8]
         """
+        device = z.device
+        dtype = z.dtype
+
         tile_sample_min_size = tile_size
         tile_latent_min_size = tile_size // 8
         tile_overlap_factor = 0.25
@@ -713,23 +716,31 @@ class WanVAE_(nn.Module):
         else:
             z = z / scale[1] + scale[0]
 
+        # Move z to CPU to free GPU memory for decoding
+        z_cpu = z.cpu()
+        del z
+        torch.cuda.empty_cache()
+
         overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))
         blend_extent = int(tile_sample_min_size * tile_overlap_factor)
         row_limit = tile_sample_min_size - blend_extent
 
-        h_latent, w_latent = z.shape[-2], z.shape[-1]
+        h_latent, w_latent = z_cpu.shape[-2], z_cpu.shape[-1]
 
-        # Decode tiles with overlap
+        # Decode tiles with overlap - keep decoded tiles on CPU
         rows = []
         for i in range(0, h_latent, overlap_size):
             row = []
             for j in range(0, w_latent, overlap_size):
-                tile = z[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size]
+                # Move tile to GPU for decoding
+                tile = z_cpu[:, :, :, i:i + tile_latent_min_size, j:j + tile_latent_min_size].to(device)
 
-                # Decode this tile frame by frame (like normal decode but without scale transform)
+                # Decode this tile frame by frame
                 self.clear_cache()
                 iter_ = tile.shape[2]
                 x = self.conv2(tile)
+                del tile
+                torch.cuda.empty_cache()
 
                 for frame_idx in range(iter_):
                     self._conv_idx = [0]
@@ -738,16 +749,20 @@ class WanVAE_(nn.Module):
                     else:
                         out_ = self.decoder(x[:, :, frame_idx:frame_idx + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
                         out = torch.cat([out, out_], 2)
+                        del out_
                 self.clear_cache()
 
-                # Clear memory after each tile
-                del tile, x
+                # Move decoded tile to CPU immediately
+                out_cpu = out.cpu()
+                del out, x
                 torch.cuda.empty_cache()
 
-                row.append(out)
+                row.append(out_cpu)
             rows.append(row)
 
-        # Blend tiles together
+        del z_cpu
+
+        # Blend tiles together on CPU
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
@@ -760,7 +775,9 @@ class WanVAE_(nn.Module):
             result_rows.append(torch.cat(result_row, dim=-1))
 
         out = torch.cat(result_rows, dim=-2)
-        return out
+
+        # Move final result back to original device
+        return out.to(device=device, dtype=dtype)
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
