@@ -15,3 +15,7 @@ wan/models_t5_umt5-xxl-enc-bf16.pth
 Most warnings are safe to ignore and will probably be removed later.
 
 A cool thing to try are the mixed weight models, I preserved all the weights that would not safely convert to fp16 in fp32 without increasing model size very much. Select preserve mixed weight dtype at the bottom of the page, download the models named like this: wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors.
+
+### SVI Long Video generation
+
+Download loras from https://huggingface.co/vita-video-gen/svi-model/tree/main/version-2.0 and use them in the svi tab of the gui.
