@@ -917,7 +917,7 @@ def wan22_submit_to_queue(
                 command.extend(["--extend_video", input_video])
                 command.extend(["--video_length", str(extend_frames)])
                 if frames_to_check > 0:
-                    command.extend(["--extend_frames_to_check", str(frames_to_check)])
+                    command.extend(["--frames_to_check", str(frames_to_check)])
             else:
                 command.extend(["--video_path", input_video, "--strength", str(v2v_strength)])
                 if v2v_low_noise_only:
