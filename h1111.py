@@ -1039,7 +1039,7 @@ def wan22_submit_to_queue(
             "guidance_scale": sample_guide_scale,
             "dual_dit_boundary": dual_dit_boundary,
             "attn_mode": attn_mode,
-            "blocks_to_swap": blocks_to_swap,
+            "blocks_to_swap": block_swap,
             "save_path": save_path,
         }
         # Add LoRA info to metadata
@@ -1602,7 +1602,7 @@ def svi_submit_to_queue(
             "guidance_scale": sample_guide_scale,
             "dual_dit_boundary": dual_dit_boundary,
             "attn_mode": attn_mode,
-            "blocks_to_swap": blocks_to_swap,
+            "blocks_to_swap": block_swap,
             "save_path": save_path,
             "is_video_extension": is_video_extension,
         }
