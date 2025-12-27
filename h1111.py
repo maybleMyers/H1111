@@ -1270,16 +1270,25 @@ def wan22_stop_queue_generation(current_batch_id: str):
 
 def wan22_stop_and_decode():
     """Create signal file to stop generation and decode current latents."""
-    global wan22_current_output_filename
+    queue = get_queue()
+    running_jobs = queue.get_running_jobs()
 
-    if wan22_current_output_filename:
-        signal_file = wan22_current_output_filename + ".stop_decode"
-        try:
-            with open(signal_file, 'w') as f:
-                f.write('decode')
-            return "Stop & Decode signal sent..."
-        except Exception as e:
-            return f"Error creating signal file: {e}"
+    if not running_jobs:
+        return "No active generation to stop"
+
+    signals_sent = 0
+    for job in running_jobs:
+        if job.output_filename:
+            signal_file = job.output_filename + ".stop_decode"
+            try:
+                with open(signal_file, 'w') as f:
+                    f.write('decode')
+                signals_sent += 1
+            except Exception as e:
+                print(f"Error creating signal file: {e}")
+
+    if signals_sent > 0:
+        return f"Stop & Decode signal sent to {signals_sent} job(s)..."
     return "No active generation to stop"
 
 
@@ -1825,16 +1834,25 @@ def svi_stop_queue_generation(current_batch_id: str):
 
 def svi_stop_and_decode():
     """Create signal file to stop SVI generation and decode current latents."""
-    global svi_current_output_filename
+    queue = get_queue()
+    running_jobs = queue.get_running_jobs()
 
-    if svi_current_output_filename:
-        signal_file = svi_current_output_filename + ".stop_decode"
-        try:
-            with open(signal_file, 'w') as f:
-                f.write('decode')
-            return "SVI Stop & Decode signal sent..."
-        except Exception as e:
-            return f"Error creating signal file: {e}"
+    if not running_jobs:
+        return "No active SVI generation to stop"
+
+    signals_sent = 0
+    for job in running_jobs:
+        if job.output_filename:
+            signal_file = job.output_filename + ".stop_decode"
+            try:
+                with open(signal_file, 'w') as f:
+                    f.write('decode')
+                signals_sent += 1
+            except Exception as e:
+                print(f"Error creating signal file: {e}")
+
+    if signals_sent > 0:
+        return f"SVI Stop & Decode signal sent to {signals_sent} job(s)..."
     return "No active SVI generation to stop"
 
 # ========================= End SVI Queue System Functions =========================
@@ -8762,22 +8780,22 @@ with gr.Blocks(
             function updateTitle(text) {
                 if (text && text.trim() && text !== lastProgressText) {
                     lastProgressText = text;
-                    // This single regex handles both raw TQDM and custom formatted progress strings.
-                    // It looks for a percentage, then finds a time string (HH:MM:SS) after it.
-                    // Group 1: Percentage from custom format like "(XX%)"
-                    // Group 2: Time from custom format like "ETA: HH:MM:SS"
-                    // Group 3: Percentage from raw TQDM format like "XX%|"
-                    // Group 4: Time from raw TQDM format like "<HH:MM:SS"
-                    const pattern = /(?:.*?\((\d+)%\).*?(?:ETA|Remaining):\s*([\d:]+))|(?:(\d+)%\|.*\[.*<([\d:?]+))/;
-                    const match = text.match(pattern);
+                    // Match formats like:
+                    // "Generating: 95% (38/40 steps) - ETA: 03:01" (queue format)
+                    // "45%|████     | 45/100 [01:23<01:45" (raw TQDM format)
 
+                    // Try queue format first: "XX% ... ETA: HH:MM:SS"
+                    let match = text.match(/(\d+)%.*?ETA:\s*([\d:]+)/);
                     if (match) {
-                        const percentage = match[1] || match[3];
-                        const time = match[2] || match[4];
-                        if (percentage && time) {
-                             document.title = `[${percentage}% ETA: ${time}] - H1111`;
-                             return;
-                        }
+                        document.title = `[${match[1]}% ETA: ${match[2]}] - H1111`;
+                        return;
+                    }
+
+                    // Try raw TQDM format: "XX%|...[...<HH:MM:SS"
+                    match = text.match(/(\d+)%\|.*\[.*<([\d:?]+)/);
+                    if (match) {
+                        document.title = `[${match[1]}% ETA: ${match[2]}] - H1111`;
+                        return;
                     }
                 }
                 // Reset title if no progress info found and we had progress before
