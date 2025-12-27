@@ -372,8 +372,10 @@ class Worker:
         print(f"[Wan Worker] Poll interval: {self.poll_interval}s")
         print("=" * 60)
 
-        # Recover any stale jobs from previous crashes
-        self.recover_stale_jobs()
+        # Clear all jobs from previous session on startup
+        cleared = self.queue.clear_all()
+        if cleared > 0:
+            print(f"[Worker] Cleared {cleared} stale job(s) from previous session")
 
         last_cleanup = time.time()
         cleanup_interval = 3600  # Clean up old jobs every hour
