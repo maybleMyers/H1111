@@ -4845,7 +4845,8 @@ def generate_svi_multi_clip(
     temp_dir = tempfile.mkdtemp()
     all_clips = []
     current_input_image = initial_image_path
-    anchor_image = initial_image_path  # SVI anchor: always the original image
+    # SVI anchor: use args.anchor_image if already set (e.g., from extend_video_svi), otherwise use initial_image_path
+    anchor_image = getattr(args, 'anchor_image', None) or initial_image_path
 
     # SVI Pro: Track latent for passing between clips
     prev_last_latent = None
