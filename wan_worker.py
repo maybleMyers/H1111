@@ -71,6 +71,7 @@ class Worker:
         self.running = True
         self.current_process: Optional[subprocess.Popen] = None
         self.current_job_id: Optional[str] = None
+        self.current_clip_info: Optional[str] = None  # Track current clip progress (e.g., "Clip 2/4")
 
         # Only setup signal handlers when running as main process (not in thread)
         if use_signals:
@@ -153,7 +154,8 @@ class Worker:
             eta = tqdm_match.group(5)
             # Main generation is 15% to 95% of total progress
             adjusted_percent = 15.0 + (percent * 0.8)
-            return adjusted_percent, f"Generating: {percent:.0f}% ({current}/{total} steps) - ETA: {eta}", current, total
+            clip_prefix = f"{self.current_clip_info} - " if self.current_clip_info else ""
+            return adjusted_percent, f"{clip_prefix}Generating: {percent:.0f}% ({current}/{total} steps) - ETA: {eta}", current, total
 
         # Alternative TQDM format (simpler)
         simple_tqdm = re.search(r'(\d+)/(\d+)\s*\[([0-9:]+)<([0-9:]+)', line)
@@ -164,7 +166,8 @@ class Worker:
             eta = simple_tqdm.group(4)
             percent = (current / total) * 100
             adjusted_percent = 15.0 + (percent * 0.8)
-            return adjusted_percent, f"Generating: {percent:.0f}% ({current}/{total} steps) - ETA: {eta}", current, total
+            clip_prefix = f"{self.current_clip_info} - " if self.current_clip_info else ""
+            return adjusted_percent, f"{clip_prefix}Generating: {percent:.0f}% ({current}/{total} steps) - ETA: {eta}", current, total
 
         # Time elapsed (completion)
         if "TIME ELAPSED:" in line:
@@ -196,6 +199,14 @@ class Worker:
         if "Preparing" in line and "latent" in line.lower():
             return 15.0, "Preparing latents...", 0, 0
 
+        # SVI clip progress (e.g., "=== Generating clip 2/4 ===")
+        clip_match = re.search(r'=== Generating clip (\d+)/(\d+) ===', line)
+        if clip_match:
+            clip_current = int(clip_match.group(1))
+            clip_total = int(clip_match.group(2))
+            self.current_clip_info = f"Clip {clip_current}/{clip_total}"
+            return 15.0, f"Starting {self.current_clip_info}...", 0, 0
+
         return None, None, 0, 0
 
     def check_cancellation(self, job_id: str) -> bool:
@@ -211,6 +222,7 @@ class Worker:
             True if job completed successfully, False otherwise
         """
         self.current_job_id = job.id
+        self.current_clip_info = None  # Reset clip tracking for new job
         print(f"\n[Worker] Starting job {job.id}")
         print(f"[Worker] Command: {' '.join(job.command)}")
 

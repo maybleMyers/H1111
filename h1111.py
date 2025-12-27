@@ -1776,7 +1776,13 @@ def svi_poll_active_job(current_job_id: str, current_batch_id: str):
     if running_job:
         timer_active = True
         progress_text = running_job.progress_text or f"Progress: {running_job.progress:.0f}%"
-        status_parts.insert(0, f"Processing SVI {completed_count + 1}/{total_jobs}")
+        # Extract clip info from progress text if available (format: "Clip X/Y - ...")
+        clip_info = ""
+        if progress_text and "Clip " in progress_text:
+            clip_match = re.search(r'Clip (\d+/\d+)', progress_text)
+            if clip_match:
+                clip_info = f" - Clip {clip_match.group(1)}"
+        status_parts.insert(0, f"Processing SVI {completed_count + 1}/{total_jobs}{clip_info}")
     elif completed_count == total_jobs and total_jobs > 0:
         status_parts.insert(0, f"All {total_jobs} SVI generation(s) complete!")
         progress_text = "Done"
@@ -8808,7 +8814,17 @@ with gr.Blocks(
 
             // Poll all progress textareas every 500ms for value changes
             setInterval(() => {
-                const progressElements = document.querySelectorAll('textarea.scroll-hide, #wan22_progress_text textarea, #svi_progress_text textarea, #wan22_progress_text input, #svi_progress_text input');
+                // Select progress elements from all tabs
+                const selectors = [
+                    'textarea.scroll-hide',  // Direct generation tabs
+                    '#wan22_progress_text input',
+                    '#wan22_progress_text textarea',
+                    '#svi_progress_text input',
+                    '#svi_progress_text textarea',
+                    '[id$="_progress_text"] input',  // Any element ending with _progress_text
+                    '[id$="_progress_text"] textarea'
+                ];
+                const progressElements = document.querySelectorAll(selectors.join(', '));
                 progressElements.forEach(element => {
                     if (element && element.value) {
                         updateTitle(element.value);
