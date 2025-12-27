@@ -720,8 +720,8 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "flash2", "flash3", "torch", "sageattn", "xformers", "sdpa"],
-        help="attention mode",
+        choices=["flash", "flash2", "flash3", "torch", "sageattn", "sageattn3", "xformers", "sdpa"],
+        help="attention mode (sageattn=auto SageAttn, sageattn3=Blackwell FP4)",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(

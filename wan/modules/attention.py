@@ -21,10 +21,18 @@ except ModuleNotFoundError:
 
 try:
     import sageattention
-
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
+    sageattention = None
+
+# SageAttention3 (Blackwell FP4) - separate package, requires SM 120+ (Blackwell GPUs)
+SAGE_ATTN_3_AVAILABLE = False
+try:
+    from sageattn3 import sageattn3_blackwell
+    SAGE_ATTN_3_AVAILABLE = True
+except ImportError:
+    sageattn3_blackwell = None
 
 try:
     import xformers.ops as xops
@@ -94,11 +102,11 @@ def flash_attention(
 
     # We cannot test Flash attention 3 in musubi tuner, so keep the original code.
     # Customized code (except for flash attention 3) is not supported q_lens and k_lens.
-    if attn_mode != "flash3" and attn_mode != "sageattn":
-        assert q_lens is None, "q_lens is not supported except for flash attention 3."
+    if attn_mode not in ("flash3", "sageattn", "sageattn3"):
+        assert q_lens is None, "q_lens is not supported except for flash attention 3 and sage attention."
         assert k_lens is None or (
             min(k_lens) == max(k_lens) and k_lens[0] == lk
-        ), "k_lens is not supported except for flash attention 3."
+        ), "k_lens is not supported except for flash attention 3 and sage attention."
 
     # SDPA
     if attn_mode == "torch" or attn_mode == "sdpa":
@@ -262,7 +270,8 @@ def flash_attention(
     #     ).unflatten(0, (b, lq))
     # elif version is None and SAGE_ATTN_AVAILABLE:
     elif attn_mode == "sageattn":
-        # print("Using sage attention")
+        # SageAttention - auto-dispatches based on GPU compute capability
+        # Uses sageattn_varlen for variable-length sequences
         assert not causal, "SAGE attention does not support causal attention."
         x = sageattention.sageattn_varlen(
             q=q,
@@ -274,6 +283,31 @@ def flash_attention(
             max_seqlen_k=lk,
             sm_scale=softmax_scale,
         ).unflatten(0, (b, lq))
+    elif attn_mode == "sageattn3":
+        # SageAttention3 (Blackwell FP4) - requires SM 120+ and separate sageattn3 package
+        assert not causal, "SAGE attention v3 does not support causal attention."
+        if not SAGE_ATTN_3_AVAILABLE:
+            warnings.warn("SageAttention3 (Blackwell) not available, falling back to SageAttention")
+            x = sageattention.sageattn_varlen(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
+                max_seqlen_q=lq,
+                max_seqlen_k=lk,
+                sm_scale=softmax_scale,
+            ).unflatten(0, (b, lq))
+        else:
+            # sageattn3_blackwell expects (B, H, L, D) layout "HND"
+            q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)  # [B, H, L, D]
+            k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
+            v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
+            x = sageattn3_blackwell(
+                q_reshaped, k_reshaped, v_reshaped,
+                is_causal=False,
+            )
+            x = x.transpose(1, 2)  # [B, L, H, D]
     else:
         raise ValueError(f"Unknown attention mode: {attn_mode}")
 
