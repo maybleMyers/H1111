@@ -1037,8 +1037,18 @@ def wan22_submit_to_queue(
             "sample_steps": sample_steps,
             "flow_shift": flow_shift,
             "guidance_scale": sample_guide_scale,
+            "dual_dit_boundary": dual_dit_boundary,
+            "attn_mode": attn_mode,
+            "blocks_to_swap": blocks_to_swap,
             "save_path": save_path,
         }
+        # Add LoRA info to metadata
+        if lora_weights_paths:
+            parameters["lora_weights_low"] = lora_weights_paths
+            parameters["lora_multipliers_low"] = lora_multipliers_values
+        if lora_weights_paths_high:
+            parameters["lora_weights_high"] = lora_weights_paths_high
+            parameters["lora_multipliers_high"] = lora_multipliers_values_high
 
         # Submit job to queue
         job = queue.add_job(
@@ -1579,6 +1589,8 @@ def svi_submit_to_queue(
             "prompts": prompt_list[:effective_num_clips],
             "negative_prompt": negative_prompt,
             "num_clips": effective_num_clips,
+            "overlap_frames": overlap_frames,
+            "num_motion_latent": num_motion_latent,
             "width": width,
             "height": height,
             "frame_num": frame_num,
@@ -1588,9 +1600,19 @@ def svi_submit_to_queue(
             "sample_steps": sample_steps,
             "flow_shift": flow_shift,
             "guidance_scale": sample_guide_scale,
+            "dual_dit_boundary": dual_dit_boundary,
+            "attn_mode": attn_mode,
+            "blocks_to_swap": blocks_to_swap,
             "save_path": save_path,
             "is_video_extension": is_video_extension,
         }
+        # Add LoRA info to metadata
+        if lora_weights_paths:
+            parameters["lora_weights_low"] = lora_weights_paths
+            parameters["lora_multipliers_low"] = lora_multipliers_values
+        if lora_weights_paths_high:
+            parameters["lora_weights_high"] = lora_weights_paths_high
+            parameters["lora_multipliers_high"] = lora_multipliers_values_high
 
         # Submit job to queue
         job = queue.add_job(
