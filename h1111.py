@@ -915,7 +915,7 @@ def wan22_submit_to_queue(
                 command.extend(["--join_frames_ending", str(join_frames_ending)])
             elif enable_extension:
                 command.extend(["--extend_video", input_video])
-                command.extend(["--video_length", str(extend_frames)])
+                command.extend(["--extend_frames", str(extend_frames)])
                 if frames_to_check > 0:
                     command.extend(["--frames_to_check", str(frames_to_check)])
             else:
