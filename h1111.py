@@ -10398,7 +10398,8 @@ with gr.Blocks(
                                 )
 
                     gr.Markdown("### Generation Parameters")
-                    # Width and height inputs
+                    # Scale slider and width/height inputs
+                    svi_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                     with gr.Row():
                         svi_width = gr.Number(label="Width", value=832, step=32, interactive=True)
                         svi_calc_height_btn = gr.Button("→")
@@ -14557,6 +14558,13 @@ with gr.Blocks(
         fn=calculate_wanx_height,
         inputs=[svi_width, svi_original_dims],
         outputs=[svi_height]
+    )
+
+    # SVI Scale slider handler
+    svi_scale_slider.change(
+        fn=update_wanx_from_scale,
+        inputs=[svi_scale_slider, svi_original_dims],
+        outputs=[svi_width, svi_height]
     )
 
     # SVI Generate button (Queue-based)

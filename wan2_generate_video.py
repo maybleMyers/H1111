@@ -2490,13 +2490,11 @@ def prepare_i2v_inputs(
             end_img_cv2 = np.array(end_img)  # PIL to numpy
         has_end_image = end_img is not None
 
-        # calculate latent dimensions: keep aspect ratio (Original Method)
-        img_height, img_width = img.size[::-1] # PIL size is W,H
-        aspect_ratio = img_height / img_width
-        lat_h = round(np.sqrt(max_area * aspect_ratio) / config.vae_stride[1] / config.patch_size[1]) * config.patch_size[1]
-        lat_w = round(np.sqrt(max_area / aspect_ratio) / config.vae_stride[2] / config.patch_size[2]) * config.patch_size[2]
-        target_height = lat_h * config.vae_stride[1]
-        target_width = lat_w * config.vae_stride[2]
+        # Use specified video_size directly (not input image aspect ratio)
+        target_height = height
+        target_width = width
+        lat_h = height // config.vae_stride[1]
+        lat_w = width // config.vae_stride[2]
 
         # --- CRITICAL ORIGINAL LOGIC DIFFERENCE #1: Frame Dimension ---
         lat_f_base = (frames - 1) // config.vae_stride[0] + 1  # size of latent frames
