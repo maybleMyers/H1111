@@ -8754,9 +8754,11 @@ with gr.Blocks(
     demo.load(None, None, None, js=r"""
         () => {
             document.title = 'H1111';
+            let lastProgressText = '';
 
             function updateTitle(text) {
-                if (text && text.trim()) {
+                if (text && text.trim() && text !== lastProgressText) {
+                    lastProgressText = text;
                     // This single regex handles both raw TQDM and custom formatted progress strings.
                     // It looks for a percentage, then finds a time string (HH:MM:SS) after it.
                     // Group 1: Percentage from custom format like "(XX%)"
@@ -8771,26 +8773,27 @@ with gr.Blocks(
                         const time = match[2] || match[4];
                         if (percentage && time) {
                              document.title = `[${percentage}% ETA: ${time}] - H1111`;
+                             return;
                         }
+                    }
+                }
+                // Reset title if no progress info found and we had progress before
+                if (!text || !text.trim()) {
+                    if (document.title !== 'H1111') {
+                        document.title = 'H1111';
                     }
                 }
             }
 
-            setTimeout(() => {
+            // Poll all progress textareas every 500ms for value changes
+            setInterval(() => {
                 const progressElements = document.querySelectorAll('textarea.scroll-hide');
                 progressElements.forEach(element => {
-                    if (element) {
-                        new MutationObserver(() => {
-                            updateTitle(element.value);
-                        }).observe(element, {
-                            attributes: true,
-                            childList: true,
-                            characterData: true,
-                            subtree: true
-                        });
+                    if (element && element.value) {
+                        updateTitle(element.value);
                     }
                 });
-            }, 1000);
+            }, 500);
         }
         """)
         
