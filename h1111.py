@@ -918,6 +918,9 @@ def wan22_submit_to_queue(
                 command.extend(["--extend_frames", str(extend_frames)])
                 if frames_to_check > 0:
                     command.extend(["--frames_to_check", str(frames_to_check)])
+                # Add ending image for video extension if provided
+                if end_image_path:
+                    command.extend(["--end_image_path", str(end_image_path)])
             else:
                 command.extend(["--video_path", input_video, "--strength", str(v2v_strength)])
                 if v2v_low_noise_only:
@@ -8787,7 +8790,7 @@ with gr.Blocks(
 
             // Poll all progress textareas every 500ms for value changes
             setInterval(() => {
-                const progressElements = document.querySelectorAll('textarea.scroll-hide');
+                const progressElements = document.querySelectorAll('textarea.scroll-hide, #wan22_progress_text textarea, #svi_progress_text textarea, #wan22_progress_text input, #svi_progress_text input');
                 progressElements.forEach(element => {
                     if (element && element.value) {
                         updateTitle(element.value);
