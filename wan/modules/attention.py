@@ -22,15 +22,18 @@ except ModuleNotFoundError:
 try:
     import sageattention
     SAGE_ATTN_AVAILABLE = True
+    print(f"[SageAttention] Successfully imported sageattention {getattr(sageattention, '__version__', 'unknown version')}")
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     sageattention = None
+    print("[SageAttention] sageattention not available")
 
 # SageAttention3 (Blackwell FP4) - separate package, requires SM 120+ (Blackwell GPUs)
 SAGE_ATTN_3_AVAILABLE = False
 try:
     from sageattn3 import sageattn3_blackwell
     SAGE_ATTN_3_AVAILABLE = True
+    print("[SageAttention] SageAttention3 (Blackwell) available")
 except ImportError:
     sageattn3_blackwell = None
 
@@ -270,44 +273,40 @@ def flash_attention(
     #     ).unflatten(0, (b, lq))
     # elif version is None and SAGE_ATTN_AVAILABLE:
     elif attn_mode == "sageattn":
-        # SageAttention - auto-dispatches based on GPU compute capability
-        # Uses sageattn_varlen for variable-length sequences
+        # SageAttention - use sageattn() for auto-dispatch to FP8 CUDA kernels on SM89+
+        # sageattn() is much faster than sageattn_varlen() which only uses Triton FP16
         assert not causal, "SAGE attention does not support causal attention."
-        x = sageattention.sageattn_varlen(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
+        # Reshape from flattened [B*L, H, C] back to [B, H, L, C] for sageattn()
+        q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)  # [B, H, L, C]
+        k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
+        v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
+        x = sageattention.sageattn(
+            q_reshaped, k_reshaped, v_reshaped,
+            tensor_layout="HND",
+            is_causal=False,
             sm_scale=softmax_scale,
-        ).unflatten(0, (b, lq))
+        )
+        x = x.transpose(1, 2)  # [B, L, H, C]
     elif attn_mode == "sageattn3":
         # SageAttention3 (Blackwell FP4) - requires SM 120+ and separate sageattn3 package
         assert not causal, "SAGE attention v3 does not support causal attention."
+        q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)  # [B, H, L, D]
+        k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
+        v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
         if not SAGE_ATTN_3_AVAILABLE:
             warnings.warn("SageAttention3 (Blackwell) not available, falling back to SageAttention")
-            x = sageattention.sageattn_varlen(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
-                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
-                max_seqlen_q=lq,
-                max_seqlen_k=lk,
+            x = sageattention.sageattn(
+                q_reshaped, k_reshaped, v_reshaped,
+                tensor_layout="HND",
+                is_causal=False,
                 sm_scale=softmax_scale,
-            ).unflatten(0, (b, lq))
+            )
         else:
-            # sageattn3_blackwell expects (B, H, L, D) layout "HND"
-            q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)  # [B, H, L, D]
-            k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
-            v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
             x = sageattn3_blackwell(
                 q_reshaped, k_reshaped, v_reshaped,
                 is_causal=False,
             )
-            x = x.transpose(1, 2)  # [B, L, H, D]
+        x = x.transpose(1, 2)  # [B, L, H, D]
     else:
         raise ValueError(f"Unknown attention mode: {attn_mode}")
 
