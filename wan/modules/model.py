@@ -1022,6 +1022,59 @@ def detect_prescaled_fp8(path: str) -> bool:
         return False
 
 
+def filter_wan_model_state_dict(state_dict: dict, keep_fp8_keys: bool = False) -> dict:
+    """
+    Filter state dict to only include keys that belong to the WanModel,
+    removing baked-in component keys (VAE, T5, CLIP, etc.) that should be loaded separately.
+
+    Args:
+        state_dict: Full state dict from checkpoint
+
+    Returns:
+        Filtered state dict containing only WanModel keys
+    """
+    wan_model_prefixes = {
+        'patch_embedding',
+        'text_embedding',
+        'time_embedding',
+        'time_projection',
+        'blocks',
+        'head',
+        'modulation',  # block modulation parameters
+        'img_emb',     # for i2v models
+        'ref_conv',    # reference convolution layer
+        'scaled_fp8',  # fp8 scaling marker (keep for fp8 handling)
+    }
+
+    # Keys to exclude (baked-in components and conditional keys)
+    exclude_prefixes = {
+        'text_encoders',
+        'vae',
+        'text_encoders.spiece_model',
+    }
+
+    filtered_sd = {}
+    for key, value in state_dict.items():
+        # Skip baked-in component keys
+        if any(key.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+
+        # Skip FP8 scale_weight keys if not using FP8
+        if not keep_fp8_keys and '.scale_weight' in key:
+            continue
+        if not keep_fp8_keys and '.scale_input' in key:
+            continue
+
+        # Keep WanModel keys
+        if any(key.startswith(prefix) for prefix in wan_model_prefixes):
+            filtered_sd[key] = value
+        # Also keep certain standalone keys
+        elif key in {'scaled_fp8'}:
+            filtered_sd[key] = value
+
+    return filtered_sd
+
+
 def load_wan_model(
     config: any,
     device: Union[str, torch.device],
@@ -1091,6 +1144,12 @@ def load_wan_model(
         if key.startswith("model.diffusion_model."):
             sd[key[22:]] = sd.pop(key)
 
+    # Filter out baked-in component keys (VAE, T5, CLIP, etc.) to avoid mismatched key warnings
+    # when using separate component loading
+    # Keep FP8 keys for FP8 models or when preserving original weights (mixed dtype)
+    keep_fp8_keys = fp8_scaled or fp8_prescaled or (dit_weight_dtype is None)
+    sd = filter_wan_model_state_dict(sd, keep_fp8_keys=keep_fp8_keys)
+
     # Check for ref_conv layer weights
     has_ref_conv = "ref_conv.weight" in sd
     in_dim_ref_conv = sd["ref_conv.weight"].shape[1] if has_ref_conv else 16 # Default if not found
@@ -1141,6 +1200,13 @@ def load_wan_model(
         # Apply FP8 monkey patch to register scale_weight and scale_input buffers
         from modules.fp8_optimization_utils import apply_fp8_monkey_patch
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=use_scaled_mm)
+    elif dit_weight_dtype is None:
+        # Mixed dtype or loading FP8 weights as-is: check if weights are FP8 and apply monkey patch if needed
+        has_fp8_weights = any(tensor.dtype in {torch.float8_e4m3fn, torch.float8_e5m2} for tensor in sd.values())
+        if has_fp8_weights:
+            logger.info(f"Detected FP8 weights in checkpoint, applying FP8 monkey patch for mixed dtype loading")
+            from modules.fp8_optimization_utils import apply_fp8_monkey_patch
+            apply_fp8_monkey_patch(model, sd, use_scaled_mm=use_scaled_mm)
 
     # Load the potentially modified state dict
     # Use strict=False initially if ref_conv might be missing in older models but present in the class
