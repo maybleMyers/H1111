@@ -700,7 +700,19 @@ class WanHuMoModel(nn.Module):
                 _log_mem(f"After block {block_idx}")
 
             if self.blocks_to_swap:
+                if _debug_mem and block_idx < 5:
+                    print(f"[HuMo Forward] Before submit_swap({block_idx}): {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+                if _debug_mem and block_idx < 5:
+                    print(f"[HuMo Forward] After submit_swap({block_idx}): {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+
+            # Force memory cleanup to check for retention issues
+            if _debug_mem and block_idx < 10:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print(f"[HuMo Forward] After cleanup block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
 
         # head
         x = self.head(x, e)

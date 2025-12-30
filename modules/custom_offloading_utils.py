@@ -193,6 +193,11 @@ class Offloader:
 
         assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
 
+        # Ensure CUDA operations from swap are complete and check memory
+        if self.cuda_available:
+            torch.cuda.synchronize()
+            print(f"[{self.block_type}] Swap complete for block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
 
