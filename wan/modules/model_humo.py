@@ -558,6 +558,15 @@ class WanHuMoModel(nn.Module):
         if self.model_type == 'i2v':
             assert y is not None
 
+        # Debug: track memory usage
+        _debug_mem = hasattr(self, '_debug_forward_mem') and self._debug_forward_mem
+        def _log_mem(msg):
+            if _debug_mem and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                print(f"[HuMo Forward] {msg}: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
+        _log_mem("Start")
+
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -566,10 +575,14 @@ class WanHuMoModel(nn.Module):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+        _log_mem("After concat x,y")
+
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+
+        _log_mem("After patch_embedding")
 
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
@@ -580,12 +593,16 @@ class WanHuMoModel(nn.Module):
                       dim=1) for u in x
         ])
 
+        _log_mem("After x padding")
+
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()).float()
             e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        _log_mem("After time_embedding")
 
         # context
         context_lens = None
@@ -595,6 +612,8 @@ class WanHuMoModel(nn.Module):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+
+        _log_mem("After text_embedding")
 
         # audio processing
         if self.insert_audio and audio is not None:
@@ -606,9 +625,8 @@ class WanHuMoModel(nn.Module):
                 torch.cat([au, au.new_zeros(1, audio_seq_len - au.size(1), au.size(2))],
                         dim=1) for au in audio
             ])
-        else:
-            audio = None
-            audio_seq_len = None
+
+        _log_mem("After audio processing")
 
         # arguments
         kwargs = dict(
@@ -625,7 +643,13 @@ class WanHuMoModel(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 
+            if block_idx == 0:
+                _log_mem(f"Before block 0")
+
             x = block(x, **kwargs)
+
+            if block_idx == 0:
+                _log_mem(f"After block 0")
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
