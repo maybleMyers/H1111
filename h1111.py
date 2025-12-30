@@ -13085,10 +13085,23 @@ with gr.Blocks(
         lambda params, video_path, first_frame: (
             (
                 # Helper to safely get and pad LoRA lists from metadata
-                (weights_from_meta := params.get("lora_weights", [])),
-                (mults_from_meta := params.get("lora_multipliers", [])),
-                (apply_low_from_meta := params.get("lora_apply_low", [])),
-                (apply_high_from_meta := params.get("lora_apply_high", [])),
+                # Support both formats: "lora_weights" (Wan2.2 style) and "lora_weights_low/high" (other tabs)
+                (raw_weights := params.get("lora_weights", [])),
+                (raw_mults := params.get("lora_multipliers", [])),
+                # If lora_weights is empty, try the _low/_high format and merge them
+                (lora_low := params.get("lora_weights_low", [])),
+                (lora_high := params.get("lora_weights_high", [])),
+                (mults_low := params.get("lora_multipliers_low", [])),
+                (mults_high := params.get("lora_multipliers_high", [])),
+                # Extract basenames from full paths if using _low/_high format
+                (lora_low_basenames := [os.path.basename(p) if p else "None" for p in lora_low]),
+                (lora_high_basenames := [os.path.basename(p) if p else "None" for p in lora_high]),
+                # Use raw_weights if available, otherwise merge low/high lists
+                (weights_from_meta := raw_weights if raw_weights else lora_low_basenames + [w for w in lora_high_basenames if w not in lora_low_basenames]),
+                (mults_from_meta := raw_mults if raw_mults else list(mults_low) + [m for i, m in enumerate(mults_high) if i >= len(mults_low) or lora_high_basenames[i] not in lora_low_basenames[:i+1]]),
+                # For apply_low/high: use metadata if available, else derive from _low/_high format
+                (apply_low_from_meta := params.get("lora_apply_low", [True] * len(lora_low) + [False] * max(0, len(lora_high) - len(lora_low)) if not params.get("lora_apply_low") and (lora_low or lora_high) else [])),
+                (apply_high_from_meta := params.get("lora_apply_high", [False] * len(lora_low) + [True] * max(0, len(lora_high) - len(lora_low)) if not params.get("lora_apply_high") and (lora_low or lora_high) else [])),
                 (padded_weights := (weights_from_meta + ["None"] * 8)[:8]),
                 (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 8)[:8]),
                 (padded_apply_low := ([bool(v) for v in apply_low_from_meta] + [True] * 8)[:8]),
@@ -13142,9 +13155,9 @@ with gr.Blocks(
                 ]
             )[-1] # Return the created list
         ),
-        inputs=[params_state, wan22_input_video, wan22_input_image],
+        inputs=[params_state],
         outputs=[
-            wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
+            wan22_prompt, wan22_negative_prompt, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
             wan22_flow_shift, wan22_sample_guide_scale, wan22_dual_dit_boundary, wan22_batch_size,
             wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,

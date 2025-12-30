@@ -3942,7 +3942,7 @@ def prepare_humo_inputs(
         i2v_mask = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
         i2v_mask[:, 0] = 1
 
-        i2v_image_expanded = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
+        i2v_image_expanded = zero_vae[:, :lat_f].clone().to(device=device, dtype=i2v_latent.dtype)
         i2v_image_expanded[:, 0:1] = i2v_latent
 
         reference_latent = torch.cat([i2v_mask, i2v_image_expanded], dim=0)
