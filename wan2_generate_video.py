@@ -3678,12 +3678,17 @@ def prepare_humo_inputs(
     lat_f = (frames - 1) // config.vae_stride[0] + 1
 
     use_i2v_mode = args.humo_i2v_image is not None
-    if use_i2v_mode:
+    has_reference_image = args.humo_mode == "TIA" and args.image_path is not None
+
+    if use_i2v_mode and not has_reference_image:
         ref_frames = 0
         lat_f_with_ref = lat_f
-    else:
-        ref_frames = 1 if args.humo_mode == "TIA" and args.image_path is not None else 0
+    elif has_reference_image:
+        ref_frames = 1
         lat_f_with_ref = lat_f + ref_frames
+    else:
+        ref_frames = 0
+        lat_f_with_ref = lat_f
 
     seq_len = lat_f_with_ref * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
 
@@ -3914,7 +3919,7 @@ def prepare_humo_inputs(
 
     reference_latent = None
     if args.humo_i2v_image is not None:
-        logger.info(f"Creating I2V reference_latent from {args.humo_i2v_image}")
+        logger.info(f"Processing I2V image from {args.humo_i2v_image}")
         i2v_img = Image.open(args.humo_i2v_image).convert("RGB")
 
         i2v_ratio = i2v_img.width / i2v_img.height
@@ -3939,14 +3944,19 @@ def prepare_humo_inputs(
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
             i2v_latent = vae.encode([i2v_tensor])[0]
 
-        i2v_mask = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
-        i2v_mask[:, 0] = 1
+        if has_reference_image:
+            y[0:4, 0] = 1
+            y[4:20, 0:1] = i2v_latent.to(y.dtype)
+            logger.info(f"Injected I2V into y at frame 0 (combined with reference image at end)")
+        else:
+            i2v_mask = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
+            i2v_mask[:, 0] = 1
 
-        i2v_image_expanded = zero_vae[:, :lat_f].clone().to(device=device, dtype=i2v_latent.dtype)
-        i2v_image_expanded[:, 0:1] = i2v_latent
+            i2v_image_expanded = zero_vae[:, :lat_f].clone().to(device=device, dtype=i2v_latent.dtype)
+            i2v_image_expanded[:, 0:1] = i2v_latent
 
-        reference_latent = torch.cat([i2v_mask, i2v_image_expanded], dim=0)
-        logger.info(f"Created I2V reference_latent: shape {reference_latent.shape}")
+            reference_latent = torch.cat([i2v_mask, i2v_image_expanded], dim=0)
+            logger.info(f"Created I2V reference_latent: shape {reference_latent.shape}")
 
         vae.to_device("cpu")
         clean_memory_on_device(device)
