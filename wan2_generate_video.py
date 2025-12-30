@@ -715,9 +715,9 @@ def parse_args() -> argparse.Namespace:
         "--v2v_use_i2v", action="store_true", 
         help="Use i2v model for V2V (extracts first frame for CLIP conditioning). Recommended for i2v-A14B."
     )
-    # I2V arguments
-    parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
-    parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
+    parser.add_argument("--image_path", type=str, default=None)
+    parser.add_argument("--end_image_path", type=str, default=None)
+    parser.add_argument("--humo_i2v_image", type=str, default=None)
     # Fun-Control arguments (NEW/MODIFIED)
     parser.add_argument(
         "--control_path", # Keep this argument name
@@ -3677,16 +3677,18 @@ def prepare_humo_inputs(
     lat_w = width // config.vae_stride[2]
     lat_f = (frames - 1) // config.vae_stride[0] + 1
 
-    # Determine reference frames (TIA mode has 1 reference frame, TA mode has 0)
-    # Official HuMo adds reference frame(s) to the latent dimension during generation
-    ref_frames = 1 if args.humo_mode == "TIA" and args.image_path is not None else 0
-    lat_f_with_ref = lat_f + ref_frames  # Extended frame count for noise/conditioning
+    use_i2v_mode = args.humo_i2v_image is not None
+    if use_i2v_mode:
+        ref_frames = 0
+        lat_f_with_ref = lat_f
+    else:
+        ref_frames = 1 if args.humo_mode == "TIA" and args.image_path is not None else 0
+        lat_f_with_ref = lat_f + ref_frames
 
-    # Calculate sequence length with extended frames (matching official HuMo)
     seq_len = lat_f_with_ref * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
 
     logger.info(f"HuMo target dimensions: {height}x{width}@{frames} -> latent ({lat_f}, {lat_h}, {lat_w})")
-    logger.info(f"Extended latent frames: {lat_f_with_ref} (base {lat_f} + {ref_frames} ref), seq_len: {seq_len}")
+    logger.info(f"I2V mode: {use_i2v_mode}, ref_frames: {ref_frames}, seq_len: {seq_len}")
 
     # Set seed
     seed = args.seed
@@ -3746,13 +3748,9 @@ def prepare_humo_inputs(
     else:
         raise ValueError("HuMo requires --audio_feat_path or (--audio_path with --extract_audio_feat)")
 
-    # Window the audio embeddings for model input
     audio_emb_windowed, _ = get_audio_emb_window(audio_emb.to(device), frames, frame0_idx=0, audio_shift=2)
     logger.info(f"Windowed audio embeddings: shape {audio_emb_windowed.shape}")
 
-    # Add zero-padding for reference frame(s) - matching official HuMo
-    # Official: zero_audio_pad = torch.zeros(latents_ref[0].shape[1], *audio_emb.shape[1:])
-    #           audio_emb = torch.cat([audio_emb, zero_audio_pad], dim=0)
     if ref_frames > 0:
         zero_audio_pad = torch.zeros(
             ref_frames, *audio_emb_windowed.shape[1:],
@@ -3914,8 +3912,45 @@ def prepare_humo_inputs(
         zero_latent = zero_vae[:, :lat_f].to(device=device, dtype=zero_vae.dtype)
         y = torch.cat([msk, zero_latent], dim=0)
 
-    # === Prepare model arguments ===
-    # HuMo uses a different argument structure with audio embeddings
+    reference_latent = None
+    if args.humo_i2v_image is not None:
+        logger.info(f"Creating I2V reference_latent from {args.humo_i2v_image}")
+        i2v_img = Image.open(args.humo_i2v_image).convert("RGB")
+
+        i2v_ratio = i2v_img.width / i2v_img.height
+        target_ratio = width / height
+        if i2v_ratio > target_ratio:
+            new_width = width
+            new_height = int(new_width / i2v_ratio)
+        else:
+            new_height = height
+            new_width = int(new_height * target_ratio)
+        i2v_img = i2v_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        delta_w = width - i2v_img.size[0]
+        delta_h = height - i2v_img.size[1]
+        i2v_padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+        i2v_img = ImageOps.expand(i2v_img, i2v_padding, fill=(255, 255, 255))
+
+        i2v_tensor = TF.to_tensor(i2v_img).sub_(0.5).div_(0.5).to(device)
+        i2v_tensor = i2v_tensor.unsqueeze(1)
+
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            i2v_latent = vae.encode([i2v_tensor])[0]
+
+        i2v_mask = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
+        i2v_mask[:, 0] = 1
+
+        i2v_image_expanded = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=i2v_latent.dtype)
+        i2v_image_expanded[:, 0:1] = i2v_latent
+
+        reference_latent = torch.cat([i2v_mask, i2v_image_expanded], dim=0)
+        logger.info(f"Created I2V reference_latent: shape {reference_latent.shape}")
+
+        vae.to_device("cpu")
+        clean_memory_on_device(device)
+
     arg_c = {
         "context": context,
         "seq_len": seq_len,
@@ -3923,22 +3958,25 @@ def prepare_humo_inputs(
         "audio": [audio_emb_windowed],
     }
 
+    if reference_latent is not None:
+        arg_c["reference_latent"] = reference_latent
+
     arg_null = {
         "context": context_null,
         "seq_len": seq_len,
         "y": [y],
-        "audio": [torch.zeros_like(audio_emb_windowed)],  # Zero audio for null
+        "audio": [torch.zeros_like(audio_emb_windowed)],
     }
 
-    # Store additional HuMo-specific parameters
+    if reference_latent is not None:
+        arg_null["reference_latent"] = reference_latent
+
     arg_c["_humo_mode"] = args.humo_mode
     arg_c["_audio_emb_full"] = audio_emb
     arg_c["_scale_a"] = args.scale_a
     arg_c["_scale_t"] = args.scale_t
     arg_c["_step_change"] = args.step_change
-    # Store zero_vae for y_null creation in sampling loop (critical for proper CFG)
     arg_c["_zero_vae"] = zero_vae
-    # Store ref_frames for stripping after sampling (matching official HuMo)
     arg_c["_ref_frames"] = ref_frames
     arg_c["_lat_f_with_ref"] = lat_f_with_ref
 

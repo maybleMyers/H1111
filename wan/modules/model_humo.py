@@ -454,10 +454,6 @@ class MLPProj(torch.nn.Module):
 
 
 class WanHuMoModel(nn.Module):
-    """
-    HuMo diffusion backbone - Wan2.2 architecture with audio cross-attention.
-    17B parameter model supporting TIA (Text+Image+Audio) and TA (Text+Audio) modes.
-    """
 
     ignore_for_config = [
         'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim', 'window_size'
@@ -470,7 +466,7 @@ class WanHuMoModel(nn.Module):
                  model_type='i2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
-                 in_dim=36,  # HuMo uses 36 for i2v: mask(4) + latent(16) + ref_latent(16)
+                 in_dim=36,
                  dim=5120,
                  ffn_dim=13824,
                  freq_dim=256,
@@ -484,28 +480,6 @@ class WanHuMoModel(nn.Module):
                  eps=1e-6,
                  audio_token_num=16,
                  insert_audio=True):
-        """
-        Initialize HuMo model.
-
-        Args:
-            model_type: 't2v' or 'i2v'
-            patch_size: 3D patch dimensions (t, h, w)
-            text_len: Maximum text token length
-            in_dim: Input channels (36 for i2v with mask+latent+ref)
-            dim: Hidden dimension (5120 for 17B model)
-            ffn_dim: FFN intermediate dimension
-            freq_dim: Sinusoidal time embedding dimension
-            text_dim: Text embedding dimension (T5)
-            out_dim: Output channels
-            num_heads: Number of attention heads
-            num_layers: Number of transformer blocks
-            window_size: Window attention size (-1, -1) for global
-            qk_norm: Whether to apply QK normalization
-            cross_attn_norm: Whether to apply cross-attention normalization
-            eps: Epsilon for normalization
-            audio_token_num: Number of audio tokens per frame (16)
-            insert_audio: Whether to use audio cross-attention
-        """
         super().__init__()
 
         assert model_type in ['t2v', 'i2v']
@@ -526,7 +500,6 @@ class WanHuMoModel(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
-        # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(
@@ -537,7 +510,6 @@ class WanHuMoModel(nn.Module):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
-        # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.insert_audio = insert_audio
         self.blocks = nn.ModuleList([
@@ -547,14 +519,12 @@ class WanHuMoModel(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # head
         self.head = Head(dim, out_dim, patch_size, eps)
 
         if self.insert_audio:
             self.audio_proj = AudioProjModel(seq_len=8, blocks=5, channels=1280,
                 intermediate_dim=512, output_dim=1536, context_tokens=audio_token_num)
 
-        # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
         self.freqs = torch.cat([
@@ -563,11 +533,9 @@ class WanHuMoModel(nn.Module):
             rope_params(1024, 2 * (d // 6))
         ], dim=1)
 
-        # block swap support
         self.blocks_to_swap = None
         self.offloader = None
 
-        # initialize weights
         self.init_weights()
 
     def forward(
@@ -578,53 +546,20 @@ class WanHuMoModel(nn.Module):
         seq_len: int,
         audio: Optional[List[torch.Tensor]] = None,
         y: Optional[List[torch.Tensor]] = None,
+        reference_latent: Optional[torch.Tensor] = None,
     ):
-        """
-        Forward pass through HuMo model.
-
-        Args:
-            x: List of input video tensors [C_in, F, H, W]
-            t: Diffusion timesteps [B]
-            context: List of text embeddings [L, C]
-            seq_len: Maximum sequence length
-            audio: List of windowed audio embeddings [iter, 8, 5, 1280]
-            y: List of conditioning tensors (mask + latent) [C, F, H, W]
-
-        Returns:
-            List of denoised video tensors [C_out, F, H/8, W/8]
-        """
-        if self.model_type == 'i2v':
-            assert y is not None
-
-        # Debug: track memory usage
-        _debug_mem = hasattr(self, '_debug_forward_mem') and self._debug_forward_mem
-        import sys
-        def _log_mem(msg):
-            if _debug_mem and torch.cuda.is_available():
-                torch.cuda.synchronize()
-                print(f"[HuMo Forward] {msg}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
-
-        if _debug_mem:
-            print(f"[HuMo Forward] blocks_to_swap={self.blocks_to_swap}, offloader={self.offloader is not None}", flush=True)
-
-        _log_mem("Start")
-
-        # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
+        if reference_latent is not None:
+            x = [torch.cat([u, reference_latent], dim=0) for u in x]
+        elif y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-        _log_mem("After concat x,y")
-
-        # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-
-        _log_mem("After patch_embedding")
 
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
@@ -635,19 +570,12 @@ class WanHuMoModel(nn.Module):
                       dim=1) for u in x
         ])
 
-        _log_mem("After x padding")
-
-        # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()).float()
             e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        _log_mem("After time_embedding")
-
-        # context
-        context_lens = None
+        context_lens = 0
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
@@ -655,22 +583,16 @@ class WanHuMoModel(nn.Module):
                 for u in context
             ]))
 
-        _log_mem("After text_embedding")
-
-        # audio processing
+        audio_seq_len = None
         if self.insert_audio and audio is not None:
             audio = [self.audio_proj(au.unsqueeze(0)).permute(0, 3, 1, 2) for au in audio]
-
             audio_seq_len = torch.tensor(max([au.shape[2] for au in audio]) * audio[0].shape[3], device=device)
-            audio = [au.flatten(2).transpose(1, 2) for au in audio]  # [1, t*16, 1536]
+            audio = [au.flatten(2).transpose(1, 2) for au in audio]
             audio = torch.cat([
                 torch.cat([au, au.new_zeros(1, audio_seq_len - au.size(1), au.size(2))],
                         dim=1) for au in audio
             ])
 
-        _log_mem("After audio processing")
-
-        # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -681,55 +603,19 @@ class WanHuMoModel(nn.Module):
             audio=audio,
             audio_seq_len=audio_seq_len)
 
-        # Clean memory before block loop to prevent accumulation during block swap
         if self.blocks_to_swap:
             clean_memory_on_device(torch.device('cuda'))
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
-                if block_idx < 5 and _debug_mem:
-                    _log_mem(f"Before wait_for_block({block_idx})")
                 self.offloader.wait_for_block(block_idx)
-                if block_idx < 5 and _debug_mem:
-                    _log_mem(f"After wait_for_block({block_idx})")
 
-            if block_idx < 5 and _debug_mem:
-                _log_mem(f"Before block {block_idx}")
-                # Check if block is on correct device
-                first_param = next(block.parameters(), None)
-                if first_param is not None:
-                    print(f"  Block {block_idx} first param device: {first_param.device}, dtype: {first_param.dtype}", flush=True)
-                else:
-                    print(f"  Block {block_idx} has no parameters!", flush=True)
-
-            # Pass debug flag for first few blocks
-            if block_idx < 3 and _debug_mem:
-                x = block(x, _block_debug=True, **kwargs)
-            else:
-                x = block(x, **kwargs)
-
-            if block_idx < 5 and _debug_mem:
-                _log_mem(f"After block {block_idx}")
+            x = block(x, **kwargs)
 
             if self.blocks_to_swap:
-                if _debug_mem and block_idx < 5:
-                    print(f"[HuMo Forward] Before submit_swap({block_idx}): {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
-                if _debug_mem and block_idx < 5:
-                    print(f"[HuMo Forward] After submit_swap({block_idx}): {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
 
-            # Force memory cleanup to check for retention issues
-            if _debug_mem and block_idx < 10:
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                print(f"[HuMo Forward] After cleanup block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
-
-        # head
         x = self.head(x, e)
-
-        # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
 
@@ -744,14 +630,12 @@ class WanHuMoModel(nn.Module):
         return out
 
     def init_weights(self):
-        # basic init
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # init embeddings
         nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
         for m in self.text_embedding.modules():
             if isinstance(m, nn.Linear):
@@ -760,26 +644,20 @@ class WanHuMoModel(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=.02)
 
-        # init output layer
         nn.init.zeros_(self.head.head.weight)
 
     def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.blocks)
 
-        assert (
-            self.blocks_to_swap <= self.num_blocks - 1
-        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        assert self.blocks_to_swap <= self.num_blocks - 1
 
         self.offloader = ModelOffloader(
             "wan_humo_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
         )
-        print(
-            f"WanHuMoModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
-        )
+        print(f"WanHuMoModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
-        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
         if self.blocks_to_swap:
             save_blocks = self.blocks
             self.blocks = None
@@ -793,16 +671,3 @@ class WanHuMoModel(nn.Module):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
-
-        # Verify block placement
-        num_resident = self.num_blocks - self.blocks_to_swap
-        print(f"[HuMo] Verifying block placement after prepare:", flush=True)
-        for i, block in enumerate(self.blocks):
-            first_param = next(block.parameters(), None)
-            if first_param is not None:
-                expected = "GPU" if i < num_resident else "CPU"
-                actual = "GPU" if first_param.device.type == "cuda" else "CPU"
-                if expected != actual:
-                    print(f"  Block {i}: MISMATCH! Expected {expected}, got {actual}", flush=True)
-                elif i < 3 or i >= self.num_blocks - 2:  # Only log first 3 and last 2
-                    print(f"  Block {i}: {actual} (correct)", flush=True)

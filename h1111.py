@@ -790,6 +790,7 @@ def humo_batch_handler(
     prompt: str,
     negative_prompt: str,
     image_path: str,
+    i2v_image_path: str,
     humo_mode: str,
     audio_source: str,
     audio_path,  # Can be None or file path
@@ -826,7 +827,6 @@ def humo_batch_handler(
     enable_preview: bool,
     preview_steps: int,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
-    """Handler for HuMo audio-driven video generation."""
     global stop_event
     stop_event.clear()
 
@@ -883,7 +883,6 @@ def humo_batch_handler(
         if negative_prompt:
             command.extend(["--negative_prompt", str(negative_prompt)])
 
-        # Handle audio input
         if audio_source == "Audio File" and audio_path:
             audio_file_path = audio_path.name if hasattr(audio_path, 'name') else str(audio_path)
             command.extend(["--audio_path", audio_file_path])
@@ -894,21 +893,20 @@ def humo_batch_handler(
             feat_file_path = audio_feat_path.name if hasattr(audio_feat_path, 'name') else str(audio_feat_path)
             command.extend(["--audio_feat_path", feat_file_path])
 
-        # Handle reference image for TIA mode
         if humo_mode == "TIA" and image_path:
             command.extend(["--image_path", str(image_path)])
 
-        # Handle zero VAE cache (now string paths)
+        if i2v_image_path:
+            command.extend(["--humo_i2v_image", str(i2v_image_path)])
+
         if zero_vae_path and zero_vae_path.strip() and os.path.exists(zero_vae_path.strip()):
             command.extend(["--zero_vae_path", zero_vae_path.strip()])
         if zero_vae_720p_path and zero_vae_720p_path.strip() and os.path.exists(zero_vae_720p_path.strip()):
             command.extend(["--zero_vae_720p_path", zero_vae_720p_path.strip()])
 
-        # Handle audio separator
         if audio_separator and audio_separator.strip() and os.path.exists(audio_separator.strip()):
             command.extend(["--audio_separator", audio_separator.strip()])
 
-        # Performance options
         if fp8: command.append("--fp8")
         if fp8_scaled: command.append("--fp8_scaled")
         if fp8_t5: command.append("--fp8_t5")
@@ -11157,14 +11155,7 @@ with gr.Blocks(
                         minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
                     )
 
-        # HuMo Audio-Driven Video Generation Tab
         with gr.Tab(id=4, label="HuMo") as humo_tab:
-            gr.Markdown("""
-            ## HuMo - Audio-Driven Talking Head Video Generation
-            Generate talking head videos driven by audio input. Supports two modes:
-            - **TIA (Text + Image + Audio)**: Generate talking video from reference image and audio
-            - **TA (Text + Audio)**: Generate talking video from audio only
-            """)
             with gr.Row():
                 with gr.Column(scale=4):
                     humo_prompt = gr.Textbox(
@@ -11202,11 +11193,11 @@ with gr.Blocks(
                         info="TIA = Text+Image+Audio, TA = Text+Audio only"
                     )
 
-                    # Reference Image (for TIA mode)
                     humo_input_image = gr.Image(label="Reference Image (for TIA mode)", type="filepath")
                     humo_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
 
-                    # Audio Input Section
+                    with gr.Accordion("I2V Mode", open=False):
+                        humo_i2v_image = gr.Image(label="I2V Start Image", type="filepath")
                     with gr.Accordion("Audio Input", open=True):
                         humo_audio_source = gr.Radio(
                             choices=["Audio File", "Pre-extracted Features"],
@@ -15278,6 +15269,7 @@ with gr.Blocks(
             humo_prompt,
             humo_negative_prompt,
             humo_input_image,
+            humo_i2v_image,
             humo_mode,
             humo_audio_source,
             humo_audio_path,
