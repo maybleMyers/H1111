@@ -1519,7 +1519,7 @@ def wan22_stop_queue_generation(current_batch_id: str):
 
     # Return reset state
     return (
-        [],  # videos
+        gr.update(),  # videos - keep existing gallery
         [],  # preview
         "Generation cancelled",  # status
         "Stopped",  # progress
