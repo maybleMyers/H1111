@@ -264,23 +264,28 @@ class ModelOffloader(Offloader):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
-        if self.debug:
-            print(f"[{self.block_type}] Prepare block devices before forward")
+        num_resident = self.num_blocks - self.blocks_to_swap
+        print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU")
 
         # Move only the first (num_blocks - blocks_to_swap) blocks to GPU
         # These are the blocks that will be on GPU initially
-        for b in blocks[0 : self.num_blocks - self.blocks_to_swap]:
+        for i, b in enumerate(blocks[0 : num_resident]):
             b.to(self.device)
             weighs_to_device(b, self.device)  # make sure all params are on device
+            if self.device.type == "cuda":
+                print(f"  Block {i} moved to GPU. GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
         # Keep the remaining blocks on CPU - they will be swapped in during forward pass
         # The swap mechanism will reuse GPU buffers from blocks moving to CPU
-        for b in blocks[self.num_blocks - self.blocks_to_swap :]:
+        for i, b in enumerate(blocks[num_resident:]):
             # Ensure all parameters are on CPU (they should already be from model loading)
             weighs_to_device(b, "cpu")
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
+
+        if self.device.type == "cuda":
+            print(f"[{self.block_type}] After prepare: GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
     def wait_for_block(self, block_idx: int):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
