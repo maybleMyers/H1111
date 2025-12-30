@@ -11254,17 +11254,17 @@ with gr.Blocks(
                         gr.Markdown("Pre-computed zero latents for better conditioning. Leave empty to use zeros.")
                         humo_zero_vae_path = gr.Textbox(
                             label="Zero VAE Cache (480p)",
-                            value="weightsHumo/zero_vae_129frame.pt",
+                            value="wan/zero_vae_129frame.pt",
                             info="Path to zero_vae_129frame.pt"
                         )
                         humo_zero_vae_720p_path = gr.Textbox(
                             label="Zero VAE Cache (720p)",
-                            value="weightsHumo/zero_vae_720p_161frame.pt",
+                            value="wan/zero_vae_720p_161frame.pt",
                             info="Path to zero_vae_720p_161frame.pt"
                         )
                         humo_audio_separator = gr.Textbox(
                             label="Audio Separator Model (ONNX)",
-                            value="weightsHumo/audio_separator/Kim_Vocal_2.onnx",
+                            value="wan/Kim_Vocal_2.onnx",
                             info="Optional: Kim_Vocal_2.onnx for vocal separation"
                         )
 

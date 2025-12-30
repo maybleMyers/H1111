@@ -33,7 +33,7 @@ from accelerate import Accelerator
 from functools import partial
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
-from PIL import Image
+from PIL import Image, ImageOps
 import cv2 # Added for V2V video loading/resizing
 import numpy as np # Added for V2V video processing
 import torchvision.transforms.functional as TF
@@ -3699,14 +3699,28 @@ def prepare_humo_inputs(
         logger.info(f"TIA mode: Loading reference image from {args.image_path}")
 
         img = Image.open(args.image_path).convert("RGB")
-        img_np = np.array(img)
 
-        # Resize to target dimensions
-        interpolation = cv2.INTER_AREA if height < img_np.shape[0] else cv2.INTER_CUBIC
-        img_resized = cv2.resize(img_np, (width, height), interpolation=interpolation)
+        # Aspect-ratio-preserving resize with white padding (matching official HuMo)
+        img_ratio = img.width / img.height
+        target_ratio = width / height
 
-        # Convert to tensor and encode
-        img_tensor = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device)
+        if img_ratio > target_ratio:  # Image is wider than target
+            new_width = width
+            new_height = int(new_width / img_ratio)
+        else:  # Image is taller than target
+            new_height = height
+            new_width = int(new_height * img_ratio)
+
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Center pad with white to target size
+        delta_w = width - img.size[0]
+        delta_h = height - img.size[1]
+        padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+        img = ImageOps.expand(img, padding, fill=(255, 255, 255))
+
+        # Convert to tensor and normalize to [-1, 1]
+        img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
         img_tensor = img_tensor.unsqueeze(1)  # [C, 1, H, W]
 
         # Encode reference image
@@ -3744,6 +3758,7 @@ def prepare_humo_inputs(
         # Create zero conditioning
         msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
         zero_latent = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
+        zero_vae = zero_latent  # For TA mode, zero_vae is the same as zero_latent
         y = torch.cat([msk, zero_latent], dim=0)
 
     # === Prepare model arguments ===
@@ -3768,6 +3783,8 @@ def prepare_humo_inputs(
     arg_c["_scale_a"] = args.scale_a
     arg_c["_scale_t"] = args.scale_t
     arg_c["_step_change"] = args.step_change
+    # Store zero_vae for y_null creation in sampling loop (critical for proper CFG)
+    arg_c["_zero_vae"] = zero_vae
 
     logger.info(f"HuMo inputs prepared successfully")
 
@@ -3818,8 +3835,25 @@ def run_humo_sampling(
     # Create zero audio for negative predictions
     audio_zero = [torch.zeros_like(arg_c["audio"][0])]
 
-    # Create null y conditioning
-    y_null = [torch.zeros_like(arg_c["y"][0])]
+    # Create proper null y conditioning with mask + zero_vae (matching official HuMo)
+    # y_null should have the same structure as y_c: [msk(4) | zero_vae(16)]
+    zero_vae_for_null = arg_c.get("_zero_vae")
+    y_shape = arg_c["y"][0].shape  # [20, lat_f, lat_h, lat_w]
+    lat_f = y_shape[1]
+    lat_h = y_shape[2]
+    lat_w = y_shape[3]
+    dtype = arg_c["y"][0].dtype
+
+    # Create mask: 1 for reference frame (last frame), 0 for frames to generate
+    # Official HuMo: msk[:,:-latents_ref[0].shape[1]] = 0 (with ref_frames=1)
+    msk = torch.ones(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
+    msk[:, :-1] = 0  # Zero for all generated frames, 1 for reference (last frame)
+
+    # Slice zero_vae to full frame count
+    zero_latent = zero_vae_for_null[:, :lat_f].to(device=device, dtype=dtype)
+
+    # Combine mask + zero_vae for y_null: [4, lat_f, lat_h, lat_w] + [16, lat_f, lat_h, lat_w]
+    y_null = [torch.cat([msk, zero_latent], dim=0)]
 
     for i, t in enumerate(tqdm(timesteps)):
         # Check for stop signal
