@@ -4096,8 +4096,9 @@ def run_humo_sampling(
                 model_arg_t = {**model_arg_c, "audio": audio_zero}
                 noise_pred_t = model(latent_model_input, t=timestep, **model_arg_t)[0]
 
-                # 3. neg_null: Null conditioning
                 model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
+                if "reference_latent" in model_arg_null_full:
+                    del model_arg_null_full["reference_latent"]
                 noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
 
                 # TA CFG formula (no step_change, no image term)
@@ -4118,24 +4119,21 @@ def run_humo_sampling(
                 model_arg_ti = {**model_arg_c, "audio": audio_zero}
                 noise_pred_ti = model(latent_model_input, t=timestep, **model_arg_ti)[0]
 
-                # 3. neg_i: Image only (no text, no audio) - use null context
                 model_arg_i = {**model_arg_null, "audio": audio_zero}
                 noise_pred_i = model(latent_model_input, t=timestep, **model_arg_i)[0]
 
-                # 4. neg_null: Null conditioning
                 model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
+                if "reference_latent" in model_arg_null_full:
+                    del model_arg_null_full["reference_latent"]
                 noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
 
-                # TIA CFG formula with step_change
                 if t_value > step_change:
-                    # Early timesteps: Image included in null
                     noise_pred = (
                         scale_a * (noise_pred_tia - noise_pred_ti) +
                         scale_t * (noise_pred_ti - noise_pred_i) +
                         noise_pred_i
                     )
                 else:
-                    # Late timesteps: Modified formula
                     noise_pred = (
                         scale_a * (noise_pred_tia - noise_pred_ti) +
                         (scale_t - 2.0) * (noise_pred_ti - noise_pred_null) +
