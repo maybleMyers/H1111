@@ -48,6 +48,15 @@ import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
 from wan.modules.ultravico import UltraViCoConfig, set_ultravico_config, set_current_visual_shape, clear_ultravico_cache
+# HuMo imports (lazy loaded to avoid import errors if dependencies not installed)
+HUMO_AVAILABLE = False
+try:
+    from wan.modules.model_humo import WanHuMoModel
+    from wan.modules.audio_proj import AudioProjModel
+    from utils.humo_audio import HuMoAudioProcessor, get_audio_emb_window, load_zero_vae, create_humo_conditioning
+    HUMO_AVAILABLE = True
+except ImportError as e:
+    pass  # HuMo will be checked when needed
 from Wan2_2.wan.modules.vae2_2 import Wan2_2_VAE
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.clip import CLIPModel
@@ -871,6 +880,34 @@ def parse_args() -> argparse.Namespace:
                             "Used to create signal files like {output_filename}.stop_decode")
     # ========================= End Queue System Arguments =========================
 
+    # ========================= HuMo Arguments =========================
+    # HuMo 17B model for audio-driven talking head synthesis
+    parser.add_argument("--humo", action="store_true",
+                       help="Enable HuMo model mode for audio-driven video generation")
+    parser.add_argument("--humo_mode", type=str, default="TIA", choices=["TIA", "TA"],
+                       help="HuMo generation mode: TIA (Text+Image+Audio) or TA (Text+Audio)")
+    parser.add_argument("--audio_path", type=str, default=None,
+                       help="Path to audio file (.wav) for HuMo audio-driven generation")
+    parser.add_argument("--audio_feat_path", type=str, default=None,
+                       help="Path to pre-extracted audio features (.pt) for HuMo")
+    parser.add_argument("--whisper_model", type=str, default=None,
+                       help="Path to Whisper model for audio feature extraction (e.g., openai/whisper-large-v3)")
+    parser.add_argument("--extract_audio_feat", action="store_true",
+                       help="Extract audio features on-the-fly using Whisper (requires --whisper_model)")
+    parser.add_argument("--audio_separator", type=str, default=None,
+                       help="Path to vocal separator model for cleaner audio input")
+    parser.add_argument("--scale_a", type=float, default=5.5,
+                       help="Audio guidance scale for HuMo CFG. Default: 5.5")
+    parser.add_argument("--scale_t", type=float, default=5.0,
+                       help="Text guidance scale for HuMo CFG. Default: 5.0")
+    parser.add_argument("--step_change", type=int, default=980,
+                       help="Timestep to change HuMo CFG formula. Default: 980")
+    parser.add_argument("--zero_vae_path", type=str, default=None,
+                       help="Path to zero VAE cache for 480p (zero_vae_129frame.pt)")
+    parser.add_argument("--zero_vae_720p_path", type=str, default=None,
+                       help="Path to zero VAE cache for 720p (zero_vae_720p_161frame.pt)")
+    # ========================= End HuMo Arguments =========================
+
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
@@ -899,7 +936,17 @@ def parse_args() -> argparse.Namespace:
     if args.mixed_dtype and args.lora_weight:
         logger.warning("--mixed_dtype with LoRA: LoRA weights will be merged at the model's original precision")
     if args.task == "i2v-14B-FC-1.1" and args.image_path is None:
-         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")    
+         logger.warning(f"Task '{args.task}' typically uses --image_path as the reference image for ref_conv. Proceeding without it.")
+
+    # HuMo argument validation
+    if args.humo or "humo" in args.task.lower():
+        if args.audio_path is None and args.audio_feat_path is None:
+            raise ValueError("HuMo mode requires --audio_path or --audio_feat_path")
+        if args.extract_audio_feat and args.whisper_model is None:
+            raise ValueError("--extract_audio_feat requires --whisper_model to be specified")
+        if args.humo_mode == "TIA" and args.image_path is None:
+            logger.warning("HuMo TIA mode typically requires --image_path for reference image. Proceeding without it.")
+
     return args
 
 class DynamicModelManager:
@@ -3521,6 +3568,343 @@ def load_control_video(control_path: str, frames: int, height: int, width: int, 
 
     return video_tensor
 
+
+# ========================= HuMo Helper Functions =========================
+
+def prepare_humo_inputs(
+    args: argparse.Namespace,
+    config,
+    accelerator: Accelerator,
+    device: torch.device,
+    vae: WanVAE,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[dict, dict]]:
+    """Prepare inputs for HuMo audio-driven video generation.
+
+    Args:
+        args: command line arguments
+        config: model configuration
+        accelerator: Accelerator instance
+        device: device to use
+        vae: VAE model
+
+    Returns:
+        Tuple of (noise, context, context_null, audio_emb, y, (arg_c, arg_null))
+    """
+    if not HUMO_AVAILABLE:
+        raise ImportError("HuMo dependencies not available. Install transformers and librosa.")
+
+    logger.info(f"Preparing HuMo inputs for mode: {args.humo_mode}")
+
+    # Get dimensions
+    height, width = args.video_size
+    frames = args.video_length
+    lat_h = height // config.vae_stride[1]
+    lat_w = width // config.vae_stride[2]
+    lat_f = (frames - 1) // config.vae_stride[0] + 1
+
+    # Calculate sequence length
+    seq_len = lat_f * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+
+    logger.info(f"HuMo target dimensions: {height}x{width}@{frames} -> latent ({lat_f}, {lat_h}, {lat_w}), seq_len: {seq_len}")
+
+    # Set seed
+    seed = args.seed
+    if not args.cpu_noise:
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
+    else:
+        seed_g = torch.manual_seed(seed)
+
+    # Generate noise
+    noise = torch.randn(
+        16, lat_f, lat_h, lat_w,
+        dtype=torch.float32, generator=seed_g,
+        device=device if not args.cpu_noise else "cpu",
+    )
+    noise = noise.to(device)
+
+    # === Load and process audio ===
+    audio_emb = None
+    audio_length = 0
+
+    if args.audio_feat_path is not None:
+        # Load pre-extracted audio features
+        logger.info(f"Loading pre-extracted audio features from {args.audio_feat_path}")
+        audio_data = torch.load(args.audio_feat_path, map_location='cpu')
+        if isinstance(audio_data, dict):
+            audio_emb = audio_data.get('audio_emb', audio_data.get('features'))
+        else:
+            audio_emb = audio_data
+        audio_length = audio_emb.shape[0]
+        logger.info(f"Loaded audio features: shape {audio_emb.shape}")
+
+    elif args.audio_path is not None and args.extract_audio_feat:
+        # Extract audio features using Whisper
+        logger.info(f"Extracting audio features from {args.audio_path}")
+        # Handle audio separator path
+        audio_sep_path = None
+        audio_sep_name = None
+        if args.audio_separator and os.path.exists(args.audio_separator):
+            audio_sep_path = os.path.dirname(args.audio_separator)
+            audio_sep_name = os.path.basename(args.audio_separator)
+            logger.info(f"Using audio separator: {args.audio_separator}")
+        audio_processor = HuMoAudioProcessor(
+            whisper_model_path=args.whisper_model,
+            device=device,
+            audio_separator_model_path=audio_sep_path,
+            audio_separator_model_name=audio_sep_name,
+        )
+        audio_emb, audio_length = audio_processor.preprocess(args.audio_path)
+        audio_processor.offload()
+        del audio_processor
+        clean_memory_on_device(device)
+        logger.info(f"Extracted audio features: shape {audio_emb.shape}")
+
+    else:
+        raise ValueError("HuMo requires --audio_feat_path or (--audio_path with --extract_audio_feat)")
+
+    # Window the audio embeddings for model input
+    audio_emb_windowed, _ = get_audio_emb_window(audio_emb.to(device), frames, frame0_idx=0, audio_shift=2)
+    logger.info(f"Windowed audio embeddings: shape {audio_emb_windowed.shape}")
+
+    # === Load text encoder and encode prompts ===
+    from wan.modules.t5 import T5EncoderModel
+
+    t5 = load_text_encoder(args, config, device)
+    t5.model.to(device)
+
+    n_prompt = args.negative_prompt if args.negative_prompt else config.sample_neg_prompt
+
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=config.t5_dtype):
+                context = t5([args.prompt], device)
+                context_null = t5([n_prompt], device)
+        else:
+            context = t5([args.prompt], device)
+            context_null = t5([n_prompt], device)
+
+    del t5
+    clean_memory_on_device(device)
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Unloaded T5 model from memory")
+
+    # === Prepare conditioning 'y' ===
+    y = None
+    ref_latent = None
+
+    if args.humo_mode == "TIA" and args.image_path is not None:
+        # TIA mode: Text + Image + Audio
+        logger.info(f"TIA mode: Loading reference image from {args.image_path}")
+
+        img = Image.open(args.image_path).convert("RGB")
+        img_np = np.array(img)
+
+        # Resize to target dimensions
+        interpolation = cv2.INTER_AREA if height < img_np.shape[0] else cv2.INTER_CUBIC
+        img_resized = cv2.resize(img_np, (width, height), interpolation=interpolation)
+
+        # Convert to tensor and encode
+        img_tensor = TF.to_tensor(img_resized).sub_(0.5).div_(0.5).to(device)
+        img_tensor = img_tensor.unsqueeze(1)  # [C, 1, H, W]
+
+        # Encode reference image
+        vae.to_device(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+            ref_latent = vae.encode([img_tensor])[0]  # [16, 1, lat_h, lat_w]
+
+        logger.info(f"Encoded reference latent: shape {ref_latent.shape}")
+
+        # Load zero VAE cache
+        zero_vae = None
+        if args.zero_vae_path is not None:
+            zero_vae = load_zero_vae(args.zero_vae_path, lat_f, vae.dtype, device)
+            logger.info(f"Loaded zero VAE cache: shape {zero_vae.shape}")
+        elif args.zero_vae_720p_path is not None and height >= 720:
+            zero_vae = load_zero_vae(args.zero_vae_720p_path, lat_f, vae.dtype, device)
+            logger.info(f"Loaded zero VAE cache (720p): shape {zero_vae.shape}")
+        else:
+            # Create zero padding if no cache available
+            logger.warning("No zero VAE cache provided, using zeros for padding")
+            zero_vae = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
+
+        # Create HuMo conditioning tensor
+        y = create_humo_conditioning(
+            ref_latent, lat_f, zero_vae, lat_h, lat_w, device, vae.dtype
+        )
+        logger.info(f"Created HuMo conditioning 'y': shape {y.shape}")
+
+        vae.to_device("cpu" if not args.vae_cache_cpu else args.vae_cache_cpu)
+        clean_memory_on_device(device)
+
+    else:
+        # TA mode: Text + Audio (no image)
+        logger.info("TA mode: No reference image, using zero conditioning")
+        # Create zero conditioning
+        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
+        zero_latent = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
+        y = torch.cat([msk, zero_latent], dim=0)
+
+    # === Prepare model arguments ===
+    # HuMo uses a different argument structure with audio embeddings
+    arg_c = {
+        "context": context,
+        "seq_len": seq_len,
+        "y": [y],
+        "audio": [audio_emb_windowed],
+    }
+
+    arg_null = {
+        "context": context_null,
+        "seq_len": seq_len,
+        "y": [y],
+        "audio": [torch.zeros_like(audio_emb_windowed)],  # Zero audio for null
+    }
+
+    # Store additional HuMo-specific parameters
+    arg_c["_humo_mode"] = args.humo_mode
+    arg_c["_audio_emb_full"] = audio_emb
+    arg_c["_scale_a"] = args.scale_a
+    arg_c["_scale_t"] = args.scale_t
+    arg_c["_step_change"] = args.step_change
+
+    logger.info(f"HuMo inputs prepared successfully")
+
+    return noise, context, context_null, audio_emb_windowed, y, (arg_c, arg_null)
+
+
+def run_humo_sampling(
+    model,
+    noise: torch.Tensor,
+    scheduler: Any,
+    timesteps: torch.Tensor,
+    args: argparse.Namespace,
+    inputs: Tuple[dict, dict],
+    device: torch.device,
+    seed_g: torch.Generator,
+    accelerator: Accelerator,
+    previewer=None,
+    preview_suffix: Optional[str] = None,
+) -> torch.Tensor:
+    """Run HuMo sampling with multi-scale CFG.
+
+    HuMo uses a unique CFG formula that combines audio, text, and image guidance:
+    - pos_tia: Full conditioning (text + image + audio)
+    - pos_ti: Text + image (no audio)
+    - neg_i: Image only (no text, no audio)
+    - neg_null: Null conditioning
+
+    The CFG formula changes at step_change timestep:
+    - Early timesteps (t > step_change):
+      noise_pred = scale_a * (pos_tia - pos_ti) + scale_t * (pos_ti - neg_i) + neg_i
+    - Late timesteps (t <= step_change):
+      noise_pred = scale_a * (pos_tia - pos_ti) + (scale_t - 2) * (pos_ti - neg_null) + neg_null
+    """
+    arg_c, arg_null = inputs
+
+    latent = noise
+    latent_storage_device = device
+
+    # Extract HuMo-specific parameters
+    scale_a = arg_c.get("_scale_a", 5.5)
+    scale_t = arg_c.get("_scale_t", 5.0)
+    step_change = arg_c.get("_step_change", 980)
+    humo_mode = arg_c.get("_humo_mode", "TIA")
+
+    num_timesteps = len(timesteps)
+    logger.info(f"Starting HuMo sampling: {num_timesteps} steps, scale_a={scale_a}, scale_t={scale_t}, step_change={step_change}")
+
+    # Create zero audio for negative predictions
+    audio_zero = [torch.zeros_like(arg_c["audio"][0])]
+
+    # Create null y conditioning
+    y_null = [torch.zeros_like(arg_c["y"][0])]
+
+    for i, t in enumerate(tqdm(timesteps)):
+        # Check for stop signal
+        if hasattr(args, 'output_filename') and args.output_filename:
+            stop_action = check_stop_signals(args.output_filename)
+            if stop_action == "decode":
+                logger.info(f"Stop signal received at step {i}/{num_timesteps}")
+                break
+
+        latent_on_device = latent.to(device)
+
+        # Prepare input for model
+        if len(latent_on_device.shape) == 5:
+            latent_model_input = [latent_on_device[j] for j in range(latent_on_device.shape[0])]
+        else:
+            latent_model_input = [latent_on_device]
+
+        timestep = torch.stack([t]).to(device)
+        t_value = t.item()
+
+        with accelerator.autocast(), torch.no_grad():
+            # Filter out internal parameters
+            model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
+            model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
+
+            # 1. pos_tia: Full conditioning (text + image + audio)
+            noise_pred_tia = model(latent_model_input, t=timestep, **model_arg_c)[0]
+
+            # 2. pos_ti: Text + image (no audio)
+            model_arg_ti = {**model_arg_c, "audio": audio_zero}
+            noise_pred_ti = model(latent_model_input, t=timestep, **model_arg_ti)[0]
+
+            # 3. neg_i: Image only (no text, no audio) - use null context
+            model_arg_i = {**model_arg_null, "audio": audio_zero}
+            noise_pred_i = model(latent_model_input, t=timestep, **model_arg_i)[0]
+
+            # 4. neg_null: Null conditioning
+            model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
+            noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
+
+            # Apply HuMo CFG formula
+            if t_value > step_change:
+                # Early timesteps: Image included in null
+                noise_pred = (
+                    scale_a * (noise_pred_tia - noise_pred_ti) +
+                    scale_t * (noise_pred_ti - noise_pred_i) +
+                    noise_pred_i
+                )
+            else:
+                # Late timesteps: Modified formula
+                noise_pred = (
+                    scale_a * (noise_pred_tia - noise_pred_ti) +
+                    (scale_t - 2.0) * (noise_pred_ti - noise_pred_null) +
+                    noise_pred_null
+                )
+
+        # Ensure proper dimensions for scheduler
+        if len(noise_pred.shape) < len(latent_on_device.shape):
+            noise_pred = noise_pred.unsqueeze(0)
+
+        # Scheduler step
+        scheduler_output = scheduler.step(
+            noise_pred.to(device),
+            t,
+            latent_on_device,
+            return_dict=False,
+            generator=seed_g
+        )
+        latent = scheduler_output[0].to(latent_storage_device)
+
+        # Preview
+        if previewer is not None and (i + 1) % args.preview == 0 and (i + 1) < num_timesteps:
+            try:
+                preview_input = latent.squeeze(0) if len(latent.shape) == 5 else latent
+                previewer.preview(preview_input.to(device), i, preview_suffix=preview_suffix)
+            except Exception as e:
+                logger.error(f"Error during HuMo preview at step {i + 1}: {e}")
+
+    logger.info("HuMo sampling loop finished.")
+    return latent
+
+
+# ========================= End HuMo Helper Functions =========================
+
+
 def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> Tuple[Any, torch.Tensor]:
     """setup scheduler for sampling
 
@@ -5389,9 +5773,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # For ti2v-5B without image, treat as T2V mode (matches official implementation)
     is_extension = args.extend_video is not None
     is_video_join = args.video_join is not None and args.ending_video is not None
-    is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control
+    # HuMo mode detection
+    is_humo = args.humo or "humo" in args.task.lower()
+    is_t2v = not is_i2v and not is_ti2v and not is_v2v and not is_fun_control and not is_humo
 
-    if is_video_join: logger.info(f"Running Video Join: {args.video_join} -> {args.ending_video}")
+    if is_humo: logger.info(f"Running HuMo audio-driven generation (mode: {args.humo_mode})")
+    elif is_video_join: logger.info(f"Running Video Join: {args.video_join} -> {args.ending_video}")
     elif is_v2v: logger.info(f"Running Video-to-Video (V2V) inference with strength {args.strength}")
     elif is_ti2v: logger.info(f"Running Text+Image-to-Video (TI2V) inference")
     elif is_i2v: logger.info(f"Running Image-to-Video (I2V) inference")
@@ -5485,8 +5872,8 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Load VAE (if needed for input processing) ---
     vae = None
-    # VAE is needed early for V2V, I2V, TI2V, and FunControl T2V
-    needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) # Refined condition
+    # VAE is needed early for V2V, I2V, TI2V, FunControl T2V, and HuMo
+    needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) or is_humo
     if needs_vae_early:
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
@@ -5531,6 +5918,109 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
         vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
+
+    # === HuMo Audio-Driven Generation Path ===
+    if is_humo:
+        logger.info("=" * 60)
+        logger.info("HUMO AUDIO-DRIVEN GENERATION")
+        logger.info(f"Mode: {args.humo_mode}")
+        logger.info(f"Audio: {args.audio_path or args.audio_feat_path}")
+        logger.info(f"Scale A: {args.scale_a}, Scale T: {args.scale_t}")
+        logger.info("=" * 60)
+
+        if not HUMO_AVAILABLE:
+            raise ImportError(
+                "HuMo dependencies not available. Please ensure the following are installed:\n"
+                "  - transformers (for Whisper)\n"
+                "  - librosa (for audio processing)\n"
+                "And that wan/modules/model_humo.py and utils/humo_audio.py exist."
+            )
+
+        # Prepare HuMo inputs
+        noise, context, context_null, audio_emb, y, inputs = prepare_humo_inputs(
+            args, cfg, accelerator, device, vae
+        )
+
+        # Load HuMo model
+        logger.info("Loading HuMo model...")
+        model = WanHuMoModel(
+            model_type='i2v',
+            patch_size=tuple(cfg.patch_size),
+            text_len=cfg.text_len,
+            in_dim=cfg.in_dim,
+            dim=cfg.dim,
+            ffn_dim=cfg.ffn_dim,
+            freq_dim=cfg.freq_dim,
+            text_dim=4096,  # T5-XXL
+            out_dim=cfg.out_dim,
+            num_heads=cfg.num_heads,
+            num_layers=cfg.num_layers,
+            window_size=tuple(cfg.window_size),
+            qk_norm=cfg.qk_norm,
+            cross_attn_norm=cfg.cross_attn_norm,
+            eps=cfg.eps,
+            audio_token_num=getattr(cfg, 'audio_token_num', 16),
+            insert_audio=getattr(cfg, 'insert_audio', True),
+        )
+
+        # Load weights
+        if args.dit is not None:
+            logger.info(f"Loading HuMo weights from {args.dit}")
+            state_dict = load_safetensors(args.dit)
+            model.load_state_dict(state_dict, strict=False)
+            del state_dict
+            clean_memory_on_device(device)
+
+        model = model.to(device=device, dtype=dit_dtype)
+        model.eval()
+        logger.info(f"HuMo model loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
+
+        # Setup scheduler
+        scheduler, timesteps = setup_scheduler(args, cfg, device)
+
+        # Set random seed
+        if not args.cpu_noise:
+            seed_g = torch.Generator(device=device)
+            seed_g.manual_seed(args.seed)
+        else:
+            seed_g = torch.manual_seed(args.seed)
+
+        # Run HuMo sampling
+        previewer = None
+        if args.preview is not None:
+            previewer = LatentPreviewer()
+            previewer.start(args.save_path, args.fps)
+
+        generated_latent = run_humo_sampling(
+            model=model,
+            noise=noise,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            args=args,
+            inputs=inputs,
+            device=device,
+            seed_g=seed_g,
+            accelerator=accelerator,
+            previewer=previewer,
+            preview_suffix=args.preview_suffix,
+        )
+
+        if previewer is not None:
+            previewer.stop()
+
+        # Cleanup
+        del model
+        clean_memory_on_device(device)
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Add batch dimension if needed
+        if len(generated_latent.shape) == 4:
+            generated_latent = generated_latent.unsqueeze(0)
+
+        logger.info(f"HuMo generation complete. Latent shape: {generated_latent.shape}")
+        return generated_latent
+    # === End HuMo Path ===
 
     # --- Prepare Inputs ---
     noise = None

@@ -9,6 +9,7 @@ from easydict import EasyDict
 from .wan_i2v_A14B import i2v_A14B
 from .wan_t2v_A14B import t2v_A14B
 from .wan_ti2v_5B import ti2v_5B
+from .wan_humo_17B import humo_17B_TIA, humo_17B_TA
 
 # LongCat configuration (based on Wan 2.1)
 longcat_t2v_13_6B = EasyDict(__name__='Config: LongCat T2V 13.6B')
@@ -39,6 +40,8 @@ WAN_CONFIGS = {
     't2v-A14B': t2v_A14B,
     'i2v-A14B': i2v_A14B,
     'ti2v-5B': ti2v_5B,
+    'humo-17B-TIA': humo_17B_TIA,
+    'humo-17B-TA': humo_17B_TA,
 }
 
 # Merge LongCat configs into WAN_CONFIGS
@@ -67,4 +70,6 @@ SUPPORTED_SIZES = {
     'i2v-A14B': ('720*1280', '1280*720', '480*832', '832*480'),
     'ti2v-5B': ('704*1280', '1280*704'),
     'longcat-t2v-13.6B': ('480*832', '832*480'),  # LongCat base resolution
+    'humo-17B-TIA': ('720*1280', '1280*720', '480*832', '832*480'),  # HuMo TIA mode
+    'humo-17B-TA': ('720*1280', '1280*720', '480*832', '832*480'),  # HuMo TA mode
 }

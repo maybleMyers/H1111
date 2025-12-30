@@ -784,6 +784,257 @@ def wan22_batch_handler(
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
 
+# ========================= HuMo Handler Function =========================
+
+def humo_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    humo_mode: str,
+    audio_source: str,
+    audio_path,  # Can be None or file path
+    audio_feat_path,  # Can be None or file path
+    whisper_model: str,
+    scale_a: float,
+    scale_t: float,
+    step_change: int,
+    zero_vae_path: str,
+    zero_vae_720p_path: str,
+    audio_separator: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    batch_size: int,
+    save_path: str,
+    attn_mode: str,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_t5: bool,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    enable_preview: bool,
+    preview_steps: int,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    """Handler for HuMo audio-driven video generation."""
+    global stop_event
+    stop_event.clear()
+
+    os.makedirs(save_path, exist_ok=True)
+    all_generated_videos = []
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, [], "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), [], status_text, "Starting HuMo generation..."
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"humo_{run_id}"
+
+        # Build command
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", str(task),
+            "--humo",
+            "--humo_mode", str(humo_mode),
+            "--prompt", str(prompt),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--scale_a", str(scale_a),
+            "--scale_t", str(scale_t),
+            "--step_change", str(step_change),
+        ]
+
+        # Add model paths
+        if dit_path:
+            command.extend(["--dit", os.path.join("wan", dit_path)])
+        if vae_path:
+            command.extend(["--vae", os.path.join("wan", vae_path)])
+        if t5_path:
+            command.extend(["--t5", os.path.join("wan", t5_path)])
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        # Handle audio input
+        if audio_source == "Audio File" and audio_path:
+            audio_file_path = audio_path.name if hasattr(audio_path, 'name') else str(audio_path)
+            command.extend(["--audio_path", audio_file_path])
+            command.append("--extract_audio_feat")
+            if whisper_model:
+                command.extend(["--whisper_model", str(whisper_model)])
+        elif audio_source == "Pre-extracted Features" and audio_feat_path:
+            feat_file_path = audio_feat_path.name if hasattr(audio_feat_path, 'name') else str(audio_feat_path)
+            command.extend(["--audio_feat_path", feat_file_path])
+
+        # Handle reference image for TIA mode
+        if humo_mode == "TIA" and image_path:
+            command.extend(["--image_path", str(image_path)])
+
+        # Handle zero VAE cache (now string paths)
+        if zero_vae_path and zero_vae_path.strip() and os.path.exists(zero_vae_path.strip()):
+            command.extend(["--zero_vae_path", zero_vae_path.strip()])
+        if zero_vae_720p_path and zero_vae_720p_path.strip() and os.path.exists(zero_vae_720p_path.strip()):
+            command.extend(["--zero_vae_720p_path", zero_vae_720p_path.strip()])
+
+        # Handle audio separator
+        if audio_separator and audio_separator.strip() and os.path.exists(audio_separator.strip()):
+            command.extend(["--audio_separator", audio_separator.strip()])
+
+        # Performance options
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_t5: command.append("--fp8_t5")
+
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult),
+            (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult),
+            (lora4_str, lora4_mult),
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        print(f"Running HuMo Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, [], "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"HUMO_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[([0-9:]+)<([0-9:]+)', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item:
+            params_for_meta = {
+                "model_type": "HuMo-17B",
+                "humo_mode": humo_mode,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "image_path": os.path.basename(image_path) if image_path else None,
+                "task": task,
+                "width": width,
+                "height": height,
+                "frame_num": frame_num,
+                "fps": fps,
+                "scale_a": scale_a,
+                "scale_t": scale_t,
+                "step_change": step_change,
+                "seed": current_seed,
+                "sample_solver": sample_solver,
+                "sample_steps": sample_steps,
+                "flow_shift": flow_shift,
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+            all_generated_videos.append((current_video_file_for_item, f"HuMo - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, [], "HuMo Batch complete.", ""
+
+
 # ========================= Wan2.2 Queue System Functions =========================
 
 def wan22_submit_to_queue(
@@ -10941,358 +11192,208 @@ with gr.Blocks(
                         minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
                     )
 
-        # WanX Image to Video Tab
-        with gr.Tab(id=4, label="WanX-i2v") as wanx_i2v_tab:
+        # HuMo Audio-Driven Video Generation Tab
+        with gr.Tab(id=4, label="HuMo") as humo_tab:
+            gr.Markdown("""
+            ## HuMo - Audio-Driven Talking Head Video Generation
+            Generate talking head videos driven by audio input. Supports two modes:
+            - **TIA (Text + Image + Audio)**: Generate talking video from reference image and audio
+            - **TA (Text + Audio)**: Generate talking video from audio only
+            """)
             with gr.Row():
                 with gr.Column(scale=4):
-                    wanx_prompt = gr.Textbox(
-                        scale=3, 
-                        label="Enter your prompt", 
-                        value="A person walking on a beach at sunset", 
+                    humo_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A person speaking naturally with clear lip movements",
                         lines=5
                     )
-                    wanx_negative_prompt = gr.Textbox(
+                    humo_negative_prompt = gr.Textbox(
                         scale=3,
                         label="Negative Prompt",
-                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        value="blurry, distorted face, unnatural lip sync, static, low quality",
                         lines=3,
                     )
 
                 with gr.Column(scale=1):
-                    wanx_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    wanx_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    humo_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    humo_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
 
                 with gr.Column(scale=2):
-                    wanx_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    wanx_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    humo_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    humo_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
 
             with gr.Row():
-                wanx_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                wanx_stop_btn = gr.Button("Stop Generation", variant="stop")
+                humo_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                humo_stop_btn = gr.Button("Stop Generation", variant="stop")
 
             with gr.Row():
                 with gr.Column():
-                    wanx_input = gr.Image(label="Input Image", type="filepath")
-                    with gr.Row():
-                        wanx_use_random_folder = gr.Checkbox(label="Use Random Images from Folder", value=False)
-                        wanx_input_folder = gr.Textbox(
-                            label="Image Folder Path", 
-                            placeholder="Path to folder containing images",
+                    # HuMo Mode Selection
+                    humo_mode = gr.Radio(
+                        choices=["TIA", "TA"],
+                        label="Generation Mode",
+                        value="TIA",
+                        info="TIA = Text+Image+Audio, TA = Text+Audio only"
+                    )
+
+                    # Reference Image (for TIA mode)
+                    humo_input_image = gr.Image(label="Reference Image (for TIA mode)", type="filepath")
+                    humo_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                    # Audio Input Section
+                    with gr.Accordion("Audio Input", open=True):
+                        humo_audio_source = gr.Radio(
+                            choices=["Audio File", "Pre-extracted Features"],
+                            label="Audio Source",
+                            value="Pre-extracted Features",
+                            info="Use audio file with Whisper extraction or pre-extracted .pt features"
+                        )
+                        humo_audio_path = gr.File(
+                            label="Audio File (.wav)",
+                            file_types=[".wav", ".mp3", ".flac"],
                             visible=False
                         )
-                        wanx_folder_status = gr.Textbox(
-                            label="Folder Status", 
-                            placeholder="Status will appear here",
-                            interactive=False,
-                            visible=False
+                        humo_audio_feat_path = gr.File(
+                            label="Pre-extracted Audio Features (.pt)",
+                            file_types=[".pt"],
+                            visible=True
                         )
-                        wanx_validate_folder_btn = gr.Button("Validate Folder", visible=False)
-                    with gr.Row():
-                        wanx_use_end_image = gr.Checkbox(label="use ending image", value=False)
-                        wanx_input_end = gr.Image(label="End Image", type="filepath", visible=False)
-                        wanx_trim_frames = gr.Checkbox(label="trim last 3 frames", value=True, visible=False, interactive=True)
-
-                    with gr.Row():
-                        wanx_use_fun_control = gr.Checkbox(label="Use Fun-Control Model", value=False)
-                        wanx_control_video = gr.Video(label="Control Video for Fun-Control", visible=False, format="mp4")
-                        wanx_control_strength = gr.Slider(minimum=0.1, maximum=2.0, step=0.05, value=1.0, 
-                            label="Control Strength", visible=False,
-                            info="Adjust influence of control video (1.0 = normal)")
-                        wanx_control_start = gr.Slider(
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.01,
-                            value=0.0,
-                            label="Control Start (Fun-Control fade-in)",
+                        humo_whisper_model = gr.Textbox(
+                            label="Whisper Model Path",
+                            value="openai/whisper-large-v3",
                             visible=False,
-                            info="When (0-1) in the timeline control influence is full after fade-in"
+                            info="HuggingFace model ID or local path"
                         )
-                        wanx_control_end = gr.Slider(
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.01,
-                            value=1.0,
-                            label="Control End (Fun-Control fade-out start)",
-                            visible=False,
-                            info="When (0-1) in the timeline control starts to fade out"
-                        )
-                    wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
-                    wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
-        
-                    # Width and height display
-                    with gr.Row():
-                        wanx_width = gr.Number(label="Width", value=832, interactive=True)
-                        wanx_calc_height_btn = gr.Button("→")
-                        wanx_calc_width_btn = gr.Button("←")
-                        wanx_height = gr.Number(label="Height", value=480, interactive=True)
-                        wanx_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
 
-                    wanx_video_length = gr.Slider(minimum=1, maximum=401, step=4, label="Video Length in Frames", value=81)
-                    wanx_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wanx_infer_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
-                    wanx_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=3.0, 
-                                            info="Recommended: 3.0 for 480p, 5.0 for others")
-                    wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Guidance Scale", value=5.0)
+                    # HuMo CFG Settings
+                    with gr.Accordion("HuMo CFG Settings", open=True):
+                        humo_scale_a = gr.Slider(
+                            minimum=0.0, maximum=15.0, step=0.1, value=5.5,
+                            label="Audio Guidance Scale (scale_a)",
+                            info="Controls audio influence on generation"
+                        )
+                        humo_scale_t = gr.Slider(
+                            minimum=0.0, maximum=15.0, step=0.1, value=5.0,
+                            label="Text Guidance Scale (scale_t)",
+                            info="Controls text influence on generation"
+                        )
+                        humo_step_change = gr.Slider(
+                            minimum=0, maximum=1000, step=10, value=980,
+                            label="CFG Step Change",
+                            info="Timestep where CFG formula changes (default: 980)"
+                        )
+
+                    # Zero VAE Cache
+                    with gr.Accordion("Zero VAE Cache (Optional)", open=False):
+                        gr.Markdown("Pre-computed zero latents for better conditioning. Leave empty to use zeros.")
+                        humo_zero_vae_path = gr.Textbox(
+                            label="Zero VAE Cache (480p)",
+                            value="weightsHumo/zero_vae_129frame.pt",
+                            info="Path to zero_vae_129frame.pt"
+                        )
+                        humo_zero_vae_720p_path = gr.Textbox(
+                            label="Zero VAE Cache (720p)",
+                            value="weightsHumo/zero_vae_720p_161frame.pt",
+                            info="Path to zero_vae_720p_161frame.pt"
+                        )
+                        humo_audio_separator = gr.Textbox(
+                            label="Audio Separator Model (ONNX)",
+                            value="weightsHumo/audio_separator/Kim_Vocal_2.onnx",
+                            info="Optional: Kim_Vocal_2.onnx for vocal separation"
+                        )
+
+                    gr.Markdown("### Generation Parameters")
+                    # Width and height inputs
+                    with gr.Row():
+                        humo_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        humo_calc_height_btn = gr.Button("→")
+                        humo_calc_width_btn = gr.Button("←")
+                        humo_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+
+                    humo_frame_num = gr.Slider(minimum=9, maximum=401, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    humo_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=25, info="HuMo default: 25 FPS")
+                    humo_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
+                    humo_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        humo_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        humo_random_seed_btn = gr.Button("🎲")
 
                 with gr.Column():
-                    wanx_output = gr.Gallery(
+                    humo_output = gr.Gallery(
                         label="Generated Videos (Click to select)",
-                        columns=[2],
-                        rows=[2],
-                        object_fit="contain",
-                        height="auto",
-                        show_label=True,
-                        elem_id="gallery",
-                        allow_preview=True,
-                        preview=True
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_humo", allow_preview=True, preview=True
                     )
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        wanx_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
-                        wanx_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                       label="Preview Every N Steps", info="Generates previews during the sampling loop.")
-                        wanx_preview_output = gr.Gallery(
+                        humo_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        humo_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        humo_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_preview_gallery"
-                        )                    
-                    wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
-                    wanx_i2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-                    wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
-                    wanx_extend_btn = gr.Button("Extend Video")
-                    wanx_frames_to_check = gr.Slider(minimum=1, maximum=100, step=1, value=30, 
-                                                   label="Frames to Check from End", 
-                                                   info="Number of frames from the end to check for sharpness")
-                    wanx_send_sharpest_frame_btn = gr.Button("Extract Sharpest Frame")
-                    wanx_trim_and_extend_btn = gr.Button("Trim Video & Prepare for Extension")
-                    wanx_sharpest_frame_status = gr.Textbox(label="Status", interactive=False)
+                            allow_preview=True, preview=True, show_label=True, elem_id="humo_preview_gallery"
+                        )
 
-                # Add a new button for directly extending with the trimmed video
-                    wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
+                    # LoRA Section
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            humo_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            humo_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        humo_lora_weights = []
+                        humo_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                humo_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                humo_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
 
-                    # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    wanx_lora_weights = []
-                    wanx_lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            wanx_lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
-                            ))
-                            wanx_lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))
-
-            with gr.Row():
-                wanx_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                # Update the wanx_task dropdown choices to include Fun-Control options
-                wanx_task = gr.Dropdown(
+            with gr.Accordion("Model Paths & Performance", open=True):
+                humo_task = gr.Dropdown(
                     label="Task",
-                    choices=["i2v-14B", "i2v-14B-FC", "i2v-14B-FC-1.1", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new"],
-                    value="i2v-14B",
-                    info="Select model type. *-FC options enable Fun-Control features"
+                    choices=["humo-17B-TIA", "humo-17B-TA"],
+                    value="humo-17B-TIA",
+                    info="HuMo model configuration"
                 )
-                wanx_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
-                wanx_dit_path = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("wan"),  # Use the existing function to get available models
-                    value="wan2.1_i2v_720p_14B_fp16.safetensors",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
-                wanx_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                wanx_clip_path = gr.Textbox(label="CLIP Path", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
-                wanx_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                wanx_save_path = gr.Textbox(label="Save Path", value="outputs")
-
-            with gr.Row():
-                wanx_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                wanx_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                wanx_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                wanx_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                wanx_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
-                
-                with gr.Column():
-                    wanx_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                    wanx_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False, info="For mixing fp16/bf16 and fp8 weights")
-                    wanx_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-
-            # Add new row for Skip Layer Guidance options
-            with gr.Row():
-                wanx_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
-                wanx_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
-                wanx_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")    
-            
-            with gr.Row():
-                wanx_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
-                with gr.Column(visible=False) as wanx_cfg_skip_options:
-                    wanx_cfg_skip_mode = gr.Radio(
-                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
-                        label="CFG Skip Mode",
-                        value="none",
-                        info="Controls which steps to apply CFG on"
-                    )
-                    wanx_cfg_apply_ratio = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
-                        label="CFG Apply Ratio", 
-                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
-                    )
-
-        #WanX-t2v Tab
-
-        # WanX Text to Video Tab
-        with gr.Tab(id=5, label="WanX-t2v") as wanx_t2v_tab:
-            with gr.Row():
-                with gr.Column(scale=4):
-                    wanx_t2v_prompt = gr.Textbox(
-                        scale=3, 
-                        label="Enter your prompt", 
-                        value="A person walking on a beach at sunset", 
-                        lines=5
-                    )
-                    wanx_t2v_negative_prompt = gr.Textbox(
-                        scale=3,
-                        label="Negative Prompt",
+                with gr.Row():
+                    humo_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn"], label="Attention Mode", value="sdpa")
+                    humo_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                with gr.Row():
+                    humo_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    humo_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    humo_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    humo_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    humo_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    humo_dit_path = gr.Dropdown(
+                        label="HuMo DiT Model (.safetensors)",
+                        choices=get_dit_models("wan"),
                         value="",
-                        lines=3,
-                        info="Leave empty to use default negative prompt"
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="17B HuMo model checkpoint"
                     )
-
-                with gr.Column(scale=1):
-                    wanx_t2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    wanx_t2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-
-                with gr.Column(scale=2):
-                    wanx_t2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    wanx_t2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
-
-            with gr.Row():
-                wanx_t2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                wanx_t2v_stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                with gr.Column():
-                    with gr.Row():
-                        wanx_t2v_width = gr.Number(label="Width", value=832, interactive=True, info="Should be divisible by 32")
-                        wanx_t2v_height = gr.Number(label="Height", value=480, interactive=True, info="Should be divisible by 32")
-                        wanx_t2v_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
-
-                    wanx_t2v_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
-                    wanx_t2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wanx_t2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
-                    wanx_t2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0, 
-                                             info="Recommended: 3.0 for I2V with 480p, 5.0 for others")
-                    wanx_t2v_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
-
-                with gr.Column():
-                    wanx_t2v_output = gr.Gallery(
-                        label="Generated Videos (Click to select)",
-                        columns=[2],
-                        rows=[2],
-                        object_fit="contain",
-                        height="auto",
-                        show_label=True,
-                        elem_id="gallery",
-                        allow_preview=True,
-                        preview=True
+                with gr.Row():
+                    humo_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    with gr.Accordion("Latent Preview (During Generation)", open=False):
-                        wanx_t2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
-                        wanx_t2v_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                        label="Preview Every N Steps", info="Generates previews during the sampling loop.")
-                        wanx_t2v_preview_output = gr.Gallery(
-                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_t2v_preview_gallery"
-                        )                    
-                    wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan v2v")
-                    wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-
-                    # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    wanx_t2v_lora_weights = []
-                    wanx_t2v_lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            wanx_t2v_lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
-                            ))
-                            wanx_t2v_lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))
-
-            with gr.Row():
-                wanx_t2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                wanx_t2v_task = gr.Dropdown(
-                    label="Task",
-                    choices=["t2v-1.3B", "t2v-14B", "t2i-14B"],
-                    value="t2v-14B",
-                    info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
-                )
-                wanx_t2v_dit_path = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("wan"),
-                    value="wan2.1_t2v_14B_fp16.safetensors",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
-                wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
-                wanx_t2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                wanx_t2v_save_path = gr.Textbox(label="Save Path", value="outputs")
-
-            with gr.Row():
-                wanx_t2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                wanx_t2v_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                wanx_t2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                wanx_t2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                wanx_t2v_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0, 
-                                         info="Max 39 for 14B model, 29 for 1.3B model")
-                
-                with gr.Column():
-                    wanx_t2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                    wanx_t2v_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False,
-                                                info="For mixing fp16/bf16 and fp8 weights")
-                    wanx_t2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-            
-            # Add new row for Skip Layer Guidance options
-            with gr.Row():
-                wanx_t2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
-                wanx_t2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
-                wanx_t2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
-                wanx_t2v_use_random_folder = gr.Checkbox(visible=False, value=False, label="Use Random Images")
-                wanx_t2v_input_folder = gr.Textbox(visible=False, value="", label="Image Folder")
-                wanx_t2v_input_end = gr.Textbox(visible=False, value="none", label="End Frame")
-            
-            with gr.Row():
-                wanx_t2v_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
-                with gr.Column(visible=False) as wanx_t2v_cfg_skip_options:
-                    wanx_t2v_cfg_skip_mode = gr.Radio(
-                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
-                        label="CFG Skip Mode",
-                        value="none",
-                        info="Controls which steps to apply CFG on"
+                    humo_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    wanx_t2v_cfg_apply_ratio = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
-                        label="CFG Apply Ratio", 
-                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
-                    )
+                humo_save_path = gr.Textbox(label="Save Path", value="outputs")
 
         #WanX-v2v Tab
         with gr.Tab(id=6, label="WanX-v2v", visible=False) as wanx_v2v_tab:
@@ -15770,6 +15871,166 @@ with gr.Blocks(
         outputs=[phantom_input_images],
         show_progress="hidden" # Can be "full" or "minimal" if you want progress for upload
     )
+
+    # ========================= HuMo Event Handlers =========================
+    # Prompt token counter
+    humo_prompt.change(fn=count_prompt_tokens, inputs=humo_prompt, outputs=humo_token_counter)
+
+    # Stop button
+    humo_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Random seed button
+    humo_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[humo_seed])
+
+    # Audio source toggle - show/hide appropriate inputs
+    def humo_toggle_audio_source(source):
+        if source == "Audio File":
+            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+        else:
+            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+
+    humo_audio_source.change(
+        fn=humo_toggle_audio_source,
+        inputs=[humo_audio_source],
+        outputs=[humo_audio_path, humo_audio_feat_path, humo_whisper_model]
+    )
+
+    # Image dimension handlers
+    humo_input_image.change(
+        fn=update_wanx_image_dimensions,
+        inputs=[humo_input_image],
+        outputs=[humo_original_dims, humo_width, humo_height]
+    )
+
+    # Width/Height calculation buttons
+    def calc_humo_height(width, img_path):
+        if img_path and os.path.exists(img_path):
+            try:
+                img = Image.open(img_path)
+                orig_w, orig_h = img.size
+                aspect = orig_h / orig_w
+                new_height = int(width * aspect)
+                new_height = (new_height // 32) * 32
+                return max(32, new_height)
+            except:
+                pass
+        return 480
+
+    def calc_humo_width(height, img_path):
+        if img_path and os.path.exists(img_path):
+            try:
+                img = Image.open(img_path)
+                orig_w, orig_h = img.size
+                aspect = orig_w / orig_h
+                new_width = int(height * aspect)
+                new_width = (new_width // 32) * 32
+                return max(32, new_width)
+            except:
+                pass
+        return 832
+
+    humo_calc_height_btn.click(
+        fn=calc_humo_height,
+        inputs=[humo_width, humo_input_image],
+        outputs=[humo_height]
+    )
+
+    humo_calc_width_btn.click(
+        fn=calc_humo_width,
+        inputs=[humo_height, humo_input_image],
+        outputs=[humo_width]
+    )
+
+    # LoRA refresh
+    humo_lora_refresh_outputs_list = []
+    for i in range(len(humo_lora_weights)):
+        humo_lora_refresh_outputs_list.extend([humo_lora_weights[i], humo_lora_multipliers[i]])
+
+    def refresh_4_loras(folder: str):
+        """Helper to refresh 4 LoRA dropdowns and reset multipliers."""
+        choices = get_lora_options(folder)
+        updates = []
+        for _ in range(4):
+            updates.extend([gr.update(choices=choices, value="None"), gr.update(value=1.0)])
+        return updates
+
+    humo_lora_refresh_btn.click(
+        fn=refresh_4_loras,
+        inputs=[humo_lora_folder],
+        outputs=humo_lora_refresh_outputs_list
+    )
+
+    # Model refresh
+    def refresh_humo_models(folder: str):
+        """Refresh model dropdowns for HuMo"""
+        return [
+            gr.update(choices=get_dit_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    humo_refresh_models_btn.click(
+        fn=refresh_humo_models,
+        inputs=[humo_model_folder],
+        outputs=[humo_dit_path, humo_vae_path, humo_t5_path]
+    )
+
+    # Generate button handler
+    humo_generate_btn.click(
+        fn=humo_batch_handler,
+        inputs=[
+            humo_prompt,
+            humo_negative_prompt,
+            humo_input_image,
+            humo_mode,
+            humo_audio_source,
+            humo_audio_path,
+            humo_audio_feat_path,
+            humo_whisper_model,
+            humo_scale_a,
+            humo_scale_t,
+            humo_step_change,
+            humo_zero_vae_path,
+            humo_zero_vae_720p_path,
+            humo_audio_separator,
+            humo_task,
+            humo_width,
+            humo_height,
+            humo_frame_num,
+            humo_fps,
+            humo_seed,
+            humo_sample_solver,
+            humo_sample_steps,
+            humo_flow_shift,
+            humo_batch_size,
+            humo_save_path,
+            humo_attn_mode,
+            humo_block_swap,
+            humo_fp8,
+            humo_fp8_scaled,
+            humo_fp8_t5,
+            humo_dit_path,
+            humo_vae_path,
+            humo_t5_path,
+            humo_lora_folder,
+            *humo_lora_weights,
+            *humo_lora_multipliers,
+            humo_enable_preview,
+            humo_preview_steps,
+        ],
+        outputs=[humo_output, humo_preview_output, humo_batch_progress, humo_progress_text],
+        queue=True
+    )
+
+    # Gallery selection handling
+    humo_selected_index = gr.State(value=0)
+
+    def handle_humo_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    humo_output.select(fn=handle_humo_gallery_select, outputs=humo_selected_index)
+
+    # ========================= End HuMo Event Handlers =========================
 
 if __name__ == "__main__":
     # Make sure 'outputs' directory exists
