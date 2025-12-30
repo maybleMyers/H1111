@@ -237,9 +237,24 @@ def save_video_with_audio(video_tensor: torch.Tensor, output_path: str, audio_pa
         audio_path: Input audio file path (WAV)
         fps: Video frame rate
     """
+    ImageSequenceClip = None
+    AudioFileClip = None
+    moviepy_version = None
+
+    # Try moviepy 2.x import first, then fall back to 1.x
     try:
-        from moviepy.editor import AudioFileClip, VideoClip
-    except ImportError:
+        from moviepy import ImageSequenceClip, AudioFileClip
+        moviepy_version = "2.x"
+        logger.info("Using moviepy 2.x for audio muxing")
+    except ImportError as e1:
+        try:
+            from moviepy.editor import ImageSequenceClip, AudioFileClip
+            moviepy_version = "1.x"
+            logger.info("Using moviepy 1.x for audio muxing")
+        except ImportError as e2:
+            logger.warning(f"moviepy import failed. moviepy 2.x error: {e1}, moviepy 1.x error: {e2}")
+
+    if ImageSequenceClip is None or AudioFileClip is None:
         logger.warning("moviepy not available, falling back to save_videos_grid without audio")
         if video_tensor.dim() == 4:
             video_tensor = video_tensor.unsqueeze(0)
@@ -250,23 +265,27 @@ def save_video_with_audio(video_tensor: torch.Tensor, output_path: str, audio_pa
     if video_tensor.dim() == 5:
         video_tensor = video_tensor[0]  # Remove batch dim -> [C, T, H, W]
 
-    # Convert to [T, H, W, C] numpy uint8
+    # Convert to list of [H, W, C] numpy uint8 frames
     video_np = video_tensor.permute(1, 2, 3, 0).cpu().numpy()
     video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
+    frames_list = [video_np[i] for i in range(video_np.shape[0])]
 
-    def make_frame(t):
-        frame_index = min(int(t * fps), video_np.shape[0] - 1)
-        return video_np[frame_index]
-
-    video_duration = video_np.shape[0] / fps
+    video_duration = len(frames_list) / fps
 
     try:
         audio_clip = AudioFileClip(audio_path)
         final_duration = min(video_duration, audio_clip.duration)
-        audio_clip = audio_clip.subclip(0, final_duration)
 
-        video_clip = VideoClip(make_frame, duration=final_duration)
-        video_clip = video_clip.set_audio(audio_clip)
+        # Trim frames to match audio duration
+        final_frame_count = int(final_duration * fps)
+        frames_list = frames_list[:final_frame_count]
+
+        # Create video clip from image sequence
+        video_clip = ImageSequenceClip(frames_list, fps=fps)
+
+        # Trim audio to match
+        audio_clip = audio_clip.subclipped(0, final_duration) if moviepy_version == "2.x" else audio_clip.subclip(0, final_duration)
+        video_clip = video_clip.with_audio(audio_clip) if moviepy_version == "2.x" else video_clip.set_audio(audio_clip)
 
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
         video_clip.write_videofile(output_path, fps=fps, audio_codec="aac", logger=None)
@@ -274,8 +293,9 @@ def save_video_with_audio(video_tensor: torch.Tensor, output_path: str, audio_pa
         # Clean up
         audio_clip.close()
         video_clip.close()
+        logger.info(f"Video with audio saved successfully: {output_path}")
     except Exception as e:
-        logger.error(f"Failed to save video with audio: {e}")
+        logger.error(f"Failed to save video with audio: {e}", exc_info=True)
         logger.info("Falling back to save_videos_grid without audio")
         if video_tensor.dim() == 3:
             video_tensor = video_tensor.unsqueeze(0)
