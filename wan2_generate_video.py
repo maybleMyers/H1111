@@ -5966,7 +5966,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Load weights
         if args.dit is not None:
             logger.info(f"Loading HuMo weights from {args.dit}")
-            state_dict = load_safetensors(args.dit)
+            state_dict = load_safetensors(args.dit, device="cpu")
             model.load_state_dict(state_dict, strict=False)
             del state_dict
             clean_memory_on_device(device)
