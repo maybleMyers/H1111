@@ -14,6 +14,7 @@ from typing import List, Optional
 from .attention import flash_attention
 from .audio_proj import AudioProjModel
 from modules.custom_offloading_utils import ModelOffloader
+from utils.device_utils import clean_memory_on_device
 
 __all__ = ["WanHuMoModel", "WanAttentionBlockHuMo"]
 
@@ -149,6 +150,7 @@ class WanSelfAttention(nn.Module):
 
         _mem("Before rope_apply")
         qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
+        del q, k, v  # Free original tensors to prevent memory accumulation
         _mem("After rope_apply")
         x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
         _mem("After flash_attention")
@@ -199,6 +201,7 @@ class WanSelfAttentionSepKVDim(nn.Module):
         q, k, v = qkv_fn(x)
 
         qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
+        del q, k, v  # Free original tensors to prevent memory accumulation
         x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
 
         x = x.flatten(2)
@@ -218,6 +221,7 @@ class WanT2VCrossAttention(WanSelfAttention):
 
         # compute attention
         qkv = [q, k, v]
+        del q, k, v  # Free tensors to prevent memory accumulation
         x = flash_attention(qkv, k_lens=context_lens)
 
         # output
@@ -255,6 +259,7 @@ class WanT2VCrossAttentionGather(WanSelfAttentionSepKVDim):
 
         # Cross-attention
         qkv = [q, k, v]
+        del q, k, v  # Free tensors to prevent memory accumulation
         x = flash_attention(qkv, k_lens=None)
 
         x = x.view(b, -1, n, d).flatten(2)
@@ -296,6 +301,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
         qkv = [q, k, v]
+        del q, k, v  # Free tensors to prevent memory accumulation
         x = flash_attention(qkv, k_lens=context_lens)
 
         # output
@@ -672,6 +678,10 @@ class WanHuMoModel(nn.Module):
             context_lens=context_lens,
             audio=audio,
             audio_seq_len=audio_seq_len)
+
+        # Clean memory before block loop to prevent accumulation during block swap
+        if self.blocks_to_swap:
+            clean_memory_on_device(torch.device('cuda'))
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
