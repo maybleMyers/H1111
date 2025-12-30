@@ -124,24 +124,39 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, _attn_debug=False):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        def _mem(msg):
+            if _attn_debug and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                print(f"      [SelfAttn] {msg}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+
+        _mem("Start")
 
         # query, key, value function
         def qkv_fn(x):
+            _mem("Before q projection")
             q = self.norm_q(self.q(x)).view(b, s, n, d)
+            _mem("After q projection")
             k = self.norm_k(self.k(x)).view(b, s, n, d)
+            _mem("After k projection")
             v = self.v(x).view(b, s, n, d)
+            _mem("After v projection")
             return q, k, v
 
         q, k, v = qkv_fn(x)
 
+        _mem("Before rope_apply")
         qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
+        _mem("After rope_apply")
         x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
+        _mem("After flash_attention")
 
         # output
         x = x.flatten(2)
         x = self.o(x)
+        _mem("After output projection")
         return x
 
 
@@ -346,15 +361,30 @@ class WanAttentionBlockHuMo(nn.Module):
         audio=None,
         audio_seq_len=None,
         ref_num_list=None,
+        _block_debug=False,  # Debug flag
     ):
+        # Debug memory tracking for block
+        if _block_debug and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            print(f"    [Block] Start: {torch.cuda.memory_allocated() / 1e9:.2f} GB, x device: {x.device}", flush=True)
+
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
+        if _block_debug and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            print(f"    [Block] After modulation: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+            # Check all parameter devices
+            for name, param in self.named_parameters():
+                if param.device.type != 'cuda':
+                    print(f"    [Block] WARN: {name} is on {param.device}!", flush=True)
+                    break
+
         # self-attention
         y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs, _attn_debug=_block_debug)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -560,10 +590,14 @@ class WanHuMoModel(nn.Module):
 
         # Debug: track memory usage
         _debug_mem = hasattr(self, '_debug_forward_mem') and self._debug_forward_mem
+        import sys
         def _log_mem(msg):
             if _debug_mem and torch.cuda.is_available():
                 torch.cuda.synchronize()
-                print(f"[HuMo Forward] {msg}: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                print(f"[HuMo Forward] {msg}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+
+        if _debug_mem:
+            print(f"[HuMo Forward] blocks_to_swap={self.blocks_to_swap}, offloader={self.offloader is not None}", flush=True)
 
         _log_mem("Start")
 
@@ -641,15 +675,29 @@ class WanHuMoModel(nn.Module):
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
+                if block_idx < 5:
+                    _log_mem(f"Before wait_for_block({block_idx})")
                 self.offloader.wait_for_block(block_idx)
+                if block_idx < 5:
+                    _log_mem(f"After wait_for_block({block_idx})")
 
-            if block_idx == 0:
-                _log_mem(f"Before block 0")
+            if block_idx < 5:
+                _log_mem(f"Before block {block_idx}")
+                # Check if block is on correct device
+                first_param = next(block.parameters(), None)
+                if first_param is not None:
+                    print(f"  Block {block_idx} first param device: {first_param.device}, dtype: {first_param.dtype}", flush=True)
+                else:
+                    print(f"  Block {block_idx} has no parameters!", flush=True)
 
-            x = block(x, **kwargs)
+            # Pass debug flag for first few blocks
+            if block_idx < 3 and _debug_mem:
+                x = block(x, _block_debug=True, **kwargs)
+            else:
+                x = block(x, **kwargs)
 
-            if block_idx == 0:
-                _log_mem(f"After block 0")
+            if block_idx < 5:
+                _log_mem(f"After block {block_idx}")
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
@@ -721,3 +769,16 @@ class WanHuMoModel(nn.Module):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+        # Verify block placement
+        num_resident = self.num_blocks - self.blocks_to_swap
+        print(f"[HuMo] Verifying block placement after prepare:", flush=True)
+        for i, block in enumerate(self.blocks):
+            first_param = next(block.parameters(), None)
+            if first_param is not None:
+                expected = "GPU" if i < num_resident else "CPU"
+                actual = "GPU" if first_param.device.type == "cuda" else "CPU"
+                if expected != actual:
+                    print(f"  Block {i}: MISMATCH! Expected {expected}, got {actual}", flush=True)
+                elif i < 3 or i >= self.num_blocks - 2:  # Only log first 3 and last 2
+                    print(f"  Block {i}: {actual} (correct)", flush=True)
