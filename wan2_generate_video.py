@@ -227,6 +227,61 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
 
     container.close()
 
+
+def save_video_with_audio(video_tensor: torch.Tensor, output_path: str, audio_path: str, fps: int = 25):
+    """Save video tensor with audio track using moviepy (matching official HuMo).
+
+    Args:
+        video_tensor: Video tensor [B, C, T, H, W] or [C, T, H, W], range [0, 1]
+        output_path: Output video file path
+        audio_path: Input audio file path (WAV)
+        fps: Video frame rate
+    """
+    try:
+        from moviepy.editor import AudioFileClip, VideoClip
+    except ImportError:
+        logger.warning("moviepy not available, falling back to save_videos_grid without audio")
+        if video_tensor.dim() == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+        save_videos_grid(video_tensor, output_path, fps=fps, rescale=False)
+        return
+
+    # Handle batch dimension
+    if video_tensor.dim() == 5:
+        video_tensor = video_tensor[0]  # Remove batch dim -> [C, T, H, W]
+
+    # Convert to [T, H, W, C] numpy uint8
+    video_np = video_tensor.permute(1, 2, 3, 0).cpu().numpy()
+    video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
+
+    def make_frame(t):
+        frame_index = min(int(t * fps), video_np.shape[0] - 1)
+        return video_np[frame_index]
+
+    video_duration = video_np.shape[0] / fps
+
+    try:
+        audio_clip = AudioFileClip(audio_path)
+        final_duration = min(video_duration, audio_clip.duration)
+        audio_clip = audio_clip.subclip(0, final_duration)
+
+        video_clip = VideoClip(make_frame, duration=final_duration)
+        video_clip = video_clip.set_audio(audio_clip)
+
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        video_clip.write_videofile(output_path, fps=fps, audio_codec="aac", logger=None)
+
+        # Clean up
+        audio_clip.close()
+        video_clip.close()
+    except Exception as e:
+        logger.error(f"Failed to save video with audio: {e}")
+        logger.info("Falling back to save_videos_grid without audio")
+        if video_tensor.dim() == 3:
+            video_tensor = video_tensor.unsqueeze(0)
+        save_videos_grid(video_tensor.unsqueeze(0), output_path, fps=fps, rescale=False)
+
+
 def save_images_grid(videos: torch.Tensor, parent_dir: str, image_name: str, rescale: bool = False, n_rows: int = 1, save_individually=True):
     from einops import rearrange  # Local import to avoid scope issues
     videos = rearrange(videos, "b c t h w -> t b c h w")
@@ -3602,10 +3657,16 @@ def prepare_humo_inputs(
     lat_w = width // config.vae_stride[2]
     lat_f = (frames - 1) // config.vae_stride[0] + 1
 
-    # Calculate sequence length
-    seq_len = lat_f * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+    # Determine reference frames (TIA mode has 1 reference frame, TA mode has 0)
+    # Official HuMo adds reference frame(s) to the latent dimension during generation
+    ref_frames = 1 if args.humo_mode == "TIA" and args.image_path is not None else 0
+    lat_f_with_ref = lat_f + ref_frames  # Extended frame count for noise/conditioning
 
-    logger.info(f"HuMo target dimensions: {height}x{width}@{frames} -> latent ({lat_f}, {lat_h}, {lat_w}), seq_len: {seq_len}")
+    # Calculate sequence length with extended frames (matching official HuMo)
+    seq_len = lat_f_with_ref * lat_h * lat_w // (config.patch_size[1] * config.patch_size[2])
+
+    logger.info(f"HuMo target dimensions: {height}x{width}@{frames} -> latent ({lat_f}, {lat_h}, {lat_w})")
+    logger.info(f"Extended latent frames: {lat_f_with_ref} (base {lat_f} + {ref_frames} ref), seq_len: {seq_len}")
 
     # Set seed
     seed = args.seed
@@ -3615,13 +3676,15 @@ def prepare_humo_inputs(
     else:
         seed_g = torch.manual_seed(seed)
 
-    # Generate noise
+    # Generate noise with extended frame count (includes reference frame slot)
+    # Official HuMo: target_shape[1] = lat_f + ref_frames
     noise = torch.randn(
-        16, lat_f, lat_h, lat_w,
+        16, lat_f_with_ref, lat_h, lat_w,
         dtype=torch.float32, generator=seed_g,
         device=device if not args.cpu_noise else "cpu",
     )
     noise = noise.to(device)
+    logger.info(f"Generated noise: shape {noise.shape}")
 
     # === Load and process audio ===
     audio_emb = None
@@ -3666,6 +3729,17 @@ def prepare_humo_inputs(
     # Window the audio embeddings for model input
     audio_emb_windowed, _ = get_audio_emb_window(audio_emb.to(device), frames, frame0_idx=0, audio_shift=2)
     logger.info(f"Windowed audio embeddings: shape {audio_emb_windowed.shape}")
+
+    # Add zero-padding for reference frame(s) - matching official HuMo
+    # Official: zero_audio_pad = torch.zeros(latents_ref[0].shape[1], *audio_emb.shape[1:])
+    #           audio_emb = torch.cat([audio_emb, zero_audio_pad], dim=0)
+    if ref_frames > 0:
+        zero_audio_pad = torch.zeros(
+            ref_frames, *audio_emb_windowed.shape[1:],
+            dtype=audio_emb_windowed.dtype, device=device
+        )
+        audio_emb_windowed = torch.cat([audio_emb_windowed, zero_audio_pad], dim=0)
+        logger.info(f"Added zero-padding for {ref_frames} reference frame(s): new shape {audio_emb_windowed.shape}")
 
     # === Load text encoder and encode prompts ===
     from wan.modules.t5 import T5EncoderModel
@@ -3730,7 +3804,7 @@ def prepare_humo_inputs(
 
         logger.info(f"Encoded reference latent: shape {ref_latent.shape}")
 
-        # Load zero VAE cache
+        # Load zero VAE cache (need lat_f frames for generated frames portion)
         zero_vae = None
         zero_vae_loaded = False
 
@@ -3762,15 +3836,16 @@ def prepare_humo_inputs(
             neutral_img = torch.full((3, 1, height, width), -1.0, device=device, dtype=vae.dtype)
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
                 single_frame_latent = vae.encode([neutral_img])[0]  # [16, 1, lat_h, lat_w]
-            # Repeat for all frames
+            # Repeat for generated frames (lat_f)
             zero_vae = single_frame_latent.repeat(1, lat_f, 1, 1)
             logger.info(f"Generated zero_vae from neutral image: shape {zero_vae.shape}")
 
-        # Create HuMo conditioning tensor
+        # Create HuMo conditioning tensor with extended frame count
+        # Official HuMo: y_c has lat_f_with_ref frames = [zero_vae(lat_f) | ref_latent(ref_frames)]
         y = create_humo_conditioning(
-            ref_latent, lat_f, zero_vae, lat_h, lat_w, device, vae.dtype
+            ref_latent, lat_f_with_ref, zero_vae, lat_h, lat_w, device, vae.dtype
         )
-        logger.info(f"Created HuMo conditioning 'y': shape {y.shape}")
+        logger.info(f"Created HuMo conditioning 'y': shape {y.shape} (extended frames: {lat_f_with_ref})")
 
         vae.to_device("cpu" if not args.vae_cache_cpu else args.vae_cache_cpu)
         clean_memory_on_device(device)
@@ -3843,6 +3918,9 @@ def prepare_humo_inputs(
     arg_c["_step_change"] = args.step_change
     # Store zero_vae for y_null creation in sampling loop (critical for proper CFG)
     arg_c["_zero_vae"] = zero_vae
+    # Store ref_frames for stripping after sampling (matching official HuMo)
+    arg_c["_ref_frames"] = ref_frames
+    arg_c["_lat_f_with_ref"] = lat_f_with_ref
 
     logger.info(f"HuMo inputs prepared successfully")
 
@@ -3896,25 +3974,33 @@ def run_humo_sampling(
     # Create proper null y conditioning with mask + zero_vae (matching official HuMo)
     # y_null should have the same structure as y_c: [msk(4) | zero_vae(16)]
     zero_vae_for_null = arg_c.get("_zero_vae")
-    y_shape = arg_c["y"][0].shape  # [20, lat_f, lat_h, lat_w]
-    lat_f = y_shape[1]
+    ref_frames = arg_c.get("_ref_frames", 0)
+    y_shape = arg_c["y"][0].shape  # [20, lat_f_with_ref, lat_h, lat_w]
+    lat_f_with_ref = y_shape[1]  # This is the extended frame count
     lat_h = y_shape[2]
     lat_w = y_shape[3]
     dtype = arg_c["y"][0].dtype
 
     # Create y_null based on mode
-    # Slice zero_vae to full frame count
-    zero_latent = zero_vae_for_null[:, :lat_f].to(device=device, dtype=dtype)
+    # Need to create zero_latent with lat_f_with_ref frames for y_null
+    # zero_vae_for_null may have fewer frames, so pad if needed
+    if zero_vae_for_null.shape[1] < lat_f_with_ref:
+        # Pad by repeating the last frame
+        pad_frames = lat_f_with_ref - zero_vae_for_null.shape[1]
+        last_frame = zero_vae_for_null[:, -1:, :, :].repeat(1, pad_frames, 1, 1)
+        zero_latent = torch.cat([zero_vae_for_null, last_frame], dim=1).to(device=device, dtype=dtype)
+    else:
+        zero_latent = zero_vae_for_null[:, :lat_f_with_ref].to(device=device, dtype=dtype)
 
     if humo_mode == "TA":
         # TA mode: mask is all zeros (no reference frame)
-        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
+        msk = torch.zeros(4, lat_f_with_ref, lat_h, lat_w, device=device, dtype=dtype)
     else:
         # TIA mode: mask has 1 for reference frame (last frame), 0 for frames to generate
-        msk = torch.ones(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
-        msk[:, :-1] = 0  # Zero for all generated frames, 1 for reference (last frame)
+        msk = torch.ones(4, lat_f_with_ref, lat_h, lat_w, device=device, dtype=dtype)
+        msk[:, :-ref_frames] = 0  # Zero for all generated frames, 1 for reference (last frame(s))
 
-    # Combine mask + zero_vae for y_null: [4, lat_f, lat_h, lat_w] + [16, lat_f, lat_h, lat_w]
+    # Combine mask + zero_vae for y_null: [4, lat_f_with_ref, H, W] + [16, lat_f_with_ref, H, W]
     y_null = [torch.cat([msk, zero_latent], dim=0)]
 
     for i, t in enumerate(tqdm(timesteps)):
@@ -6142,6 +6228,19 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             preview_suffix=args.preview_suffix,
         )
 
+        # Strip reference frame(s) from output latent (matching official HuMo)
+        # Official: x0 = [x0_[:,:-latents_ref[0].shape[1]] for x0_ in x0]
+        arg_c, _ = inputs
+        ref_frames_to_strip = arg_c.get("_ref_frames", 0)
+        if ref_frames_to_strip > 0:
+            logger.info(f"Stripping {ref_frames_to_strip} reference frame(s) from latent")
+            # generated_latent shape: [16, lat_f_with_ref, H, W] or [B, 16, lat_f_with_ref, H, W]
+            if generated_latent.dim() == 4:
+                generated_latent = generated_latent[:, :-ref_frames_to_strip, :, :]
+            else:
+                generated_latent = generated_latent[:, :, :-ref_frames_to_strip, :, :]
+            logger.info(f"After stripping: latent shape {generated_latent.shape}")
+
         # Cleanup
         del model
         clean_memory_on_device(device)
@@ -7229,11 +7328,19 @@ def save_output(
             os.makedirs(os.path.dirname(video_path), exist_ok=True)
         else:
             video_path = os.path.join(save_path, f"{base_name}.mp4")
-        # save_videos_grid expects [B, T, H, W, C], need to permute and rescale if needed
-        # Input video_tensor is [B, C, T, H, W], range [0, 1]
-        # save_videos_grid handles the rescale flag correctly if input is [0,1]
+
+        # Check if this is HuMo mode with audio - use audio muxing
+        is_humo_with_audio = (getattr(args, 'humo', False) or "humo" in args.task.lower()) and getattr(args, 'audio_path', None)
+
         try:
-            save_videos_grid(video_tensor, video_path, fps=args.fps, rescale=False) # Pass rescale=False as tensor is already [0,1]
+            if is_humo_with_audio:
+                # HuMo mode: Save video with audio track (matching official implementation)
+                logger.info(f"Saving HuMo video with audio from: {args.audio_path}")
+                save_video_with_audio(video_tensor, video_path, args.audio_path, fps=args.fps)
+            else:
+                # Standard mode: Save video without audio
+                # save_videos_grid expects [B, C, T, H, W], range [0, 1]
+                save_videos_grid(video_tensor, video_path, fps=args.fps, rescale=False)
             logger.info(f"Video saved to: {video_path}")
         except Exception as e:
             logger.error(f"Failed to save video file: {e}")
