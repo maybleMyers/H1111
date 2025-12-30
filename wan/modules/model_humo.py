@@ -136,12 +136,8 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
+        x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
 
         # output
         x = x.flatten(2)
@@ -187,12 +183,8 @@ class WanSelfAttentionSepKVDim(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
+        x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
 
         x = x.flatten(2)
         x = self.o(x)
@@ -210,7 +202,8 @@ class WanT2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        qkv = [q, k, v]
+        x = flash_attention(qkv, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -246,7 +239,8 @@ class WanT2VCrossAttentionGather(WanSelfAttentionSepKVDim):
         v = v.reshape(-1, 16, n, d)
 
         # Cross-attention
-        x = flash_attention(q, k, v, k_lens=None)
+        qkv = [q, k, v]
+        x = flash_attention(qkv, k_lens=None)
 
         x = x.view(b, -1, n, d).flatten(2)
         x = self.o(x)
@@ -286,7 +280,8 @@ class WanI2VCrossAttention(WanSelfAttention):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        qkv = [q, k, v]
+        x = flash_attention(qkv, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
