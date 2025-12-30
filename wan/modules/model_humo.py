@@ -575,7 +575,7 @@ class WanHuMoModel(nn.Module):
                 sinusoidal_embedding_1d(self.freq_dim, t).float()).float()
             e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
 
-        context_lens = 0
+        context_lens = None
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
