@@ -5980,7 +5980,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         else:
             model = model.to(device=device, dtype=dit_dtype)
 
-        model.eval()
+        model.eval().requires_grad_(False)
         model._debug_forward_mem = True  # Enable memory debugging for first forward pass
         logger.info(f"HuMo model loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
 
