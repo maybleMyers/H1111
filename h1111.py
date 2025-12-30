@@ -2101,7 +2101,7 @@ def svi_stop_queue_generation(current_batch_id: str):
 
     # Return reset state
     return (
-        [],  # videos
+        gr.update(),  # videos - keep existing gallery
         [],  # preview
         "SVI generation cancelled",  # status
         "Stopped",  # progress
