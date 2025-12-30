@@ -193,10 +193,11 @@ class Offloader:
 
         assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
 
-        # Ensure CUDA operations from swap are complete and check memory
+        # Ensure CUDA operations from swap are complete
         if self.cuda_available:
             torch.cuda.synchronize()
-            print(f"[{self.block_type}] Swap complete for block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
+            if self.debug:
+                print(f"[{self.block_type}] Swap complete for block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
 
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
@@ -270,14 +271,15 @@ class ModelOffloader(Offloader):
             return
 
         num_resident = self.num_blocks - self.blocks_to_swap
-        print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU")
+        if self.debug:
+            print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU")
 
         # Move only the first (num_blocks - blocks_to_swap) blocks to GPU
         # These are the blocks that will be on GPU initially
         for i, b in enumerate(blocks[0 : num_resident]):
             b.to(self.device)
             weighs_to_device(b, self.device)  # make sure all params are on device
-            if self.device.type == "cuda":
+            if self.debug and self.device.type == "cuda":
                 print(f"  Block {i} moved to GPU. GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
         # Keep the remaining blocks on CPU - they will be swapped in during forward pass
@@ -289,7 +291,7 @@ class ModelOffloader(Offloader):
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
 
-        if self.device.type == "cuda":
+        if self.debug and self.device.type == "cuda":
             print(f"[{self.block_type}] After prepare: GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
     def wait_for_block(self, block_idx: int):

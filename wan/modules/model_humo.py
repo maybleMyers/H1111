@@ -687,13 +687,13 @@ class WanHuMoModel(nn.Module):
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
-                if block_idx < 5:
+                if block_idx < 5 and _debug_mem:
                     _log_mem(f"Before wait_for_block({block_idx})")
                 self.offloader.wait_for_block(block_idx)
-                if block_idx < 5:
+                if block_idx < 5 and _debug_mem:
                     _log_mem(f"After wait_for_block({block_idx})")
 
-            if block_idx < 5:
+            if block_idx < 5 and _debug_mem:
                 _log_mem(f"Before block {block_idx}")
                 # Check if block is on correct device
                 first_param = next(block.parameters(), None)
@@ -708,7 +708,7 @@ class WanHuMoModel(nn.Module):
             else:
                 x = block(x, **kwargs)
 
-            if block_idx < 5:
+            if block_idx < 5 and _debug_mem:
                 _log_mem(f"After block {block_idx}")
 
             if self.blocks_to_swap:

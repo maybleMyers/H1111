@@ -3777,11 +3777,46 @@ def prepare_humo_inputs(
 
     else:
         # TA mode: Text + Audio (no image)
-        logger.info("TA mode: No reference image, using zero conditioning")
-        # Create zero conditioning
-        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
-        zero_latent = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=torch.float32)
-        zero_vae = zero_latent  # For TA mode, zero_vae is the same as zero_latent
+        logger.info("TA mode: No reference image, loading/generating zero_vae conditioning")
+
+        # Load or generate proper zero_vae for TA mode (NOT raw zeros)
+        zero_vae = None
+        zero_vae_loaded = False
+
+        # Try to load pre-computed zero_vae
+        if args.zero_vae_path is not None:
+            loaded = load_zero_vae(args.zero_vae_path, lat_f, vae.dtype, device)
+            if loaded.shape[2] == lat_h and loaded.shape[3] == lat_w:
+                zero_vae = loaded
+                zero_vae_loaded = True
+                logger.info(f"TA mode: Loaded zero VAE cache: shape {zero_vae.shape}")
+            else:
+                logger.warning(f"TA mode: zero_vae dimensions mismatch: loaded {loaded.shape[2]}x{loaded.shape[3]}, need {lat_h}x{lat_w}")
+
+        if not zero_vae_loaded and args.zero_vae_720p_path is not None:
+            loaded = load_zero_vae(args.zero_vae_720p_path, lat_f, vae.dtype, device)
+            if loaded.shape[2] == lat_h and loaded.shape[3] == lat_w:
+                zero_vae = loaded
+                zero_vae_loaded = True
+                logger.info(f"TA mode: Loaded zero VAE cache (720p): shape {zero_vae.shape}")
+            else:
+                logger.warning(f"TA mode: zero_vae_720p dimensions mismatch: loaded {loaded.shape[2]}x{loaded.shape[3]}, need {lat_h}x{lat_w}")
+
+        if not zero_vae_loaded:
+            # Generate zero_vae by encoding a neutral (black) image through VAE
+            logger.info("TA mode: Generating zero_vae by encoding neutral image through VAE...")
+            vae.to_device(device)
+            neutral_img = torch.full((3, 1, height, width), -1.0, device=device, dtype=vae.dtype)
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+                single_frame_latent = vae.encode([neutral_img])[0]  # [16, 1, lat_h, lat_w]
+            zero_vae = single_frame_latent.repeat(1, lat_f, 1, 1)
+            logger.info(f"TA mode: Generated zero_vae from neutral image: shape {zero_vae.shape}")
+            vae.to_device("cpu")
+            clean_memory_on_device(device)
+
+        # Create TA mode conditioning: mask is all zeros (no reference frame)
+        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=zero_vae.dtype)
+        zero_latent = zero_vae[:, :lat_f].to(device=device, dtype=zero_vae.dtype)
         y = torch.cat([msk, zero_latent], dim=0)
 
     # === Prepare model arguments ===
@@ -3867,13 +3902,17 @@ def run_humo_sampling(
     lat_w = y_shape[3]
     dtype = arg_c["y"][0].dtype
 
-    # Create mask: 1 for reference frame (last frame), 0 for frames to generate
-    # Official HuMo: msk[:,:-latents_ref[0].shape[1]] = 0 (with ref_frames=1)
-    msk = torch.ones(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
-    msk[:, :-1] = 0  # Zero for all generated frames, 1 for reference (last frame)
-
+    # Create y_null based on mode
     # Slice zero_vae to full frame count
     zero_latent = zero_vae_for_null[:, :lat_f].to(device=device, dtype=dtype)
+
+    if humo_mode == "TA":
+        # TA mode: mask is all zeros (no reference frame)
+        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
+    else:
+        # TIA mode: mask has 1 for reference frame (last frame), 0 for frames to generate
+        msk = torch.ones(4, lat_f, lat_h, lat_w, device=device, dtype=dtype)
+        msk[:, :-1] = 0  # Zero for all generated frames, 1 for reference (last frame)
 
     # Combine mask + zero_vae for y_null: [4, lat_f, lat_h, lat_w] + [16, lat_f, lat_h, lat_w]
     y_null = [torch.cat([msk, zero_latent], dim=0)]
@@ -3902,36 +3941,62 @@ def run_humo_sampling(
             model_arg_c = {k: v for k, v in arg_c.items() if not k.startswith('_')}
             model_arg_null = {k: v for k, v in arg_null.items() if not k.startswith('_')}
 
-            # 1. pos_tia: Full conditioning (text + image + audio)
-            noise_pred_tia = model(latent_model_input, t=timestep, **model_arg_c)[0]
+            if humo_mode == "TA":
+                # TA Mode: Text + Audio only (no image reference)
+                # Uses 3 forward passes with simpler CFG formula
 
-            # 2. pos_ti: Text + image (no audio)
-            model_arg_ti = {**model_arg_c, "audio": audio_zero}
-            noise_pred_ti = model(latent_model_input, t=timestep, **model_arg_ti)[0]
+                # 1. pos_ta: Text + Audio conditioning
+                noise_pred_ta = model(latent_model_input, t=timestep, **model_arg_c)[0]
 
-            # 3. neg_i: Image only (no text, no audio) - use null context
-            model_arg_i = {**model_arg_null, "audio": audio_zero}
-            noise_pred_i = model(latent_model_input, t=timestep, **model_arg_i)[0]
+                # 2. pos_t: Text only (no audio)
+                model_arg_t = {**model_arg_c, "audio": audio_zero}
+                noise_pred_t = model(latent_model_input, t=timestep, **model_arg_t)[0]
 
-            # 4. neg_null: Null conditioning
-            model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
-            noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
+                # 3. neg_null: Null conditioning
+                model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
+                noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
 
-            # Apply HuMo CFG formula
-            if t_value > step_change:
-                # Early timesteps: Image included in null
+                # TA CFG formula (no step_change, no image term)
                 noise_pred = (
-                    scale_a * (noise_pred_tia - noise_pred_ti) +
-                    scale_t * (noise_pred_ti - noise_pred_i) +
-                    noise_pred_i
-                )
-            else:
-                # Late timesteps: Modified formula
-                noise_pred = (
-                    scale_a * (noise_pred_tia - noise_pred_ti) +
-                    (scale_t - 2.0) * (noise_pred_ti - noise_pred_null) +
+                    scale_a * (noise_pred_ta - noise_pred_t) +
+                    scale_t * (noise_pred_t - noise_pred_null) +
                     noise_pred_null
                 )
+
+            else:
+                # TIA Mode: Text + Image + Audio (with reference image)
+                # Uses 4 forward passes with step_change logic
+
+                # 1. pos_tia: Full conditioning (text + image + audio)
+                noise_pred_tia = model(latent_model_input, t=timestep, **model_arg_c)[0]
+
+                # 2. pos_ti: Text + image (no audio)
+                model_arg_ti = {**model_arg_c, "audio": audio_zero}
+                noise_pred_ti = model(latent_model_input, t=timestep, **model_arg_ti)[0]
+
+                # 3. neg_i: Image only (no text, no audio) - use null context
+                model_arg_i = {**model_arg_null, "audio": audio_zero}
+                noise_pred_i = model(latent_model_input, t=timestep, **model_arg_i)[0]
+
+                # 4. neg_null: Null conditioning
+                model_arg_null_full = {**model_arg_null, "audio": audio_zero, "y": y_null}
+                noise_pred_null = model(latent_model_input, t=timestep, **model_arg_null_full)[0]
+
+                # TIA CFG formula with step_change
+                if t_value > step_change:
+                    # Early timesteps: Image included in null
+                    noise_pred = (
+                        scale_a * (noise_pred_tia - noise_pred_ti) +
+                        scale_t * (noise_pred_ti - noise_pred_i) +
+                        noise_pred_i
+                    )
+                else:
+                    # Late timesteps: Modified formula
+                    noise_pred = (
+                        scale_a * (noise_pred_tia - noise_pred_ti) +
+                        (scale_t - 2.0) * (noise_pred_ti - noise_pred_null) +
+                        noise_pred_null
+                    )
 
         # Ensure proper dimensions for scheduler
         if len(noise_pred.shape) < len(latent_on_device.shape):
@@ -6038,7 +6103,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             model = model.to(device=device, dtype=dit_dtype)
 
         model.eval().requires_grad_(False)
-        model._debug_forward_mem = True  # Enable memory debugging for first forward pass
+        model._debug_forward_mem = False  # Disable memory debugging (set to True for debugging)
         logger.info(f"HuMo model loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
 
         # Setup scheduler
