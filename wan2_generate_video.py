@@ -4050,13 +4050,11 @@ def run_humo_sampling(
     else:
         zero_latent = zero_vae_for_null[:, :lat_f_with_ref].to(device=device, dtype=dtype)
 
-    if humo_mode == "TA":
-        # TA mode: mask is all zeros (no reference frame)
+    if humo_mode == "TA" or ref_frames == 0:
         msk = torch.zeros(4, lat_f_with_ref, lat_h, lat_w, device=device, dtype=dtype)
     else:
-        # TIA mode: mask has 1 for reference frame (last frame), 0 for frames to generate
         msk = torch.ones(4, lat_f_with_ref, lat_h, lat_w, device=device, dtype=dtype)
-        msk[:, :-ref_frames] = 0  # Zero for all generated frames, 1 for reference (last frame(s))
+        msk[:, :-ref_frames] = 0
 
     # Combine mask + zero_vae for y_null: [4, lat_f_with_ref, H, W] + [16, lat_f_with_ref, H, W]
     y_null = [torch.cat([msk, zero_latent], dim=0)]
