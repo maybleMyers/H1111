@@ -5971,7 +5971,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             del state_dict
             clean_memory_on_device(device)
 
-        model = model.to(device=device, dtype=dit_dtype)
+        # Handle block swap vs full GPU load (same as Wan2.2)
+        if args.blocks_to_swap > 0:
+            logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
+            model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+            model.move_to_device_except_swap_blocks(device)
+            model.prepare_block_swap_before_forward()
+        else:
+            model = model.to(device=device, dtype=dit_dtype)
+
         model.eval()
         logger.info(f"HuMo model loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
 

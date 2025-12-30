@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from .attention import flash_attention
 from .audio_proj import AudioProjModel
+from modules.custom_offloading_utils import ModelOffloader
 
 __all__ = ["WanHuMoModel", "WanAttentionBlockHuMo"]
 
@@ -529,6 +530,10 @@ class WanHuMoModel(nn.Module):
             rope_params(1024, 2 * (d // 6))
         ], dim=1)
 
+        # block swap support
+        self.blocks_to_swap = None
+        self.offloader = None
+
         # initialize weights
         self.init_weights()
 
@@ -621,8 +626,14 @@ class WanHuMoModel(nn.Module):
             audio=audio,
             audio_seq_len=audio_seq_len)
 
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_idx)
+
             x = block(x, **kwargs)
+
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
 
         # head
         x = self.head(x, e)
@@ -660,3 +671,34 @@ class WanHuMoModel(nn.Module):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+        self.blocks_to_swap = blocks_to_swap
+        self.num_blocks = len(self.blocks)
+
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 1
+        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+
+        self.offloader = ModelOffloader(
+            "wan_humo_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
+        )
+        print(
+            f"WanHuMoModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_blocks = self.blocks
+            self.blocks = None
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.blocks = save_blocks
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
