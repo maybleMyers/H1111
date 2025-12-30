@@ -11338,7 +11338,7 @@ with gr.Blocks(
                     humo_dit_path = gr.Dropdown(
                         label="HuMo DiT Model (.safetensors)",
                         choices=get_dit_models("wan"),
-                        value="",
+                        value="humo_17b_fp32_low_noise.safetensors",
                         allow_custom_value=True,
                         interactive=True,
                         info="17B HuMo model checkpoint"

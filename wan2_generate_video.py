@@ -3732,16 +3732,39 @@ def prepare_humo_inputs(
 
         # Load zero VAE cache
         zero_vae = None
+        zero_vae_loaded = False
+
+        # Try to load pre-computed zero_vae
         if args.zero_vae_path is not None:
-            zero_vae = load_zero_vae(args.zero_vae_path, lat_f, vae.dtype, device)
-            logger.info(f"Loaded zero VAE cache: shape {zero_vae.shape}")
-        elif args.zero_vae_720p_path is not None and height >= 720:
-            zero_vae = load_zero_vae(args.zero_vae_720p_path, lat_f, vae.dtype, device)
-            logger.info(f"Loaded zero VAE cache (720p): shape {zero_vae.shape}")
-        else:
-            # Create zero padding if no cache available
-            logger.warning("No zero VAE cache provided, using zeros for padding")
-            zero_vae = torch.zeros(16, lat_f, lat_h, lat_w, device=device, dtype=vae.dtype)
+            loaded = load_zero_vae(args.zero_vae_path, lat_f, vae.dtype, device)
+            # Check if spatial dimensions match (H, W)
+            if loaded.shape[2] == lat_h and loaded.shape[3] == lat_w:
+                zero_vae = loaded
+                zero_vae_loaded = True
+                logger.info(f"Loaded zero VAE cache: shape {zero_vae.shape}")
+            else:
+                logger.warning(f"zero_vae dimensions mismatch: loaded {loaded.shape[2]}x{loaded.shape[3]}, need {lat_h}x{lat_w}")
+
+        if not zero_vae_loaded and args.zero_vae_720p_path is not None:
+            loaded = load_zero_vae(args.zero_vae_720p_path, lat_f, vae.dtype, device)
+            if loaded.shape[2] == lat_h and loaded.shape[3] == lat_w:
+                zero_vae = loaded
+                zero_vae_loaded = True
+                logger.info(f"Loaded zero VAE cache (720p): shape {zero_vae.shape}")
+            else:
+                logger.warning(f"zero_vae_720p dimensions mismatch: loaded {loaded.shape[2]}x{loaded.shape[3]}, need {lat_h}x{lat_w}")
+
+        if not zero_vae_loaded:
+            # Generate zero_vae by encoding a black image through VAE
+            # This produces semantically valid latents instead of raw zeros
+            logger.info("Generating zero_vae by encoding neutral image through VAE...")
+            # Create a black image tensor normalized to [-1, 1] (black = -1 after normalization)
+            neutral_img = torch.full((3, 1, height, width), -1.0, device=device, dtype=vae.dtype)
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=vae.dtype):
+                single_frame_latent = vae.encode([neutral_img])[0]  # [16, 1, lat_h, lat_w]
+            # Repeat for all frames
+            zero_vae = single_frame_latent.repeat(1, lat_f, 1, 1)
+            logger.info(f"Generated zero_vae from neutral image: shape {zero_vae.shape}")
 
         # Create HuMo conditioning tensor
         y = create_humo_conditioning(
