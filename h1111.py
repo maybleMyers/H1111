@@ -11271,7 +11271,7 @@ with gr.Blocks(
                     humo_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=25, info="HuMo default: 25 FPS")
                     humo_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
                     humo_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
-                    humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                    humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
                     with gr.Row():
                         humo_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         humo_random_seed_btn = gr.Button("🎲")
