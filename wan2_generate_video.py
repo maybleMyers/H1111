@@ -5996,8 +5996,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Run HuMo sampling
         previewer = None
         if args.preview is not None:
-            previewer = LatentPreviewer()
-            previewer.start(args.save_path, args.fps)
+            try:
+                # Use noise as initial latent for preview (without batch dim)
+                initial_latent_for_preview = noise.clone().squeeze(0) if noise.dim() == 5 else noise.clone()
+                previewer = LatentPreviewer(args, initial_latent_for_preview, timesteps, device, dit_dtype, model_type="wan")
+                logger.info("HuMo Latent Previewer initialized successfully.")
+            except Exception as e:
+                logger.error(f"Failed to initialize HuMo Latent Previewer: {e}", exc_info=True)
+                previewer = None
 
         generated_latent = run_humo_sampling(
             model=model,
@@ -6012,9 +6018,6 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             previewer=previewer,
             preview_suffix=args.preview_suffix,
         )
-
-        if previewer is not None:
-            previewer.stop()
 
         # Cleanup
         del model
