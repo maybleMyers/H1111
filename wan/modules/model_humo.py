@@ -46,14 +46,14 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply_inplace(x, grid_sizes, freqs):
+    """In-place rotary position embedding to avoid memory duplication during block swap."""
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
-    output = []
+    # loop over samples - modify x in-place
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
@@ -61,19 +61,15 @@ def rope_apply(x, grid_sizes, freqs):
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+            freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # apply rotary embedding IN-PLACE (only modify first seq_len elements)
+        x[i, :seq_len] = torch.view_as_real(x_i * freqs_i).flatten(2).to(x.dtype)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    return x
 
 
 class WanRMSNorm(nn.Module):
@@ -147,10 +143,13 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        del x  # Free input tensor immediately
 
         _mem("Before rope_apply")
-        qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
-        del q, k, v  # Free original tensors to prevent memory accumulation
+        rope_apply_inplace(q, grid_sizes, freqs)
+        rope_apply_inplace(k, grid_sizes, freqs)
+        qkv = [q, k, v]
+        del q, k, v  # Free references after creating qkv list
         _mem("After rope_apply")
         x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
         _mem("After flash_attention")
@@ -199,9 +198,12 @@ class WanSelfAttentionSepKVDim(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        del x  # Free input tensor immediately
 
-        qkv = [rope_apply(q, grid_sizes, freqs), rope_apply(k, grid_sizes, freqs), v]
-        del q, k, v  # Free original tensors to prevent memory accumulation
+        rope_apply_inplace(q, grid_sizes, freqs)
+        rope_apply_inplace(k, grid_sizes, freqs)
+        qkv = [q, k, v]
+        del q, k, v  # Free references after creating qkv list
         x = flash_attention(qkv, k_lens=seq_lens, window_size=self.window_size)
 
         x = x.flatten(2)
