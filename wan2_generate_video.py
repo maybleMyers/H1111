@@ -656,6 +656,20 @@ class _StoryMemModels:
     hpsv3_model = None
     hpsv3_device = None
 
+def _unload_keyframe_models():
+    """Unload HPSv3 and CLIP models to free VRAM for other models."""
+    if _StoryMemModels.hpsv3_model is not None:
+        del _StoryMemModels.hpsv3_model
+        _StoryMemModels.hpsv3_model = None
+        _StoryMemModels.hpsv3_device = None
+        logger.info("HPSv3 model unloaded")
+    if _StoryMemModels.clip_model is not None:
+        del _StoryMemModels.clip_model
+        _StoryMemModels.clip_model = None
+        _StoryMemModels.clip_device = None
+        logger.info("CLIP model unloaded")
+    torch.cuda.empty_cache()
+
 def _get_clip_model(device="cuda"):
     """Load CLIP model for frame similarity (lazy, singleton)."""
     if _StoryMemModels.clip_model is not None:
@@ -6594,7 +6608,8 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                     args.keyframe_quality_threshold, str(device)
                 )
-                # Models will be reloaded to GPU when needed
+                # Unload HPSv3 and CLIP to free VRAM for next shot
+                _unload_keyframe_models()
                 # Extract last frame for MI2V transitions
                 if args.mi2v:
                     try:
@@ -6630,6 +6645,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                     args.keyframe_quality_threshold, str(device)
                 )
+                _unload_keyframe_models()
                 continue
 
             if is_first_shot and not args.m2v_first_shot:
@@ -6648,6 +6664,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                     args.keyframe_quality_threshold, str(device)
                 )
+                _unload_keyframe_models()
                 continue
 
             memory_bank = sorted(glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"))
@@ -6939,6 +6956,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                 args.keyframe_quality_threshold, str(device)
             )
+            _unload_keyframe_models()
 
     if output_video_paths:
         final_output_path = os.path.join(story_output_dir, f"{sanitized_name}_final.mp4")
