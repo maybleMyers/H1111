@@ -2255,13 +2255,19 @@ def storymem_generate(
 
     yield [], [], f"Starting StoryMem generation: {len(story_json['scenes'])} scenes", "Building command..."
 
+    # Create unique timestamped output directory for this story generation
+    sanitized_story_name = story_name.replace(' ', '_')
+    timestamp = int(time.time())
+    story_output_dir = os.path.join(save_path, "storymem", f"{sanitized_story_name}_{timestamp}")
+    os.makedirs(story_output_dir, exist_ok=True)
+
     command = [
         sys.executable, "wan2_generate_video.py",
         "--task", "i2v-A14B",
         "--story_mode",
         "--story_json", story_json_str,
         "--prompt", story_overview or "Story generation",
-        "--save_path", save_path,
+        "--save_path", story_output_dir,
         "--video_size", str(int(height)), str(int(width)),
         "--video_length", str(int(frame_num)),
         "--fps", str(int(fps)),
@@ -2286,13 +2292,12 @@ def storymem_generate(
         command.append("--t2v_first_shot")
     elif m2v_first_shot:
         command.append("--m2v_first_shot")
-        output_dir = os.path.join(save_path, story_name.replace(' ', '_'))
-        os.makedirs(output_dir, exist_ok=True)
+        # Copy reference images to story output directory as initial keyframes
         ref_images = [ref_image1, ref_image2, ref_image3, ref_image4]
         keyframe_idx = 0
         for ref_img in ref_images:
             if ref_img and os.path.exists(ref_img):
-                dst_path = os.path.join(output_dir, f"00_00_keyframe{keyframe_idx}.jpg")
+                dst_path = os.path.join(story_output_dir, f"00_00_keyframe{keyframe_idx}.jpg")
                 from PIL import Image
                 img = Image.open(ref_img)
                 img.convert("RGB").save(dst_path, "JPEG", quality=95)

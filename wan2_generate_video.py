@@ -6566,18 +6566,17 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     story_name = story_script.get("story_name", "untitled_story")
     scenes = story_script.get("scenes", [])
 
-    # Create story output directory
-    # For M2V first shot, GUI pre-copies reference images to save_path/story_name
-    # so we must use that exact path to find them
+    # Story output directory
+    # GUI creates timestamped directory and passes it as save_path
+    # CLI users can pass their own directory or use the fallback
     import re as regex_module
 
     # Sanitized name for file naming (aggressive sanitization for filesystem safety)
     sanitized_name = regex_module.sub(r'[^\w\-]', '_', story_name)
 
     if args.save_path:
-        # Use save_path as base - match GUI's naming: story_name.replace(' ', '_')
-        gui_sanitized_name = story_name.replace(' ', '_')
-        story_output_dir = os.path.join(args.save_path, gui_sanitized_name)
+        # Use save_path directly (GUI already creates timestamped storymem directory)
+        story_output_dir = args.save_path
     else:
         # Fallback with timestamp for CLI usage
         timestamp = int(time.time())
