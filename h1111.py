@@ -2402,7 +2402,20 @@ def storymem_generate(
     preview_base_dir = os.path.join(save_path, "previews")
     preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
 
+    global stop_event
+    stop_event.clear()
+
     for line in iter(process.stdout.readline, ''):
+        # Check for stop request
+        if stop_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            yield all_videos, previews, "StoryMem generation stopped by user.", ""
+            return
+
         line_strip = line.strip()
         if not line_strip:
             continue
@@ -2443,6 +2456,8 @@ def storymem_generate(
 
 
 def storymem_stop_generation(batch_id: str):
+    global stop_event
+    stop_event.set()
     return [], [], "StoryMem generation stopped", "", "", "", gr.Timer(value=2.0, active=False)
 
 # ========================= End StoryMem Generation Functions =========================
