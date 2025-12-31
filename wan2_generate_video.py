@@ -693,12 +693,7 @@ def _offload_dit_to_cpu_full(model, device, args):
                 except Exception as e:
                     logger.warning(f"Error waiting for block {idx}: {e}")
 
-            # Shutdown ThreadPoolExecutor
-            if hasattr(model.offloader, 'thread_pool'):
-                try:
-                    model.offloader.thread_pool.shutdown(wait=True)
-                except:
-                    pass
+            # Clear pending futures but DON'T shutdown thread_pool - it's needed for subsequent shots
             if hasattr(model.offloader, 'futures'):
                 model.offloader.futures.clear()
 
@@ -6529,6 +6524,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     import torchvision.transforms.functional as TF
     from contextlib import contextmanager
     from decord import VideoReader, cpu
+    from PIL import Image
 
     device = torch.device(args.device)
     cfg = WAN_CONFIGS[args.task]
@@ -6919,7 +6915,8 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             preview_suffix = getattr(args, 'preview_suffix', None) or f"storymem_{scene_num}_{shot_num}"
             if LatentPreviewer is not None and args.preview is not None and args.preview > 0:
                 try:
-                    initial_latent_for_preview = latent.clone()
+                    # Use video-only portion for preview (exclude memory frames) to match what preview() receives
+                    initial_latent_for_preview = latent[:, memory_size:, :, :].clone()
                     story_previewer = LatentPreviewer(args, initial_latent_for_preview, timesteps, device, param_dtype, model_type="wan")
                     logger.info(f"StoryMem: Latent Previewer initialized for Scene {scene_num} Shot {shot_num}")
                 except Exception as e:
@@ -7012,12 +7009,6 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 args.keyframe_quality_threshold, str(device)
             )
             _unload_keyframe_models()
-
-            # Re-prepare block swap after full CPU offload for next shot
-            # (block swap state was cleaned up during offload, need to reinitialize)
-            if getattr(args, 'blocks_to_swap', 0) > 0 and dit_low_noise is not None:
-                dit_low_noise.prepare_block_swap_before_forward()
-                dit_high_noise.prepare_block_swap_before_forward()
 
     if output_video_paths:
         final_output_path = os.path.join(story_output_dir, f"{sanitized_name}_final.mp4")
