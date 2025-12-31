@@ -6831,15 +6831,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             elif motion_frames_file is not None:
                 video = video[:, 5:]
 
-            from wan.utils.utils import save_video
-            save_video(
-                tensor=video[None],
-                save_file=output_path,
-                fps=getattr(cfg, 'sample_fps', 16),
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1)
-            )
+            # Normalize video from [-1, 1] to [0, 1] for save_videos_grid
+            video_to_save = (video + 1.0) / 2.0
+            save_videos_grid(video_to_save.unsqueeze(0), output_path, fps=getattr(cfg, 'sample_fps', 16), rescale=False)
             output_video_paths.append(output_path)
 
             save_keyframes_from_video(
