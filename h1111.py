@@ -2271,7 +2271,7 @@ def storymem_generate(
         "--keyframe_quality_threshold", str(keyframe_quality_threshold),
         "--m2v_boundary", str(m2v_boundary),
         "--attn_mode", attn_mode,
-        "--block_swap", str(int(block_swap)),
+        "--blocks_to_swap", str(int(block_swap)),
     ]
 
     if t2v_first_shot:
@@ -2309,7 +2309,7 @@ def storymem_generate(
     if mixed_dtype:
         command.append("--mixed_dtype")
     if vae_fp32:
-        command.append("--vae_fp32")
+        command.extend(["--vae_dtype", "float32"])
     if compile_model:
         command.append("--compile")
 
@@ -11000,7 +11000,7 @@ with gr.Blocks(
             with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
                     storymem_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4")
-                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Blocks to Swap to Save VRAM", value=30)
                 with gr.Row():
                     storymem_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     storymem_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion for mixed weight models")
