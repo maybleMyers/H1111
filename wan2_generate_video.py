@@ -6502,12 +6502,12 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     boundary = args.m2v_boundary * num_train_timesteps
     sample_neg_prompt = getattr(cfg, 'sample_neg_prompt', '')
 
-    from wan.modules.vae2_1 import Wan2_1_VAE
+    from wan.modules.vae import WanVAE
     from wan.modules.t5 import T5EncoderModel
     from wan.modules.model import WanModel
 
     vae_path = args.vae
-    vae = Wan2_1_VAE(vae_pth=vae_path, device=device)
+    vae = WanVAE(vae_path=vae_path, device=device)
 
     t5_path = args.t5
     t5_model = T5EncoderModel(
