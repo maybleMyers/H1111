@@ -6514,8 +6514,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
         text_len=getattr(cfg, 'text_len', 512),
         dtype=getattr(cfg, 't5_dtype', torch.bfloat16),
         device=torch.device('cpu'),
-        checkpoint_path=t5_path,
-        tokenizer_path="google/umt5-xxl"
+        weight_path=t5_path,
+        tokenizer_path="google/umt5-xxl",
+        fp8=args.fp8_t5
     )
 
     dit_low_noise = None
