@@ -4,6 +4,46 @@
 
 StoryMem is a multi-shot video storytelling system that maintains character identity consistency across scenes using a **Memory Bank** and **Dual-DiT** architecture.
 
+---
+
+## Additional Dependencies
+
+StoryMem requires these additional packages beyond the base H1111 installation:
+
+### Required for Keyframe Extraction
+
+| Package | Purpose | Install Command |
+|---------|---------|-----------------|
+| **hpsv3** | HPSv3 quality scoring for keyframe selection | `pip install hpsv3` |
+| **CLIP** | Similarity measurement between keyframes | `pip install git+https://github.com/openai/CLIP.git` |
+
+### Required for Story Processing
+
+| Package | Purpose | Install Command |
+|---------|---------|-----------------|
+| **json5** | Parse story script JSON files | `pip install json5` |
+| **decord** | Video frame extraction | `pip install decord` |
+
+### Full Requirements (from source repository)
+
+```
+pip install hpsv3
+pip install git+https://github.com/openai/CLIP.git
+pip install json5 decord easydict
+```
+
+### Optional (already in base install)
+
+These are likely already installed with H1111:
+- `opencv-python>=4.9.0.80`
+- `diffusers==0.32.2`
+- `transformers==4.45.2`
+- `peft==0.14.0`
+- `accelerate>=1.1.1`
+- `imageio[ffmpeg]`
+
+---
+
 ## LoRA Files
 
 There are **4 LoRA files** in total, organized into 2 mode-specific folders:
