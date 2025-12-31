@@ -48,6 +48,7 @@ svi_current_output_filename = None
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
+STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -2251,7 +2252,7 @@ def storymem_generate(
 
     command = [
         sys.executable, "wan2_generate_video.py",
-        "--task", "i2v-14B",
+        "--task", "i2v-A14B",
         "--story_mode",
         "--story_json", story_json_str,
         "--video_size", str(int(height)), str(int(width)),
@@ -11047,6 +11048,10 @@ with gr.Blocks(
                         interactive=True
                     )
                 storymem_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    storymem_save_defaults_btn = gr.Button("Save Defaults")
+                    storymem_load_defaults_btn = gr.Button("Load Defaults")
+                    storymem_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
         # SVI Tab (Stable-Video-Infinity) - Multi-Clip Long Video Generation
         with gr.Tab(id=16, label="SVI") as svi_tab:
@@ -14889,6 +14894,142 @@ with gr.Blocks(
         outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text,
                  storymem_job_id_state, storymem_batch_id_state, storymem_poll_timer],
         queue=False
+    )
+
+    # ===== StoryMem Save/Load Defaults =====
+    storymem_ui_default_components_ORDERED_LIST = [
+        # Story settings
+        storymem_story_name, storymem_story_overview,
+        storymem_negative_prompt,
+        # Memory bank settings
+        storymem_max_memory_size, storymem_fix_keyframes,
+        storymem_max_keyframes_per_video, storymem_keyframe_similarity_threshold, storymem_keyframe_quality_threshold,
+        # Generation modes
+        storymem_t2v_first_shot, storymem_m2v_first_shot,
+        storymem_mi2v, storymem_mm2v,
+        storymem_m2v_boundary,
+        # Video settings
+        storymem_width, storymem_height,
+        storymem_frame_num, storymem_fps,
+        storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
+        storymem_sample_solver, storymem_seed,
+        # Performance settings
+        storymem_attn_mode, storymem_block_swap,
+        storymem_fp8, storymem_fp8_scaled, storymem_fp8_prescaled, storymem_fp8_fast, storymem_fp8_t5,
+        storymem_mixed_dtype, storymem_vae_fp32,
+        storymem_compile,
+        # Model paths
+        storymem_model_folder,
+        storymem_dit_low_noise_path, storymem_dit_high_noise_path,
+        storymem_vae_path, storymem_t5_path,
+        storymem_save_path,
+        # LoRA settings
+        storymem_lora_folder,
+    ] + storymem_lora_weights + storymem_lora_multipliers + storymem_lora_apply_low + storymem_lora_apply_high
+
+    storymem_ui_default_keys = [
+        # Story settings
+        "storymem_story_name", "storymem_story_overview",
+        "storymem_negative_prompt",
+        # Memory bank settings
+        "storymem_max_memory_size", "storymem_fix_keyframes",
+        "storymem_max_keyframes_per_video", "storymem_keyframe_similarity_threshold", "storymem_keyframe_quality_threshold",
+        # Generation modes
+        "storymem_t2v_first_shot", "storymem_m2v_first_shot",
+        "storymem_mi2v", "storymem_mm2v",
+        "storymem_m2v_boundary",
+        # Video settings
+        "storymem_width", "storymem_height",
+        "storymem_frame_num", "storymem_fps",
+        "storymem_sample_steps", "storymem_flow_shift", "storymem_sample_guide_scale",
+        "storymem_sample_solver", "storymem_seed",
+        # Performance settings
+        "storymem_attn_mode", "storymem_block_swap",
+        "storymem_fp8", "storymem_fp8_scaled", "storymem_fp8_prescaled", "storymem_fp8_fast", "storymem_fp8_t5",
+        "storymem_mixed_dtype", "storymem_vae_fp32",
+        "storymem_compile",
+        # Model paths
+        "storymem_model_folder",
+        "storymem_dit_low_noise_path", "storymem_dit_high_noise_path",
+        "storymem_vae_path", "storymem_t5_path",
+        "storymem_save_path",
+        # LoRA settings
+        "storymem_lora_folder",
+    ] + [f"storymem_lora_weight_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_storymem_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(storymem_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(STORYMEM_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "StoryMem defaults saved successfully."
+        except Exception as e:
+            return f"Error saving StoryMem defaults: {e}"
+
+    def load_storymem_defaults(request: gr.Request):
+        lora_folder = "lora"
+        lora_choices = get_lora_options(lora_folder)
+
+        if not os.path.exists(STORYMEM_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(storymem_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(storymem_ui_default_keys) + [""]
+
+        try:
+            with open(STORYMEM_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(storymem_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        # Update lora folder from settings
+        lora_folder = loaded_settings.get("storymem_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(storymem_ui_default_keys):
+            component = storymem_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["StoryMem defaults loaded successfully."]
+
+    storymem_save_defaults_btn.click(
+        fn=save_storymem_defaults,
+        inputs=storymem_ui_default_components_ORDERED_LIST,
+        outputs=[storymem_defaults_status]
+    )
+    storymem_load_defaults_btn.click(
+        fn=load_storymem_defaults,
+        inputs=None,
+        outputs=storymem_ui_default_components_ORDERED_LIST + [storymem_defaults_status]
+    )
+
+    def initial_load_storymem_defaults():
+        results_and_status = load_storymem_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_storymem_defaults,
+        inputs=None,
+        outputs=storymem_ui_default_components_ORDERED_LIST
     )
 
     # ===== SVI (Stable-Video-Infinity) Event Handlers =====
