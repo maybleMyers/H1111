@@ -30,6 +30,8 @@ from gradio_image_annotation import image_annotator
 
 # Add global stop event
 stop_event = threading.Event()
+# Global process reference for storymem (to allow stopping)
+storymem_process = None
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
@@ -2382,6 +2384,7 @@ def storymem_generate(
 
     print(f"Running StoryMem Command: {' '.join(command[:20])}...")
 
+    global storymem_process
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -2391,6 +2394,7 @@ def storymem_generate(
         encoding='utf-8',
         errors='replace'
     )
+    storymem_process = process
 
     all_videos = []
     previews = []
@@ -2451,13 +2455,25 @@ def storymem_generate(
                 yield all_videos.copy(), previews.copy(), f"Completed Scene {current_scene} Shot {current_shot}", ""
 
     process.wait()
+    storymem_process = None
 
     yield all_videos, previews, "StoryMem generation complete!", ""
 
 
 def storymem_stop_generation(batch_id: str):
-    global stop_event
+    global stop_event, storymem_process
     stop_event.set()
+    # Terminate the subprocess directly to unblock readline()
+    if storymem_process is not None:
+        try:
+            storymem_process.terminate()
+            storymem_process.wait(timeout=3)
+        except:
+            try:
+                storymem_process.kill()
+            except:
+                pass
+        storymem_process = None
     return [], [], "StoryMem generation stopped", "", "", "", gr.Timer(value=2.0, active=False)
 
 # ========================= End StoryMem Generation Functions =========================
