@@ -6844,15 +6844,17 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             vae.to(device)
 
             if memory_size > 0:
-                # Encode each memory image separately using the correct VAE pattern
-                memory_latents = []
-                for img in memory:
-                    img_resized = torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic').squeeze(0).to(device)
-                    # VAE expects [C, F, H, W] for video, use single frame
-                    img_for_vae = img_resized.unsqueeze(1)  # [C, 1, H, W]
-                    encoded = vae.encode([img_for_vae])[0]  # Returns [C', 1, H', W']
-                    memory_latents.append(encoded.squeeze(1))  # [C', H', W']
-                memory_latent = torch.stack(memory_latents, dim=1).float()  # [C', M, H', W']
+                # Batch encode all memory images at once (matches official StoryMem method)
+                # This preserves temporal context across the batch through VAE's causal convolutions
+                # Resize all memory images to target size
+                memory_resized = [
+                    torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic').squeeze(0)
+                    for img in memory
+                ]
+                # Stack into batch tensor: [M, C, H, W]
+                memory_batch = torch.stack(memory_resized, dim=0).to(device)
+                # Batch encode: returns [C', M, H', W'] ready for concatenation
+                memory_latent = vae.encode_memory_batch(memory_batch)
             else:
                 memory_latent = None
 

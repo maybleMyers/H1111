@@ -915,6 +915,38 @@ class WanVAE:
         with torch.amp.autocast('cuda', dtype=self.dtype):
             return [self.model.encode(u.unsqueeze(0), self.scale, any_end_frame=any_end_frame).float().squeeze(0) for u in videos]
 
+    def encode_memory_batch(self, memory_images):
+        """
+        Batch encode memory images for StoryMem M2V generation.
+
+        This matches the official StoryMem encoding method where all memory images
+        are encoded in a single batch call, preserving temporal context across
+        the batch through the VAE's causal convolution caching.
+
+        Args:
+            memory_images: Tensor of shape [M, C, H, W] where M is number of memory frames
+                          Values should be in range [-1, 1]
+
+        Returns:
+            Tensor of shape [C', M, H', W'] (latent channels, memory count, latent H, latent W)
+            Ready to concatenate with video latents for M2V conditioning
+        """
+        with torch.amp.autocast('cuda', dtype=self.dtype):
+            # Add frame dimension: [M, C, H, W] -> [M, C, 1, H, W]
+            # This treats each memory image as a single-frame "video" in a batch
+            memory_with_frame_dim = memory_images.unsqueeze(2)
+
+            # Batch encode all memory images at once
+            # The VAE processes this as M separate single-frame videos in one batch
+            # Shape: [M, C, 1, H, W] -> [M, C', 1, H', W']
+            encoded = self.model.encode(memory_with_frame_dim, self.scale).float()
+
+            # Remove frame dimension and permute to [C', M, H', W']
+            # [M, C', 1, H', W'] -> [M, C', H', W'] -> [C', M, H', W']
+            encoded = encoded.squeeze(2).permute(1, 0, 2, 3)
+
+            return encoded
+
     def decode(self, zs):
         with torch.amp.autocast('cuda', dtype=self.dtype):
             return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]
