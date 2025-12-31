@@ -836,7 +836,10 @@ def extract_keyframes_from_video(
     quality_threshold: float = 3.0,
     device: str = "cuda"
 ) -> Tuple[List[torch.Tensor], List[int]]:
-    """Extract quality keyframes from video that are dissimilar to existing memory.
+    """Extract quality keyframes from video using StoryMem's two-phase approach.
+
+    Phase 1: Extract keyframes by comparing to last keyframe within video (adaptive threshold)
+    Phase 2: Filter extracted keyframes against existing memory bank
 
     Args:
         video_path: Path to video file
@@ -851,53 +854,83 @@ def extract_keyframes_from_video(
     """
     import decord
     from decord import VideoReader, cpu
+    import torch.nn.functional as F
 
     if existing_memory is None:
         existing_memory = []
 
-    # Load video frames
+    # Load video frames (all at once like source)
     vr = VideoReader(video_path, ctx=cpu())
     num_frames = len(vr)
+    all_frames_np = vr.get_batch(list(range(num_frames))).asnumpy()
+    all_frames = torch.from_numpy(all_frames_np).permute(0, 3, 1, 2).float()  # [N, C, H, W]
+
+    # Resize frames for processing (like source)
+    h, w = all_frames.shape[2], all_frames.shape[3]
+    resized_frames = F.interpolate(all_frames, size=(224, 224), mode="bilinear", antialias=True)
 
     # Load HPSv3 for quality filtering
     hpsv3_model, _ = _get_hpsv3_model(device)
 
-    keyframes = []
-    keyframe_indices = []
-    last_keyframe = None
+    # Phase 1: Extract keyframes from video (compare only to last keyframe, not memory)
+    # Adaptive threshold like source: if too many keyframes, lower threshold and retry
+    ADAPTIVE_ALPHA = 0.01
+    current_threshold = similarity_threshold
 
-    for i in range(num_frames):
-        frame = vr[i].asnumpy()
-        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float()  # [C, H, W]
+    while True:
+        keyframe_indices = []
 
-        # Quality check
-        if is_low_quality_frame(frame_tensor, hpsv3_model, quality_threshold):
-            continue
+        # Find first frame that passes quality check
+        first_keyframe_idx = 0
+        while first_keyframe_idx < num_frames:
+            if not is_low_quality_frame(resized_frames[first_keyframe_idx], hpsv3_model, quality_threshold):
+                break
+            first_keyframe_idx += 1
 
-        # Similarity check against existing memory
+        if first_keyframe_idx >= num_frames:
+            # All frames are low quality
+            logger.info(f"All {num_frames} frames failed quality check (threshold={quality_threshold})")
+            break
+
+        keyframe_indices = [first_keyframe_idx]
+        last_keyframe = resized_frames[first_keyframe_idx]
+
+        # Check remaining frames (start from frame 2 like source)
+        for i in range(2, num_frames):
+            current_frame = resized_frames[i]
+            sim = get_frame_similarity_clip(last_keyframe, current_frame, device)
+
+            # If similarity is LOW (frame is different) AND quality is good, add as keyframe
+            if sim < current_threshold and not is_low_quality_frame(current_frame, hpsv3_model, quality_threshold):
+                keyframe_indices.append(i)
+                last_keyframe = current_frame
+
+        # Adaptive: if too many keyframes, lower threshold and retry
+        if len(keyframe_indices) > max_keyframes:
+            current_threshold -= ADAPTIVE_ALPHA
+        else:
+            break
+
+    # Phase 2: Filter keyframes against existing memory bank
+    final_keyframes = []
+    final_indices = []
+
+    for idx in keyframe_indices:
+        frame = all_frames[idx]
         is_unique = True
+
         for mem_frame in existing_memory:
-            sim = get_frame_similarity_clip(frame_tensor, mem_frame, device)
-            if sim > similarity_threshold:
+            sim = get_frame_similarity_clip(frame, mem_frame, device)
+            if sim > similarity_threshold:  # Too similar to memory, skip
                 is_unique = False
                 break
-
-        # Similarity check against already selected keyframes
-        if is_unique and last_keyframe is not None:
-            sim = get_frame_similarity_clip(frame_tensor, last_keyframe, device)
-            if sim > similarity_threshold:
-                is_unique = False
 
         if is_unique:
-            keyframes.append(frame_tensor)
-            keyframe_indices.append(i)
-            last_keyframe = frame_tensor
+            final_keyframes.append(frame)
+            final_indices.append(idx)
 
-            if len(keyframes) >= max_keyframes:
-                break
-
-    logger.info(f"Extracted {len(keyframes)} keyframes from {video_path} (indices: {keyframe_indices})")
-    return keyframes, keyframe_indices
+    logger.info(f"Extracted {len(final_keyframes)} keyframes from {video_path} (indices: {final_indices})")
+    return final_keyframes, final_indices
 
 def save_keyframes_from_video(
     video_path: str,
