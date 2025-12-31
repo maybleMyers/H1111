@@ -2209,7 +2209,9 @@ def storymem_generate(
     sample_steps: int, flow_shift: float, sample_guide_scale: float,
     sample_solver: str, seed: int,
     attn_mode: str, block_swap: int,
-    fp8: bool, fp8_t5: bool,
+    fp8: bool, fp8_scaled: bool, fp8_prescaled: bool, fp8_fast: bool, fp8_t5: bool,
+    mixed_dtype: bool, vae_fp32: bool,
+    compile_model: bool,
     model_folder: str,
     dit_low_noise_path: str, dit_high_noise_path: str,
     vae_path: str, t5_path: str,
@@ -2293,8 +2295,20 @@ def storymem_generate(
         command.append("--mm2v")
     if fp8:
         command.append("--fp8")
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    if fp8_prescaled:
+        command.append("--fp8_prescaled")
+    if fp8_fast:
+        command.append("--fp8_fast")
     if fp8_t5:
         command.append("--fp8_t5")
+    if mixed_dtype:
+        command.append("--mixed_dtype")
+    if vae_fp32:
+        command.append("--vae_fp32")
+    if compile_model:
+        command.append("--compile")
 
     if seed >= 0:
         command.extend(["--seed", str(int(seed))])
@@ -2376,7 +2390,6 @@ def storymem_generate(
         print(f"STORYMEM: {line_strip}")
 
         if "Scene" in line_strip and "Shot" in line_strip:
-            import re
             match = re.search(r"Scene (\d+) / Shot (\d+)", line_strip)
             if match:
                 current_scene = match.group(1)
@@ -10981,13 +10994,25 @@ with gr.Blocks(
                                     label="Apply to High Noise", value=False, scale=1
                                 ))
 
-            with gr.Accordion("Model Paths", open=True):
+            with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
-                    storymem_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "sageattn"], label="Attention Mode", value="sdpa")
-                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap", value=30)
+                    storymem_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4")
+                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
-                    storymem_fp8 = gr.Checkbox(label="FP8 (DiT)", value=False)
-                    storymem_fp8_t5 = gr.Checkbox(label="FP8 T5", value=False)
+                    storymem_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    storymem_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion for mixed weight models")
+                    storymem_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    storymem_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                    storymem_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    storymem_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    storymem_vae_fp32 = gr.Checkbox(label="Use FP32 VAE (higher quality, more VRAM)", value=True)
+                with gr.Row():
+                    storymem_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
+                    )
                 with gr.Row():
                     storymem_model_folder = gr.Textbox(label="Model Folder", value="wan")
                     storymem_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
@@ -14836,7 +14861,9 @@ with gr.Blocks(
             storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
             storymem_sample_solver, storymem_seed,
             storymem_attn_mode, storymem_block_swap,
-            storymem_fp8, storymem_fp8_t5,
+            storymem_fp8, storymem_fp8_scaled, storymem_fp8_prescaled, storymem_fp8_fast, storymem_fp8_t5,
+            storymem_mixed_dtype, storymem_vae_fp32,
+            storymem_compile,
             storymem_model_folder,
             storymem_dit_low_noise_path, storymem_dit_high_noise_path,
             storymem_vae_path, storymem_t5_path,
