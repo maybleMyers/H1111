@@ -2255,6 +2255,8 @@ def storymem_generate(
         "--task", "i2v-A14B",
         "--story_mode",
         "--story_json", story_json_str,
+        "--prompt", story_overview or "Story generation",
+        "--save_path", save_path,
         "--video_size", str(int(height)), str(int(width)),
         "--video_length", str(int(frame_num)),
         "--fps", str(int(fps)),
