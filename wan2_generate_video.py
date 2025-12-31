@@ -6731,8 +6731,18 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 dit_low_noise.eval().requires_grad_(False)
                 dit_high_noise.eval().requires_grad_(False)
 
-                dit_low_noise.to(device)
-                dit_high_noise.cpu()
+                if getattr(args, 'blocks_to_swap', 0) > 0:
+                    logger.info(f"StoryMem: Enable swap {args.blocks_to_swap} blocks to CPU for low noise model")
+                    dit_low_noise.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+                    dit_low_noise.move_to_device_except_swap_blocks(device)
+                    dit_low_noise.prepare_block_swap_before_forward()
+
+                    logger.info(f"StoryMem: Enable swap {args.blocks_to_swap} blocks to CPU for high noise model")
+                    dit_high_noise.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+                    dit_high_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
+                else:
+                    dit_low_noise.to(device)
+                    dit_high_noise.cpu()
 
             guide_scale = (args.guidance_scale, args.guidance_scale)
             shift = args.flow_shift or getattr(cfg, 'sample_shift', 5.0)
@@ -6758,14 +6768,24 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
                     if t.item() >= boundary:
                         if next(dit_high_noise.parameters()).device.type == 'cpu':
-                            dit_low_noise.cpu()
-                            dit_high_noise.to(device)
+                            if getattr(args, 'blocks_to_swap', 0) > 0:
+                                dit_low_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
+                                dit_high_noise.move_to_device_except_swap_blocks(device)
+                                dit_high_noise.prepare_block_swap_before_forward()
+                            else:
+                                dit_low_noise.cpu()
+                                dit_high_noise.to(device)
                         model = dit_high_noise
                         current_guide_scale = guide_scale[1]
                     else:
                         if next(dit_low_noise.parameters()).device.type == 'cpu':
-                            dit_high_noise.cpu()
-                            dit_low_noise.to(device)
+                            if getattr(args, 'blocks_to_swap', 0) > 0:
+                                dit_high_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
+                                dit_low_noise.move_to_device_except_swap_blocks(device)
+                                dit_low_noise.prepare_block_swap_before_forward()
+                            else:
+                                dit_high_noise.cpu()
+                                dit_low_noise.to(device)
                         model = dit_low_noise
                         current_guide_scale = guide_scale[0]
 
