@@ -2408,7 +2408,7 @@ def storymem_generate(
 
     # Preview monitoring setup
     last_preview_mtime = 0
-    preview_base_dir = os.path.join(save_path, "previews")
+    preview_base_dir = os.path.join(story_output_dir, "previews")
     preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
 
     global stop_event
