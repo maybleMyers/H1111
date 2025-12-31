@@ -6768,6 +6768,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             t5_model.model.cpu()
             torch.cuda.empty_cache()
 
+            # Move VAE back to GPU for encoding (it may have been moved to CPU for HPSv3)
+            vae.to(device)
+
             if memory_size > 0:
                 # Encode each memory image separately using the correct VAE pattern
                 memory_latents = []
