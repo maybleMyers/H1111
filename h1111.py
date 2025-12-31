@@ -2426,14 +2426,14 @@ def storymem_generate(
         if video_match:
             video_path = video_match.group(1).strip()
             if os.path.exists(video_path):
-                all_videos.append((video_path, f"Scene {current_scene} Shot {current_shot}"))
+                # Check if this is the final story video
+                if "_final.mp4" in video_path:
+                    all_videos.append((video_path, "Final Story Video"))
+                else:
+                    all_videos.append((video_path, f"Scene {current_scene} Shot {current_shot}"))
                 yield all_videos.copy(), previews.copy(), f"Completed Scene {current_scene} Shot {current_shot}", ""
 
     process.wait()
-
-    final_video = os.path.join("outputs", f"{story_name.replace(' ', '_')}.mp4")
-    if os.path.exists(final_video):
-        all_videos.append((final_video, "Final Story Video"))
 
     yield all_videos, previews, "StoryMem generation complete!", ""
 

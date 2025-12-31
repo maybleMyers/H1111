@@ -6474,14 +6474,18 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     device = torch.device(args.device)
     cfg = WAN_CONFIGS[args.task]
 
-    story_output_dir = "outputs/storymem"
-    os.makedirs(story_output_dir, exist_ok=True)
-
     story_script = load_story_script(args)
     story_name = story_script.get("story_name", "untitled_story")
     scenes = story_script.get("scenes", [])
 
-    story_json_path = os.path.join(story_output_dir, "story.json")
+    # Create unique story output directory with sanitized story name and timestamp
+    import re as regex_module
+    sanitized_name = regex_module.sub(r'[^\w\-]', '_', story_name)
+    timestamp = int(time.time())
+    story_output_dir = f"outputs/storymem/{sanitized_name}_{timestamp}"
+    os.makedirs(story_output_dir, exist_ok=True)
+
+    story_json_path = os.path.join(story_output_dir, f"{sanitized_name}_story.json")
     with open(story_json_path, 'w', encoding='utf-8') as f:
         json.dump(story_script, f, indent=2, ensure_ascii=False)
 
@@ -6761,8 +6765,20 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             arg_c = {'context': [context[0]], 'seq_len': max_seq_len, 'y': [y]}
             arg_null = {'context': context_null, 'seq_len': max_seq_len, 'y': [y]}
 
+            # Initialize previewer for this shot if enabled
+            story_previewer = None
+            preview_suffix = getattr(args, 'preview_suffix', None) or f"storymem_{scene_num}_{shot_num}"
+            if LatentPreviewer is not None and args.preview is not None and args.preview > 0:
+                try:
+                    initial_latent_for_preview = latent.clone()
+                    story_previewer = LatentPreviewer(args, initial_latent_for_preview, timesteps, device, param_dtype, model_type="wan")
+                    logger.info(f"StoryMem: Latent Previewer initialized for Scene {scene_num} Shot {shot_num}")
+                except Exception as e:
+                    logger.warning(f"StoryMem: Failed to initialize Latent Previewer: {e}")
+                    story_previewer = None
+
             with torch.amp.autocast('cuda', dtype=param_dtype), torch.no_grad():
-                for t in tqdm(timesteps, desc=f"M2V {scene_num}-{shot_num}"):
+                for step_idx, t in enumerate(tqdm(timesteps, desc=f"M2V {scene_num}-{shot_num}")):
                     latent_model_input = [latent.to(device)]
                     timestep = torch.stack([t]).to(device)
 
@@ -6798,6 +6814,15 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     temp_x0 = sample_scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False, generator=seed_g)[0]
                     latent = temp_x0.squeeze(0)
 
+                    # Generate preview if enabled
+                    if story_previewer is not None and (step_idx + 1) % args.preview == 0 and (step_idx + 1) < len(timesteps):
+                        try:
+                            # Extract video portion for preview (exclude memory latents)
+                            preview_latent = latent[:, memory_size:, :, :].clone()
+                            story_previewer.preview(preview_latent.to(device), step_idx, preview_suffix=preview_suffix)
+                        except Exception as e:
+                            logger.warning(f"StoryMem: Preview generation failed: {e}")
+
             video_latent = latent[:, memory_size:, :, :]
             video = vae.decode([video_latent])[0].float().clamp_(-1, 1)
 
@@ -6828,8 +6853,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             torch.cuda.empty_cache()
 
     if output_video_paths:
-        final_output_path = os.path.join("outputs", f"{story_name.replace(' ', '_')}.mp4")
+        final_output_path = os.path.join(story_output_dir, f"{sanitized_name}_final.mp4")
         concatenate_story_videos(output_video_paths, final_output_path)
+        logger.info(f"Final story video saved to: {final_output_path}")
 
     if dit_low_noise is not None:
         del dit_low_noise, dit_high_noise
