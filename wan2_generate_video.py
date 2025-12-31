@@ -6700,8 +6700,33 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 dit_path_low = args.dit_low_noise or args.dit
                 dit_path_high = args.dit_high_noise or args.dit
 
-                dit_low_noise = WanModel.from_pretrained(dit_path_low)
-                dit_high_noise = WanModel.from_pretrained(dit_path_high)
+                # Determine dtype (matching rest of pipeline)
+                dit_weight_dtype = param_dtype
+                if getattr(args, 'mixed_dtype', False):
+                    dit_weight_dtype = None
+
+                # Load models using existing load_wan_model function
+                dit_low_noise = load_wan_model(
+                    cfg, device, dit_path_low,
+                    getattr(args, 'attn_mode', 'sdpa'),  # attn_mode
+                    False,                                 # split_attn
+                    "cpu",                                 # loading_device (for offloading)
+                    dit_weight_dtype,
+                    fp8_scaled=getattr(args, 'fp8_scaled', False),
+                    fp8_prescaled=getattr(args, 'fp8_prescaled', False),
+                    use_scaled_mm=getattr(args, 'fp8_fast', False)
+                )
+
+                dit_high_noise = load_wan_model(
+                    cfg, device, dit_path_high,
+                    getattr(args, 'attn_mode', 'sdpa'),
+                    False,
+                    "cpu",
+                    dit_weight_dtype,
+                    fp8_scaled=getattr(args, 'fp8_scaled', False),
+                    fp8_prescaled=getattr(args, 'fp8_prescaled', False),
+                    use_scaled_mm=getattr(args, 'fp8_fast', False)
+                )
 
                 dit_low_noise.eval().requires_grad_(False)
                 dit_high_noise.eval().requires_grad_(False)
