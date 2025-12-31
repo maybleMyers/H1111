@@ -2135,6 +2135,278 @@ def svi_stop_and_decode():
 # ========================= End SVI Queue System Functions =========================
 
 
+# ========================= StoryMem Generation Functions =========================
+
+def storymem_build_story_json(
+    story_name: str, story_overview: str,
+    s1_prompt1: str, s1_ff_prompt1: str, s1_cut1: bool,
+    s1_prompt2: str, s1_ff_prompt2: str, s1_cut2: bool,
+    s1_prompt3: str, s1_ff_prompt3: str, s1_cut3: bool,
+    s1_prompt4: str, s1_ff_prompt4: str, s1_cut4: bool,
+    s2_prompt1: str, s2_ff_prompt1: str, s2_cut1: bool,
+    s2_prompt2: str, s2_ff_prompt2: str, s2_cut2: bool,
+    s2_prompt3: str, s2_ff_prompt3: str, s2_cut3: bool,
+    s2_prompt4: str, s2_ff_prompt4: str, s2_cut4: bool,
+    s3_prompt1: str, s3_ff_prompt1: str, s3_cut1: bool,
+    s3_prompt2: str, s3_ff_prompt2: str, s3_cut2: bool,
+    s3_prompt3: str, s3_ff_prompt3: str, s3_cut3: bool,
+    s3_prompt4: str, s3_ff_prompt4: str, s3_cut4: bool,
+) -> dict:
+    scenes = []
+    scene1_prompts = [(s1_prompt1, s1_ff_prompt1, s1_cut1), (s1_prompt2, s1_ff_prompt2, s1_cut2),
+                      (s1_prompt3, s1_ff_prompt3, s1_cut3), (s1_prompt4, s1_ff_prompt4, s1_cut4)]
+    scene2_prompts = [(s2_prompt1, s2_ff_prompt1, s2_cut1), (s2_prompt2, s2_ff_prompt2, s2_cut2),
+                      (s2_prompt3, s2_ff_prompt3, s2_cut3), (s2_prompt4, s2_ff_prompt4, s2_cut4)]
+    scene3_prompts = [(s3_prompt1, s3_ff_prompt1, s3_cut1), (s3_prompt2, s3_ff_prompt2, s3_cut2),
+                      (s3_prompt3, s3_ff_prompt3, s3_cut3), (s3_prompt4, s3_ff_prompt4, s3_cut4)]
+
+    for scene_num, scene_data in enumerate([scene1_prompts, scene2_prompts, scene3_prompts], 1):
+        video_prompts = []
+        first_frame_prompts = []
+        cuts = []
+        for prompt, ff_prompt, cut in scene_data:
+            if prompt and prompt.strip():
+                video_prompts.append(prompt.strip())
+                first_frame_prompts.append(ff_prompt.strip() if ff_prompt else "")
+                cuts.append(cut)
+        if video_prompts:
+            scenes.append({
+                "scene_num": scene_num,
+                "video_prompts": video_prompts,
+                "first_frame_prompt": first_frame_prompts,
+                "cut": cuts
+            })
+
+    return {
+        "story_name": story_name or "untitled_story",
+        "story_overview": story_overview or "",
+        "scenes": scenes
+    }
+
+
+def storymem_generate(
+    story_name: str, story_overview: str,
+    s1_prompt1: str, s1_ff_prompt1: str, s1_cut1: bool,
+    s1_prompt2: str, s1_ff_prompt2: str, s1_cut2: bool,
+    s1_prompt3: str, s1_ff_prompt3: str, s1_cut3: bool,
+    s1_prompt4: str, s1_ff_prompt4: str, s1_cut4: bool,
+    s2_prompt1: str, s2_ff_prompt1: str, s2_cut1: bool,
+    s2_prompt2: str, s2_ff_prompt2: str, s2_cut2: bool,
+    s2_prompt3: str, s2_ff_prompt3: str, s2_cut3: bool,
+    s2_prompt4: str, s2_ff_prompt4: str, s2_cut4: bool,
+    s3_prompt1: str, s3_ff_prompt1: str, s3_cut1: bool,
+    s3_prompt2: str, s3_ff_prompt2: str, s3_cut2: bool,
+    s3_prompt3: str, s3_ff_prompt3: str, s3_cut3: bool,
+    s3_prompt4: str, s3_ff_prompt4: str, s3_cut4: bool,
+    negative_prompt: str,
+    max_memory_size: int, fix_keyframes: int,
+    max_keyframes_per_video: int, keyframe_similarity_threshold: float, keyframe_quality_threshold: float,
+    t2v_first_shot: bool, m2v_first_shot: bool,
+    mi2v: bool, mm2v: bool,
+    m2v_boundary: float,
+    width: int, height: int,
+    frame_num: int, fps: int,
+    sample_steps: int, flow_shift: float, sample_guide_scale: float,
+    sample_solver: str, seed: int,
+    attn_mode: str, block_swap: int,
+    fp8: bool, fp8_t5: bool,
+    model_folder: str,
+    dit_low_noise_path: str, dit_high_noise_path: str,
+    vae_path: str, t5_path: str,
+    save_path: str,
+    lora_folder: str,
+    lora1: str, lora1_mult: float, lora1_low: bool, lora1_high: bool,
+    lora2: str, lora2_mult: float, lora2_low: bool, lora2_high: bool,
+    lora3: str, lora3_mult: float, lora3_low: bool, lora3_high: bool,
+    lora4: str, lora4_mult: float, lora4_low: bool, lora4_high: bool,
+    lora5: str, lora5_mult: float, lora5_low: bool, lora5_high: bool,
+    lora6: str, lora6_mult: float, lora6_low: bool, lora6_high: bool,
+    lora7: str, lora7_mult: float, lora7_low: bool, lora7_high: bool,
+    lora8: str, lora8_mult: float, lora8_low: bool, lora8_high: bool,
+    ref_image1: str, ref_image2: str, ref_image3: str, ref_image4: str,
+):
+    import json
+    import subprocess
+    import shutil
+
+    story_json = storymem_build_story_json(
+        story_name, story_overview,
+        s1_prompt1, s1_ff_prompt1, s1_cut1, s1_prompt2, s1_ff_prompt2, s1_cut2,
+        s1_prompt3, s1_ff_prompt3, s1_cut3, s1_prompt4, s1_ff_prompt4, s1_cut4,
+        s2_prompt1, s2_ff_prompt1, s2_cut1, s2_prompt2, s2_ff_prompt2, s2_cut2,
+        s2_prompt3, s2_ff_prompt3, s2_cut3, s2_prompt4, s2_ff_prompt4, s2_cut4,
+        s3_prompt1, s3_ff_prompt1, s3_cut1, s3_prompt2, s3_ff_prompt2, s3_cut2,
+        s3_prompt3, s3_ff_prompt3, s3_cut3, s3_prompt4, s3_ff_prompt4, s3_cut4,
+    )
+
+    if not story_json["scenes"]:
+        yield [], [], "Error: No shots defined", ""
+        return
+
+    story_json_str = json.dumps(story_json, ensure_ascii=False)
+
+    yield [], [], f"Starting StoryMem generation: {len(story_json['scenes'])} scenes", "Building command..."
+
+    command = [
+        sys.executable, "wan2_generate_video.py",
+        "--task", "i2v-14B",
+        "--story_mode",
+        "--story_json", story_json_str,
+        "--video_size", str(int(height)), str(int(width)),
+        "--video_length", str(int(frame_num)),
+        "--fps", str(int(fps)),
+        "--infer_steps", str(int(sample_steps)),
+        "--flow_shift", str(flow_shift),
+        "--guidance_scale", str(sample_guide_scale),
+        "--sample_solver", sample_solver,
+        "--max_memory_size", str(int(max_memory_size)),
+        "--fix_keyframes", str(int(fix_keyframes)),
+        "--max_keyframes_per_video", str(int(max_keyframes_per_video)),
+        "--keyframe_similarity_threshold", str(keyframe_similarity_threshold),
+        "--keyframe_quality_threshold", str(keyframe_quality_threshold),
+        "--m2v_boundary", str(m2v_boundary),
+        "--attn_mode", attn_mode,
+        "--block_swap", str(int(block_swap)),
+    ]
+
+    if t2v_first_shot:
+        command.append("--t2v_first_shot")
+    if m2v_first_shot:
+        command.append("--m2v_first_shot")
+        output_dir = os.path.join(save_path, story_name.replace(' ', '_'))
+        os.makedirs(output_dir, exist_ok=True)
+        ref_images = [ref_image1, ref_image2, ref_image3, ref_image4]
+        keyframe_idx = 0
+        for ref_img in ref_images:
+            if ref_img and os.path.exists(ref_img):
+                dst_path = os.path.join(output_dir, f"00_00_keyframe{keyframe_idx}.jpg")
+                from PIL import Image
+                img = Image.open(ref_img)
+                img.convert("RGB").save(dst_path, "JPEG", quality=95)
+                keyframe_idx += 1
+        if keyframe_idx == 0:
+            yield [], [], "Error: M2V First Shot requires at least one reference image", ""
+            return
+    if mi2v:
+        command.append("--mi2v")
+    if mm2v:
+        command.append("--mm2v")
+    if fp8:
+        command.append("--fp8")
+    if fp8_t5:
+        command.append("--fp8_t5")
+
+    if seed >= 0:
+        command.extend(["--seed", str(int(seed))])
+
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+
+    dit_low = os.path.join(model_folder, dit_low_noise_path) if dit_low_noise_path else None
+    dit_high = os.path.join(model_folder, dit_high_noise_path) if dit_high_noise_path else None
+    vae = os.path.join(model_folder, vae_path) if vae_path else None
+    t5 = os.path.join(model_folder, t5_path) if t5_path else None
+
+    if dit_low:
+        command.extend(["--dit_low_noise", dit_low])
+    if dit_high:
+        command.extend(["--dit_high_noise", dit_high])
+    if vae:
+        command.extend(["--vae", vae])
+    if t5:
+        command.extend(["--t5", t5])
+
+    loras = [
+        (lora1, lora1_mult, lora1_low, lora1_high),
+        (lora2, lora2_mult, lora2_low, lora2_high),
+        (lora3, lora3_mult, lora3_low, lora3_high),
+        (lora4, lora4_mult, lora4_low, lora4_high),
+        (lora5, lora5_mult, lora5_low, lora5_high),
+        (lora6, lora6_mult, lora6_low, lora6_high),
+        (lora7, lora7_mult, lora7_low, lora7_high),
+        (lora8, lora8_mult, lora8_low, lora8_high),
+    ]
+
+    lora_weights_low = []
+    lora_multipliers_low = []
+    lora_weights_high = []
+    lora_multipliers_high = []
+
+    for lora_name, mult, apply_low, apply_high in loras:
+        if lora_name and lora_name != "None":
+            full_path = os.path.join(lora_folder, lora_name)
+            if os.path.exists(full_path):
+                if apply_low:
+                    lora_weights_low.append(full_path)
+                    lora_multipliers_low.append(mult)
+                if apply_high:
+                    lora_weights_high.append(full_path)
+                    lora_multipliers_high.append(mult)
+
+    if lora_weights_low:
+        command.extend(["--lora_weight"] + lora_weights_low)
+        command.extend(["--lora_multiplier"] + [str(m) for m in lora_multipliers_low])
+
+    if lora_weights_high:
+        command.extend(["--lora_weight_high"] + lora_weights_high)
+        command.extend(["--lora_multiplier_high"] + [str(m) for m in lora_multipliers_high])
+
+    print(f"Running StoryMem Command: {' '.join(command[:20])}...")
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding='utf-8',
+        errors='replace'
+    )
+
+    all_videos = []
+    previews = []
+    current_scene = ""
+    current_shot = ""
+
+    for line in iter(process.stdout.readline, ''):
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+
+        print(f"STORYMEM: {line_strip}")
+
+        if "Scene" in line_strip and "Shot" in line_strip:
+            import re
+            match = re.search(r"Scene (\d+) / Shot (\d+)", line_strip)
+            if match:
+                current_scene = match.group(1)
+                current_shot = match.group(2)
+
+        if "M2V" in line_strip and "%" in line_strip:
+            yield all_videos.copy(), previews.copy(), f"Scene {current_scene} Shot {current_shot}", line_strip
+
+        video_match = re.search(r"saved to[:\s]+(.+\.mp4)", line_strip, re.IGNORECASE)
+        if video_match:
+            video_path = video_match.group(1).strip()
+            if os.path.exists(video_path):
+                all_videos.append((video_path, f"Scene {current_scene} Shot {current_shot}"))
+                yield all_videos.copy(), previews.copy(), f"Completed Scene {current_scene} Shot {current_shot}", ""
+
+    process.wait()
+
+    final_video = os.path.join("outputs", f"{story_name.replace(' ', '_')}.mp4")
+    if os.path.exists(final_video):
+        all_videos.append((final_video, "Final Story Video"))
+
+    yield all_videos, previews, "StoryMem generation complete!", ""
+
+
+def storymem_stop_generation(batch_id: str):
+    return [], [], "StoryMem generation stopped", "", "", "", gr.Timer(value=2.0, active=False)
+
+# ========================= End StoryMem Generation Functions =========================
+
+
 ### SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
 def svi_batch_handler(
     # Multi-clip prompts
@@ -10512,8 +10784,247 @@ with gr.Blocks(
                             info="Frames around harmonic peaks to suppress"
                         )
 
+        # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
+        with gr.Tab(id=17, label="StoryMem") as storymem_tab:
+            gr.Markdown("""
+            ## StoryMem - Multi-Shot Story Video Generation
+            Generate consistent multi-shot story videos with memory bank for identity preservation.
+            Uses dual-DiT architecture (M2V) with keyframe extraction for character consistency across scenes.
+            """)
+
+            with gr.Row():
+                storymem_story_name = gr.Textbox(label="Story Name", value="my_story", scale=2, info="Used for output filename")
+                storymem_story_overview = gr.Textbox(label="Story Overview", value="A story about...", scale=4, lines=2, info="Overall story description")
+
+            with gr.Accordion("Scene 1 Shots", open=True):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s1_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="A young woman with long black hair walks through a sunlit garden, wearing a flowing white dress.")
+                        storymem_s1_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Young woman with long black hair, white dress, standing at garden entrance; warm sunlight, flowers in background.")
+                        storymem_s1_cut1 = gr.Checkbox(label="Scene Cut", value=True, info="Start of new scene")
+                    with gr.Column():
+                        storymem_s1_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="She pauses to smell a beautiful red rose, smiling softly. Close-up of her face showing joy.")
+                        storymem_s1_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Close-up of woman's face near red rose; soft smile, eyes closed, petals near her cheek.")
+                        storymem_s1_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s1_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="A butterfly lands on her outstretched hand. She watches it with wonder.")
+                        storymem_s1_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Woman's hand extended, butterfly approaching; soft garden bokeh, gentle expression of anticipation.")
+                        storymem_s1_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s1_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s1_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s1_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Accordion("Scene 2 Shots", open=False):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s2_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="")
+                        storymem_s2_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="")
+                        storymem_s2_cut1 = gr.Checkbox(label="Scene Cut", value=True)
+                    with gr.Column():
+                        storymem_s2_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="")
+                        storymem_s2_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="")
+                        storymem_s2_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s2_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="")
+                        storymem_s2_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="")
+                        storymem_s2_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s2_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s2_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s2_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Accordion("Scene 3 Shots", open=False):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s3_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="")
+                        storymem_s3_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="")
+                        storymem_s3_cut1 = gr.Checkbox(label="Scene Cut", value=True)
+                    with gr.Column():
+                        storymem_s3_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="")
+                        storymem_s3_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="")
+                        storymem_s3_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s3_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="")
+                        storymem_s3_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="")
+                        storymem_s3_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s3_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s3_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s3_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Row():
+                with gr.Column(scale=4):
+                    storymem_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=2,
+                    )
+                with gr.Column(scale=2):
+                    storymem_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    storymem_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+            storymem_job_id_state = gr.State(value="")
+            storymem_batch_id_state = gr.State(value="")
+            storymem_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                storymem_generate_btn = gr.Button("Generate Story Video", elem_classes="green-btn")
+                storymem_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Memory Bank Settings")
+                    with gr.Row():
+                        storymem_max_memory_size = gr.Slider(minimum=1, maximum=16, step=1, label="Max Memory Size", value=8,
+                                                             info="Maximum keyframes in memory bank")
+                        storymem_fix_keyframes = gr.Slider(minimum=0, maximum=8, step=1, label="Fixed Keyframes", value=3,
+                                                           info="Number of initial keyframes to always keep")
+                    with gr.Row():
+                        storymem_max_keyframes_per_video = gr.Slider(minimum=1, maximum=10, step=1, label="Keyframes per Video", value=3,
+                                                                     info="Max keyframes extracted from each shot")
+                        storymem_keyframe_similarity_threshold = gr.Slider(minimum=0.5, maximum=1.0, step=0.01, label="Similarity Threshold", value=0.9,
+                                                                           info="CLIP similarity threshold")
+                        storymem_keyframe_quality_threshold = gr.Slider(minimum=0.0, maximum=5.0, step=0.1, label="Quality Threshold", value=3.0,
+                                                                        info="HPSv3 quality threshold")
+
+                    gr.Markdown("### Generation Mode")
+                    with gr.Row():
+                        storymem_t2v_first_shot = gr.Checkbox(label="T2V First Shot", value=True,
+                                                              info="Generate first shot with T2V model")
+                        storymem_m2v_first_shot = gr.Checkbox(label="M2V First Shot", value=False,
+                                                              info="Generate first shot with M2V using reference images")
+                    with gr.Row():
+                        storymem_mi2v = gr.Checkbox(label="MI2V Transitions", value=True,
+                                                    info="Use last frame for smooth transitions")
+                        storymem_mm2v = gr.Checkbox(label="MM2V Transitions", value=False,
+                                                    info="Use 5 motion frames for transitions")
+
+                    with gr.Accordion("Reference Images (for M2V First Shot)", open=False):
+                        gr.Markdown("Upload reference images for initial memory bank when using M2V First Shot mode.")
+                        with gr.Row():
+                            storymem_ref_image1 = gr.Image(label="Reference 1", type="filepath")
+                            storymem_ref_image2 = gr.Image(label="Reference 2", type="filepath")
+                        with gr.Row():
+                            storymem_ref_image3 = gr.Image(label="Reference 3", type="filepath")
+                            storymem_ref_image4 = gr.Image(label="Reference 4", type="filepath")
+
+                    gr.Markdown("### Generation Parameters")
+                    storymem_m2v_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="M2V Boundary", value=0.9,
+                                                      info="Dual-DiT switching threshold")
+                    with gr.Row():
+                        storymem_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        storymem_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    storymem_frame_num = gr.Slider(minimum=9, maximum=241, step=4, label="Frames Per Shot", value=81, info="Frame count (4n+1)")
+                    storymem_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    storymem_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    storymem_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    storymem_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    storymem_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        storymem_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        storymem_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    storymem_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_storymem", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview", open=True):
+                        storymem_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            storymem_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            storymem_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        storymem_lora_weights = []
+                        storymem_lora_multipliers = []
+                        storymem_lora_apply_low = []
+                        storymem_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                storymem_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                storymem_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                storymem_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                storymem_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                storymem_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                storymem_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                storymem_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                storymem_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+
+            with gr.Accordion("Model Paths", open=True):
+                with gr.Row():
+                    storymem_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "sageattn"], label="Attention Mode", value="sdpa")
+                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap", value=30)
+                with gr.Row():
+                    storymem_fp8 = gr.Checkbox(label="FP8 (DiT)", value=False)
+                    storymem_fp8_t5 = gr.Checkbox(label="FP8 T5", value=False)
+                with gr.Row():
+                    storymem_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    storymem_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    storymem_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    storymem_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                with gr.Row():
+                    storymem_vae_path = gr.Dropdown(
+                        label="VAE Model",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    storymem_t5_path = gr.Dropdown(
+                        label="T5 Model",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                storymem_save_path = gr.Textbox(label="Save Path", value="outputs")
+
         # SVI Tab (Stable-Video-Infinity) - Multi-Clip Long Video Generation
-        with gr.Tab(id=16, label="SVI (Long Video)") as svi_tab:
+        with gr.Tab(id=16, label="SVI") as svi_tab:
             gr.Markdown("""
             ## SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
             Generate long, consistent videos by chaining multiple clips. Each clip uses the last frame of the previous clip as input.
@@ -11549,14 +12060,18 @@ with gr.Blocks(
                             "--output", output_path
                         ]
                         print(f"Using '{script_name}' to convert {input_file.name} to {output_path} for FramePack.")
-                    else: # Existing logic for "default" and "other"
+                    else:
                         script_name = "convert_lora.py"
+                        if target_format == "peft to default":
+                            target_arg = "peft"
+                        else:
+                            target_arg = target_format.lower()
                         cmd = [
                             sys.executable,
                             script_name,
                             "--input", input_file.name,
                             "--output", output_path,
-                            "--target", target_format.lower()
+                            "--target", target_arg
                         ]
 
                     print(f"Running conversion command: {' '.join(cmd)}")
@@ -11600,10 +12115,10 @@ with gr.Blocks(
                 input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
                 output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
                 format_radio = gr.Radio(
-                    choices=["default", "other", "Hunyuan to FramePack"], # <-- Added new choice here
+                    choices=["default", "other", "peft to default", "Hunyuan to FramePack"],
                     value="default",
                     label="Target Format",
-                    info="Choose 'default' for H1111/MUSUBI format, 'other' for diffusion pipe format, or 'Hunyuan to FramePack' for FramePack compatibility."
+                    info="'default': diffusers to H1111/MUSUBI, 'other': to diffusion pipe, 'peft to default': PEFT/StoryMem to H1111/MUSUBI, 'Hunyuan to FramePack': FramePack compatibility"
                 )
 
             with gr.Row():
@@ -13072,6 +13587,7 @@ with gr.Blocks(
         if video_path:
             metadata["enable_v2v"] = True
             first_frame_path = extract_first_frame(video_path)
+            metadata["first_frame_path"] = first_frame_path  # Store in metadata for .then() handler
 
         return f"Parameters ready for Wan2.2", metadata, video_path, first_frame_path
 
@@ -13082,7 +13598,7 @@ with gr.Blocks(
         outputs=[status, params_state, wan22_input_video, wan22_input_image]
     ).then(
         # This lambda function is updated to return values for all 8 LoRAs and other new controls.
-        lambda params, video_path, first_frame: (
+        lambda params: (
             (
                 # Helper to safely get and pad LoRA lists from metadata
                 # Support both formats: "lora_weights" (Wan2.2 style) and "lora_weights_low/high" (other tabs)
@@ -13111,7 +13627,7 @@ with gr.Blocks(
                 [
                     params.get("prompt", ""),
                     params.get("negative_prompt", ""),
-                    first_frame,  # image_path - use extracted first frame
+                    params.get("first_frame_path"),  # image_path - retrieved from metadata
                     params.get("task", "i2v-A14B"),
                     params.get('width', 832),
                     params.get('height', 480),
@@ -13157,7 +13673,7 @@ with gr.Blocks(
         ),
         inputs=[params_state],
         outputs=[
-            wan22_prompt, wan22_negative_prompt, wan22_task, wan22_width, wan22_height,
+            wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
             wan22_flow_shift, wan22_sample_guide_scale, wan22_dual_dit_boundary, wan22_batch_size,
             wan22_save_path, wan22_attn_mode, wan22_mixed_dtype, wan22_block_swap, wan22_fp8, wan22_fp8_scaled, wan22_fp8_t5,
@@ -14264,6 +14780,88 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== StoryMem Event Handlers =====
+    storymem_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[storymem_seed])
+
+    def refresh_storymem_models(folder: str):
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    storymem_refresh_models_btn.click(
+        fn=refresh_storymem_models,
+        inputs=[storymem_model_folder],
+        outputs=[storymem_dit_low_noise_path, storymem_dit_high_noise_path, storymem_vae_path, storymem_t5_path]
+    )
+
+    def refresh_storymem_loras(folder):
+        choices = get_lora_options(folder)
+        return [gr.update(choices=choices) for _ in range(8)]
+
+    storymem_lora_refresh_btn.click(
+        fn=refresh_storymem_loras,
+        inputs=[storymem_lora_folder],
+        outputs=storymem_lora_weights
+    )
+
+    storymem_generate_btn.click(
+        fn=storymem_generate,
+        inputs=[
+            storymem_story_name, storymem_story_overview,
+            storymem_s1_prompt1, storymem_s1_ff_prompt1, storymem_s1_cut1,
+            storymem_s1_prompt2, storymem_s1_ff_prompt2, storymem_s1_cut2,
+            storymem_s1_prompt3, storymem_s1_ff_prompt3, storymem_s1_cut3,
+            storymem_s1_prompt4, storymem_s1_ff_prompt4, storymem_s1_cut4,
+            storymem_s2_prompt1, storymem_s2_ff_prompt1, storymem_s2_cut1,
+            storymem_s2_prompt2, storymem_s2_ff_prompt2, storymem_s2_cut2,
+            storymem_s2_prompt3, storymem_s2_ff_prompt3, storymem_s2_cut3,
+            storymem_s2_prompt4, storymem_s2_ff_prompt4, storymem_s2_cut4,
+            storymem_s3_prompt1, storymem_s3_ff_prompt1, storymem_s3_cut1,
+            storymem_s3_prompt2, storymem_s3_ff_prompt2, storymem_s3_cut2,
+            storymem_s3_prompt3, storymem_s3_ff_prompt3, storymem_s3_cut3,
+            storymem_s3_prompt4, storymem_s3_ff_prompt4, storymem_s3_cut4,
+            storymem_negative_prompt,
+            storymem_max_memory_size, storymem_fix_keyframes,
+            storymem_max_keyframes_per_video, storymem_keyframe_similarity_threshold, storymem_keyframe_quality_threshold,
+            storymem_t2v_first_shot, storymem_m2v_first_shot,
+            storymem_mi2v, storymem_mm2v,
+            storymem_m2v_boundary,
+            storymem_width, storymem_height,
+            storymem_frame_num, storymem_fps,
+            storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
+            storymem_sample_solver, storymem_seed,
+            storymem_attn_mode, storymem_block_swap,
+            storymem_fp8, storymem_fp8_t5,
+            storymem_model_folder,
+            storymem_dit_low_noise_path, storymem_dit_high_noise_path,
+            storymem_vae_path, storymem_t5_path,
+            storymem_save_path,
+            storymem_lora_folder,
+            storymem_lora_weights[0], storymem_lora_multipliers[0], storymem_lora_apply_low[0], storymem_lora_apply_high[0],
+            storymem_lora_weights[1], storymem_lora_multipliers[1], storymem_lora_apply_low[1], storymem_lora_apply_high[1],
+            storymem_lora_weights[2], storymem_lora_multipliers[2], storymem_lora_apply_low[2], storymem_lora_apply_high[2],
+            storymem_lora_weights[3], storymem_lora_multipliers[3], storymem_lora_apply_low[3], storymem_lora_apply_high[3],
+            storymem_lora_weights[4], storymem_lora_multipliers[4], storymem_lora_apply_low[4], storymem_lora_apply_high[4],
+            storymem_lora_weights[5], storymem_lora_multipliers[5], storymem_lora_apply_low[5], storymem_lora_apply_high[5],
+            storymem_lora_weights[6], storymem_lora_multipliers[6], storymem_lora_apply_low[6], storymem_lora_apply_high[6],
+            storymem_lora_weights[7], storymem_lora_multipliers[7], storymem_lora_apply_low[7], storymem_lora_apply_high[7],
+            storymem_ref_image1, storymem_ref_image2, storymem_ref_image3, storymem_ref_image4,
+        ],
+        outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text],
+        queue=True
+    )
+
+    storymem_stop_btn.click(
+        fn=storymem_stop_generation,
+        inputs=[storymem_batch_id_state],
+        outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text,
+                 storymem_job_id_state, storymem_batch_id_state, storymem_poll_timer],
+        queue=False
     )
 
     # ===== SVI (Stable-Video-Infinity) Event Handlers =====

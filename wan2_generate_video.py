@@ -645,6 +645,383 @@ class SVISlidingWindowDenoiser:
 # ========================= End SVI Utility Functions =========================
 
 
+# ========================= StoryMem Utility Functions =========================
+
+# Lazy-loaded models for keyframe extraction
+class _StoryMemModels:
+    """Singleton for lazy-loading CLIP and HPSv3 models."""
+    clip_model = None
+    clip_device = None
+    clip_dtype = torch.float32
+    hpsv3_model = None
+    hpsv3_device = None
+
+def _get_clip_model(device="cuda"):
+    """Load CLIP model for frame similarity (lazy, singleton)."""
+    if _StoryMemModels.clip_model is not None:
+        return _StoryMemModels.clip_model, _StoryMemModels.clip_device, _StoryMemModels.clip_dtype
+
+    try:
+        import clip
+        model, _ = clip.load("ViT-B/32", device=device, jit=False)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        _StoryMemModels.clip_model = model
+        _StoryMemModels.clip_device = device
+        _StoryMemModels.clip_dtype = torch.float32
+        logger.info(f"CLIP model loaded on {device}")
+        return model, device, torch.float32
+    except ImportError:
+        logger.warning("CLIP not installed. Install with: pip install git+https://github.com/openai/CLIP.git")
+        return None, None, None
+
+def _get_hpsv3_model(device="cuda"):
+    """Load HPSv3 model for quality scoring (lazy, singleton)."""
+    if _StoryMemModels.hpsv3_model is not None:
+        return _StoryMemModels.hpsv3_model, _StoryMemModels.hpsv3_device
+
+    try:
+        from hpsv3 import HPSv3RewardInferencer
+        model = HPSv3RewardInferencer(device=device)
+        _StoryMemModels.hpsv3_model = model
+        _StoryMemModels.hpsv3_device = device
+        logger.info(f"HPSv3 model loaded on {device}")
+        return model, device
+    except ImportError:
+        logger.warning("HPSv3 not installed. Keyframe quality filtering disabled.")
+        return None, None
+
+def _clip_preprocess_tensor(x_chw: torch.Tensor, size=224):
+    """Preprocess tensor for CLIP (normalize and resize)."""
+    x = x_chw.unsqueeze(0)  # (1,3,H,W)
+    x = torch.nn.functional.interpolate(x, size=(size, size), mode="bilinear", align_corners=False)
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    return x
+
+def _ensure_rgb01(chw: torch.Tensor):
+    """Ensure tensor is RGB float [0,1]."""
+    x = chw
+    if not torch.is_floating_point(x):
+        x = x.float()
+    if x.max() > 1.5:
+        x = x / 255.0
+    if x.shape[0] == 1:
+        x = x.repeat(3, 1, 1)
+    return x.clamp(0.0, 1.0)
+
+@torch.no_grad()
+def get_frame_similarity_clip(frame1: torch.Tensor, frame2: torch.Tensor, device="cuda") -> float:
+    """Compute CLIP-based similarity between two frames.
+
+    Args:
+        frame1: First frame tensor [C, H, W] or [H, W, C]
+        frame2: Second frame tensor [C, H, W] or [H, W, C]
+        device: Device for computation
+
+    Returns:
+        Cosine similarity score (0.0 to 1.0)
+    """
+    model, dev, dt = _get_clip_model(device)
+    if model is None:
+        return 0.0  # Fallback: assume frames are different
+
+    # Ensure CHW format
+    if frame1.shape[-1] == 3:
+        frame1 = frame1.permute(2, 0, 1)
+    if frame2.shape[-1] == 3:
+        frame2 = frame2.permute(2, 0, 1)
+
+    f1 = _ensure_rgb01(frame1).to(dev)
+    f2 = _ensure_rgb01(frame2).to(dev)
+
+    x1 = _clip_preprocess_tensor(f1).to(dev, dtype=dt)
+    x2 = _clip_preprocess_tensor(f2).to(dev, dtype=dt)
+
+    z1 = model.encode_image(x1)
+    z2 = model.encode_image(x2)
+
+    z1 = torch.nn.functional.normalize(z1, dim=-1)
+    z2 = torch.nn.functional.normalize(z2, dim=-1)
+    cos = (z1 * z2).sum(dim=-1)
+    return cos.item()
+
+def is_low_quality_frame(frame: torch.Tensor, quality_model, threshold: float = 3.0) -> bool:
+    """Check if frame is low quality using HPSv3.
+
+    Args:
+        frame: Frame tensor [C, H, W], values in [0, 255] or [0, 1]
+        quality_model: HPSv3 model instance
+        threshold: Quality threshold (default 3.0)
+
+    Returns:
+        True if low quality, False otherwise
+    """
+    if quality_model is None:
+        return False  # No quality filtering without HPSv3
+
+    # Convert to numpy uint8 HWC format
+    if frame.shape[0] == 3:
+        frame = frame.permute(1, 2, 0)
+    frame_np = frame.cpu().numpy()
+    if frame_np.max() <= 1.0:
+        frame_np = (frame_np * 255).astype(np.uint8)
+    else:
+        frame_np = frame_np.astype(np.uint8).clip(0, 255)
+
+    rewards = quality_model.reward(image_paths=[Image.fromarray(frame_np)], prompts=[""])
+    score = rewards[0][0].item()
+    return score < threshold
+
+def extract_keyframes_from_video(
+    video_path: str,
+    existing_memory: List[torch.Tensor] = None,
+    max_keyframes: int = 3,
+    similarity_threshold: float = 0.9,
+    quality_threshold: float = 3.0,
+    device: str = "cuda"
+) -> Tuple[List[torch.Tensor], List[int]]:
+    """Extract quality keyframes from video that are dissimilar to existing memory.
+
+    Args:
+        video_path: Path to video file
+        existing_memory: List of existing memory frame tensors [C, H, W]
+        max_keyframes: Maximum keyframes to extract
+        similarity_threshold: CLIP similarity threshold (higher = more similar)
+        quality_threshold: HPSv3 quality threshold
+        device: Device for computation
+
+    Returns:
+        Tuple of (keyframe tensors, keyframe indices)
+    """
+    import decord
+    from decord import VideoReader, cpu
+
+    if existing_memory is None:
+        existing_memory = []
+
+    # Load video frames
+    vr = VideoReader(video_path, ctx=cpu())
+    num_frames = len(vr)
+
+    # Load HPSv3 for quality filtering
+    hpsv3_model, _ = _get_hpsv3_model(device)
+
+    keyframes = []
+    keyframe_indices = []
+    last_keyframe = None
+
+    for i in range(num_frames):
+        frame = vr[i].asnumpy()
+        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float()  # [C, H, W]
+
+        # Quality check
+        if is_low_quality_frame(frame_tensor, hpsv3_model, quality_threshold):
+            continue
+
+        # Similarity check against existing memory
+        is_unique = True
+        for mem_frame in existing_memory:
+            sim = get_frame_similarity_clip(frame_tensor, mem_frame, device)
+            if sim > similarity_threshold:
+                is_unique = False
+                break
+
+        # Similarity check against already selected keyframes
+        if is_unique and last_keyframe is not None:
+            sim = get_frame_similarity_clip(frame_tensor, last_keyframe, device)
+            if sim > similarity_threshold:
+                is_unique = False
+
+        if is_unique:
+            keyframes.append(frame_tensor)
+            keyframe_indices.append(i)
+            last_keyframe = frame_tensor
+
+            if len(keyframes) >= max_keyframes:
+                break
+
+    logger.info(f"Extracted {len(keyframes)} keyframes from {video_path} (indices: {keyframe_indices})")
+    return keyframes, keyframe_indices
+
+def save_keyframes_from_video(
+    video_path: str,
+    output_dir: str,
+    existing_memory_paths: List[str] = None,
+    max_keyframes: int = 3,
+    similarity_threshold: float = 0.9,
+    quality_threshold: float = 3.0,
+    device: str = "cuda"
+) -> Tuple[List[str], str, str]:
+    """Extract and save keyframes from video, plus last frame and motion frames.
+
+    Args:
+        video_path: Path to video file
+        output_dir: Directory to save keyframes
+        existing_memory_paths: List of existing memory image paths
+        max_keyframes: Maximum keyframes to extract
+        similarity_threshold: CLIP similarity threshold
+        quality_threshold: HPSv3 quality threshold
+        device: Device for computation
+
+    Returns:
+        Tuple of (keyframe paths, last_frame_path, motion_frames_path)
+    """
+    import decord
+    from decord import VideoReader, cpu
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load existing memory frames if paths provided
+    existing_memory = []
+    if existing_memory_paths:
+        for path in existing_memory_paths:
+            try:
+                img = Image.open(path).convert("RGB")
+                img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float()
+                existing_memory.append(img_tensor)
+            except Exception as e:
+                logger.warning(f"Failed to load memory image {path}: {e}")
+
+    # Extract keyframes
+    keyframes, keyframe_indices = extract_keyframes_from_video(
+        video_path, existing_memory, max_keyframes,
+        similarity_threshold, quality_threshold, device
+    )
+
+    # Save keyframes
+    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+    keyframe_paths = []
+    for i, kf in enumerate(keyframes):
+        kf_path = os.path.join(output_dir, f"{video_basename}_keyframe{i}.jpg")
+        kf_np = kf.permute(1, 2, 0).numpy().astype(np.uint8)
+        Image.fromarray(kf_np).save(kf_path)
+        keyframe_paths.append(kf_path)
+
+    # Load video for last frame and motion frames
+    vr = VideoReader(video_path, ctx=cpu())
+    num_frames = len(vr)
+
+    # Save last frame
+    last_frame = vr[num_frames - 1].asnumpy()
+    last_frame_path = os.path.join(output_dir, "last_frame.jpg")
+    Image.fromarray(last_frame).save(last_frame_path)
+
+    # Save motion frames (last 5 frames as video)
+    motion_frames_path = os.path.join(output_dir, "motion_frames.mp4")
+    motion_start = max(0, num_frames - 5)
+    motion_frames = [vr[i].asnumpy() for i in range(motion_start, num_frames)]
+
+    h, w, _ = motion_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(motion_frames_path, fourcc, 5, (w, h))
+    for frame in motion_frames:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        writer.write(frame_bgr)
+    writer.release()
+
+    return keyframe_paths, last_frame_path, motion_frames_path
+
+def prepare_memory_bank(
+    all_keyframes: List[str],
+    max_size: int = 8,
+    fix_count: int = 3
+) -> List[str]:
+    """Prepare memory bank with sliding window strategy.
+
+    Keeps first `fix_count` keyframes fixed, then uses most recent frames.
+
+    Args:
+        all_keyframes: All keyframe paths collected so far
+        max_size: Maximum memory bank size
+        fix_count: Number of initial keyframes to always keep
+
+    Returns:
+        Selected keyframe paths for memory bank
+    """
+    if len(all_keyframes) <= max_size:
+        return all_keyframes
+
+    # Keep first fix_count + most recent (max_size - fix_count)
+    fixed = all_keyframes[:fix_count]
+    recent = all_keyframes[-(max_size - fix_count):]
+    return fixed + recent
+
+def load_story_script(args) -> dict:
+    """Load story script from JSON string or file.
+
+    Args:
+        args: Parsed arguments with story_json or story_file
+
+    Returns:
+        Story script dictionary
+    """
+    import json
+
+    if args.story_json:
+        return json.loads(args.story_json)
+    elif args.story_file:
+        with open(args.story_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    else:
+        raise ValueError("No story script provided")
+
+def concatenate_story_videos(video_paths: List[str], output_path: str) -> bool:
+    """Concatenate video segments into final story video using ffmpeg.
+
+    Args:
+        video_paths: List of video segment paths in order
+        output_path: Path for concatenated output video
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import subprocess
+
+    if not video_paths:
+        logger.warning("No videos to concatenate")
+        return False
+
+    # Create concat list file
+    list_path = output_path.replace(".mp4", "_concat_list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for v in video_paths:
+            f.write(f"file '{os.path.abspath(v)}'\n")
+
+    # Try stream copy first (fastest)
+    ret = subprocess.run(
+        ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-y", output_path],
+        capture_output=True
+    )
+
+    if ret.returncode != 0:
+        logger.info("Stream copy failed, re-encoding...")
+        # Fallback to re-encoding
+        ret = subprocess.run([
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-r", "16", "-y", output_path
+        ], capture_output=True)
+
+    # Clean up list file
+    try:
+        os.remove(list_path)
+    except:
+        pass
+
+    if ret.returncode == 0:
+        logger.info(f"Concatenated {len(video_paths)} videos to {output_path}")
+        return True
+    else:
+        logger.error(f"Video concatenation failed: {ret.stderr.decode()}")
+        return False
+
+# ========================= End StoryMem Utility Functions =========================
+
+
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Wan 2.2 inference script with new model architecture support")
@@ -983,6 +1360,52 @@ def parse_args() -> argparse.Namespace:
                        help="Path to zero VAE cache for 720p (zero_vae_720p_161frame.pt)")
     # ========================= End HuMo Arguments =========================
 
+    # ========================= StoryMem Arguments =========================
+    # Story-driven video generation with memory bank for identity consistency
+    parser.add_argument("--story_mode", action="store_true",
+                       help="Enable StoryMem story generation mode for multi-shot video with consistent identity")
+    parser.add_argument("--story_json", type=str, default=None,
+                       help="Story script as JSON string. Format: {\"story_name\": \"...\", \"story_overview\": \"...\", "
+                            "\"scenes\": [{\"scene_num\": 1, \"video_prompts\": [...], \"first_frame_prompt\": [...], \"cut\": [...]}]}. "
+                            "See StoryMem/story/*.json for examples. JSON is saved to outputs/storymem/story.json")
+    parser.add_argument("--story_file", type=str, default=None,
+                       help="Path to story script JSON file (alternative to --story_json)")
+
+    # Memory Bank Settings
+    parser.add_argument("--max_memory_size", type=int, default=8,
+                       help="Maximum number of keyframes to keep in memory bank (default: 8)")
+    parser.add_argument("--fix_keyframes", type=int, default=3,
+                       help="Number of initial keyframes to always keep in memory bank (default: 3)")
+
+    # Generation Mode Options
+    parser.add_argument("--t2v_first_shot", action="store_true",
+                       help="Generate first shot with T2V model instead of M2V")
+    parser.add_argument("--m2v_first_shot", action="store_true",
+                       help="Generate first shot with M2V model (uses memory bank)")
+    parser.add_argument("--mi2v", action="store_true",
+                       help="Use last frame from previous video for I2V transitions (Memory-Image-to-Video)")
+    parser.add_argument("--mm2v", action="store_true",
+                       help="Use motion frames (5 frames) for smoother transitions (Memory-Motion-to-Video)")
+
+    # M2V-specific Model Options (reuses existing --dit_low_noise, --dit_high_noise, --lora_weight, --lora_weight_high)
+    parser.add_argument("--m2v_finetune_dir", type=str, default=None,
+                       help="Path to fine-tuned M2V backbone weights directory (contains backbone_low_noise.pth and backbone_high_noise.pth)")
+    parser.add_argument("--m2v_boundary", type=float, default=0.9,
+                       help="Boundary for dual-dit model switching in M2V (default: 0.9, uses high noise model above this threshold)")
+
+    # Keyframe Extraction Settings (HPSv3 + CLIP)
+    parser.add_argument("--keyframe_similarity_threshold", type=float, default=0.9,
+                       help="Minimum CLIP similarity threshold for keyframe selection (default: 0.9)")
+    parser.add_argument("--max_keyframes_per_video", type=int, default=3,
+                       help="Maximum number of keyframes to extract per video segment (default: 3)")
+    parser.add_argument("--keyframe_quality_threshold", type=float, default=3.0,
+                       help="HPSv3 quality threshold for keyframe selection (default: 3.0)")
+
+    # Memory Bank Input (for single M2V generation without story mode)
+    parser.add_argument("--memory_files", type=str, nargs="*", default=None,
+                       help="List of memory files (images or videos) for M2V generation")
+    # ========================= End StoryMem Arguments =========================
+
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
@@ -1021,6 +1444,20 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--extract_audio_feat requires --whisper_model to be specified")
         if args.humo_mode == "TIA" and args.image_path is None:
             logger.warning("HuMo TIA mode typically requires --image_path for reference image. Proceeding without it.")
+
+    # StoryMem argument validation
+    if args.story_mode:
+        if args.story_json is None and args.story_file is None:
+            raise ValueError("--story_mode requires --story_json or --story_file to be specified")
+        if args.story_json is not None and args.story_file is not None:
+            raise ValueError("--story_json and --story_file cannot be used together")
+        if args.mi2v and args.mm2v:
+            raise ValueError("--mi2v and --mm2v cannot be used together (choose one transition mode)")
+        if args.t2v_first_shot and args.m2v_first_shot:
+            raise ValueError("--t2v_first_shot and --m2v_first_shot cannot be used together")
+        # Ensure dual-dit models are specified for M2V
+        if args.dit is None and (args.dit_low_noise is None or args.dit_high_noise is None):
+            logger.warning("StoryMem M2V typically requires dual-dit models. Specify --dit for both, or --dit_low_noise and --dit_high_noise separately.")
 
     return args
 
@@ -6024,19 +6461,351 @@ def generate_extended_video(
     logger.info(f"Generated extended video: {final_video.shape}")
     return final_video
 
-def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
-    """main function for generation pipeline (T2V, I2V, V2V)
 
-    Args:
-        args: command line arguments
+def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
+    import json
+    import glob as glob_module
+    import av
+    import random
+    import torchvision.transforms.functional as TF
+    from contextlib import contextmanager
+    from decord import VideoReader, cpu
 
-    Returns:
-        Optional[torch.Tensor]: generated latent tensor [B, C, F, H, W], or None if only saving merged model.
-    """
     device = torch.device(args.device)
     cfg = WAN_CONFIGS[args.task]
 
-    # --- Determine Mode ---
+    story_output_dir = "outputs/storymem"
+    os.makedirs(story_output_dir, exist_ok=True)
+
+    story_script = load_story_script(args)
+    story_name = story_script.get("story_name", "untitled_story")
+    scenes = story_script.get("scenes", [])
+
+    story_json_path = os.path.join(story_output_dir, "story.json")
+    with open(story_json_path, 'w', encoding='utf-8') as f:
+        json.dump(story_script, f, indent=2, ensure_ascii=False)
+
+    logger.info("=" * 60)
+    logger.info(f"STORYMEM: {story_name}")
+    logger.info(f"Scenes: {len(scenes)}")
+    logger.info("=" * 60)
+
+    output_video_paths = []
+
+    height, width = args.video_size[0], args.video_size[1]
+    max_area = height * width
+    frame_num = args.video_length or getattr(cfg, 'frame_num', 81)
+    vae_stride = getattr(cfg, 'vae_stride', (4, 8, 8))
+    patch_size = getattr(cfg, 'patch_size', (1, 2, 2))
+    num_train_timesteps = getattr(cfg, 'num_train_timesteps', 1000)
+    param_dtype = getattr(cfg, 'param_dtype', torch.bfloat16)
+    boundary = args.m2v_boundary * num_train_timesteps
+    sample_neg_prompt = getattr(cfg, 'sample_neg_prompt', '')
+
+    from wan.modules.vae2_1 import Wan2_1_VAE
+    from wan.modules.t5 import T5EncoderModel
+    from wan.modules.model import WanModel
+
+    vae_path = args.vae
+    vae = Wan2_1_VAE(vae_pth=vae_path, device=device)
+
+    t5_path = args.t5
+    t5_model = T5EncoderModel(
+        text_len=getattr(cfg, 'text_len', 512),
+        dtype=getattr(cfg, 't5_dtype', torch.bfloat16),
+        device=torch.device('cpu'),
+        checkpoint_path=t5_path,
+        tokenizer_path="google/umt5-xxl"
+    )
+
+    dit_low_noise = None
+    dit_high_noise = None
+
+    for scene in scenes:
+        scene_num = scene.get("scene_num", 1)
+        video_prompts = scene.get("video_prompts", [])
+        cuts = scene.get("cut", [True] * len(video_prompts))
+
+        for shot_idx, prompt in enumerate(video_prompts):
+            shot_num = shot_idx + 1
+            is_first_shot = (scene_num == 1 and shot_num == 1)
+            is_scene_cut = cuts[shot_idx] if shot_idx < len(cuts) else True
+
+            logger.info(f"\n{'='*40}")
+            logger.info(f"Scene {scene_num} / Shot {shot_num}: {prompt[:60]}...")
+            logger.info(f"{'='*40}")
+
+            output_path = os.path.join(story_output_dir, f"{scene_num:02d}_{shot_num:02d}.mp4")
+
+            if is_first_shot and args.t2v_first_shot:
+                t2v_args = argparse.Namespace(**vars(args))
+                t2v_args.prompt = prompt
+                t2v_args.story_mode = False
+                t2v_args.save_path = output_path
+                generate(t2v_args)
+                output_video_paths.append(output_path)
+                save_keyframes_from_video(
+                    output_path, story_output_dir,
+                    glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
+                    args.max_keyframes_per_video, args.keyframe_similarity_threshold,
+                    args.keyframe_quality_threshold, str(device)
+                )
+                continue
+
+            if is_first_shot and not args.m2v_first_shot:
+                t2v_args = argparse.Namespace(**vars(args))
+                t2v_args.prompt = prompt
+                t2v_args.story_mode = False
+                t2v_args.save_path = output_path
+                generate(t2v_args)
+                output_video_paths.append(output_path)
+                save_keyframes_from_video(
+                    output_path, story_output_dir,
+                    glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
+                    args.max_keyframes_per_video, args.keyframe_similarity_threshold,
+                    args.keyframe_quality_threshold, str(device)
+                )
+                continue
+
+            memory_bank = sorted(glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"))
+            if len(memory_bank) > args.max_memory_size:
+                memory_bank = memory_bank[:args.fix_keyframes] + memory_bank[-(args.max_memory_size - args.fix_keyframes):]
+
+            first_frame_file = None
+            motion_frames_file = None
+            if args.mi2v and not is_scene_cut:
+                last_frame_path = os.path.join(story_output_dir, "last_frame.jpg")
+                if os.path.exists(last_frame_path):
+                    first_frame_file = last_frame_path
+            if args.mm2v and not is_scene_cut:
+                motion_path = os.path.join(story_output_dir, "motion_frames.mp4")
+                if os.path.exists(motion_path):
+                    motion_frames_file = motion_path
+
+            memory = []
+            for filename in memory_bank:
+                if filename.endswith(".mp4"):
+                    container = av.open(filename)
+                    stream = container.streams.video[0]
+                    stream.thread_type = "AUTO"
+                    frames = []
+                    for frame in container.decode(stream):
+                        img = frame.to_image().convert("RGB")
+                        frames.append(img)
+                    total = len(frames)
+                    if total > 0:
+                        idxs = [0, total - 1]
+                        if total > 2:
+                            mids = random.sample(list(range(1, total - 1)), min(2, total - 2))
+                            idxs.extend(mids)
+                        idxs = sorted(set(idxs))
+                        for i in idxs:
+                            img_tensor = TF.to_tensor(frames[i]).sub_(0.5).div_(0.5).to(device)
+                            memory.append(img_tensor)
+                    container.close()
+                else:
+                    img = Image.open(filename).convert("RGB")
+                    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+                    memory.append(img_tensor)
+
+            memory_size = len(memory)
+            if memory_size > 0:
+                h, w = memory[0].shape[1:]
+            else:
+                h, w = height, width
+
+            first_frame = None
+            if first_frame_file is not None:
+                first_frame = Image.open(first_frame_file).convert("RGB")
+                first_frame = TF.to_tensor(first_frame).sub_(0.5).div_(0.5).to(device)
+                h, w = first_frame.shape[1:]
+
+            motion_frames = None
+            if motion_frames_file is not None:
+                vr = VideoReader(motion_frames_file, ctx=cpu())
+                assert len(vr) == 5
+                frames = []
+                for i in range(5):
+                    frame = vr[i].asnumpy()
+                    frame = Image.fromarray(frame).convert("RGB")
+                    frame = TF.to_tensor(frame).sub_(0.5).div_(0.5).to(device)
+                    frames.append(frame)
+                motion_frames = torch.stack(frames, dim=0)
+                h, w = motion_frames.shape[-2:]
+
+            aspect_ratio = h / w
+            lat_h = round(np.sqrt(max_area * aspect_ratio)) // vae_stride[1] // patch_size[1] * patch_size[1]
+            lat_w = round(np.sqrt(max_area / aspect_ratio)) // vae_stride[2] // patch_size[2] * patch_size[2]
+            lat_t = (frame_num - 1) // vae_stride[0] + 1 + memory_size
+            h = lat_h * vae_stride[1]
+            w = lat_w * vae_stride[2]
+
+            max_seq_len = lat_t * lat_h * lat_w // (patch_size[1] * patch_size[2])
+
+            seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+            seed_g = torch.Generator(device=device)
+            seed_g.manual_seed(seed + shot_idx)
+            noise = torch.randn(16, lat_t, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=device)
+
+            msk = torch.ones(1, frame_num + memory_size, lat_h, lat_w, device=device)
+            if args.fix_keyframes is not None and memory_size > args.fix_keyframes:
+                msk[:, args.fix_keyframes:memory_size] = 2
+            msk[:, memory_size:] = 0
+            if first_frame_file is not None:
+                msk[:, memory_size] = 1
+            if motion_frames_file is not None:
+                msk[:, memory_size:memory_size + 5] = 1
+            msk = torch.concat([
+                torch.repeat_interleave(msk[:, :memory_size + 1], repeats=vae_stride[0], dim=1),
+                msk[:, memory_size + 1:]
+            ], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]
+
+            t5_model.model.to(device)
+            context = t5_model([prompt], device)
+            context_null = t5_model([sample_neg_prompt], device)
+            t5_model.model.cpu()
+            torch.cuda.empty_cache()
+
+            if memory_size > 0:
+                memory_tensor = [torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic') for img in memory]
+                memory_tensor = torch.cat(memory_tensor, dim=0).to(device)
+                memory_latent = vae.encode(memory_tensor.unsqueeze(2)).float().squeeze(2).permute(1, 0, 2, 3)
+            else:
+                memory_latent = None
+
+            if first_frame is not None:
+                u = vae.encode(
+                    torch.concat([
+                        torch.nn.functional.interpolate(first_frame[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
+                        torch.zeros(3, frame_num - 1, h, w)
+                    ], dim=1).unsqueeze(0).to(device)
+                ).float().squeeze(0)
+            elif motion_frames is not None:
+                u = vae.encode(
+                    torch.concat([
+                        motion_frames.transpose(0, 1).to(device),
+                        torch.zeros(3, frame_num - 5, h, w).to(device)
+                    ], dim=1).unsqueeze(0)
+                ).float().squeeze(0)
+            else:
+                u = torch.zeros(3, frame_num, h, w).to(device)
+                u = vae.encode(u.unsqueeze(0)).float().squeeze(0)
+
+            if memory_latent is not None:
+                y = torch.cat([memory_latent, u], dim=1)
+            else:
+                y = u
+            y = torch.cat([msk, y], dim=0)
+
+            if dit_low_noise is None:
+                dit_path_low = args.dit_low_noise or args.dit
+                dit_path_high = args.dit_high_noise or args.dit
+
+                dit_low_noise = WanModel.from_pretrained(dit_path_low)
+                dit_high_noise = WanModel.from_pretrained(dit_path_high)
+
+                dit_low_noise.eval().requires_grad_(False)
+                dit_high_noise.eval().requires_grad_(False)
+
+                dit_low_noise.to(device)
+                dit_high_noise.cpu()
+
+            guide_scale = (args.guidance_scale, args.guidance_scale)
+            shift = args.flow_shift or getattr(cfg, 'sample_shift', 5.0)
+            sampling_steps = args.infer_steps or getattr(cfg, 'sample_steps', 40)
+
+            if args.sample_solver == 'unipc':
+                sample_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=num_train_timesteps, shift=1, use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
+                timesteps = sample_scheduler.timesteps
+            else:
+                sample_scheduler = FlowDPMSolverMultistepScheduler(num_train_timesteps=num_train_timesteps, shift=1, use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=sampling_sigmas)
+
+            latent = noise
+            arg_c = {'context': [context[0]], 'seq_len': max_seq_len, 'y': [y]}
+            arg_null = {'context': context_null, 'seq_len': max_seq_len, 'y': [y]}
+
+            with torch.amp.autocast('cuda', dtype=param_dtype), torch.no_grad():
+                for t in tqdm(timesteps, desc=f"M2V {scene_num}-{shot_num}"):
+                    latent_model_input = [latent.to(device)]
+                    timestep = torch.stack([t]).to(device)
+
+                    if t.item() >= boundary:
+                        if next(dit_high_noise.parameters()).device.type == 'cpu':
+                            dit_low_noise.cpu()
+                            dit_high_noise.to(device)
+                        model = dit_high_noise
+                        current_guide_scale = guide_scale[1]
+                    else:
+                        if next(dit_low_noise.parameters()).device.type == 'cpu':
+                            dit_high_noise.cpu()
+                            dit_low_noise.to(device)
+                        model = dit_low_noise
+                        current_guide_scale = guide_scale[0]
+
+                    noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                    torch.cuda.empty_cache()
+                    noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+                    torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + current_guide_scale * (noise_pred_cond - noise_pred_uncond)
+
+                    temp_x0 = sample_scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False, generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+
+            video_latent = latent[:, memory_size:, :, :]
+            video = vae.decode(video_latent.unsqueeze(0)).float().clamp_(-1, 1).squeeze(0)
+
+            if first_frame_file is not None:
+                video = video[:, 1:]
+            elif motion_frames_file is not None:
+                video = video[:, 5:]
+
+            from wan.utils.utils import save_video
+            save_video(
+                tensor=video[None],
+                save_file=output_path,
+                fps=getattr(cfg, 'sample_fps', 16),
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1)
+            )
+            output_video_paths.append(output_path)
+
+            save_keyframes_from_video(
+                output_path, story_output_dir,
+                glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
+                args.max_keyframes_per_video, args.keyframe_similarity_threshold,
+                args.keyframe_quality_threshold, str(device)
+            )
+
+            del video, latent, noise
+            torch.cuda.empty_cache()
+
+    if output_video_paths:
+        final_output_path = os.path.join("outputs", f"{story_name.replace(' ', '_')}.mp4")
+        concatenate_story_videos(output_video_paths, final_output_path)
+
+    if dit_low_noise is not None:
+        del dit_low_noise, dit_high_noise
+    del t5_model, vae
+    torch.cuda.empty_cache()
+
+    return None
+
+
+def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
+    device = torch.device(args.device)
+    cfg = WAN_CONFIGS[args.task]
+
+    is_story_mode = getattr(args, 'story_mode', False)
+    if is_story_mode:
+        logger.info("Running StoryMem story generation mode")
+        return generate_story_video(args)
+
     is_i2v = args.image_path is not None and "i2v" in args.task
     is_ti2v = args.image_path is not None and "ti2v" in args.task  # Text+Image-to-Video
     is_v2v_i2v = args.video_path is not None and args.v2v_use_i2v  # V2V using i2v model
