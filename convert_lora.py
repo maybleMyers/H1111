@@ -13,6 +13,14 @@ logging.basicConfig(level=logging.INFO)
 
 
 def convert_from_peft(prefix, weights_sd):
+    """
+    Convert from PEFT format to default LoRA format.
+
+    Supports multiple PEFT variants:
+    - Standard PEFT: base_model.model.{module}.lora_A.weight
+    - PEFT with default: base_model.model.{module}.lora_A.default.weight
+    - SVI/Direct PEFT: {module}.lora_A.default.weight (no base_model.model. prefix)
+    """
     new_weights_sd = {}
     lora_dims = {}
     unconverted_keys = []
@@ -22,17 +30,35 @@ def convert_from_peft(prefix, weights_sd):
         return {}
 
     for key, weight in weights_sd.items():
-        if not key.startswith("base_model.model."):
-            unconverted_keys.append(key)
-            continue
-
-        key_body = key[len("base_model.model."):]
-
+        # Check for lora_A or lora_B pattern (required for PEFT format)
         if ".lora_A." not in key and ".lora_B." not in key:
             unconverted_keys.append(key)
             continue
 
-        new_key = f"{prefix}{key_body}".replace(".", "_").replace("_lora_A_", ".lora_down.").replace("_lora_B_", ".lora_up.")
+        # Remove base_model.model. prefix if present, otherwise use key as-is
+        # This handles both standard PEFT and SVI/direct PEFT formats
+        if key.startswith("base_model.model."):
+            key_body = key[len("base_model.model."):]
+        else:
+            key_body = key
+
+        # Build new key with prefix
+        new_key = f"{prefix}{key_body}"
+
+        # Handle .default. in key (e.g., .lora_A.default.weight -> .lora_down.weight)
+        new_key = new_key.replace(".lora_A.default.weight", ".lora_down.weight")
+        new_key = new_key.replace(".lora_B.default.weight", ".lora_up.weight")
+        # Also handle without .default. for standard PEFT
+        new_key = new_key.replace(".lora_A.weight", ".lora_down.weight")
+        new_key = new_key.replace(".lora_B.weight", ".lora_up.weight")
+
+        # Convert dots to underscores in the base name only (preserve .lora_down.weight etc.)
+        parts = new_key.rsplit(".lora_", 1)
+        if len(parts) == 2:
+            new_key = parts[0].replace(".", "_") + ".lora_" + parts[1]
+        else:
+            new_key = new_key.replace(".", "_")
+
         new_weights_sd[new_key] = weight
 
         lora_name = new_key.split(".")[0]

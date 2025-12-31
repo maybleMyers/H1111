@@ -668,7 +668,50 @@ def _unload_keyframe_models():
         _StoryMemModels.clip_model = None
         _StoryMemModels.clip_device = None
         logger.info("CLIP model unloaded")
+    gc.collect()
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
+
+def _offload_dit_to_cpu_full(model, device, args):
+    """Fully offload DiT model to CPU, including all blocks and offloader cleanup.
+
+    This mirrors the cleanup logic from DynamicModelManager.get_model() at lines 1534-1571.
+    Used before loading HPSv3 to ensure all GPU memory is freed.
+    """
+    if model is None:
+        return
+
+    # Handle block swapping cleanup if enabled
+    if hasattr(model, 'blocks_to_swap') and model.blocks_to_swap and model.blocks_to_swap > 0:
+        logger.info("Cleaning up block swapping for model offload...")
+
+        # Wait for any pending block operations
+        if hasattr(model, 'offloader') and model.offloader is not None:
+            for idx in range(len(model.blocks)):
+                try:
+                    model.offloader.wait_for_block(idx)
+                except Exception as e:
+                    logger.warning(f"Error waiting for block {idx}: {e}")
+
+            # Shutdown ThreadPoolExecutor
+            if hasattr(model.offloader, 'thread_pool'):
+                try:
+                    model.offloader.thread_pool.shutdown(wait=True)
+                except:
+                    pass
+            if hasattr(model.offloader, 'futures'):
+                model.offloader.futures.clear()
+
+    # Move ALL blocks to CPU (this is the critical fix - move_to_device_except_swap_blocks skips this)
+    if hasattr(model, 'blocks') and model.blocks is not None:
+        for idx, block in enumerate(model.blocks):
+            try:
+                model.blocks[idx] = block.cpu()
+            except Exception as e:
+                logger.warning(f"Error moving block {idx} to CPU: {e}")
+
+    # Move rest of model to CPU (embeddings, head, etc.)
+    model.to('cpu')
 
 def _get_clip_model(device="cuda"):
     """Load CLIP model for frame similarity (lazy, singleton)."""
@@ -6944,14 +6987,23 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             del video, latent, noise
 
             # Offload models to CPU before loading HPSv3 for keyframe extraction
-            if getattr(args, 'blocks_to_swap', 0) > 0:
-                dit_low_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
-                dit_high_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
-            else:
-                dit_low_noise.cpu()
-                dit_high_noise.cpu()
+            logger.info("Offloading DiT models to CPU for HPSv3 keyframe extraction")
+            torch.cuda.synchronize()
+
+            # Clear torch.compile cache if enabled (prevents compiled graph references)
+            if getattr(args, 'compile', False):
+                logger.info("Clearing torch.compile cache before model offload")
+                torch._dynamo.reset()
+
+            # Fully offload both DiT models (including ALL blocks, not just embeddings/head)
+            _offload_dit_to_cpu_full(dit_low_noise, device, args)
+            _offload_dit_to_cpu_full(dit_high_noise, device, args)
             vae.to('cpu')
+
+            gc.collect()
             torch.cuda.empty_cache()
+            if hasattr(torch.cuda, 'ipc_collect'):
+                torch.cuda.ipc_collect()
 
             save_keyframes_from_video(
                 output_path, story_output_dir,
@@ -6960,6 +7012,12 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 args.keyframe_quality_threshold, str(device)
             )
             _unload_keyframe_models()
+
+            # Re-prepare block swap after full CPU offload for next shot
+            # (block swap state was cleaned up during offload, need to reinitialize)
+            if getattr(args, 'blocks_to_swap', 0) > 0 and dit_low_noise is not None:
+                dit_low_noise.prepare_block_swap_before_forward()
+                dit_high_noise.prepare_block_swap_before_forward()
 
     if output_video_paths:
         final_output_path = os.path.join(story_output_dir, f"{sanitized_name}_final.mp4")
