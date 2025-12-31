@@ -2227,6 +2227,8 @@ def storymem_generate(
     lora7: str, lora7_mult: float, lora7_low: bool, lora7_high: bool,
     lora8: str, lora8_mult: float, lora8_low: bool, lora8_high: bool,
     ref_image1: str, ref_image2: str, ref_image3: str, ref_image4: str,
+    enable_preview: bool,
+    preview_steps: int,
 ):
     import json
     import subprocess
@@ -2313,6 +2315,12 @@ def storymem_generate(
     if compile_model:
         command.append("--compile")
 
+    # Generate unique preview suffix for this generation
+    unique_preview_suffix = f"storymem_{story_name.replace(' ', '_')}_{int(time.time())}"
+    if enable_preview and preview_steps > 0:
+        command.extend(["--preview", str(preview_steps)])
+        command.extend(["--preview_suffix", unique_preview_suffix])
+
     if seed >= 0:
         command.extend(["--seed", str(int(seed))])
 
@@ -2385,6 +2393,11 @@ def storymem_generate(
     current_scene = ""
     current_shot = ""
 
+    # Preview monitoring setup
+    last_preview_mtime = 0
+    preview_base_dir = os.path.join(save_path, "previews")
+    preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
     for line in iter(process.stdout.readline, ''):
         line_strip = line.strip()
         if not line_strip:
@@ -2397,6 +2410,14 @@ def storymem_generate(
             if match:
                 current_scene = match.group(1)
                 current_shot = match.group(2)
+
+        # Check for preview updates
+        if enable_preview:
+            if os.path.exists(preview_mp4_path):
+                current_mtime = os.path.getmtime(preview_mp4_path)
+                if current_mtime > last_preview_mtime:
+                    previews = [preview_mp4_path]
+                    last_preview_mtime = current_mtime
 
         if "M2V" in line_strip and "%" in line_strip:
             yield all_videos.copy(), previews.copy(), f"Scene {current_scene} Shot {current_shot}", line_strip
@@ -10950,7 +10971,10 @@ with gr.Blocks(
                         columns=[2], rows=[2], object_fit="contain", height="auto",
                         show_label=True, elem_id="gallery_storymem", allow_preview=True, preview=True
                     )
-                    with gr.Accordion("Latent Preview", open=True):
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        storymem_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        storymem_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                           label="Preview Every N Steps")
                         storymem_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
                             allow_preview=True, preview=True
@@ -14885,6 +14909,7 @@ with gr.Blocks(
             storymem_lora_weights[6], storymem_lora_multipliers[6], storymem_lora_apply_low[6], storymem_lora_apply_high[6],
             storymem_lora_weights[7], storymem_lora_multipliers[7], storymem_lora_apply_low[7], storymem_lora_apply_high[7],
             storymem_ref_image1, storymem_ref_image2, storymem_ref_image3, storymem_ref_image4,
+            storymem_enable_preview, storymem_preview_steps,
         ],
         outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text],
         queue=True
@@ -14915,6 +14940,8 @@ with gr.Blocks(
         storymem_frame_num, storymem_fps,
         storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
         storymem_sample_solver, storymem_seed,
+        # Preview settings
+        storymem_enable_preview, storymem_preview_steps,
         # Performance settings
         storymem_attn_mode, storymem_block_swap,
         storymem_fp8, storymem_fp8_scaled, storymem_fp8_prescaled, storymem_fp8_fast, storymem_fp8_t5,
@@ -14945,6 +14972,8 @@ with gr.Blocks(
         "storymem_frame_num", "storymem_fps",
         "storymem_sample_steps", "storymem_flow_shift", "storymem_sample_guide_scale",
         "storymem_sample_solver", "storymem_seed",
+        # Preview settings
+        "storymem_enable_preview", "storymem_preview_steps",
         # Performance settings
         "storymem_attn_mode", "storymem_block_swap",
         "storymem_fp8", "storymem_fp8_scaled", "storymem_fp8_prescaled", "storymem_fp8_fast", "storymem_fp8_t5",
