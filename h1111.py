@@ -10793,23 +10793,23 @@ with gr.Blocks(
             """)
 
             with gr.Row():
-                storymem_story_name = gr.Textbox(label="Story Name", value="my_story", scale=2, info="Used for output filename")
-                storymem_story_overview = gr.Textbox(label="Story Overview", value="A story about...", scale=4, lines=2, info="Overall story description")
+                storymem_story_name = gr.Textbox(label="Story Name", value="hybrid_havoc_miami", scale=2, info="Used for output filename")
+                storymem_story_overview = gr.Textbox(label="Story Overview", value="A cute cat-owl-parrot hybrid perches on a palm tree in Miami, watching seven blue capybaras perform amazing water gymnastics. The capybaras do backflips, barrel rolls and somersaults playfully while the mischievous hybrid observes, eventually laughing menacingly at their aquatic performance.", scale=4, lines=2, info="Overall story description")
 
             with gr.Accordion("Scene 1 Shots", open=True):
                 with gr.Row():
                     with gr.Column():
-                        storymem_s1_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="A young woman with long black hair walks through a sunlit garden, wearing a flowing white dress.")
-                        storymem_s1_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Young woman with long black hair, white dress, standing at garden entrance; warm sunlight, flowers in background.")
+                        storymem_s1_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="Sunny Miami beach with palm trees swaying in the breeze. A cute cat-owl-parrot hybrid with fluffy fur, large owl eyes, and colorful parrot feathers perches on a palm branch. The ocean glimmers in the background. Wide establishing shot with warm tropical lighting.")
+                        storymem_s1_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid on palm branch; fluffy fur, large owl eyes, colorful feathers; Miami beach and ocean in background; warm sunlight.")
                         storymem_s1_cut1 = gr.Checkbox(label="Scene Cut", value=True, info="Start of new scene")
                     with gr.Column():
-                        storymem_s1_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="She pauses to smell a beautiful red rose, smiling softly. Close-up of her face showing joy.")
-                        storymem_s1_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Close-up of woman's face near red rose; soft smile, eyes closed, petals near her cheek.")
+                        storymem_s1_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="Seven blue capybaras emerge from the shallow Miami waters, their bright blue fur glistening. They line up in formation on the beach, preparing for their performance. Medium shot capturing their synchronized movements and playful expressions.")
+                        storymem_s1_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Seven blue capybaras in shallow water; bright blue fur glistening wet; lined up in formation; Miami beach setting.")
                         storymem_s1_cut2 = gr.Checkbox(label="Scene Cut", value=False)
                 with gr.Row():
                     with gr.Column():
-                        storymem_s1_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="A butterfly lands on her outstretched hand. She watches it with wonder.")
-                        storymem_s1_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Woman's hand extended, butterfly approaching; soft garden bokeh, gentle expression of anticipation.")
+                        storymem_s1_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="The blue capybaras begin their water gymnastics routine, splashing into the waves. Two capybaras perform synchronized backflips while others cheer. The cat-owl-parrot hybrid tilts its head curiously from the branch. Dynamic medium shot with water droplets catching sunlight.")
+                        storymem_s1_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Blue capybaras mid-backflip in shallow waves; water splashing around them; sunlit droplets; hybrid visible on branch in background.")
                         storymem_s1_cut3 = gr.Checkbox(label="Scene Cut", value=False)
                     with gr.Column():
                         storymem_s1_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
@@ -10819,17 +10819,17 @@ with gr.Blocks(
             with gr.Accordion("Scene 2 Shots", open=False):
                 with gr.Row():
                     with gr.Column():
-                        storymem_s2_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="")
-                        storymem_s2_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="")
+                        storymem_s2_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="The seven blue capybaras perform spectacular barrel rolls in the Miami surf. They tumble and spin through the shallow water playfully, their blue fur creating streaks of color. Wide shot showing all seven in synchronized aquatic acrobatics.")
+                        storymem_s2_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Seven blue capybaras mid-barrel-roll in surf; synchronized spinning; water spraying; bright Miami sunshine.")
                         storymem_s2_cut1 = gr.Checkbox(label="Scene Cut", value=True)
                     with gr.Column():
-                        storymem_s2_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="")
-                        storymem_s2_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="")
+                        storymem_s2_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="Three blue capybaras leap over each other doing somersaults while the others swim in circles below. The atmosphere is joyful and energetic. Medium close-up capturing their playful expressions and the splash of water around them.")
+                        storymem_s2_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Three blue capybaras mid-somersault; others swimming below; joyful expressions; water splashing everywhere.")
                         storymem_s2_cut2 = gr.Checkbox(label="Scene Cut", value=False)
                 with gr.Row():
                     with gr.Column():
-                        storymem_s2_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="")
-                        storymem_s2_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="")
+                        storymem_s2_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="Close-up of the cat-owl-parrot hybrid watching intently from the palm branch. Its large owl eyes follow the capybaras' movements. Its parrot feathers ruffle slightly in the breeze. The expression shows growing amusement. Soft bokeh of the beach performance in background.")
+                        storymem_s2_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid close-up on branch; large owl eyes focused; parrot feathers ruffling; amused expression; beach bokeh behind.")
                         storymem_s2_cut3 = gr.Checkbox(label="Scene Cut", value=False)
                     with gr.Column():
                         storymem_s2_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
@@ -10839,17 +10839,17 @@ with gr.Blocks(
             with gr.Accordion("Scene 3 Shots", open=False):
                 with gr.Row():
                     with gr.Column():
-                        storymem_s3_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="")
-                        storymem_s3_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="")
+                        storymem_s3_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="Grand finale as all seven blue capybaras perform a synchronized tower formation, stacking on each other before splashing down together. Water explodes upward in a spectacular display. Wide cinematic shot capturing the full performance.")
+                        storymem_s3_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Seven blue capybaras in tower formation; about to splash down; water tension visible; dramatic Miami sunset lighting.")
                         storymem_s3_cut1 = gr.Checkbox(label="Scene Cut", value=True)
                     with gr.Column():
-                        storymem_s3_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="")
-                        storymem_s3_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="")
+                        storymem_s3_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="The cat-owl-parrot hybrid opens its beak wide and begins to laugh menacingly at the capybaras below. Its owl eyes narrow with mischief and its parrot feathers puff up dramatically. Close-up shot with dramatic lighting emphasizing the sinister amusement.")
+                        storymem_s3_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid laughing; beak open wide; owl eyes narrowed mischievously; feathers puffed; menacing expression.")
                         storymem_s3_cut2 = gr.Checkbox(label="Scene Cut", value=False)
                 with gr.Row():
                     with gr.Column():
-                        storymem_s3_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="")
-                        storymem_s3_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="")
+                        storymem_s3_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="The blue capybaras look up at the laughing hybrid with confused expressions. The hybrid continues its menacing cackle from the palm tree. Final wide shot showing the contrast between the bewildered capybaras in the water and the amused hybrid above. Miami sunset in background.")
+                        storymem_s3_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Blue capybaras looking up confused; hybrid cackling on branch above; Miami sunset backdrop; comedic contrast between subjects.")
                         storymem_s3_cut3 = gr.Checkbox(label="Scene Cut", value=False)
                     with gr.Column():
                         storymem_s3_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
