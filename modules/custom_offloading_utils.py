@@ -31,44 +31,73 @@ def synchronize_device(device: torch.device):
 
 
 def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+    """
+    Swap weights between two layers, moving layer_to_cpu's weights to CPU and layer_to_cuda's weights to GPU.
+    Uses buffer reuse for large weight tensors to minimize GPU memory allocation.
+    Also handles biases and other parameters with simple device transfers.
+    """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
-
-    # This is not working for all cases (e.g. SD3), so we need to find the corresponding modules
-    # for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-    #     print(module_to_cpu.__class__, module_to_cuda.__class__)
-    #     if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-    #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+    other_param_jobs = []  # For biases and other non-weight parameters
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
+        module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
+        if module_to_cpu is None:
+            continue
+
+        # Handle weight parameter with buffer reuse
         if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
-            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
-            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
+            if module_to_cpu.weight is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
                 weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
-            else:
-                if module_to_cuda.weight.data.device.type != device.type:
-                    # print(
-                    #     f"Module {module_to_cuda_name} not found in CPU model or shape mismatch, so not swapping and moving to device"
-                    # )
-                    module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+            elif module_to_cuda.weight.data.device.type != device.type:
+                module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+
+        # Handle all other parameters (bias, etc.) - collect them for simple transfer
+        for param_name, param in module_to_cuda.named_parameters(recurse=False):
+            if param_name == "weight":  # Already handled above
+                continue
+            if param is not None:
+                cpu_param = getattr(module_to_cpu, param_name, None)
+                if cpu_param is not None:
+                    other_param_jobs.append((module_to_cpu, module_to_cuda, param_name, cpu_param.data, param.data))
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        # cuda to cpu
+        # cuda to cpu - weights (with buffer reuse)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
             module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
+        # cuda to cpu - other params (simple transfer)
+        for module_to_cpu, module_to_cuda, param_name, cpu_param_data, cuda_param_data in other_param_jobs:
+            # If the GPU module's param is on GPU, move to CPU
+            if cpu_param_data.device.type == device.type:
+                setattr(module_to_cpu, param_name + "_data_backup", cpu_param_data)  # temporary backup
+                getattr(module_to_cpu, param_name).data = cpu_param_data.to("cpu", non_blocking=True)
+
         stream.synchronize()
 
-        # cpu to cuda
+        # cpu to cuda - weights (reuse GPU buffer)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
             module_to_cuda.weight.data = cuda_data_view
+
+        # cpu to cuda - other params (simple transfer, reuse buffer if available)
+        for module_to_cpu, module_to_cuda, param_name, cpu_param_data, cuda_param_data in other_param_jobs:
+            backup_key = param_name + "_data_backup"
+            if hasattr(module_to_cpu, backup_key):
+                # Reuse the GPU buffer from the module that moved to CPU
+                gpu_buffer = getattr(module_to_cpu, backup_key)
+                gpu_buffer.copy_(cuda_param_data, non_blocking=True)
+                getattr(module_to_cuda, param_name).data = gpu_buffer
+                delattr(module_to_cpu, backup_key)
+            else:
+                # Fallback: simple transfer to GPU
+                getattr(module_to_cuda, param_name).data = cuda_param_data.to(device, non_blocking=True)
 
     stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
@@ -100,9 +129,12 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
+    """Move all parameters (weights, biases, and any other parameters) to the specified device."""
     for module in layer.modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data = module.weight.data.to(device, non_blocking=True)
+        # Move all named parameters, not just weights
+        for param_name, param in list(module.named_parameters(recurse=False)):
+            if param is not None:
+                param.data = param.data.to(device, non_blocking=True)
 
 
 class Offloader:
@@ -160,6 +192,12 @@ class Offloader:
         _, bidx_to_cuda = future.result()
 
         assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
+
+        # Ensure CUDA operations from swap are complete
+        if self.cuda_available:
+            torch.cuda.synchronize()
+            if self.debug:
+                print(f"[{self.block_type}] Swap complete for block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
 
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
@@ -232,19 +270,29 @@ class ModelOffloader(Offloader):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
+        num_resident = self.num_blocks - self.blocks_to_swap
         if self.debug:
-            print(f"[{self.block_type}] Prepare block devices before forward")
+            print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU")
 
-        for b in blocks[0 : self.num_blocks - self.blocks_to_swap]:
+        # Move only the first (num_blocks - blocks_to_swap) blocks to GPU
+        # These are the blocks that will be on GPU initially
+        for i, b in enumerate(blocks[0 : num_resident]):
             b.to(self.device)
-            weighs_to_device(b, self.device)  # make sure weights are on device
+            weighs_to_device(b, self.device)  # make sure all params are on device
+            if self.debug and self.device.type == "cuda":
+                print(f"  Block {i} moved to GPU. GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
-        for b in blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first
-            weighs_to_device(b, "cpu")  # make sure weights are on cpu
+        # Keep the remaining blocks on CPU - they will be swapped in during forward pass
+        # The swap mechanism will reuse GPU buffers from blocks moving to CPU
+        for i, b in enumerate(blocks[num_resident:]):
+            # Ensure all parameters are on CPU (they should already be from model loading)
+            weighs_to_device(b, "cpu")
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
+
+        if self.debug and self.device.type == "cuda":
+            print(f"[{self.block_type}] After prepare: GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
     def wait_for_block(self, block_idx: int):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:

@@ -12,6 +12,75 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def convert_from_peft(prefix, weights_sd):
+    """
+    Convert from PEFT format to default LoRA format.
+
+    Supports multiple PEFT variants:
+    - Standard PEFT: base_model.model.{module}.lora_A.weight
+    - PEFT with default: base_model.model.{module}.lora_A.default.weight
+    - SVI/Direct PEFT: {module}.lora_A.default.weight (no base_model.model. prefix)
+    """
+    new_weights_sd = {}
+    lora_dims = {}
+    unconverted_keys = []
+
+    if not weights_sd:
+        logger.warning("Input file is empty. Nothing to convert.")
+        return {}
+
+    for key, weight in weights_sd.items():
+        # Check for lora_A or lora_B pattern (required for PEFT format)
+        if ".lora_A." not in key and ".lora_B." not in key:
+            unconverted_keys.append(key)
+            continue
+
+        # Remove base_model.model. prefix if present, otherwise use key as-is
+        # This handles both standard PEFT and SVI/direct PEFT formats
+        if key.startswith("base_model.model."):
+            key_body = key[len("base_model.model."):]
+        else:
+            key_body = key
+
+        # Build new key with prefix
+        new_key = f"{prefix}{key_body}"
+
+        # Handle .default. in key (e.g., .lora_A.default.weight -> .lora_down.weight)
+        new_key = new_key.replace(".lora_A.default.weight", ".lora_down.weight")
+        new_key = new_key.replace(".lora_B.default.weight", ".lora_up.weight")
+        # Also handle without .default. for standard PEFT
+        new_key = new_key.replace(".lora_A.weight", ".lora_down.weight")
+        new_key = new_key.replace(".lora_B.weight", ".lora_up.weight")
+
+        # Convert dots to underscores in the base name only (preserve .lora_down.weight etc.)
+        parts = new_key.rsplit(".lora_", 1)
+        if len(parts) == 2:
+            new_key = parts[0].replace(".", "_") + ".lora_" + parts[1]
+        else:
+            new_key = new_key.replace(".", "_")
+
+        new_weights_sd[new_key] = weight
+
+        lora_name = new_key.split(".")[0]
+        if lora_name not in lora_dims and "lora_down" in new_key:
+            lora_dims[lora_name] = weight.shape[0]
+
+    if not new_weights_sd:
+        logger.info("Input file does not appear to be in PEFT format. No keys converted.")
+        return {}
+
+    if unconverted_keys:
+        logger.warning("Some keys were not in the expected PEFT format and were skipped:")
+        for key in unconverted_keys:
+            logger.warning(f"  - Skipped key: {key}")
+
+    for lora_name, dim in lora_dims.items():
+        new_weights_sd[f"{lora_name}.alpha"] = torch.tensor(dim)
+
+    logger.info(f"Converted {len(new_weights_sd)} keys from PEFT format")
+    return new_weights_sd
+
+
 def convert_from_diffusers(prefix, weights_sd):
     # convert from diffusers(?) to default LoRA
     # Diffusers format: {"diffusion_model.module.name.lora_A.weight": weight, "diffusion_model.module.name.lora_B.weight": weight, ...}
@@ -137,10 +206,12 @@ def convert(input_file, output_file, target_format):
     if target_format == "default":
         new_weights_sd = convert_from_diffusers(prefix, weights_sd)
         metadata = metadata or {}
-        # Only recalculate hashes if a conversion actually happened.
-        # If we just copied the weights, the hashes are already valid.
         if new_weights_sd is not weights_sd:
              model_utils.precalculate_safetensors_hashes(new_weights_sd, metadata)
+    elif target_format == "peft":
+        new_weights_sd = convert_from_peft(prefix, weights_sd)
+        metadata = metadata or {}
+        model_utils.precalculate_safetensors_hashes(new_weights_sd, metadata)
     elif target_format == "other":
         new_weights_sd = convert_to_diffusers(prefix, weights_sd)
     else:
@@ -160,7 +231,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Convert LoRA weights between default and other formats")
     parser.add_argument("--input", type=str, required=True, help="input model file")
     parser.add_argument("--output", type=str, required=True, help="output model file")
-    parser.add_argument("--target", type=str, required=True, choices=["other", "default"], help="target format")
+    parser.add_argument("--target", type=str, required=True, choices=["other", "default", "peft"], help="target format (peft: convert from PEFT/StoryMem format)")
     args = parser.parse_args()
     return args
 

@@ -21,3 +21,7 @@ A cool thing to try are the mixed weight models, I preserved all the weights tha
 Download loras from https://huggingface.co/vita-video-gen/svi-model/tree/main/version-2.0 and use them in the svi tab of the gui. Lightx latest i2v 10lora seems to work with cfg distill sampler.  wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/tree/main  
 
 Seems to work best with 4 overlap frames, 1 motion latent frames and 1 motion frame offset for glitch free video.
+
+### Storymem
+
+This is quite complicated. View https://github.com/maybleMyers/H1111/blob/story/docs/StoryMem_Guide.md for more details.

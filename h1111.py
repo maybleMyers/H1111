@@ -30,6 +30,8 @@ from gradio_image_annotation import image_annotator
 
 # Add global stop event
 stop_event = threading.Event()
+# Global process reference for storymem (to allow stopping)
+storymem_process = None
 skip_event = threading.Event()
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ svi_current_output_filename = None
 UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
+STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -784,6 +787,255 @@ def wan22_batch_handler(
     yield all_generated_videos, [], "Wan2.2 Batch complete.", ""
 
 
+# ========================= HuMo Handler Function =========================
+
+def humo_batch_handler(
+    prompt: str,
+    negative_prompt: str,
+    image_path: str,
+    i2v_image_path: str,
+    humo_mode: str,
+    audio_source: str,
+    audio_path,  # Can be None or file path
+    audio_feat_path,  # Can be None or file path
+    whisper_model: str,
+    scale_a: float,
+    scale_t: float,
+    step_change: int,
+    zero_vae_path: str,
+    zero_vae_720p_path: str,
+    audio_separator: str,
+    task: str,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    batch_size: int,
+    save_path: str,
+    attn_mode: str,
+    block_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_t5: bool,
+    dit_path: str,
+    vae_path: str,
+    t5_path: str,
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    enable_preview: bool,
+    preview_steps: int,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    global stop_event
+    stop_event.clear()
+
+    os.makedirs(save_path, exist_ok=True)
+    all_generated_videos = []
+
+    for i in range(int(batch_size)):
+        if stop_event.is_set():
+            yield all_generated_videos, [], "Generation stopped by user.", ""
+            return
+
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = base_seed + i
+
+        status_text = f"Processing Item {i+1}/{batch_size} (Seed: {current_seed})"
+        yield all_generated_videos.copy(), [], status_text, "Starting HuMo generation..."
+
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"humo_{run_id}"
+
+        # Build command
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", str(task),
+            "--humo",
+            "--humo_mode", str(humo_mode),
+            "--prompt", str(prompt),
+            "--video_size", str(height), str(width),
+            "--video_length", str(frame_num),
+            "--fps", str(fps),
+            "--infer_steps", str(sample_steps),
+            "--flow_shift", str(flow_shift),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(block_swap),
+            "--scale_a", str(scale_a),
+            "--scale_t", str(scale_t),
+            "--step_change", str(step_change),
+        ]
+
+        # Add model paths
+        if dit_path:
+            command.extend(["--dit", os.path.join("wan", dit_path)])
+        if vae_path:
+            command.extend(["--vae", os.path.join("wan", vae_path)])
+        if t5_path:
+            command.extend(["--t5", os.path.join("wan", t5_path)])
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+
+        if audio_source == "Audio File" and audio_path:
+            audio_file_path = audio_path.name if hasattr(audio_path, 'name') else str(audio_path)
+            command.extend(["--audio_path", audio_file_path])
+            command.append("--extract_audio_feat")
+            if whisper_model:
+                command.extend(["--whisper_model", str(whisper_model)])
+        elif audio_source == "Pre-extracted Features" and audio_feat_path:
+            feat_file_path = audio_feat_path.name if hasattr(audio_feat_path, 'name') else str(audio_feat_path)
+            command.extend(["--audio_feat_path", feat_file_path])
+
+        if humo_mode == "TIA" and image_path:
+            command.extend(["--image_path", str(image_path)])
+
+        if i2v_image_path:
+            command.extend(["--humo_i2v_image", str(i2v_image_path)])
+
+        if zero_vae_path and zero_vae_path.strip() and os.path.exists(zero_vae_path.strip()):
+            command.extend(["--zero_vae_path", zero_vae_path.strip()])
+        if zero_vae_720p_path and zero_vae_720p_path.strip() and os.path.exists(zero_vae_720p_path.strip()):
+            command.extend(["--zero_vae_720p_path", zero_vae_720p_path.strip()])
+
+        if audio_separator and audio_separator.strip() and os.path.exists(audio_separator.strip()):
+            command.extend(["--audio_separator", audio_separator.strip()])
+
+        if fp8: command.append("--fp8")
+        if fp8_scaled: command.append("--fp8_scaled")
+        if fp8_t5: command.append("--fp8_t5")
+
+        if enable_preview and preview_steps > 0:
+            command.extend(["--preview", str(preview_steps)])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult),
+            (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult),
+            (lora4_str, lora4_mult),
+        ]
+
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+                    else:
+                        print(f"Warning: LoRA file not found: {path}")
+
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        print(f"Running HuMo Command: {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1
+        )
+
+        current_preview_yield_list = []
+        last_preview_mtime = 0
+        preview_base_dir = os.path.join(save_path, "previews")
+        preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        current_video_file_for_item = None
+        progress_text_update = "Subprocess started..."
+
+        for line in iter(process.stdout.readline, ''):
+            if stop_event.is_set():
+                try: process.terminate(); process.wait(timeout=5)
+                except: process.kill(); process.wait()
+                yield all_generated_videos, [], "Generation stopped by user.", ""
+                return
+
+            line_strip = line.strip()
+            if not line_strip: continue
+            print(f"HUMO_SUBPROCESS: {line_strip}")
+
+            tqdm_match = re.search(r'(\d+)\%\|.+\| (\d+/\d+) \[([0-9:]+)<([0-9:]+)', line_strip)
+            video_saved_match = re.search(r"Video saved to:\s*(.*\.mp4)", line_strip)
+
+            if video_saved_match:
+                found_path = video_saved_match.group(1).strip()
+                if os.path.exists(found_path):
+                    current_video_file_for_item = found_path
+                progress_text_update = f"Finalizing: {os.path.basename(found_path)}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Saved"
+            elif tqdm_match:
+                percentage = tqdm_match.group(1)
+                steps_iter = tqdm_match.group(2)
+                time_remaining = tqdm_match.group(4)
+                progress_text_update = f"Step {steps_iter} ({percentage}%) | ETA: {time_remaining}"
+                status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Denoising"
+
+            if enable_preview:
+                if os.path.exists(preview_mp4_path):
+                    current_mtime = os.path.getmtime(preview_mp4_path)
+                    if current_mtime > last_preview_mtime:
+                        current_preview_yield_list = [preview_mp4_path]
+                        last_preview_mtime = current_mtime
+
+            yield all_generated_videos.copy(), current_preview_yield_list, status_text, progress_text_update
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0 and current_video_file_for_item:
+            params_for_meta = {
+                "model_type": "HuMo-17B",
+                "humo_mode": humo_mode,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "image_path": os.path.basename(image_path) if image_path else None,
+                "task": task,
+                "width": width,
+                "height": height,
+                "frame_num": frame_num,
+                "fps": fps,
+                "scale_a": scale_a,
+                "scale_t": scale_t,
+                "step_change": step_change,
+                "seed": current_seed,
+                "sample_solver": sample_solver,
+                "sample_steps": sample_steps,
+                "flow_shift": flow_shift,
+            }
+            try:
+                add_metadata_to_video(current_video_file_for_item, params_for_meta)
+            except Exception as meta_err:
+                print(f"Warning: Failed to add metadata to {current_video_file_for_item}: {meta_err}")
+
+            all_generated_videos.append((current_video_file_for_item, f"HuMo - Seed: {current_seed}"))
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Completed"
+            progress_text_update = f"Saved: {os.path.basename(current_video_file_for_item)}"
+        else:
+            status_text = f"Item {i+1}/{batch_size} (Seed: {current_seed}) - Failed (Code: {return_code})"
+            progress_text_update = "Subprocess failed. Check console."
+
+        yield all_generated_videos.copy(), [], status_text, progress_text_update
+
+        clear_cuda_cache()
+        time.sleep(0.2)
+
+    yield all_generated_videos, [], "HuMo Batch complete.", ""
+
+
 # ========================= Wan2.2 Queue System Functions =========================
 
 def wan22_submit_to_queue(
@@ -1268,7 +1520,7 @@ def wan22_stop_queue_generation(current_batch_id: str):
 
     # Return reset state
     return (
-        [],  # videos
+        gr.update(),  # videos - keep existing gallery
         [],  # preview
         "Generation cancelled",  # status
         "Stopped",  # progress
@@ -1850,7 +2102,7 @@ def svi_stop_queue_generation(current_batch_id: str):
 
     # Return reset state
     return (
-        [],  # videos
+        gr.update(),  # videos - keep existing gallery
         [],  # preview
         "SVI generation cancelled",  # status
         "Stopped",  # progress
@@ -1884,6 +2136,347 @@ def svi_stop_and_decode():
     return "No active SVI generation to stop"
 
 # ========================= End SVI Queue System Functions =========================
+
+
+# ========================= StoryMem Generation Functions =========================
+
+def storymem_build_story_json(
+    story_name: str, story_overview: str,
+    s1_prompt1: str, s1_ff_prompt1: str, s1_cut1: bool,
+    s1_prompt2: str, s1_ff_prompt2: str, s1_cut2: bool,
+    s1_prompt3: str, s1_ff_prompt3: str, s1_cut3: bool,
+    s1_prompt4: str, s1_ff_prompt4: str, s1_cut4: bool,
+    s2_prompt1: str, s2_ff_prompt1: str, s2_cut1: bool,
+    s2_prompt2: str, s2_ff_prompt2: str, s2_cut2: bool,
+    s2_prompt3: str, s2_ff_prompt3: str, s2_cut3: bool,
+    s2_prompt4: str, s2_ff_prompt4: str, s2_cut4: bool,
+    s3_prompt1: str, s3_ff_prompt1: str, s3_cut1: bool,
+    s3_prompt2: str, s3_ff_prompt2: str, s3_cut2: bool,
+    s3_prompt3: str, s3_ff_prompt3: str, s3_cut3: bool,
+    s3_prompt4: str, s3_ff_prompt4: str, s3_cut4: bool,
+) -> dict:
+    scenes = []
+    scene1_prompts = [(s1_prompt1, s1_ff_prompt1, s1_cut1), (s1_prompt2, s1_ff_prompt2, s1_cut2),
+                      (s1_prompt3, s1_ff_prompt3, s1_cut3), (s1_prompt4, s1_ff_prompt4, s1_cut4)]
+    scene2_prompts = [(s2_prompt1, s2_ff_prompt1, s2_cut1), (s2_prompt2, s2_ff_prompt2, s2_cut2),
+                      (s2_prompt3, s2_ff_prompt3, s2_cut3), (s2_prompt4, s2_ff_prompt4, s2_cut4)]
+    scene3_prompts = [(s3_prompt1, s3_ff_prompt1, s3_cut1), (s3_prompt2, s3_ff_prompt2, s3_cut2),
+                      (s3_prompt3, s3_ff_prompt3, s3_cut3), (s3_prompt4, s3_ff_prompt4, s3_cut4)]
+
+    for scene_num, scene_data in enumerate([scene1_prompts, scene2_prompts, scene3_prompts], 1):
+        video_prompts = []
+        first_frame_prompts = []
+        cuts = []
+        for prompt, ff_prompt, cut in scene_data:
+            if prompt and prompt.strip():
+                video_prompts.append(prompt.strip())
+                first_frame_prompts.append(ff_prompt.strip() if ff_prompt else "")
+                cuts.append(cut)
+        if video_prompts:
+            scenes.append({
+                "scene_num": scene_num,
+                "video_prompts": video_prompts,
+                "first_frame_prompt": first_frame_prompts,
+                "cut": cuts
+            })
+
+    return {
+        "story_name": story_name or "untitled_story",
+        "story_overview": story_overview or "",
+        "scenes": scenes
+    }
+
+
+def storymem_generate(
+    story_name: str, story_overview: str,
+    s1_prompt1: str, s1_ff_prompt1: str, s1_cut1: bool,
+    s1_prompt2: str, s1_ff_prompt2: str, s1_cut2: bool,
+    s1_prompt3: str, s1_ff_prompt3: str, s1_cut3: bool,
+    s1_prompt4: str, s1_ff_prompt4: str, s1_cut4: bool,
+    s2_prompt1: str, s2_ff_prompt1: str, s2_cut1: bool,
+    s2_prompt2: str, s2_ff_prompt2: str, s2_cut2: bool,
+    s2_prompt3: str, s2_ff_prompt3: str, s2_cut3: bool,
+    s2_prompt4: str, s2_ff_prompt4: str, s2_cut4: bool,
+    s3_prompt1: str, s3_ff_prompt1: str, s3_cut1: bool,
+    s3_prompt2: str, s3_ff_prompt2: str, s3_cut2: bool,
+    s3_prompt3: str, s3_ff_prompt3: str, s3_cut3: bool,
+    s3_prompt4: str, s3_ff_prompt4: str, s3_cut4: bool,
+    negative_prompt: str,
+    max_memory_size: int, fix_keyframes: int,
+    max_keyframes_per_video: int, keyframe_similarity_threshold: float, keyframe_quality_threshold: float,
+    t2v_first_shot: bool, m2v_first_shot: bool,
+    mi2v: bool, mm2v: bool,
+    m2v_boundary: float,
+    width: int, height: int,
+    frame_num: int, fps: int,
+    sample_steps: int, flow_shift: float, sample_guide_scale: float,
+    sample_solver: str, seed: int,
+    attn_mode: str, block_swap: int,
+    fp8: bool, fp8_scaled: bool, fp8_prescaled: bool, fp8_fast: bool, fp8_t5: bool,
+    mixed_dtype: bool, vae_fp32: bool,
+    compile_model: bool,
+    model_folder: str,
+    dit_low_noise_path: str, dit_high_noise_path: str,
+    vae_path: str, t5_path: str,
+    save_path: str,
+    lora_folder: str,
+    lora1: str, lora1_mult: float, lora1_low: bool, lora1_high: bool,
+    lora2: str, lora2_mult: float, lora2_low: bool, lora2_high: bool,
+    lora3: str, lora3_mult: float, lora3_low: bool, lora3_high: bool,
+    lora4: str, lora4_mult: float, lora4_low: bool, lora4_high: bool,
+    lora5: str, lora5_mult: float, lora5_low: bool, lora5_high: bool,
+    lora6: str, lora6_mult: float, lora6_low: bool, lora6_high: bool,
+    lora7: str, lora7_mult: float, lora7_low: bool, lora7_high: bool,
+    lora8: str, lora8_mult: float, lora8_low: bool, lora8_high: bool,
+    ref_image1: str, ref_image2: str, ref_image3: str, ref_image4: str,
+    input_video: str,
+    enable_preview: bool,
+    preview_steps: int,
+):
+    import json
+    import subprocess
+    import shutil
+
+    story_json = storymem_build_story_json(
+        story_name, story_overview,
+        s1_prompt1, s1_ff_prompt1, s1_cut1, s1_prompt2, s1_ff_prompt2, s1_cut2,
+        s1_prompt3, s1_ff_prompt3, s1_cut3, s1_prompt4, s1_ff_prompt4, s1_cut4,
+        s2_prompt1, s2_ff_prompt1, s2_cut1, s2_prompt2, s2_ff_prompt2, s2_cut2,
+        s2_prompt3, s2_ff_prompt3, s2_cut3, s2_prompt4, s2_ff_prompt4, s2_cut4,
+        s3_prompt1, s3_ff_prompt1, s3_cut1, s3_prompt2, s3_ff_prompt2, s3_cut2,
+        s3_prompt3, s3_ff_prompt3, s3_cut3, s3_prompt4, s3_ff_prompt4, s3_cut4,
+    )
+
+    if not story_json["scenes"]:
+        yield [], [], "Error: No shots defined", ""
+        return
+
+    story_json_str = json.dumps(story_json, ensure_ascii=False)
+
+    yield [], [], f"Starting StoryMem generation: {len(story_json['scenes'])} scenes", "Building command..."
+
+    command = [
+        sys.executable, "wan2_generate_video.py",
+        "--task", "i2v-A14B",
+        "--story_mode",
+        "--story_json", story_json_str,
+        "--prompt", story_overview or "Story generation",
+        "--save_path", save_path,
+        "--video_size", str(int(height)), str(int(width)),
+        "--video_length", str(int(frame_num)),
+        "--fps", str(int(fps)),
+        "--infer_steps", str(int(sample_steps)),
+        "--flow_shift", str(flow_shift),
+        "--guidance_scale", str(sample_guide_scale),
+        "--sample_solver", sample_solver,
+        "--max_memory_size", str(int(max_memory_size)),
+        "--fix_keyframes", str(int(fix_keyframes)),
+        "--max_keyframes_per_video", str(int(max_keyframes_per_video)),
+        "--keyframe_similarity_threshold", str(keyframe_similarity_threshold),
+        "--keyframe_quality_threshold", str(keyframe_quality_threshold),
+        "--m2v_boundary", str(m2v_boundary),
+        "--attn_mode", attn_mode,
+        "--blocks_to_swap", str(int(block_swap)),
+    ]
+
+    # Input video takes precedence over t2v/m2v first shot modes
+    if input_video and os.path.exists(input_video):
+        command.extend(["--input_video", input_video])
+    elif t2v_first_shot:
+        command.append("--t2v_first_shot")
+    elif m2v_first_shot:
+        command.append("--m2v_first_shot")
+        output_dir = os.path.join(save_path, story_name.replace(' ', '_'))
+        os.makedirs(output_dir, exist_ok=True)
+        ref_images = [ref_image1, ref_image2, ref_image3, ref_image4]
+        keyframe_idx = 0
+        for ref_img in ref_images:
+            if ref_img and os.path.exists(ref_img):
+                dst_path = os.path.join(output_dir, f"00_00_keyframe{keyframe_idx}.jpg")
+                from PIL import Image
+                img = Image.open(ref_img)
+                img.convert("RGB").save(dst_path, "JPEG", quality=95)
+                keyframe_idx += 1
+        if keyframe_idx == 0:
+            yield [], [], "Error: M2V First Shot requires at least one reference image", ""
+            return
+    if mi2v:
+        command.append("--mi2v")
+    if mm2v:
+        command.append("--mm2v")
+    if fp8:
+        command.append("--fp8")
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    if fp8_prescaled:
+        command.append("--fp8_prescaled")
+    if fp8_fast:
+        command.append("--fp8_fast")
+    if fp8_t5:
+        command.append("--fp8_t5")
+    if mixed_dtype:
+        command.append("--mixed_dtype")
+    if vae_fp32:
+        command.extend(["--vae_dtype", "float32"])
+    if compile_model:
+        command.append("--compile")
+
+    # Generate unique preview suffix for this generation
+    unique_preview_suffix = f"storymem_{story_name.replace(' ', '_')}_{int(time.time())}"
+    if enable_preview and preview_steps > 0:
+        command.extend(["--preview", str(preview_steps)])
+        command.extend(["--preview_suffix", unique_preview_suffix])
+
+    if seed >= 0:
+        command.extend(["--seed", str(int(seed))])
+
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+
+    dit_low = os.path.join(model_folder, dit_low_noise_path) if dit_low_noise_path else None
+    dit_high = os.path.join(model_folder, dit_high_noise_path) if dit_high_noise_path else None
+    vae = os.path.join(model_folder, vae_path) if vae_path else None
+    t5 = os.path.join(model_folder, t5_path) if t5_path else None
+
+    if dit_low:
+        command.extend(["--dit_low_noise", dit_low])
+    if dit_high:
+        command.extend(["--dit_high_noise", dit_high])
+    if vae:
+        command.extend(["--vae", vae])
+    if t5:
+        command.extend(["--t5", t5])
+
+    loras = [
+        (lora1, lora1_mult, lora1_low, lora1_high),
+        (lora2, lora2_mult, lora2_low, lora2_high),
+        (lora3, lora3_mult, lora3_low, lora3_high),
+        (lora4, lora4_mult, lora4_low, lora4_high),
+        (lora5, lora5_mult, lora5_low, lora5_high),
+        (lora6, lora6_mult, lora6_low, lora6_high),
+        (lora7, lora7_mult, lora7_low, lora7_high),
+        (lora8, lora8_mult, lora8_low, lora8_high),
+    ]
+
+    lora_weights_low = []
+    lora_multipliers_low = []
+    lora_weights_high = []
+    lora_multipliers_high = []
+
+    for lora_name, mult, apply_low, apply_high in loras:
+        if lora_name and lora_name != "None":
+            full_path = os.path.join(lora_folder, lora_name)
+            if os.path.exists(full_path):
+                if apply_low:
+                    lora_weights_low.append(full_path)
+                    lora_multipliers_low.append(mult)
+                if apply_high:
+                    lora_weights_high.append(full_path)
+                    lora_multipliers_high.append(mult)
+
+    if lora_weights_low:
+        command.extend(["--lora_weight"] + lora_weights_low)
+        command.extend(["--lora_multiplier"] + [str(m) for m in lora_multipliers_low])
+
+    if lora_weights_high:
+        command.extend(["--lora_weight_high"] + lora_weights_high)
+        command.extend(["--lora_multiplier_high"] + [str(m) for m in lora_multipliers_high])
+
+    print(f"Running StoryMem Command: {' '.join(command[:20])}...")
+
+    global storymem_process
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding='utf-8',
+        errors='replace'
+    )
+    storymem_process = process
+
+    all_videos = []
+    previews = []
+    current_scene = ""
+    current_shot = ""
+
+    # Preview monitoring setup
+    last_preview_mtime = 0
+    preview_base_dir = os.path.join(save_path, "previews")
+    preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+    global stop_event
+    stop_event.clear()
+
+    for line in iter(process.stdout.readline, ''):
+        # Check for stop request
+        if stop_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            yield all_videos, previews, "StoryMem generation stopped by user.", ""
+            return
+
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+
+        print(f"STORYMEM: {line_strip}")
+
+        if "Scene" in line_strip and "Shot" in line_strip:
+            match = re.search(r"Scene (\d+) / Shot (\d+)", line_strip)
+            if match:
+                current_scene = match.group(1)
+                current_shot = match.group(2)
+
+        # Check for preview updates
+        if enable_preview:
+            if os.path.exists(preview_mp4_path):
+                current_mtime = os.path.getmtime(preview_mp4_path)
+                if current_mtime > last_preview_mtime:
+                    previews = [preview_mp4_path]
+                    last_preview_mtime = current_mtime
+
+        if "M2V" in line_strip and "%" in line_strip:
+            yield all_videos.copy(), previews.copy(), f"Scene {current_scene} Shot {current_shot}", line_strip
+
+        video_match = re.search(r"saved to[:\s]+(.+\.mp4)", line_strip, re.IGNORECASE)
+        if video_match:
+            video_path = video_match.group(1).strip()
+            if os.path.exists(video_path):
+                # Check if this is the final story video
+                if "_final.mp4" in video_path:
+                    all_videos.append((video_path, "Final Story Video"))
+                else:
+                    all_videos.append((video_path, f"Scene {current_scene} Shot {current_shot}"))
+                yield all_videos.copy(), previews.copy(), f"Completed Scene {current_scene} Shot {current_shot}", ""
+
+    process.wait()
+    storymem_process = None
+
+    yield all_videos, previews, "StoryMem generation complete!", ""
+
+
+def storymem_stop_generation(batch_id: str):
+    global stop_event, storymem_process
+    stop_event.set()
+    # Terminate the subprocess directly to unblock readline()
+    if storymem_process is not None:
+        try:
+            storymem_process.terminate()
+            storymem_process.wait(timeout=3)
+        except:
+            try:
+                storymem_process.kill()
+            except:
+                pass
+        storymem_process = None
+    return [], [], "StoryMem generation stopped", "", "", "", gr.Timer(value=2.0, active=False)
+
+# ========================= End StoryMem Generation Functions =========================
 
 
 ### SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
@@ -8357,39 +8950,6 @@ def wanx_generate_video_batch(
     
     yield all_videos, "Batch complete", ""
 
-def update_wanx_t2v_dimensions(size):
-    """Update width and height based on selected size"""
-    width, height = map(int, size.split('*'))
-    return gr.update(value=width), gr.update(value=height)
-
-def handle_wanx_t2v_gallery_select(evt: gr.SelectData) -> int:
-    """Track selected index when gallery item is clicked"""
-    return evt.index
-
-def send_wanx_t2v_to_v2v(
-    gallery, prompt, selected_index, width, height, video_length,
-    fps, infer_steps, seed, flow_shift, guidance_scale, negative_prompt
-) -> Tuple:
-    """Send the selected WanX T2V video to Video2Video tab"""
-    if not gallery or selected_index is None or selected_index >= len(gallery):
-        return (None, "", width, height, video_length, fps, infer_steps, seed, 
-                flow_shift, guidance_scale, negative_prompt)
-
-    selected_item = gallery[selected_index]
-
-    if isinstance(selected_item, dict):
-        video_path = selected_item.get("name", selected_item.get("data", None))
-    elif isinstance(selected_item, (tuple, list)):
-        video_path = selected_item[0]
-    else:
-        video_path = selected_item
-
-    if isinstance(video_path, tuple):
-        video_path = video_path[0]
-
-    return (str(video_path), prompt, width, height, video_length, fps, infer_steps, seed, 
-            flow_shift, guidance_scale, negative_prompt)
-
 def prepare_for_batch_extension(input_img, base_video, batch_size):
     """Prepare inputs for batch video extension"""
     if input_img is None:
@@ -8786,14 +9346,12 @@ with gr.Blocks(
     params_state = gr.State() #New addition
     i2v_selected_index = gr.State(value=None) 
     skyreels_selected_index = gr.State(value=None)
-    wanx_i2v_selected_index = gr.State(value=None)
     extended_videos = gr.State(value=[])
     wanx_base_video = gr.State(value=None)
     wanx_sharpest_frame_number = gr.State(value=None)  
     wanx_sharpest_frame_path = gr.State(value=None)   
     wanx_trimmed_video_path = gr.State(value=None) 
     wanx_v2v_selected_index = gr.State(value=None)
-    wanx_t2v_selected_index = gr.State(value=None)
     wan22_selected_index = gr.State(value=None)
     framepack_selected_index = gr.State(value=None)
     framepack_original_dims = gr.State(value="")
@@ -10298,8 +10856,270 @@ with gr.Blocks(
                             info="Frames around harmonic peaks to suppress"
                         )
 
+        # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
+        with gr.Tab(id=17, label="StoryMem") as storymem_tab:
+            gr.Markdown("""
+            ## StoryMem - Multi-Shot Story Video Generation
+            Generate consistent multi-shot story videos with memory bank for identity preservation.
+            Uses dual-DiT architecture (M2V) with keyframe extraction for character consistency across scenes.
+            """)
+
+            with gr.Row():
+                storymem_story_name = gr.Textbox(label="Story Name", value="hybrid_havoc_miami", scale=2, info="Used for output filename")
+                storymem_story_overview = gr.Textbox(label="Story Overview", value="A cute cat-owl-parrot hybrid perches on a palm tree in Miami, watching seven blue capybaras perform amazing water gymnastics. The capybaras do backflips, barrel rolls and somersaults playfully while the mischievous hybrid observes, eventually laughing menacingly at their aquatic performance.", scale=4, lines=2, info="Overall story description")
+
+            with gr.Accordion("Scene 1 Shots", open=True):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s1_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="Sunny Miami beach with palm trees swaying in the breeze. A cute cat-owl-parrot hybrid with fluffy fur, large owl eyes, and colorful parrot feathers perches on a palm branch. The ocean glimmers in the background. Wide establishing shot with warm tropical lighting.")
+                        storymem_s1_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid on palm branch; fluffy fur, large owl eyes, colorful feathers; Miami beach and ocean in background; warm sunlight.")
+                        storymem_s1_cut1 = gr.Checkbox(label="Scene Cut", value=True, info="Start of new scene")
+                    with gr.Column():
+                        storymem_s1_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="Seven blue capybaras emerge from the shallow Miami waters, their bright blue fur glistening. They line up in formation on the beach, preparing for their performance. Medium shot capturing their synchronized movements and playful expressions.")
+                        storymem_s1_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Seven blue capybaras in shallow water; bright blue fur glistening wet; lined up in formation; Miami beach setting.")
+                        storymem_s1_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s1_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="The blue capybaras begin their water gymnastics routine, splashing into the waves. Two capybaras perform synchronized backflips while others cheer. The cat-owl-parrot hybrid tilts its head curiously from the branch. Dynamic medium shot with water droplets catching sunlight.")
+                        storymem_s1_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Blue capybaras mid-backflip in shallow waves; water splashing around them; sunlit droplets; hybrid visible on branch in background.")
+                        storymem_s1_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s1_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s1_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s1_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Accordion("Scene 2 Shots", open=False):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s2_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="The seven blue capybaras perform spectacular barrel rolls in the Miami surf. They tumble and spin through the shallow water playfully, their blue fur creating streaks of color. Wide shot showing all seven in synchronized aquatic acrobatics.")
+                        storymem_s2_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Seven blue capybaras mid-barrel-roll in surf; synchronized spinning; water spraying; bright Miami sunshine.")
+                        storymem_s2_cut1 = gr.Checkbox(label="Scene Cut", value=True)
+                    with gr.Column():
+                        storymem_s2_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="Three blue capybaras leap over each other doing somersaults while the others swim in circles below. The atmosphere is joyful and energetic. Medium close-up capturing their playful expressions and the splash of water around them.")
+                        storymem_s2_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Three blue capybaras mid-somersault; others swimming below; joyful expressions; water splashing everywhere.")
+                        storymem_s2_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s2_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="Close-up of the cat-owl-parrot hybrid watching intently from the palm branch. Its large owl eyes follow the capybaras' movements. Its parrot feathers ruffle slightly in the breeze. The expression shows growing amusement. Soft bokeh of the beach performance in background.")
+                        storymem_s2_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid close-up on branch; large owl eyes focused; parrot feathers ruffling; amused expression; beach bokeh behind.")
+                        storymem_s2_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s2_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s2_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s2_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Accordion("Scene 3 Shots", open=False):
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s3_prompt1 = gr.Textbox(label="Shot 1 Video Prompt", lines=3, value="Grand finale as all seven blue capybaras perform a synchronized tower formation, stacking on each other before splashing down together. Water explodes upward in a spectacular display. Wide cinematic shot capturing the full performance.")
+                        storymem_s3_ff_prompt1 = gr.Textbox(label="Shot 1 First Frame Prompt", lines=2, value="Seven blue capybaras in tower formation; about to splash down; water tension visible; dramatic Miami sunset lighting.")
+                        storymem_s3_cut1 = gr.Checkbox(label="Scene Cut", value=True)
+                    with gr.Column():
+                        storymem_s3_prompt2 = gr.Textbox(label="Shot 2 Video Prompt", lines=3, value="The cat-owl-parrot hybrid opens its beak wide and begins to laugh menacingly at the capybaras below. Its owl eyes narrow with mischief and its parrot feathers puff up dramatically. Close-up shot with dramatic lighting emphasizing the sinister amusement.")
+                        storymem_s3_ff_prompt2 = gr.Textbox(label="Shot 2 First Frame Prompt", lines=2, value="Cat-owl-parrot hybrid laughing; beak open wide; owl eyes narrowed mischievously; feathers puffed; menacing expression.")
+                        storymem_s3_cut2 = gr.Checkbox(label="Scene Cut", value=False)
+                with gr.Row():
+                    with gr.Column():
+                        storymem_s3_prompt3 = gr.Textbox(label="Shot 3 Video Prompt", lines=3, value="The blue capybaras look up at the laughing hybrid with confused expressions. The hybrid continues its menacing cackle from the palm tree. Final wide shot showing the contrast between the bewildered capybaras in the water and the amused hybrid above. Miami sunset in background.")
+                        storymem_s3_ff_prompt3 = gr.Textbox(label="Shot 3 First Frame Prompt", lines=2, value="Blue capybaras looking up confused; hybrid cackling on branch above; Miami sunset backdrop; comedic contrast between subjects.")
+                        storymem_s3_cut3 = gr.Checkbox(label="Scene Cut", value=False)
+                    with gr.Column():
+                        storymem_s3_prompt4 = gr.Textbox(label="Shot 4 Video Prompt", lines=3, value="")
+                        storymem_s3_ff_prompt4 = gr.Textbox(label="Shot 4 First Frame Prompt", lines=2, value="")
+                        storymem_s3_cut4 = gr.Checkbox(label="Scene Cut", value=False)
+
+            with gr.Row():
+                with gr.Column(scale=4):
+                    storymem_negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=2,
+                    )
+                with gr.Column(scale=2):
+                    storymem_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    storymem_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+            storymem_job_id_state = gr.State(value="")
+            storymem_batch_id_state = gr.State(value="")
+            storymem_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                storymem_generate_btn = gr.Button("Generate Story Video", elem_classes="green-btn")
+                storymem_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Memory Bank Settings")
+                    with gr.Row():
+                        storymem_max_memory_size = gr.Slider(minimum=1, maximum=16, step=1, label="Max Memory Size", value=8,
+                                                             info="Maximum keyframes in memory bank")
+                        storymem_fix_keyframes = gr.Slider(minimum=0, maximum=8, step=1, label="Fixed Keyframes", value=3,
+                                                           info="Number of initial keyframes to always keep")
+                    with gr.Row():
+                        storymem_max_keyframes_per_video = gr.Slider(minimum=1, maximum=10, step=1, label="Keyframes per Video", value=3,
+                                                                     info="Max keyframes extracted from each shot")
+                        storymem_keyframe_similarity_threshold = gr.Slider(minimum=0.5, maximum=1.0, step=0.01, label="Similarity Threshold", value=0.9,
+                                                                           info="CLIP similarity threshold")
+                        storymem_keyframe_quality_threshold = gr.Slider(minimum=0.0, maximum=5.0, step=0.1, label="Quality Threshold", value=3.0,
+                                                                        info="HPSv3 quality threshold")
+
+                    gr.Markdown("### Generation Mode")
+                    with gr.Row():
+                        storymem_t2v_first_shot = gr.Checkbox(label="T2V First Shot", value=True,
+                                                              info="Generate first shot with T2V model")
+                        storymem_m2v_first_shot = gr.Checkbox(label="M2V First Shot", value=False,
+                                                              info="Generate first shot with M2V using reference images")
+                    with gr.Row():
+                        storymem_mi2v = gr.Checkbox(label="MI2V Transitions", value=True,
+                                                    info="Use last frame for smooth transitions")
+                        storymem_mm2v = gr.Checkbox(label="MM2V Transitions", value=False,
+                                                    info="Use 5 motion frames for transitions")
+
+                    with gr.Accordion("Input Video as First Shot", open=False):
+                        gr.Markdown("Provide an existing video to use as the first shot. Keyframes will be extracted for the memory bank and generation will continue from shot 2.")
+                        storymem_input_video = gr.Video(label="Input Video (First Shot)", sources=["upload"])
+
+                    with gr.Accordion("Reference Images (for M2V First Shot)", open=False):
+                        gr.Markdown("Upload reference images for initial memory bank when using M2V First Shot mode.")
+                        with gr.Row():
+                            storymem_ref_image1 = gr.Image(label="Reference 1", type="filepath")
+                            storymem_ref_image2 = gr.Image(label="Reference 2", type="filepath")
+                        with gr.Row():
+                            storymem_ref_image3 = gr.Image(label="Reference 3", type="filepath")
+                            storymem_ref_image4 = gr.Image(label="Reference 4", type="filepath")
+
+                    gr.Markdown("### Generation Parameters")
+                    storymem_m2v_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="M2V Boundary", value=0.9,
+                                                      info="Dual-DiT switching threshold")
+                    with gr.Row():
+                        storymem_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        storymem_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                    storymem_frame_num = gr.Slider(minimum=9, maximum=241, step=4, label="Frames Per Shot", value=81, info="Frame count (4n+1)")
+                    storymem_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    storymem_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    storymem_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    storymem_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                    storymem_sample_solver = gr.Radio(choices=["unipc", "dpm++"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        storymem_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        storymem_random_seed_btn = gr.Button("🎲")
+
+                with gr.Column():
+                    storymem_output = gr.Gallery(
+                        label="Generated Videos",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_storymem", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        storymem_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        storymem_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                           label="Preview Every N Steps")
+                        storymem_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True
+                        )
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            storymem_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            storymem_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        storymem_lora_weights = []
+                        storymem_lora_multipliers = []
+                        storymem_lora_apply_low = []
+                        storymem_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                storymem_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                storymem_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                storymem_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                storymem_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                storymem_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                storymem_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                storymem_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                storymem_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    storymem_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4")
+                    storymem_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Blocks to Swap to Save VRAM", value=30)
+                with gr.Row():
+                    storymem_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    storymem_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion for mixed weight models")
+                    storymem_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                    storymem_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                    storymem_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    storymem_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                    storymem_vae_fp32 = gr.Checkbox(label="Use FP32 VAE (higher quality, more VRAM)", value=True)
+                with gr.Row():
+                    storymem_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
+                    )
+                with gr.Row():
+                    storymem_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    storymem_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    storymem_dit_low_noise_path = gr.Dropdown(
+                        label="DiT Low Noise Model",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value=get_default_low_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    storymem_dit_high_noise_path = gr.Dropdown(
+                        label="DiT High Noise Model",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value=get_default_high_noise_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                with gr.Row():
+                    storymem_vae_path = gr.Dropdown(
+                        label="VAE Model",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    storymem_t5_path = gr.Dropdown(
+                        label="T5 Model",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                storymem_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    storymem_save_defaults_btn = gr.Button("Save Defaults")
+                    storymem_load_defaults_btn = gr.Button("Load Defaults")
+                    storymem_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+
         # SVI Tab (Stable-Video-Infinity) - Multi-Clip Long Video Generation
-        with gr.Tab(id=16, label="SVI (Long Video)") as svi_tab:
+        with gr.Tab(id=16, label="SVI") as svi_tab:
             gr.Markdown("""
             ## SVI (Stable-Video-Infinity) - Multi-Clip Long Video Generation
             Generate long, consistent videos by chaining multiple clips. Each clip uses the last frame of the previous clip as input.
@@ -10941,358 +11761,201 @@ with gr.Blocks(
                         minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
                     )
 
-        # WanX Image to Video Tab
-        with gr.Tab(id=4, label="WanX-i2v") as wanx_i2v_tab:
+        with gr.Tab(id=4, label="HuMo") as humo_tab:
             with gr.Row():
                 with gr.Column(scale=4):
-                    wanx_prompt = gr.Textbox(
-                        scale=3, 
-                        label="Enter your prompt", 
-                        value="A person walking on a beach at sunset", 
+                    humo_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A person speaking naturally with clear lip movements",
                         lines=5
                     )
-                    wanx_negative_prompt = gr.Textbox(
+                    humo_negative_prompt = gr.Textbox(
                         scale=3,
                         label="Negative Prompt",
-                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        value="blurry, distorted face, unnatural lip sync, static, low quality",
                         lines=3,
                     )
 
                 with gr.Column(scale=1):
-                    wanx_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    wanx_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    humo_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                    humo_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
 
                 with gr.Column(scale=2):
-                    wanx_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    wanx_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
+                    humo_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    humo_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
 
             with gr.Row():
-                wanx_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                wanx_stop_btn = gr.Button("Stop Generation", variant="stop")
+                humo_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                humo_stop_btn = gr.Button("Stop Generation", variant="stop")
 
             with gr.Row():
                 with gr.Column():
-                    wanx_input = gr.Image(label="Input Image", type="filepath")
-                    with gr.Row():
-                        wanx_use_random_folder = gr.Checkbox(label="Use Random Images from Folder", value=False)
-                        wanx_input_folder = gr.Textbox(
-                            label="Image Folder Path", 
-                            placeholder="Path to folder containing images",
+                    # HuMo Mode Selection
+                    humo_mode = gr.Radio(
+                        choices=["TIA", "TA"],
+                        label="Generation Mode",
+                        value="TIA",
+                        info="TIA = Text+Image+Audio, TA = Text+Audio only"
+                    )
+
+                    humo_input_image = gr.Image(label="Reference Image (for TIA mode)", type="filepath")
+                    humo_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                    with gr.Accordion("I2V Mode", open=False):
+                        humo_i2v_image = gr.Image(label="I2V Start Image", type="filepath")
+                    with gr.Accordion("Audio Input", open=True):
+                        humo_audio_source = gr.Radio(
+                            choices=["Audio File", "Pre-extracted Features"],
+                            label="Audio Source",
+                            value="Pre-extracted Features",
+                            info="Use audio file with Whisper extraction or pre-extracted .pt features"
+                        )
+                        humo_audio_path = gr.File(
+                            label="Audio File (.wav)",
+                            file_types=[".wav", ".mp3", ".flac"],
                             visible=False
                         )
-                        wanx_folder_status = gr.Textbox(
-                            label="Folder Status", 
-                            placeholder="Status will appear here",
-                            interactive=False,
-                            visible=False
+                        humo_audio_feat_path = gr.File(
+                            label="Pre-extracted Audio Features (.pt)",
+                            file_types=[".pt"],
+                            visible=True
                         )
-                        wanx_validate_folder_btn = gr.Button("Validate Folder", visible=False)
-                    with gr.Row():
-                        wanx_use_end_image = gr.Checkbox(label="use ending image", value=False)
-                        wanx_input_end = gr.Image(label="End Image", type="filepath", visible=False)
-                        wanx_trim_frames = gr.Checkbox(label="trim last 3 frames", value=True, visible=False, interactive=True)
-
-                    with gr.Row():
-                        wanx_use_fun_control = gr.Checkbox(label="Use Fun-Control Model", value=False)
-                        wanx_control_video = gr.Video(label="Control Video for Fun-Control", visible=False, format="mp4")
-                        wanx_control_strength = gr.Slider(minimum=0.1, maximum=2.0, step=0.05, value=1.0, 
-                            label="Control Strength", visible=False,
-                            info="Adjust influence of control video (1.0 = normal)")
-                        wanx_control_start = gr.Slider(
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.01,
-                            value=0.0,
-                            label="Control Start (Fun-Control fade-in)",
+                        humo_whisper_model = gr.Textbox(
+                            label="Whisper Model Path",
+                            value="openai/whisper-large-v3",
                             visible=False,
-                            info="When (0-1) in the timeline control influence is full after fade-in"
+                            info="HuggingFace model ID or local path"
                         )
-                        wanx_control_end = gr.Slider(
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.01,
-                            value=1.0,
-                            label="Control End (Fun-Control fade-out start)",
-                            visible=False,
-                            info="When (0-1) in the timeline control starts to fade out"
-                        )
-                    wanx_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
-                    wanx_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=True)
-        
-                    # Width and height display
-                    with gr.Row():
-                        wanx_width = gr.Number(label="Width", value=832, interactive=True)
-                        wanx_calc_height_btn = gr.Button("→")
-                        wanx_calc_width_btn = gr.Button("←")
-                        wanx_height = gr.Number(label="Height", value=480, interactive=True)
-                        wanx_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
 
-                    wanx_video_length = gr.Slider(minimum=1, maximum=401, step=4, label="Video Length in Frames", value=81)
-                    wanx_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wanx_infer_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
-                    wanx_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=3.0, 
-                                            info="Recommended: 3.0 for 480p, 5.0 for others")
-                    wanx_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Guidance Scale", value=5.0)
+                    # HuMo CFG Settings
+                    with gr.Accordion("HuMo CFG Settings", open=True):
+                        humo_scale_a = gr.Slider(
+                            minimum=0.0, maximum=15.0, step=0.1, value=5.5,
+                            label="Audio Guidance Scale (scale_a)",
+                            info="Controls audio influence on generation"
+                        )
+                        humo_scale_t = gr.Slider(
+                            minimum=0.0, maximum=15.0, step=0.1, value=5.0,
+                            label="Text Guidance Scale (scale_t)",
+                            info="Controls text influence on generation"
+                        )
+                        humo_step_change = gr.Slider(
+                            minimum=0, maximum=1000, step=10, value=980,
+                            label="CFG Step Change",
+                            info="Timestep where CFG formula changes (default: 980)"
+                        )
+
+                    # Zero VAE Cache
+                    with gr.Accordion("Zero VAE Cache (Optional)", open=False):
+                        gr.Markdown("Pre-computed zero latents for better conditioning. Leave empty to use zeros.")
+                        humo_zero_vae_path = gr.Textbox(
+                            label="Zero VAE Cache (480p)",
+                            value="wan/zero_vae_129frame.pt",
+                            info="Path to zero_vae_129frame.pt"
+                        )
+                        humo_zero_vae_720p_path = gr.Textbox(
+                            label="Zero VAE Cache (720p)",
+                            value="wan/zero_vae_720p_161frame.pt",
+                            info="Path to zero_vae_720p_161frame.pt"
+                        )
+                        humo_audio_separator = gr.Textbox(
+                            label="Audio Separator Model (ONNX)",
+                            value="wan/Kim_Vocal_2.onnx",
+                            info="Optional: Kim_Vocal_2.onnx for vocal separation"
+                        )
+
+                    gr.Markdown("### Generation Parameters")
+                    # Width and height inputs
+                    with gr.Row():
+                        humo_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                        humo_calc_height_btn = gr.Button("→")
+                        humo_calc_width_btn = gr.Button("←")
+                        humo_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+
+                    humo_frame_num = gr.Slider(minimum=9, maximum=401, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                    humo_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=25, info="HuMo default: 25 FPS")
+                    humo_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
+                    humo_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
+                    with gr.Row():
+                        humo_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        humo_random_seed_btn = gr.Button("🎲")
 
                 with gr.Column():
-                    wanx_output = gr.Gallery(
+                    humo_output = gr.Gallery(
                         label="Generated Videos (Click to select)",
-                        columns=[2],
-                        rows=[2],
-                        object_fit="contain",
-                        height="auto",
-                        show_label=True,
-                        elem_id="gallery",
-                        allow_preview=True,
-                        preview=True
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_humo", allow_preview=True, preview=True
                     )
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        wanx_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
-                        wanx_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                       label="Preview Every N Steps", info="Generates previews during the sampling loop.")
-                        wanx_preview_output = gr.Gallery(
+                        humo_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        humo_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                       label="Preview Every N Steps")
+                        humo_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_preview_gallery"
-                        )                    
-                    wanx_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
-                    wanx_i2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-                    wanx_send_last_frame_btn = gr.Button("Send Last Frame to Input")
-                    wanx_extend_btn = gr.Button("Extend Video")
-                    wanx_frames_to_check = gr.Slider(minimum=1, maximum=100, step=1, value=30, 
-                                                   label="Frames to Check from End", 
-                                                   info="Number of frames from the end to check for sharpness")
-                    wanx_send_sharpest_frame_btn = gr.Button("Extract Sharpest Frame")
-                    wanx_trim_and_extend_btn = gr.Button("Trim Video & Prepare for Extension")
-                    wanx_sharpest_frame_status = gr.Textbox(label="Status", interactive=False)
+                            allow_preview=True, preview=True, show_label=True, elem_id="humo_preview_gallery"
+                        )
 
-                # Add a new button for directly extending with the trimmed video
-                    wanx_extend_with_trimmed_btn = gr.Button("Extend with Trimmed Video")
+                    # LoRA Section
+                    with gr.Accordion("LoRA", open=True):
+                        with gr.Row():
+                            humo_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            humo_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        humo_lora_weights = []
+                        humo_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                humo_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                humo_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
 
-                    # Add LoRA section for WanX-i2v similar to other tabs
-                    wanx_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    wanx_lora_weights = []
-                    wanx_lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            wanx_lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
-                            ))
-                            wanx_lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))
-
-            with gr.Row():
-                wanx_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                # Update the wanx_task dropdown choices to include Fun-Control options
-                wanx_task = gr.Dropdown(
+            with gr.Accordion("Model Paths & Performance", open=True):
+                humo_task = gr.Dropdown(
                     label="Task",
-                    choices=["i2v-14B", "i2v-14B-FC", "i2v-14B-FC-1.1", "t2v-14B", "t2v-1.3B", "t2v-14B-FC", "t2v-1.3B-FC", "i2v-1.3B-new"],
-                    value="i2v-14B",
-                    info="Select model type. *-FC options enable Fun-Control features"
+                    choices=["humo-17B-TIA", "humo-17B-TA"],
+                    value="humo-17B-TIA",
+                    info="HuMo model configuration"
                 )
-                wanx_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
-                wanx_dit_path = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("wan"),  # Use the existing function to get available models
-                    value="wan2.1_i2v_720p_14B_fp16.safetensors",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                wanx_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
-                wanx_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                wanx_clip_path = gr.Textbox(label="CLIP Path", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
-                wanx_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                wanx_save_path = gr.Textbox(label="Save Path", value="outputs")
-
-            with gr.Row():
-                wanx_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                wanx_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                wanx_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                wanx_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                wanx_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0)
-                
-                with gr.Column():
-                    wanx_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                    wanx_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False, info="For mixing fp16/bf16 and fp8 weights")
-                    wanx_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-
-            # Add new row for Skip Layer Guidance options
-            with gr.Row():
-                wanx_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
-                wanx_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
-                wanx_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")    
-            
-            with gr.Row():
-                wanx_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
-                with gr.Column(visible=False) as wanx_cfg_skip_options:
-                    wanx_cfg_skip_mode = gr.Radio(
-                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
-                        label="CFG Skip Mode",
-                        value="none",
-                        info="Controls which steps to apply CFG on"
+                with gr.Row():
+                    humo_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn"], label="Attention Mode", value="sdpa")
+                    humo_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                with gr.Row():
+                    humo_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    humo_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    humo_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    humo_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    humo_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    humo_dit_path = gr.Dropdown(
+                        label="HuMo DiT Model (.safetensors)",
+                        choices=get_dit_models("wan"),
+                        value="humo_17b_fp32_low_noise.safetensors",
+                        allow_custom_value=True,
+                        interactive=True,
+                        info="17B HuMo model checkpoint"
                     )
-                    wanx_cfg_apply_ratio = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
-                        label="CFG Apply Ratio", 
-                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
+                with gr.Row():
+                    humo_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-
-        #WanX-t2v Tab
-
-        # WanX Text to Video Tab
-        with gr.Tab(id=5, label="WanX-t2v") as wanx_t2v_tab:
-            with gr.Row():
-                with gr.Column(scale=4):
-                    wanx_t2v_prompt = gr.Textbox(
-                        scale=3, 
-                        label="Enter your prompt", 
-                        value="A person walking on a beach at sunset", 
-                        lines=5
+                    humo_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    wanx_t2v_negative_prompt = gr.Textbox(
-                        scale=3,
-                        label="Negative Prompt",
-                        value="",
-                        lines=3,
-                        info="Leave empty to use default negative prompt"
-                    )
-
-                with gr.Column(scale=1):
-                    wanx_t2v_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    wanx_t2v_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-
-                with gr.Column(scale=2):
-                    wanx_t2v_batch_progress = gr.Textbox(label="", visible=True, elem_id="batch_progress")
-                    wanx_t2v_progress_text = gr.Textbox(label="", visible=True, elem_id="progress_text")
-
-            with gr.Row():
-                wanx_t2v_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                wanx_t2v_stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                with gr.Column():
-                    with gr.Row():
-                        wanx_t2v_width = gr.Number(label="Width", value=832, interactive=True, info="Should be divisible by 32")
-                        wanx_t2v_height = gr.Number(label="Height", value=480, interactive=True, info="Should be divisible by 32")
-                        wanx_t2v_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
-
-                    wanx_t2v_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
-                    wanx_t2v_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wanx_t2v_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=20)
-                    wanx_t2v_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0, 
-                                             info="Recommended: 3.0 for I2V with 480p, 5.0 for others")
-                    wanx_t2v_guidance_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
-
-                with gr.Column():
-                    wanx_t2v_output = gr.Gallery(
-                        label="Generated Videos (Click to select)",
-                        columns=[2],
-                        rows=[2],
-                        object_fit="contain",
-                        height="auto",
-                        show_label=True,
-                        elem_id="gallery",
-                        allow_preview=True,
-                        preview=True
-                    )
-                    with gr.Accordion("Latent Preview (During Generation)", open=False):
-                        wanx_t2v_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
-                        wanx_t2v_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                        label="Preview Every N Steps", info="Generates previews during the sampling loop.")
-                        wanx_t2v_preview_output = gr.Gallery(
-                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="wanx_t2v_preview_gallery"
-                        )                    
-                    wanx_t2v_send_to_v2v_btn = gr.Button("Send Selected to Hunyuan v2v")
-                    wanx_t2v_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-
-                    # Add LoRA section for WanX-t2v
-                    wanx_t2v_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    wanx_t2v_lora_weights = []
-                    wanx_t2v_lora_multipliers = []
-                    for i in range(4):
-                        with gr.Column():
-                            wanx_t2v_lora_weights.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", 
-                                choices=get_lora_options(), 
-                                value="None", 
-                                allow_custom_value=True,
-                                interactive=True
-                            ))
-                            wanx_t2v_lora_multipliers.append(gr.Slider(
-                                label=f"Multiplier", 
-                                minimum=0.0, 
-                                maximum=2.0, 
-                                step=0.05, 
-                                value=1.0
-                            ))
-
-            with gr.Row():
-                wanx_t2v_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                wanx_t2v_task = gr.Dropdown(
-                    label="Task",
-                    choices=["t2v-1.3B", "t2v-14B", "t2i-14B"],
-                    value="t2v-14B",
-                    info="Select model size: t2v-1.3B is faster, t2v-14B has higher quality"
-                )
-                wanx_t2v_dit_path = gr.Dropdown(
-                    label="DiT Model",
-                    choices=get_dit_models("wan"),
-                    value="wan2.1_t2v_14B_fp16.safetensors",
-                    allow_custom_value=True,
-                    interactive=True
-                )
-                wanx_t2v_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
-                wanx_t2v_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                wanx_t2v_clip_path = gr.Textbox(label="CLIP Path", visible=False, value="")
-                wanx_t2v_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                wanx_t2v_save_path = gr.Textbox(label="Save Path", value="outputs")
-
-            with gr.Row():
-                wanx_t2v_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                wanx_t2v_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                wanx_t2v_exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                wanx_t2v_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                wanx_t2v_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=0, 
-                                         info="Max 39 for 14B model, 29 for 1.3B model")
-                
-                with gr.Column():
-                    wanx_t2v_fp8 = gr.Checkbox(label="Use FP8", value=True)
-                    wanx_t2v_fp8_scaled = gr.Checkbox(label="Use Scaled FP8", value=False,
-                                                info="For mixing fp16/bf16 and fp8 weights")
-                    wanx_t2v_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-            
-            # Add new row for Skip Layer Guidance options
-            with gr.Row():
-                wanx_t2v_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated layer indices, e.g. 1,5,10", info="Layers to skip for guidance")
-                wanx_t2v_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0, info="When to start skipping layers (% of total steps)")
-                wanx_t2v_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0, info="When to stop skipping layers (% of total steps)")
-                wanx_t2v_use_random_folder = gr.Checkbox(visible=False, value=False, label="Use Random Images")
-                wanx_t2v_input_folder = gr.Textbox(visible=False, value="", label="Image Folder")
-                wanx_t2v_input_end = gr.Textbox(visible=False, value="none", label="End Frame")
-            
-            with gr.Row():
-                wanx_t2v_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip (similar to teacache)", value=False)
-                with gr.Column(visible=False) as wanx_t2v_cfg_skip_options:
-                    wanx_t2v_cfg_skip_mode = gr.Radio(
-                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
-                        label="CFG Skip Mode",
-                        value="none",
-                        info="Controls which steps to apply CFG on"
-                    )
-                    wanx_t2v_cfg_apply_ratio = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=0.7,
-                        label="CFG Apply Ratio", 
-                        info="Ratio of steps to apply CFG (0.0-1.0). Lower values = faster, but less accurate"
-                    )
+                humo_save_path = gr.Textbox(label="Save Path", value="outputs")
 
         #WanX-v2v Tab
         with gr.Tab(id=6, label="WanX-v2v", visible=False) as wanx_v2v_tab:
@@ -11452,8 +12115,6 @@ with gr.Blocks(
             with gr.Row():
                 send_to_framepack_btn = gr.Button("Send to FramePack", variant="primary")
                 send_to_wan22_btn = gr.Button("Send to Wan2.2", variant="primary")
-                send_to_wanx_i2v_btn = gr.Button("Send to WanX-i2v", variant="primary")
-                send_to_wanx_t2v_btn = gr.Button("Send to WanX-t2v", variant="primary")
                 send_to_wanx_v2v_btn = gr.Button("Send to WanX-v2v", variant="primary")
                 send_to_svi_btn = gr.Button("Send to SVI", variant="primary")
                 
@@ -11494,14 +12155,18 @@ with gr.Blocks(
                             "--output", output_path
                         ]
                         print(f"Using '{script_name}' to convert {input_file.name} to {output_path} for FramePack.")
-                    else: # Existing logic for "default" and "other"
+                    else:
                         script_name = "convert_lora.py"
+                        if target_format == "peft to default":
+                            target_arg = "peft"
+                        else:
+                            target_arg = target_format.lower()
                         cmd = [
                             sys.executable,
                             script_name,
                             "--input", input_file.name,
                             "--output", output_path,
-                            "--target", target_format.lower()
+                            "--target", target_arg
                         ]
 
                     print(f"Running conversion command: {' '.join(cmd)}")
@@ -11545,10 +12210,10 @@ with gr.Blocks(
                 input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
                 output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
                 format_radio = gr.Radio(
-                    choices=["default", "other", "Hunyuan to FramePack"], # <-- Added new choice here
+                    choices=["default", "other", "peft to default", "Hunyuan to FramePack"],
                     value="default",
                     label="Target Format",
-                    info="Choose 'default' for H1111/MUSUBI format, 'other' for diffusion pipe format, or 'Hunyuan to FramePack' for FramePack compatibility."
+                    info="'default': diffusers to H1111/MUSUBI, 'other': to diffusion pipe, 'peft to default': PEFT/StoryMem to H1111/MUSUBI, 'Hunyuan to FramePack': FramePack compatibility"
                 )
 
             with gr.Row():
@@ -12711,54 +13376,6 @@ with gr.Blocks(
         queue=False # Send signal immediately
     )    
 
-    def toggle_fun_control(use_fun_control):
-        """Toggle control video visibility and update task suffix"""
-        # Only update visibility, don't try to set paths
-        return gr.update(visible=use_fun_control)
-
-    def update_task_for_funcontrol(use_fun_control, current_task):
-        """Add or remove -FC suffix from task based on checkbox"""
-        if use_fun_control:
-            if not current_task.endswith("-FC"):
-                if "i2v" in current_task:
-                    return "i2v-14B-FC"
-                elif "t2v" in current_task:
-                    return "t2v-14B-FC"
-            return current_task
-        else:
-            if current_task.endswith("-FC"):
-                return current_task.replace("-FC", "")
-            return current_task
-
-    wanx_use_fun_control.change(
-        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=x), gr.update(visible=x)),
-        inputs=[wanx_use_fun_control],
-        outputs=[wanx_control_video, wanx_control_strength, wanx_control_start, wanx_control_end]
-    )
-
-    # Make task change update checkbox state
-    def update_from_task(task):
-        """Update Fun-Control checkbox and control video visibility based on task"""
-        is_fun_control = "-FC" in task
-        return gr.update(value=is_fun_control), gr.update(visible=is_fun_control)
-
-    wanx_task.change(
-        fn=update_from_task,
-        inputs=[wanx_task],
-        outputs=[wanx_use_fun_control, wanx_control_video]
-    )
-    wanx_enable_cfg_skip.change(
-        fn=lambda x: gr.update(visible=x),
-        inputs=[wanx_enable_cfg_skip],
-        outputs=[wanx_cfg_skip_options]
-    )
-
-    wanx_t2v_enable_cfg_skip.change(
-        fn=lambda x: gr.update(visible=x),
-        inputs=[wanx_t2v_enable_cfg_skip],
-        outputs=[wanx_t2v_cfg_skip_options]
-    )
-
     wanx_v2v_enable_cfg_skip.change(
         fn=lambda x: gr.update(visible=x),
         inputs=[wanx_v2v_enable_cfg_skip],
@@ -12803,55 +13420,6 @@ with gr.Blocks(
         fn=update_wanx_from_scale,  # Reuse function from WanX tabs
         inputs=[wanx_v2v_scale_slider, wanx_v2v_original_dims],
         outputs=[wanx_v2v_width, wanx_v2v_height]
-    )
-
-    def change_to_wanx_v2v_tab():
-        return gr.Tabs(selected=6) 
-
-    def send_wanx_t2v_to_v2v_input(gallery, selected_index):
-        """Send the selected WanX-t2v video to WanX-v2v input"""
-        if gallery is None or not gallery:
-            return None, None
-
-        if selected_index is None and len(gallery) == 1:
-            selected_index = 0
-
-        if selected_index is None or selected_index >= len(gallery):
-            return None, None
-
-        # Get the video path
-        item = gallery[selected_index]
-        video_path = parse_video_path(item)
-
-        return video_path, "Video sent from WanX-t2v tab"
-    
-    wanx_t2v_send_to_wanx_v2v_btn.click(
-        fn=send_wanx_t2v_to_v2v_input,
-        inputs=[wanx_t2v_output, wanx_t2v_selected_index],
-        outputs=[wanx_v2v_input, wanx_v2v_batch_progress]
-    ).then(
-        fn=lambda prompt: prompt,
-        inputs=[wanx_t2v_prompt],
-        outputs=[wanx_v2v_prompt]
-    ).then(
-        fn=change_to_wanx_v2v_tab,
-        inputs=None,
-        outputs=[tabs]
-    )
-
-    # Send video from WanX-i2v to WanX-v2v
-    wanx_i2v_send_to_wanx_v2v_btn.click(
-        fn=send_wanx_t2v_to_v2v_input,  # Reuse the same function
-        inputs=[wanx_output, wanx_i2v_selected_index],
-        outputs=[wanx_v2v_input, wanx_v2v_batch_progress]
-    ).then(
-        fn=lambda prompt: prompt,
-        inputs=[wanx_prompt],
-        outputs=[wanx_v2v_prompt]
-    ).then(
-        fn=change_to_wanx_v2v_tab,
-        inputs=None,
-        outputs=[tabs]
     )
 
     # Update model paths when task changes
@@ -13084,144 +13652,6 @@ with gr.Blocks(
         outputs=[tabs]
     )
 
-    #Video Extension
-    wanx_send_last_frame_btn.click(
-        fn=send_last_frame_handler,
-        inputs=[wanx_output, wanx_i2v_selected_index],
-        outputs=[wanx_input, wanx_base_video]
-    )
-
-    wanx_extend_btn.click(
-        fn=prepare_for_batch_extension,
-        inputs=[wanx_input, wanx_base_video, wanx_batch_size],
-        outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text]
-    ).then(
-        fn=lambda batch_size, base_video:
-            "Starting batch extension..." if base_video and batch_size > 0 else
-            "Error: Missing base video or invalid batch size",
-        inputs=[wanx_batch_size, wanx_base_video],
-        outputs=[wanx_batch_progress]
-    ).then(
-        # Process batch extension one at a time
-        fn=process_batch_extension,
-        inputs=[
-            wanx_prompt,
-            wanx_negative_prompt,
-            wanx_input,               # Input image (last frame)
-            wanx_base_video,          # Base video to extend
-            wanx_width,
-            wanx_height,
-            wanx_video_length,
-            wanx_fps,
-            wanx_infer_steps,
-            wanx_flow_shift,
-            wanx_guidance_scale,
-            wanx_seed,
-            wanx_batch_size,
-            wanx_task,
-            wanx_dit_folder,          # <<< Pass the folder path
-            wanx_dit_path,            # <<< Pass the model filename
-            wanx_vae_path,
-            wanx_t5_path,
-            wanx_clip_path,
-            wanx_save_path,
-            wanx_output_type,
-            wanx_sample_solver,
-            wanx_exclude_single_blocks,
-            wanx_attn_mode,
-            wanx_block_swap,
-            wanx_fp8,
-            wanx_fp8_scaled,
-            wanx_fp8_t5,
-            wanx_lora_folder,
-            wanx_slg_layers,
-            wanx_slg_start,
-            wanx_slg_end,
-            # Pass LoRA weights and multipliers individually
-            wanx_lora_weights[0],
-            wanx_lora_weights[1],
-            wanx_lora_weights[2],
-            wanx_lora_weights[3],
-            wanx_lora_multipliers[0],
-            wanx_lora_multipliers[1],
-            wanx_lora_multipliers[2],
-            wanx_lora_multipliers[3]
-        ],
-        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
-    )
-
-    # Extract and send sharpest frame to input
-    wanx_send_sharpest_frame_btn.click(
-        fn=send_sharpest_frame_handler,
-        inputs=[wanx_output, wanx_i2v_selected_index, wanx_frames_to_check],
-        outputs=[wanx_input, wanx_base_video, wanx_sharpest_frame_number, wanx_sharpest_frame_status]
-    )
-
-    # Trim video to sharpest frame and prepare for extension
-    wanx_trim_and_extend_btn.click(
-        fn=trim_and_prepare_for_extension,
-        inputs=[wanx_base_video, wanx_sharpest_frame_number, wanx_save_path],
-        outputs=[wanx_trimmed_video_path, wanx_sharpest_frame_status]
-    ).then(
-        fn=lambda path, status: (path, status if "Failed" in status else "Video trimmed successfully and ready for extension"),
-        inputs=[wanx_trimmed_video_path, wanx_sharpest_frame_status],
-        outputs=[wanx_base_video, wanx_sharpest_frame_status]
-    )
-
-    wanx_extend_with_trimmed_btn.click(
-        # Prepare step: Sets the base video to the trimmed video path
-        fn=prepare_for_batch_extension,
-        inputs=[wanx_input, wanx_trimmed_video_path, wanx_batch_size], # Use trimmed video path here
-        outputs=[wanx_input, wanx_base_video, wanx_batch_size, wanx_batch_progress, wanx_progress_text] # Update base_video state
-    ).then(
-        # Actual extension processing step
-        fn=process_batch_extension,
-        inputs=[
-            wanx_prompt,
-            wanx_negative_prompt,
-            wanx_input,               # Input image (sharpest frame)
-            wanx_trimmed_video_path,  # Base video to extend (the trimmed one)
-            wanx_width,
-            wanx_height,
-            wanx_video_length,
-            wanx_fps,
-            wanx_infer_steps,
-            wanx_flow_shift,
-            wanx_guidance_scale,
-            wanx_seed,
-            wanx_batch_size,
-            wanx_task,
-            wanx_dit_folder,          # <<< Pass the folder path
-            wanx_dit_path,            # <<< Pass the model filename
-            wanx_vae_path,
-            wanx_t5_path,
-            wanx_clip_path,
-            wanx_save_path,
-            wanx_output_type,
-            wanx_sample_solver,
-            wanx_exclude_single_blocks,
-            wanx_attn_mode,
-            wanx_block_swap,
-            wanx_fp8,
-            wanx_fp8_scaled,
-            wanx_fp8_t5,
-            wanx_lora_folder,
-            wanx_slg_layers,
-            wanx_slg_start,
-            wanx_slg_end,
-            # Pass LoRA weights and multipliers individually
-            wanx_lora_weights[0],
-            wanx_lora_weights[1],
-            wanx_lora_weights[2],
-            wanx_lora_weights[3],
-            wanx_lora_multipliers[0],
-            wanx_lora_multipliers[1],
-            wanx_lora_multipliers[2],
-            wanx_lora_multipliers[3]
-        ],
-        outputs=[wanx_output, wanx_batch_progress, wanx_progress_text]
-    )
-
     #Video Info
     def handle_send_to_wanx_tab(metadata, target_tab, video_path=None):
         """Common handler for sending video parameters to WanX tabs"""
@@ -13238,97 +13668,9 @@ with gr.Blocks(
         # Just pass through all parameters - we'll use them in the .then() function
         return f"Parameters ready for {tab_names.get(target_tab, target_tab)}", metadata, video_path
 
-    def change_to_wanx_i2v_tab():
-        return gr.Tabs(selected=4)  # WanX-i2v tab index
-
-    def change_to_wanx_t2v_tab():
-        return gr.Tabs(selected=5)  # WanX-t2v tab index
-    
     def change_to_wan22_tab():
         return gr.Tabs(selected=12)  # Wan2.2 tab index
 
-
-    send_to_wanx_i2v_btn.click(
-        fn=lambda m: ("Parameters ready for WanX-i2v", m),
-        inputs=[metadata_output],
-        outputs=[status, params_state]
-    ).then(
-        # Reusing the same pattern as other tab transfers with LoRA handling
-        lambda params: [
-            params.get("prompt", ""),
-            params.get("width", 832),
-            params.get("height", 480),
-            params.get("video_length", 81),
-            params.get("fps", 16),
-            params.get("infer_steps", 40),
-            params.get("seed", -1),
-            params.get("flow_shift", 3.0),
-            params.get("guidance_scale", 5.0),
-            params.get("attn_mode", "sdpa"),
-            params.get("block_swap", 0),
-            params.get("task", "i2v-14B"),
-            params.get("negative_prompt", ""),
-            *[params.get("lora_weights", ["None"]*4)[i] if isinstance(params.get("lora_weights", []), list) and i < len(params.get("lora_weights", [])) else "None" for i in range(4)],
-            *[params.get("lora_multipliers", [1.0]*4)[i] if isinstance(params.get("lora_multipliers", []), list) and i < len(params.get("lora_multipliers", [])) else 1.0 for i in range(4)]
-        ] if params else [gr.update()]*20,
-        inputs=params_state,
-        outputs=[
-            wanx_prompt, wanx_width, wanx_height, wanx_video_length, 
-            wanx_fps, wanx_infer_steps, wanx_seed, wanx_flow_shift, 
-            wanx_guidance_scale, wanx_attn_mode, wanx_block_swap,
-            wanx_task, wanx_negative_prompt, 
-            *wanx_lora_weights,
-            *wanx_lora_multipliers
-        ]
-    ).then(
-        fn=change_to_wanx_i2v_tab, 
-        inputs=None, 
-        outputs=[tabs]
-    )
-
-    # 3. Update the WanX-t2v button handler
-    send_to_wanx_t2v_btn.click(
-        fn=lambda m: handle_send_to_wanx_tab(m, 'wanx_t2v'),
-        inputs=[metadata_output],
-        outputs=[status, params_state]
-    ).then(
-        lambda params: [
-            params.get("prompt", ""),
-            params.get("width", 832),
-            params.get("height", 480),
-            params.get("video_length", 81),
-            params.get("fps", 16),
-            params.get("infer_steps", 50),
-            params.get("seed", -1),
-            params.get("flow_shift", 5.0),
-            params.get("guidance_scale", 5.0),
-            params.get("attn_mode", "sdpa"),
-            params.get("block_swap", 0),
-            params.get("negative_prompt", ""),
-            *[params.get("lora_weights", ["None"]*4)[i] if isinstance(params.get("lora_weights", []), list) and i < len(params.get("lora_weights", [])) else "None" for i in range(4)],
-            *[params.get("lora_multipliers", [1.0]*4)[i] if isinstance(params.get("lora_multipliers", []), list) and i < len(params.get("lora_multipliers", [])) else 1.0 for i in range(4)]
-        ] if params else [gr.update()]*20,
-        inputs=params_state,
-        outputs=[
-            wanx_t2v_prompt,
-            wanx_t2v_width,
-            wanx_t2v_height,
-            wanx_t2v_video_length,
-            wanx_t2v_fps,
-            wanx_t2v_infer_steps,
-            wanx_t2v_seed,
-            wanx_t2v_flow_shift,
-            wanx_t2v_guidance_scale,
-            wanx_t2v_attn_mode,
-            wanx_t2v_block_swap,
-            wanx_t2v_negative_prompt,
-            *wanx_t2v_lora_weights,
-            *wanx_t2v_lora_multipliers
-        ]
-    ).then(
-        fn=change_to_wanx_t2v_tab, inputs=None, outputs=[tabs]
-    )
-    
     # Add a function to handle video transfer to wan22 tab
     def handle_send_to_wan22_tab(metadata: dict, video_path: str) -> Tuple[str, Dict, str, Optional[str]]:
         """Handle both parameters and video transfer from Video Info to Wan2.2 tab"""
@@ -13340,6 +13682,7 @@ with gr.Blocks(
         if video_path:
             metadata["enable_v2v"] = True
             first_frame_path = extract_first_frame(video_path)
+            metadata["first_frame_path"] = first_frame_path  # Store in metadata for .then() handler
 
         return f"Parameters ready for Wan2.2", metadata, video_path, first_frame_path
 
@@ -13350,13 +13693,26 @@ with gr.Blocks(
         outputs=[status, params_state, wan22_input_video, wan22_input_image]
     ).then(
         # This lambda function is updated to return values for all 8 LoRAs and other new controls.
-        lambda params, video_path, first_frame: (
+        lambda params: (
             (
                 # Helper to safely get and pad LoRA lists from metadata
-                (weights_from_meta := params.get("lora_weights", [])),
-                (mults_from_meta := params.get("lora_multipliers", [])),
-                (apply_low_from_meta := params.get("lora_apply_low", [])),
-                (apply_high_from_meta := params.get("lora_apply_high", [])),
+                # Support both formats: "lora_weights" (Wan2.2 style) and "lora_weights_low/high" (other tabs)
+                (raw_weights := params.get("lora_weights", [])),
+                (raw_mults := params.get("lora_multipliers", [])),
+                # If lora_weights is empty, try the _low/_high format and merge them
+                (lora_low := params.get("lora_weights_low", [])),
+                (lora_high := params.get("lora_weights_high", [])),
+                (mults_low := params.get("lora_multipliers_low", [])),
+                (mults_high := params.get("lora_multipliers_high", [])),
+                # Extract basenames from full paths if using _low/_high format
+                (lora_low_basenames := [os.path.basename(p) if p else "None" for p in lora_low]),
+                (lora_high_basenames := [os.path.basename(p) if p else "None" for p in lora_high]),
+                # Use raw_weights if available, otherwise merge low/high lists
+                (weights_from_meta := raw_weights if raw_weights else lora_low_basenames + [w for w in lora_high_basenames if w not in lora_low_basenames]),
+                (mults_from_meta := raw_mults if raw_mults else list(mults_low) + [m for i, m in enumerate(mults_high) if i >= len(mults_low) or lora_high_basenames[i] not in lora_low_basenames[:i+1]]),
+                # For apply_low/high: use metadata if available, else derive from _low/_high format
+                (apply_low_from_meta := params.get("lora_apply_low", [True] * len(lora_low) + [False] * max(0, len(lora_high) - len(lora_low)) if not params.get("lora_apply_low") and (lora_low or lora_high) else [])),
+                (apply_high_from_meta := params.get("lora_apply_high", [False] * len(lora_low) + [True] * max(0, len(lora_high) - len(lora_low)) if not params.get("lora_apply_high") and (lora_low or lora_high) else [])),
                 (padded_weights := (weights_from_meta + ["None"] * 8)[:8]),
                 (padded_mults := ([float(m) if isinstance(m, (int, float, str)) and str(m).replace('.', '', 1).isdigit() else 1.0 for m in mults_from_meta] + [1.0] * 8)[:8]),
                 (padded_apply_low := ([bool(v) for v in apply_low_from_meta] + [True] * 8)[:8]),
@@ -13366,7 +13722,7 @@ with gr.Blocks(
                 [
                     params.get("prompt", ""),
                     params.get("negative_prompt", ""),
-                    first_frame,  # image_path - use extracted first frame
+                    params.get("first_frame_path"),  # image_path - retrieved from metadata
                     params.get("task", "i2v-A14B"),
                     params.get('width', 832),
                     params.get('height', 480),
@@ -13410,7 +13766,7 @@ with gr.Blocks(
                 ]
             )[-1] # Return the created list
         ),
-        inputs=[params_state, wan22_input_video, wan22_input_image],
+        inputs=[params_state],
         outputs=[
             wan22_prompt, wan22_negative_prompt, wan22_input_image, wan22_task, wan22_width, wan22_height,
             wan22_frame_num, wan22_fps, wan22_seed, wan22_sample_solver, wan22_sample_steps,
@@ -14521,6 +14877,232 @@ with gr.Blocks(
         outputs=wan22_lora_refresh_outputs_list
     )
 
+    # ===== StoryMem Event Handlers =====
+    storymem_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[storymem_seed])
+
+    def refresh_storymem_models(folder: str):
+        return [
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    storymem_refresh_models_btn.click(
+        fn=refresh_storymem_models,
+        inputs=[storymem_model_folder],
+        outputs=[storymem_dit_low_noise_path, storymem_dit_high_noise_path, storymem_vae_path, storymem_t5_path]
+    )
+
+    def refresh_storymem_loras(folder):
+        choices = get_lora_options(folder)
+        return [gr.update(choices=choices) for _ in range(8)]
+
+    storymem_lora_refresh_btn.click(
+        fn=refresh_storymem_loras,
+        inputs=[storymem_lora_folder],
+        outputs=storymem_lora_weights
+    )
+
+    storymem_generate_btn.click(
+        fn=storymem_generate,
+        inputs=[
+            storymem_story_name, storymem_story_overview,
+            storymem_s1_prompt1, storymem_s1_ff_prompt1, storymem_s1_cut1,
+            storymem_s1_prompt2, storymem_s1_ff_prompt2, storymem_s1_cut2,
+            storymem_s1_prompt3, storymem_s1_ff_prompt3, storymem_s1_cut3,
+            storymem_s1_prompt4, storymem_s1_ff_prompt4, storymem_s1_cut4,
+            storymem_s2_prompt1, storymem_s2_ff_prompt1, storymem_s2_cut1,
+            storymem_s2_prompt2, storymem_s2_ff_prompt2, storymem_s2_cut2,
+            storymem_s2_prompt3, storymem_s2_ff_prompt3, storymem_s2_cut3,
+            storymem_s2_prompt4, storymem_s2_ff_prompt4, storymem_s2_cut4,
+            storymem_s3_prompt1, storymem_s3_ff_prompt1, storymem_s3_cut1,
+            storymem_s3_prompt2, storymem_s3_ff_prompt2, storymem_s3_cut2,
+            storymem_s3_prompt3, storymem_s3_ff_prompt3, storymem_s3_cut3,
+            storymem_s3_prompt4, storymem_s3_ff_prompt4, storymem_s3_cut4,
+            storymem_negative_prompt,
+            storymem_max_memory_size, storymem_fix_keyframes,
+            storymem_max_keyframes_per_video, storymem_keyframe_similarity_threshold, storymem_keyframe_quality_threshold,
+            storymem_t2v_first_shot, storymem_m2v_first_shot,
+            storymem_mi2v, storymem_mm2v,
+            storymem_m2v_boundary,
+            storymem_width, storymem_height,
+            storymem_frame_num, storymem_fps,
+            storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
+            storymem_sample_solver, storymem_seed,
+            storymem_attn_mode, storymem_block_swap,
+            storymem_fp8, storymem_fp8_scaled, storymem_fp8_prescaled, storymem_fp8_fast, storymem_fp8_t5,
+            storymem_mixed_dtype, storymem_vae_fp32,
+            storymem_compile,
+            storymem_model_folder,
+            storymem_dit_low_noise_path, storymem_dit_high_noise_path,
+            storymem_vae_path, storymem_t5_path,
+            storymem_save_path,
+            storymem_lora_folder,
+            storymem_lora_weights[0], storymem_lora_multipliers[0], storymem_lora_apply_low[0], storymem_lora_apply_high[0],
+            storymem_lora_weights[1], storymem_lora_multipliers[1], storymem_lora_apply_low[1], storymem_lora_apply_high[1],
+            storymem_lora_weights[2], storymem_lora_multipliers[2], storymem_lora_apply_low[2], storymem_lora_apply_high[2],
+            storymem_lora_weights[3], storymem_lora_multipliers[3], storymem_lora_apply_low[3], storymem_lora_apply_high[3],
+            storymem_lora_weights[4], storymem_lora_multipliers[4], storymem_lora_apply_low[4], storymem_lora_apply_high[4],
+            storymem_lora_weights[5], storymem_lora_multipliers[5], storymem_lora_apply_low[5], storymem_lora_apply_high[5],
+            storymem_lora_weights[6], storymem_lora_multipliers[6], storymem_lora_apply_low[6], storymem_lora_apply_high[6],
+            storymem_lora_weights[7], storymem_lora_multipliers[7], storymem_lora_apply_low[7], storymem_lora_apply_high[7],
+            storymem_ref_image1, storymem_ref_image2, storymem_ref_image3, storymem_ref_image4,
+            storymem_input_video,
+            storymem_enable_preview, storymem_preview_steps,
+        ],
+        outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text],
+        queue=True
+    )
+
+    storymem_stop_btn.click(
+        fn=storymem_stop_generation,
+        inputs=[storymem_batch_id_state],
+        outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text,
+                 storymem_job_id_state, storymem_batch_id_state, storymem_poll_timer],
+        queue=False
+    )
+
+    # ===== StoryMem Save/Load Defaults =====
+    storymem_ui_default_components_ORDERED_LIST = [
+        # Story settings
+        storymem_story_name, storymem_story_overview,
+        storymem_negative_prompt,
+        # Memory bank settings
+        storymem_max_memory_size, storymem_fix_keyframes,
+        storymem_max_keyframes_per_video, storymem_keyframe_similarity_threshold, storymem_keyframe_quality_threshold,
+        # Generation modes
+        storymem_t2v_first_shot, storymem_m2v_first_shot,
+        storymem_mi2v, storymem_mm2v,
+        storymem_m2v_boundary,
+        # Video settings
+        storymem_width, storymem_height,
+        storymem_frame_num, storymem_fps,
+        storymem_sample_steps, storymem_flow_shift, storymem_sample_guide_scale,
+        storymem_sample_solver, storymem_seed,
+        # Preview settings
+        storymem_enable_preview, storymem_preview_steps,
+        # Performance settings
+        storymem_attn_mode, storymem_block_swap,
+        storymem_fp8, storymem_fp8_scaled, storymem_fp8_prescaled, storymem_fp8_fast, storymem_fp8_t5,
+        storymem_mixed_dtype, storymem_vae_fp32,
+        storymem_compile,
+        # Model paths
+        storymem_model_folder,
+        storymem_dit_low_noise_path, storymem_dit_high_noise_path,
+        storymem_vae_path, storymem_t5_path,
+        storymem_save_path,
+        # LoRA settings
+        storymem_lora_folder,
+    ] + storymem_lora_weights + storymem_lora_multipliers + storymem_lora_apply_low + storymem_lora_apply_high
+
+    storymem_ui_default_keys = [
+        # Story settings
+        "storymem_story_name", "storymem_story_overview",
+        "storymem_negative_prompt",
+        # Memory bank settings
+        "storymem_max_memory_size", "storymem_fix_keyframes",
+        "storymem_max_keyframes_per_video", "storymem_keyframe_similarity_threshold", "storymem_keyframe_quality_threshold",
+        # Generation modes
+        "storymem_t2v_first_shot", "storymem_m2v_first_shot",
+        "storymem_mi2v", "storymem_mm2v",
+        "storymem_m2v_boundary",
+        # Video settings
+        "storymem_width", "storymem_height",
+        "storymem_frame_num", "storymem_fps",
+        "storymem_sample_steps", "storymem_flow_shift", "storymem_sample_guide_scale",
+        "storymem_sample_solver", "storymem_seed",
+        # Preview settings
+        "storymem_enable_preview", "storymem_preview_steps",
+        # Performance settings
+        "storymem_attn_mode", "storymem_block_swap",
+        "storymem_fp8", "storymem_fp8_scaled", "storymem_fp8_prescaled", "storymem_fp8_fast", "storymem_fp8_t5",
+        "storymem_mixed_dtype", "storymem_vae_fp32",
+        "storymem_compile",
+        # Model paths
+        "storymem_model_folder",
+        "storymem_dit_low_noise_path", "storymem_dit_high_noise_path",
+        "storymem_vae_path", "storymem_t5_path",
+        "storymem_save_path",
+        # LoRA settings
+        "storymem_lora_folder",
+    ] + [f"storymem_lora_weight_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"storymem_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_storymem_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(storymem_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(STORYMEM_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "StoryMem defaults saved successfully."
+        except Exception as e:
+            return f"Error saving StoryMem defaults: {e}"
+
+    def load_storymem_defaults(request: gr.Request):
+        lora_folder = "lora"
+        lora_choices = get_lora_options(lora_folder)
+
+        if not os.path.exists(STORYMEM_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(storymem_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(storymem_ui_default_keys) + [""]
+
+        try:
+            with open(STORYMEM_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(storymem_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        # Update lora folder from settings
+        lora_folder = loaded_settings.get("storymem_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(storymem_ui_default_keys):
+            component = storymem_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["StoryMem defaults loaded successfully."]
+
+    storymem_save_defaults_btn.click(
+        fn=save_storymem_defaults,
+        inputs=storymem_ui_default_components_ORDERED_LIST,
+        outputs=[storymem_defaults_status]
+    )
+    storymem_load_defaults_btn.click(
+        fn=load_storymem_defaults,
+        inputs=None,
+        outputs=storymem_ui_default_components_ORDERED_LIST + [storymem_defaults_status]
+    )
+
+    def initial_load_storymem_defaults():
+        results_and_status = load_storymem_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_storymem_defaults,
+        inputs=None,
+        outputs=storymem_ui_default_components_ORDERED_LIST
+    )
+
     # ===== SVI (Stable-Video-Infinity) Event Handlers =====
     # Stop button - cancels queued/running jobs
     svi_stop_btn.click(
@@ -15335,350 +15917,6 @@ with gr.Blocks(
         outputs=v2v_refresh_outputs
     )
 
-    # WanX-i2v tab connections
-    wanx_prompt.change(fn=count_prompt_tokens, inputs=wanx_prompt, outputs=wanx_token_counter)
-    wanx_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-
-    # Image input handling for WanX-i2v
-    wanx_input.change(
-        fn=update_wanx_image_dimensions,
-        inputs=[wanx_input],
-        outputs=[wanx_original_dims, wanx_width, wanx_height]
-    )
-
-    # Scale slider handling for WanX-i2v
-    wanx_scale_slider.change(
-        fn=update_wanx_from_scale,
-        inputs=[wanx_scale_slider, wanx_original_dims],
-        outputs=[wanx_width, wanx_height]
-    )
-
-    # Width/height calculation buttons for WanX-i2v
-    wanx_calc_width_btn.click(
-        fn=calculate_wanx_width,
-        inputs=[wanx_height, wanx_original_dims],
-        outputs=[wanx_width]
-    )
-
-    wanx_calc_height_btn.click(
-        fn=calculate_wanx_height,
-        inputs=[wanx_width, wanx_original_dims],
-        outputs=[wanx_height]
-    )
-    # Add visibility toggle for the folder input components
-    wanx_use_random_folder.change(
-        fn=lambda x: (gr.update(visible=x), gr.update(visible=x), gr.update(visible=x), gr.update(visible=not x)),
-        inputs=[wanx_use_random_folder],
-        outputs=[wanx_input_folder, wanx_folder_status, wanx_validate_folder_btn, wanx_input]
-    )
-    def toggle_end_image(use_end_image):
-        return (
-            gr.update(visible=use_end_image, interactive=use_end_image),  # wanx_input_end
-            gr.update(visible=False)  # wanx_trim_frames
-        )
-    wanx_use_end_image.change(
-        fn=toggle_end_image,
-        inputs=[wanx_use_end_image],
-        outputs=[wanx_input_end, wanx_trim_frames]
-    )
-    # Validate folder button handler
-    wanx_validate_folder_btn.click(
-        fn=lambda folder: get_random_image_from_folder(folder)[1],
-        inputs=[wanx_input_folder],
-        outputs=[wanx_folder_status]
-    )
-
-    # Flow shift recommendation buttons
-    wanx_recommend_flow_btn.click(
-        fn=recommend_wanx_flow_shift,
-        inputs=[wanx_width, wanx_height],
-        outputs=[wanx_flow_shift]
-    )
-
-    wanx_t2v_recommend_flow_btn.click(
-        fn=recommend_wanx_flow_shift,
-        inputs=[wanx_t2v_width, wanx_t2v_height],
-        outputs=[wanx_t2v_flow_shift]
-    )
-    
-    # Generate button handler
-    wanx_generate_btn.click(
-        fn=wanx_batch_handler,
-        inputs=[
-            wanx_use_random_folder,
-            wanx_prompt,
-            wanx_negative_prompt,
-            wanx_width,
-            wanx_height,
-            wanx_video_length,
-            wanx_fps,
-            wanx_infer_steps,
-            wanx_flow_shift,
-            wanx_guidance_scale,
-            wanx_seed,
-            wanx_batch_size,
-            wanx_input_folder,
-            wanx_input_end, # Make sure this is passed
-            wanx_task,
-            wanx_dit_folder,
-            wanx_dit_path,
-            wanx_vae_path,
-            wanx_t5_path,
-            wanx_clip_path,
-            wanx_save_path,
-            wanx_output_type,
-            wanx_sample_solver,
-            wanx_exclude_single_blocks,
-            wanx_attn_mode,
-            wanx_block_swap,
-            wanx_fp8,
-            wanx_fp8_scaled,
-            wanx_fp8_t5,
-            wanx_lora_folder,
-            wanx_slg_layers,
-            wanx_slg_start,
-            wanx_slg_end,
-            wanx_enable_cfg_skip,
-            wanx_cfg_skip_mode,
-            wanx_cfg_apply_ratio,
-            # --- ADDED PREVIEW INPUTS ---
-            wanx_enable_preview,
-            wanx_preview_steps,
-            # --- END ADDED ---
-            *wanx_lora_weights,
-            *wanx_lora_multipliers,
-            wanx_input,              # Input image (used as input_file in handler)
-            wanx_control_video,      # Control video
-            wanx_control_strength,
-            wanx_control_start,
-            wanx_control_end,
-        ],
-        outputs=[
-            wanx_output,          # Main video gallery
-            wanx_preview_output,  # ADDED: Preview gallery
-            wanx_batch_progress,  # Status text
-            wanx_progress_text    # Progress text
-        ], # Now 4 outputs
-        queue=True
-    ).then(
-        fn=lambda batch_size: 0 if batch_size == 1 else None,
-        inputs=[wanx_batch_size],
-        outputs=wanx_i2v_selected_index
-    )
-    
-    # Add refresh button handler for WanX-i2v tab
-    wanx_refresh_outputs = [wanx_dit_path]  # Add model dropdown to outputs
-    for i in range(4):
-        wanx_refresh_outputs.extend([wanx_lora_weights[i], wanx_lora_multipliers[i]])
-
-    wanx_refresh_btn.click(
-        fn=update_dit_and_lora_dropdowns,  # This function already exists and handles both updates
-        inputs=[wanx_dit_folder, wanx_lora_folder, wanx_dit_path] + wanx_lora_weights + wanx_lora_multipliers,
-        outputs=wanx_refresh_outputs
-    )
-    wanx_dit_folder.change(
-        fn=update_dit_dropdown,
-        inputs=[wanx_dit_folder],
-        outputs=[wanx_dit_path]
-    )
-
-    wanx_dit_folder.change(
-        fn=update_dit_dropdown,
-        inputs=[wanx_dit_folder],
-        outputs=[wanx_t2v_dit_path]
-    )
-
-    wanx_dit_folder.change(
-        fn=update_dit_dropdown,
-        inputs=[wanx_dit_folder],
-        outputs=[wanx_v2v_dit_path]
-    )
-    
-    # Gallery selection handling
-    wanx_output.select(
-        fn=handle_wanx_gallery_select,
-        inputs=[wanx_output],
-        outputs=[wanx_i2v_selected_index, wanx_base_video]
-    )
-    
-    # Send to Video2Video handler
-    wanx_send_to_v2v_btn.click(
-        fn=send_wanx_to_v2v,
-        inputs=[
-            wanx_output,  # Gallery with videos
-            wanx_prompt,  # Prompt text
-            wanx_i2v_selected_index,  # Use the correct selected index state
-            wanx_width, 
-            wanx_height, 
-            wanx_video_length,
-            wanx_fps, 
-            wanx_infer_steps, 
-            wanx_seed,
-            wanx_flow_shift, 
-            wanx_guidance_scale,
-            wanx_negative_prompt
-        ],
-        outputs=[
-            v2v_input,  # Video input in V2V tab
-            v2v_prompt,  # Prompt in V2V tab
-            v2v_width, 
-            v2v_height,
-            v2v_video_length, 
-            v2v_fps, 
-            v2v_infer_steps,
-            v2v_seed, 
-            v2v_flow_shift, 
-            v2v_cfg_scale,
-            v2v_negative_prompt
-        ]
-    ).then(
-        fn=change_to_tab_two,  # Function to switch to Video2Video tab
-        inputs=None,
-        outputs=[tabs]
-    )
-    # Connect prompt token counter
-    wanx_t2v_prompt.change(fn=count_prompt_tokens, inputs=wanx_t2v_prompt, outputs=wanx_t2v_token_counter)
-
-    # Stop button handler
-    wanx_t2v_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
-
-    # Flow shift recommendation button
-    wanx_t2v_recommend_flow_btn.click(
-        fn=recommend_wanx_flow_shift,
-        inputs=[wanx_t2v_width, wanx_t2v_height],
-        outputs=[wanx_t2v_flow_shift]
-    )
-
-    # Task change handler to update CLIP visibility and path
-    def update_clip_visibility(task):
-        is_i2v = "i2v" in task
-        return gr.update(visible=is_i2v)
-
-    wanx_t2v_task.change(
-        fn=update_clip_visibility,
-        inputs=[wanx_t2v_task],
-        outputs=[wanx_t2v_clip_path]
-    )
-
-        # Generate button handler for T2V
-    wanx_t2v_generate_btn.click(
-        fn=wanx_batch_handler,
-        inputs=[
-            wanx_t2v_use_random_folder, # use_random
-            wanx_t2v_prompt,            # prompt
-            wanx_t2v_negative_prompt,   # negative_prompt
-            wanx_t2v_width,             # width
-            wanx_t2v_height,            # height
-            wanx_t2v_video_length,      # video_length
-            wanx_t2v_fps,               # fps
-            wanx_t2v_infer_steps,       # infer_steps
-            wanx_t2v_flow_shift,        # flow_shift
-            wanx_t2v_guidance_scale,    # guidance_scale
-            wanx_t2v_seed,              # seed
-            wanx_t2v_batch_size,        # batch_size
-            wanx_t2v_input_folder,      # input_folder_path
-            wanx_t2v_input_end,         # wanx_input_end
-            wanx_t2v_task,              # task
-            wanx_dit_folder,            # dit_folder (shared)
-            wanx_t2v_dit_path,          # dit_path
-            wanx_t2v_vae_path,          # vae_path
-            wanx_t2v_t5_path,           # t5_path
-            wanx_t2v_clip_path,         # clip_path (often None for t2v)
-            wanx_t2v_save_path,         # save_path
-            wanx_t2v_output_type,       # output_type
-            wanx_t2v_sample_solver,     # sample_solver
-            wanx_t2v_exclude_single_blocks, # exclude_single_blocks
-            wanx_t2v_attn_mode,         # attn_mode
-            wanx_t2v_block_swap,        # block_swap
-            wanx_t2v_fp8,               # fp8
-            wanx_t2v_fp8_scaled,        # fp8_scaled
-            wanx_t2v_fp8_t5,            # fp8_t5
-            wanx_t2v_lora_folder,       # lora_folder
-            wanx_t2v_slg_layers,        # slg_layers
-            wanx_t2v_slg_start,         # slg_start
-            wanx_t2v_slg_end,           # slg_end
-            wanx_t2v_enable_cfg_skip,   # enable_cfg_skip
-            wanx_t2v_cfg_skip_mode,     # cfg_skip_mode
-            wanx_t2v_cfg_apply_ratio,   # cfg_apply_ratio
-            # --- ADDED PREVIEW INPUTS ---
-            wanx_t2v_enable_preview,
-            wanx_t2v_preview_steps,
-            # --- END ADDED ---
-            *wanx_t2v_lora_weights,     # *lora_params (weights)
-            *wanx_t2v_lora_multipliers, # *lora_params (multipliers)
-            # --- ADDED Placeholders for trailing args expected by wanx_batch_handler ---
-            gr.File(value=None, visible=False), # Placeholder for input_file (None for T2V)
-            gr.Video(value=None, visible=False), # Placeholder for control_video (None for T2V)
-            gr.Number(value=1.0, visible=False), # Placeholder for control_strength
-            gr.Number(value=0.0, visible=False), # Placeholder for control_start
-            gr.Number(value=1.0, visible=False), # Placeholder for control_end
-            # --- END Placeholders ---
-        ],
-        outputs=[
-            wanx_t2v_output,         # Main video gallery
-            wanx_t2v_preview_output, # ADDED: Preview gallery
-            wanx_t2v_batch_progress, # Status text
-            wanx_t2v_progress_text   # Progress text
-        ], # Now 4 outputs
-        queue=True
-    ).then(
-        fn=lambda batch_size: 0 if batch_size == 1 else None,
-        inputs=[wanx_t2v_batch_size],
-        outputs=wanx_t2v_selected_index
-    )
-    
-    # Add refresh button handler for WanX-t2v tab
-    wanx_t2v_refresh_outputs = [wanx_t2v_dit_path]  # This is one output
-    for i in range(4):
-        wanx_t2v_refresh_outputs.extend([wanx_t2v_lora_weights[i], wanx_t2v_lora_multipliers[i]])  # This adds 8 more outputs
-
-    wanx_t2v_refresh_btn.click(
-        fn=update_dit_and_lora_dropdowns,  # Change to this function instead
-        inputs=[wanx_dit_folder, wanx_t2v_lora_folder, wanx_t2v_dit_path] + wanx_t2v_lora_weights + wanx_t2v_lora_multipliers,
-        outputs=wanx_t2v_refresh_outputs
-    )
-
-    # Gallery selection handling
-    wanx_t2v_output.select(
-        fn=handle_wanx_t2v_gallery_select,
-        outputs=wanx_t2v_selected_index
-    )
-
-    # Send to Video2Video handler
-    wanx_t2v_send_to_v2v_btn.click(
-        fn=send_wanx_t2v_to_v2v,
-        inputs=[
-            wanx_t2v_output, 
-            wanx_t2v_prompt, 
-            wanx_t2v_selected_index,
-            wanx_t2v_width, 
-            wanx_t2v_height, 
-            wanx_t2v_video_length,
-            wanx_t2v_fps, 
-            wanx_t2v_infer_steps, 
-            wanx_t2v_seed,
-            wanx_t2v_flow_shift, 
-            wanx_t2v_guidance_scale,
-            wanx_t2v_negative_prompt
-        ],
-        outputs=[
-            v2v_input, 
-            v2v_prompt, 
-            v2v_width, 
-            v2v_height,
-            v2v_video_length, 
-            v2v_fps, 
-            v2v_infer_steps,
-            v2v_seed, 
-            v2v_flow_shift, 
-            v2v_cfg_scale,
-            v2v_negative_prompt
-        ]
-    ).then(
-        fn=change_to_tab_two,
-        inputs=None,
-        outputs=[tabs]
-    )
     # Phantom Tab Event Handlers
     phantom_prompt.change(fn=count_prompt_tokens, inputs=phantom_prompt, outputs=phantom_token_counter)
     phantom_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
@@ -15770,6 +16008,167 @@ with gr.Blocks(
         outputs=[phantom_input_images],
         show_progress="hidden" # Can be "full" or "minimal" if you want progress for upload
     )
+
+    # ========================= HuMo Event Handlers =========================
+    # Prompt token counter
+    humo_prompt.change(fn=count_prompt_tokens, inputs=humo_prompt, outputs=humo_token_counter)
+
+    # Stop button
+    humo_stop_btn.click(fn=lambda: stop_event.set(), queue=False)
+
+    # Random seed button
+    humo_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[humo_seed])
+
+    # Audio source toggle - show/hide appropriate inputs
+    def humo_toggle_audio_source(source):
+        if source == "Audio File":
+            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+        else:
+            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+
+    humo_audio_source.change(
+        fn=humo_toggle_audio_source,
+        inputs=[humo_audio_source],
+        outputs=[humo_audio_path, humo_audio_feat_path, humo_whisper_model]
+    )
+
+    # Image dimension handlers
+    humo_input_image.change(
+        fn=update_wanx_image_dimensions,
+        inputs=[humo_input_image],
+        outputs=[humo_original_dims, humo_width, humo_height]
+    )
+
+    # Width/Height calculation buttons
+    def calc_humo_height(width, img_path):
+        if img_path and os.path.exists(img_path):
+            try:
+                img = Image.open(img_path)
+                orig_w, orig_h = img.size
+                aspect = orig_h / orig_w
+                new_height = int(width * aspect)
+                new_height = (new_height // 32) * 32
+                return max(32, new_height)
+            except:
+                pass
+        return 480
+
+    def calc_humo_width(height, img_path):
+        if img_path and os.path.exists(img_path):
+            try:
+                img = Image.open(img_path)
+                orig_w, orig_h = img.size
+                aspect = orig_w / orig_h
+                new_width = int(height * aspect)
+                new_width = (new_width // 32) * 32
+                return max(32, new_width)
+            except:
+                pass
+        return 832
+
+    humo_calc_height_btn.click(
+        fn=calc_humo_height,
+        inputs=[humo_width, humo_input_image],
+        outputs=[humo_height]
+    )
+
+    humo_calc_width_btn.click(
+        fn=calc_humo_width,
+        inputs=[humo_height, humo_input_image],
+        outputs=[humo_width]
+    )
+
+    # LoRA refresh
+    humo_lora_refresh_outputs_list = []
+    for i in range(len(humo_lora_weights)):
+        humo_lora_refresh_outputs_list.extend([humo_lora_weights[i], humo_lora_multipliers[i]])
+
+    def refresh_4_loras(folder: str):
+        """Helper to refresh 4 LoRA dropdowns and reset multipliers."""
+        choices = get_lora_options(folder)
+        updates = []
+        for _ in range(4):
+            updates.extend([gr.update(choices=choices, value="None"), gr.update(value=1.0)])
+        return updates
+
+    humo_lora_refresh_btn.click(
+        fn=refresh_4_loras,
+        inputs=[humo_lora_folder],
+        outputs=humo_lora_refresh_outputs_list
+    )
+
+    # Model refresh
+    def refresh_humo_models(folder: str):
+        """Refresh model dropdowns for HuMo"""
+        return [
+            gr.update(choices=get_dit_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder))
+        ]
+
+    humo_refresh_models_btn.click(
+        fn=refresh_humo_models,
+        inputs=[humo_model_folder],
+        outputs=[humo_dit_path, humo_vae_path, humo_t5_path]
+    )
+
+    # Generate button handler
+    humo_generate_btn.click(
+        fn=humo_batch_handler,
+        inputs=[
+            humo_prompt,
+            humo_negative_prompt,
+            humo_input_image,
+            humo_i2v_image,
+            humo_mode,
+            humo_audio_source,
+            humo_audio_path,
+            humo_audio_feat_path,
+            humo_whisper_model,
+            humo_scale_a,
+            humo_scale_t,
+            humo_step_change,
+            humo_zero_vae_path,
+            humo_zero_vae_720p_path,
+            humo_audio_separator,
+            humo_task,
+            humo_width,
+            humo_height,
+            humo_frame_num,
+            humo_fps,
+            humo_seed,
+            humo_sample_solver,
+            humo_sample_steps,
+            humo_flow_shift,
+            humo_batch_size,
+            humo_save_path,
+            humo_attn_mode,
+            humo_block_swap,
+            humo_fp8,
+            humo_fp8_scaled,
+            humo_fp8_t5,
+            humo_dit_path,
+            humo_vae_path,
+            humo_t5_path,
+            humo_lora_folder,
+            *humo_lora_weights,
+            *humo_lora_multipliers,
+            humo_enable_preview,
+            humo_preview_steps,
+        ],
+        outputs=[humo_output, humo_preview_output, humo_batch_progress, humo_progress_text],
+        queue=True
+    )
+
+    # Gallery selection handling
+    humo_selected_index = gr.State(value=0)
+
+    def handle_humo_gallery_select(evt: gr.SelectData) -> int:
+        return evt.index
+
+    humo_output.select(fn=handle_humo_gallery_select, outputs=humo_selected_index)
+
+    # ========================= End HuMo Event Handlers =========================
 
 if __name__ == "__main__":
     # Make sure 'outputs' directory exists

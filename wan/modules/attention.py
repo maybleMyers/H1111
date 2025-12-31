@@ -255,6 +255,7 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic,
         )[0].unflatten(0, (b, lq))
+        del q, k, v  # Free tensors to prevent memory accumulation
     # elif (version is None or version == 2) and FLASH_ATTN_2_AVAILABLE:
     #     # assert FLASH_ATTN_2_AVAILABLE
     #     x = flash_attn.flash_attn_varlen_func(
@@ -286,6 +287,7 @@ def flash_attention(
             is_causal=False,
             sm_scale=softmax_scale,
         )
+        del q, k, v, q_reshaped, k_reshaped, v_reshaped  # Free tensors to prevent memory accumulation
         x = x.transpose(1, 2)  # [B, L, H, C]
     elif attn_mode == "sageattn3":
         # SageAttention3 (Blackwell FP4) - requires SM 120+ and separate sageattn3 package
@@ -306,6 +308,7 @@ def flash_attention(
                 q_reshaped, k_reshaped, v_reshaped,
                 is_causal=False,
             )
+        del q, k, v, q_reshaped, k_reshaped, v_reshaped  # Free tensors to prevent memory accumulation
         x = x.transpose(1, 2)  # [B, L, H, D]
     else:
         raise ValueError(f"Unknown attention mode: {attn_mode}")
