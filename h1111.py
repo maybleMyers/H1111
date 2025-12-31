@@ -2227,6 +2227,7 @@ def storymem_generate(
     lora7: str, lora7_mult: float, lora7_low: bool, lora7_high: bool,
     lora8: str, lora8_mult: float, lora8_low: bool, lora8_high: bool,
     ref_image1: str, ref_image2: str, ref_image3: str, ref_image4: str,
+    input_video: str,
     enable_preview: bool,
     preview_steps: int,
 ):
@@ -2276,9 +2277,12 @@ def storymem_generate(
         "--blocks_to_swap", str(int(block_swap)),
     ]
 
-    if t2v_first_shot:
+    # Input video takes precedence over t2v/m2v first shot modes
+    if input_video and os.path.exists(input_video):
+        command.extend(["--input_video", input_video])
+    elif t2v_first_shot:
         command.append("--t2v_first_shot")
-    if m2v_first_shot:
+    elif m2v_first_shot:
         command.append("--m2v_first_shot")
         output_dir = os.path.join(save_path, story_name.replace(' ', '_'))
         os.makedirs(output_dir, exist_ok=True)
@@ -10940,6 +10944,10 @@ with gr.Blocks(
                         storymem_mm2v = gr.Checkbox(label="MM2V Transitions", value=False,
                                                     info="Use 5 motion frames for transitions")
 
+                    with gr.Accordion("Input Video as First Shot", open=False):
+                        gr.Markdown("Provide an existing video to use as the first shot. Keyframes will be extracted for the memory bank and generation will continue from shot 2.")
+                        storymem_input_video = gr.Video(label="Input Video (First Shot)", sources=["upload"])
+
                     with gr.Accordion("Reference Images (for M2V First Shot)", open=False):
                         gr.Markdown("Upload reference images for initial memory bank when using M2V First Shot mode.")
                         with gr.Row():
@@ -14909,6 +14917,7 @@ with gr.Blocks(
             storymem_lora_weights[6], storymem_lora_multipliers[6], storymem_lora_apply_low[6], storymem_lora_apply_high[6],
             storymem_lora_weights[7], storymem_lora_multipliers[7], storymem_lora_apply_low[7], storymem_lora_apply_high[7],
             storymem_ref_image1, storymem_ref_image2, storymem_ref_image3, storymem_ref_image4,
+            storymem_input_video,
             storymem_enable_preview, storymem_preview_steps,
         ],
         outputs=[storymem_output, storymem_preview_output, storymem_batch_progress, storymem_progress_text],

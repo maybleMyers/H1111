@@ -1382,6 +1382,8 @@ def parse_args() -> argparse.Namespace:
                        help="Generate first shot with T2V model instead of M2V")
     parser.add_argument("--m2v_first_shot", action="store_true",
                        help="Generate first shot with M2V model (uses memory bank)")
+    parser.add_argument("--input_video", type=str, default=None,
+                       help="Use existing video as first shot (extracts keyframes and continues from shot 2)")
     parser.add_argument("--mi2v", action="store_true",
                        help="Use last frame from previous video for I2V transitions (Memory-Image-to-Video)")
     parser.add_argument("--mm2v", action="store_true",
@@ -6533,6 +6535,77 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             logger.info(f"{'='*40}")
 
             output_path = os.path.join(story_output_dir, f"{scene_num:02d}_{shot_num:02d}.mp4")
+
+            # Handle input video as first shot
+            if is_first_shot and args.input_video and os.path.exists(args.input_video):
+                logger.info(f"Using input video as first shot: {args.input_video}")
+                # Resize input video to match generation parameters
+                try:
+                    import av
+                    from PIL import Image
+                    container = av.open(args.input_video)
+                    stream = container.streams.video[0]
+                    input_fps = float(stream.average_rate) if stream.average_rate else args.fps
+
+                    frames = []
+                    for frame in container.decode(stream):
+                        img = frame.to_image().convert("RGB")
+                        # Resize to match generation dimensions
+                        img_resized = img.resize((width, height), Image.LANCZOS)
+                        frames.append(img_resized)
+                    container.close()
+
+                    if frames:
+                        # Save resized video
+                        logger.info(f"Resizing input video from {img.size} to {width}x{height}, {len(frames)} frames")
+                        resized_container = av.open(output_path, mode='w')
+                        resized_stream = resized_container.add_stream('libx264', rate=int(input_fps))
+                        resized_stream.width = width
+                        resized_stream.height = height
+                        resized_stream.pix_fmt = 'yuv420p'
+                        resized_stream.bit_rate = 4000000
+
+                        for img in frames:
+                            av_frame = av.VideoFrame.from_image(img)
+                            for packet in resized_stream.encode(av_frame):
+                                resized_container.mux(packet)
+                        for packet in resized_stream.encode():
+                            resized_container.mux(packet)
+                        resized_container.close()
+                        logger.info(f"Saved resized input video: {output_path}")
+                    else:
+                        raise ValueError("No frames extracted from input video")
+                except Exception as e:
+                    logger.error(f"Failed to resize input video: {e}, copying as-is")
+                    import shutil
+                    shutil.copy2(args.input_video, output_path)
+
+                output_video_paths.append(output_path)
+                # Extract keyframes for memory bank
+                save_keyframes_from_video(
+                    output_path, story_output_dir,
+                    glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
+                    args.max_keyframes_per_video, args.keyframe_similarity_threshold,
+                    args.keyframe_quality_threshold, str(device)
+                )
+                # Extract last frame for MI2V transitions
+                if args.mi2v:
+                    try:
+                        import av
+                        container = av.open(output_path)
+                        stream = container.streams.video[0]
+                        last_frame = None
+                        for frame in container.decode(stream):
+                            last_frame = frame
+                        if last_frame:
+                            last_frame_img = last_frame.to_image().convert("RGB")
+                            last_frame_path = os.path.join(story_output_dir, "last_frame.jpg")
+                            last_frame_img.save(last_frame_path, quality=95)
+                            logger.info(f"Saved last frame for MI2V: {last_frame_path}")
+                        container.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to extract last frame for MI2V: {e}")
+                continue
 
             if is_first_shot and args.t2v_first_shot:
                 t2v_args = argparse.Namespace(**vars(args))
