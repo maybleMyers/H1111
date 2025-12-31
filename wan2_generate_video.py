@@ -6502,22 +6502,14 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     boundary = args.m2v_boundary * num_train_timesteps
     sample_neg_prompt = getattr(cfg, 'sample_neg_prompt', '')
 
-    from wan.modules.vae import WanVAE
-    from wan.modules.t5 import T5EncoderModel
     from wan.modules.model import WanModel
 
-    vae_path = args.vae
-    vae = WanVAE(vae_path=vae_path, device=device)
+    # Use the same VAE loading as the main pipeline
+    vae_dtype = torch.float32 if getattr(args, 'vae_dtype', None) == 'float32' else torch.bfloat16
+    vae = load_vae(args, cfg, device, vae_dtype)
 
-    t5_path = args.t5
-    t5_model = T5EncoderModel(
-        text_len=getattr(cfg, 'text_len', 512),
-        dtype=getattr(cfg, 't5_dtype', torch.bfloat16),
-        device=torch.device('cpu'),
-        weight_path=t5_path,
-        tokenizer_path="google/umt5-xxl",
-        fp8=args.fp8_t5
-    )
+    # Use the same T5 loading as the main pipeline
+    t5_model = load_text_encoder(args, cfg, device)
 
     dit_low_noise = None
     dit_high_noise = None
@@ -6670,29 +6662,33 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             torch.cuda.empty_cache()
 
             if memory_size > 0:
-                memory_tensor = [torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic') for img in memory]
-                memory_tensor = torch.cat(memory_tensor, dim=0).to(device)
-                memory_latent = vae.encode(memory_tensor.unsqueeze(2)).float().squeeze(2).permute(1, 0, 2, 3)
+                # Encode each memory image separately using the correct VAE pattern
+                memory_latents = []
+                for img in memory:
+                    img_resized = torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic').squeeze(0).to(device)
+                    # VAE expects [C, F, H, W] for video, use single frame
+                    img_for_vae = img_resized.unsqueeze(1)  # [C, 1, H, W]
+                    encoded = vae.encode([img_for_vae])[0]  # Returns [C', 1, H', W']
+                    memory_latents.append(encoded.squeeze(1))  # [C', H', W']
+                memory_latent = torch.stack(memory_latents, dim=1).float()  # [C', M, H', W']
             else:
                 memory_latent = None
 
             if first_frame is not None:
-                u = vae.encode(
-                    torch.concat([
-                        torch.nn.functional.interpolate(first_frame[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
-                        torch.zeros(3, frame_num - 1, h, w)
-                    ], dim=1).unsqueeze(0).to(device)
-                ).float().squeeze(0)
+                input_tensor = torch.concat([
+                    torch.nn.functional.interpolate(first_frame[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
+                    torch.zeros(3, frame_num - 1, h, w)
+                ], dim=1).to(device)
+                u = vae.encode([input_tensor])[0].float()
             elif motion_frames is not None:
-                u = vae.encode(
-                    torch.concat([
-                        motion_frames.transpose(0, 1).to(device),
-                        torch.zeros(3, frame_num - 5, h, w).to(device)
-                    ], dim=1).unsqueeze(0)
-                ).float().squeeze(0)
+                input_tensor = torch.concat([
+                    motion_frames.transpose(0, 1).to(device),
+                    torch.zeros(3, frame_num - 5, h, w).to(device)
+                ], dim=1)
+                u = vae.encode([input_tensor])[0].float()
             else:
-                u = torch.zeros(3, frame_num, h, w).to(device)
-                u = vae.encode(u.unsqueeze(0)).float().squeeze(0)
+                input_tensor = torch.zeros(3, frame_num, h, w).to(device)
+                u = vae.encode([input_tensor])[0].float()
 
             if memory_latent is not None:
                 y = torch.cat([memory_latent, u], dim=1)
@@ -6758,7 +6754,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     latent = temp_x0.squeeze(0)
 
             video_latent = latent[:, memory_size:, :, :]
-            video = vae.decode(video_latent.unsqueeze(0)).float().clamp_(-1, 1).squeeze(0)
+            video = vae.decode([video_latent])[0].float().clamp_(-1, 1)
 
             if first_frame_file is not None:
                 video = video[:, 1:]
