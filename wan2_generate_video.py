@@ -6516,6 +6516,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # Use the same T5 loading as the main pipeline
     t5_model = load_text_encoder(args, cfg, device)
+    # Move T5 to CPU immediately - it will be moved to GPU only when encoding prompts
+    t5_model.model.cpu()
+    torch.cuda.empty_cache()
 
     dit_low_noise = None
     dit_high_noise = None
@@ -6582,12 +6585,16 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
                 output_video_paths.append(output_path)
                 # Extract keyframes for memory bank
+                # Unload VAE to free GPU memory for HPSv3 (7B model) - T5 is already on CPU
+                vae.to('cpu')
+                torch.cuda.empty_cache()
                 save_keyframes_from_video(
                     output_path, story_output_dir,
                     glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
                     args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                     args.keyframe_quality_threshold, str(device)
                 )
+                # Models will be reloaded to GPU when needed
                 # Extract last frame for MI2V transitions
                 if args.mi2v:
                     try:
@@ -6614,6 +6621,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 t2v_args.save_path = output_path
                 generate(t2v_args)
                 output_video_paths.append(output_path)
+                # Offload VAE before HPSv3 keyframe extraction (T5 already on CPU)
+                vae.to('cpu')
+                torch.cuda.empty_cache()
                 save_keyframes_from_video(
                     output_path, story_output_dir,
                     glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
@@ -6629,6 +6639,9 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 t2v_args.save_path = output_path
                 generate(t2v_args)
                 output_video_paths.append(output_path)
+                # Offload VAE before HPSv3 keyframe extraction (T5 already on CPU)
+                vae.to('cpu')
+                torch.cuda.empty_cache()
                 save_keyframes_from_video(
                     output_path, story_output_dir,
                     glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
@@ -6908,15 +6921,24 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
             save_videos_grid(video.unsqueeze(0), output_path, fps=getattr(cfg, 'sample_fps', 16), rescale=True)
             output_video_paths.append(output_path)
 
+            del video, latent, noise
+
+            # Offload models to CPU before loading HPSv3 for keyframe extraction
+            if getattr(args, 'blocks_to_swap', 0) > 0:
+                dit_low_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
+                dit_high_noise.move_to_device_except_swap_blocks(torch.device('cpu'))
+            else:
+                dit_low_noise.cpu()
+                dit_high_noise.cpu()
+            vae.to('cpu')
+            torch.cuda.empty_cache()
+
             save_keyframes_from_video(
                 output_path, story_output_dir,
                 glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"),
                 args.max_keyframes_per_video, args.keyframe_similarity_threshold,
                 args.keyframe_quality_threshold, str(device)
             )
-
-            del video, latent, noise
-            torch.cuda.empty_cache()
 
     if output_video_paths:
         final_output_path = os.path.join(story_output_dir, f"{sanitized_name}_final.mp4")
