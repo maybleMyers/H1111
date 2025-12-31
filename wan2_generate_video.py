@@ -6566,11 +6566,22 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     story_name = story_script.get("story_name", "untitled_story")
     scenes = story_script.get("scenes", [])
 
-    # Create unique story output directory with sanitized story name and timestamp
+    # Create story output directory
+    # For M2V first shot, GUI pre-copies reference images to save_path/story_name
+    # so we must use that exact path to find them
     import re as regex_module
+
+    # Sanitized name for file naming (aggressive sanitization for filesystem safety)
     sanitized_name = regex_module.sub(r'[^\w\-]', '_', story_name)
-    timestamp = int(time.time())
-    story_output_dir = f"outputs/storymem/{sanitized_name}_{timestamp}"
+
+    if args.save_path:
+        # Use save_path as base - match GUI's naming: story_name.replace(' ', '_')
+        gui_sanitized_name = story_name.replace(' ', '_')
+        story_output_dir = os.path.join(args.save_path, gui_sanitized_name)
+    else:
+        # Fallback with timestamp for CLI usage
+        timestamp = int(time.time())
+        story_output_dir = f"outputs/storymem/{sanitized_name}_{timestamp}"
     os.makedirs(story_output_dir, exist_ok=True)
 
     story_json_path = os.path.join(story_output_dir, f"{sanitized_name}_story.json")
@@ -6740,6 +6751,15 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 continue
 
             memory_bank = sorted(glob_module.glob(f"{story_output_dir}/*keyframe*.jpg"))
+
+            # Log memory bank status (especially important for M2V first shot with reference images)
+            if is_first_shot and args.m2v_first_shot:
+                if memory_bank:
+                    logger.info(f"M2V First Shot: Found {len(memory_bank)} reference image(s) in memory bank: {memory_bank}")
+                else:
+                    logger.warning(f"M2V First Shot: No reference images found in {story_output_dir}/*keyframe*.jpg")
+                    logger.warning("Ensure reference images are provided in the GUI or pre-copied as keyframes")
+
             if len(memory_bank) > args.max_memory_size:
                 memory_bank = memory_bank[:args.fix_keyframes] + memory_bank[-(args.max_memory_size - args.fix_keyframes):]
 
