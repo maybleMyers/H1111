@@ -116,8 +116,9 @@ def sage_attention(
         raise NotImplementedError("headdim=96 not implemented")
 
     # Quantize Q and K to INT8
+    # Use smaller block sizes (32) for GPU shared memory compatibility (101KB limit)
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
-        q, k, sm_scale=sm_scale, tensor_layout=tensor_layout, BLKQ=128, BLKK=128
+        q, k, sm_scale=sm_scale, tensor_layout=tensor_layout, BLKQ=32, BLKK=32
     )
 
     if is_causal:
@@ -133,8 +134,8 @@ def sage_attention(
             sigmoid_a=sigmoid_a,
             alpha_xpos_xi=alpha_xpos_xi,
             beta_xpos_xi=beta_xpos_xi,
-            BLOCK_M=128,
-            BLOCK_N=128,
+            BLOCK_M=32,  # Reduced for GPU shared memory compatibility (101KB limit)
+            BLOCK_N=32,  # Reduced for GPU shared memory compatibility (101KB limit)
             sink_width=sink_width,
             window_width=window_width,
             multi_factor=multi_factor,

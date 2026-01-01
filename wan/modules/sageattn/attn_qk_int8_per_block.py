@@ -169,8 +169,8 @@ def forward(q, k, v, flags, block_bias, decay_mask, q_scale, k_scale, tensor_lay
               sigmoid_a: float = 1.0,
               alpha_xpos_xi: float = 0.9999967941742395,
               beta_xpos_xi: float = 0.9999860536252945,
-              BLOCK_M: int = 128,
-              BLOCK_N: int = 128,
+              BLOCK_M: int = 32,  # Reduced for GPU shared memory compatibility (101KB limit)
+              BLOCK_N: int = 32,  # Reduced for GPU shared memory compatibility (101KB limit)
               sink_width: int = 4,
               window_width: int = 16,
               multi_factor: float = None,
@@ -241,8 +241,8 @@ def forward(q, k, v, flags, block_bias, decay_mask, q_scale, k_scale, tensor_lay
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4,
+        num_warps=2,  # Reduced for shared memory compatibility (101KB limit)
+        num_stages=1,  # Single stage to minimize shared memory usage
         xpos_xi=xpos_xi,
         window_th=window_th,
         sigmoid_a=sigmoid_a,
