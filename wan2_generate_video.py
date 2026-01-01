@@ -47,7 +47,14 @@ from Wan2_2.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 import wan
 from wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from wan.modules.vae import WanVAE
-from wan.modules.ultravico import UltraViCoConfig, set_ultravico_config, set_current_visual_shape, clear_ultravico_cache
+from wan.modules.ultravico import (
+    UltraViCoConfig,
+    set_ultravico_config,
+    set_current_visual_shape,
+    clear_ultravico_cache,
+    set_sage_ultravico_config,
+    calculate_frame_tokens,
+)
 # HuMo imports (lazy loaded to avoid import errors if dependencies not installed)
 HUMO_AVAILABLE = False
 try:
@@ -1266,8 +1273,8 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "flash2", "flash3", "torch", "sageattn", "sageattn3", "xformers", "sdpa"],
-        help="attention mode (sageattn=auto SageAttn, sageattn3=Blackwell FP4)",
+        choices=["flash", "flash2", "flash3", "torch", "sageattn", "sageattn3", "xformers", "sdpa", "sage_ultravico"],
+        help="attention mode (sageattn=auto SageAttn, sageattn3=Blackwell FP4, sage_ultravico=memory-efficient UltraViCo with Triton)",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
@@ -8069,11 +8076,6 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     # --- Initialize UltraViCo if Enabled ---
     if args.ultravico:
-        # UltraViCo requires SDPA attention mode for attention bias support
-        if args.attn_mode not in ("torch", "sdpa"):
-            logger.warning(f"UltraViCo requires --attn_mode torch or sdpa, but got '{args.attn_mode}'. "
-                          f"UltraViCo attention decay will NOT be applied. Consider switching to --attn_mode torch.")
-
         # Get latent dimensions from the latent tensor shape
         # latent shape is [B, C, F, H, W] or [C, F, H, W]
         if len(latent.shape) == 5:
@@ -8089,22 +8091,50 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
             # Use half of typical video length as training window
             training_frames = min(21, lat_f_uv)  # Default 21 latent frames (~5s)
 
-        ultravico_config = UltraViCoConfig(
-            enabled=True,
-            training_frames=training_frames,
-            alpha=args.ultravico_alpha,
-            beta=args.ultravico_beta,
-            suppress_harmonics=args.ultravico_suppress_harmonics,
-            gamma=args.ultravico_gamma,
-        )
-        set_ultravico_config(ultravico_config)
+        # Check if using sage_ultravico mode (memory-efficient Triton kernel)
+        if args.attn_mode == "sage_ultravico":
+            # sage_ultravico uses inline decay in Triton kernel, no bias matrix needed
+            # Calculate frame_tokens from pixel resolution
+            pixel_height = lat_h_uv * cfg.vae_stride[1]
+            pixel_width = lat_w_uv * cfg.vae_stride[2]
+            frame_tokens = calculate_frame_tokens(
+                pixel_height, pixel_width,
+                vae_stride=cfg.vae_stride,
+                patch_size=cfg.patch_size
+            )
 
-        # Set the visual shape for attention bias computation
-        # Shape is (T, H, W) in latent space
-        set_current_visual_shape((lat_f_uv, lat_h_uv, lat_w_uv))
+            set_sage_ultravico_config(
+                enabled=True,
+                multi_factor=args.ultravico_alpha,
+                frame_tokens=frame_tokens,
+                training_frames=training_frames,
+            )
 
-        logger.info(f"UltraViCo enabled: training_frames={training_frames}, alpha={args.ultravico_alpha}, "
-                   f"suppress_harmonics={args.ultravico_suppress_harmonics}, visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
+            logger.info(f"UltraViCo (sage_ultravico mode) enabled: training_frames={training_frames}, "
+                       f"alpha={args.ultravico_alpha}, frame_tokens={frame_tokens}, "
+                       f"visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
+        else:
+            # Standard SDPA path requires attention bias matrix
+            if args.attn_mode not in ("torch", "sdpa"):
+                logger.warning(f"UltraViCo with bias matrix requires --attn_mode torch or sdpa, but got '{args.attn_mode}'. "
+                              f"UltraViCo attention decay will NOT be applied. Consider using --attn_mode sage_ultravico for memory-efficient mode.")
+
+            ultravico_config = UltraViCoConfig(
+                enabled=True,
+                training_frames=training_frames,
+                alpha=args.ultravico_alpha,
+                beta=args.ultravico_beta,
+                suppress_harmonics=args.ultravico_suppress_harmonics,
+                gamma=args.ultravico_gamma,
+            )
+            set_ultravico_config(ultravico_config)
+
+            # Set the visual shape for attention bias computation
+            # Shape is (T, H, W) in latent space
+            set_current_visual_shape((lat_f_uv, lat_h_uv, lat_w_uv))
+
+            logger.info(f"UltraViCo (bias matrix mode) enabled: training_frames={training_frames}, alpha={args.ultravico_alpha}, "
+                       f"suppress_harmonics={args.ultravico_suppress_harmonics}, visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
 
     # --- Run Sampling Loop ---
     logger.info("Starting denoising sampling loop...")

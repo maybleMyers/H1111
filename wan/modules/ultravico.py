@@ -157,6 +157,12 @@ _cached_bias: Optional[torch.Tensor] = None
 _cached_shape: Optional[Tuple[int, int, int]] = None
 _current_visual_shape: Optional[Tuple[int, int, int]] = None
 
+# Sage UltraViCo parameters (for memory-efficient Triton kernel path)
+_sage_ultravico_enabled: bool = False
+_sage_multi_factor: float = 0.9  # UltraViCo decay factor (alpha)
+_sage_frame_tokens: int = 1560  # Tokens per latent frame (resolution-dependent)
+_sage_training_frames: int = 21  # Training window in latent frames
+
 
 def set_ultravico_config(config: UltraViCoConfig):
     """Set global UltraViCo configuration."""
@@ -275,3 +281,66 @@ def clear_ultravico_cache():
     _cached_bias = None
     _cached_shape = None
     _current_visual_shape = None
+
+
+# Sage UltraViCo functions (for memory-efficient Triton kernel path)
+
+def set_sage_ultravico_config(
+    enabled: bool,
+    multi_factor: float = 0.9,
+    frame_tokens: int = 1560,
+    training_frames: int = 21
+):
+    """
+    Set configuration for sage_ultravico attention mode.
+
+    This is the memory-efficient path that uses Triton kernels with inline decay
+    instead of materializing a full attention bias matrix.
+
+    Args:
+        enabled: Whether sage_ultravico is active
+        multi_factor: UltraViCo decay factor (alpha), typically 0.85-0.95
+        frame_tokens: Tokens per latent frame (resolution-dependent)
+            - 720x1280: 3600
+            - 480x854: ~1605
+        training_frames: Training window in latent frames (default: 21 for Wan)
+    """
+    global _sage_ultravico_enabled, _sage_multi_factor, _sage_frame_tokens, _sage_training_frames
+    _sage_ultravico_enabled = enabled
+    _sage_multi_factor = multi_factor
+    _sage_frame_tokens = frame_tokens
+    _sage_training_frames = training_frames
+
+
+def is_sage_ultravico_enabled() -> bool:
+    """Check if sage_ultravico mode is enabled."""
+    return _sage_ultravico_enabled
+
+
+def get_sage_ultravico_params() -> Tuple[float, int, int]:
+    """
+    Get sage_ultravico parameters.
+
+    Returns:
+        Tuple of (multi_factor, frame_tokens, training_frames)
+    """
+    return _sage_multi_factor, _sage_frame_tokens, _sage_training_frames
+
+
+def calculate_frame_tokens(height: int, width: int, vae_stride: Tuple[int, int, int] = (4, 8, 8), patch_size: Tuple[int, int, int] = (1, 2, 2)) -> int:
+    """
+    Calculate frame_tokens from video resolution.
+
+    Args:
+        height: Video height in pixels
+        width: Video width in pixels
+        vae_stride: VAE temporal/spatial stride (default: Wan2.2 values)
+        patch_size: Patch size for patchification
+
+    Returns:
+        Number of tokens per latent frame
+    """
+    lat_h = height // vae_stride[1]
+    lat_w = width // vae_stride[2]
+    frame_tokens = (lat_h * lat_w) // (patch_size[1] * patch_size[2])
+    return frame_tokens

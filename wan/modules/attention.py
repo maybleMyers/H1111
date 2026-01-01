@@ -44,6 +44,15 @@ try:
 except ImportError:
     XFORMERS_AVAILABLE = False
 
+# UltraViCo-enabled SageAttention (local Triton kernels)
+SAGE_ULTRAVICO_AVAILABLE = False
+try:
+    from .sageattn import sage_attention as sage_ultravico_attention
+    SAGE_ULTRAVICO_AVAILABLE = True
+    print("[SageAttention] UltraViCo-enabled SageAttention (local Triton kernels) available")
+except ImportError as e:
+    sage_ultravico_attention = None
+    print(f"[SageAttention] UltraViCo-enabled SageAttention not available: {e}")
 
 import warnings
 
@@ -75,7 +84,11 @@ def flash_attention(
     version=None,
     attn_mode: Optional[str] = "torch",
     split_attn: bool = False,
-    attn_bias: Optional[torch.Tensor] = None,  # UltraViCo attention bias
+    attn_bias: Optional[torch.Tensor] = None,  # UltraViCo attention bias (for SDPA path)
+    # UltraViCo parameters for sage_ultravico mode
+    multi_factor: Optional[float] = None,  # UltraViCo decay factor (alpha), e.g., 0.9
+    frame_tokens: int = 1560,  # Tokens per latent frame (resolution-dependent)
+    training_frames: int = 21,  # Training window in latent frames
 ):
     """
     q:              [B, Lq, Nq, C1].
@@ -105,7 +118,7 @@ def flash_attention(
 
     # We cannot test Flash attention 3 in musubi tuner, so keep the original code.
     # Customized code (except for flash attention 3) is not supported q_lens and k_lens.
-    if attn_mode not in ("flash3", "sageattn", "sageattn3"):
+    if attn_mode not in ("flash3", "sageattn", "sageattn3", "sage_ultravico"):
         assert q_lens is None, "q_lens is not supported except for flash attention 3 and sage attention."
         assert k_lens is None or (
             min(k_lens) == max(k_lens) and k_lens[0] == lk
@@ -203,7 +216,7 @@ def flash_attention(
     #     del q, k, v
     #     return x.type(out_dtype)
 
-    assert not split_attn, "split_attn is not supported in flash attention 3 or sage attention."
+    assert not split_attn, "split_attn is not supported in flash attention 3, sage attention, or sage_ultravico."
 
     # preprocess query: in Wan 2.1, q_lens is always None.
     if q_lens is None:
@@ -310,6 +323,30 @@ def flash_attention(
             )
         del q, k, v, q_reshaped, k_reshaped, v_reshaped  # Free tensors to prevent memory accumulation
         x = x.transpose(1, 2)  # [B, L, H, D]
+    elif attn_mode == "sage_ultravico":
+        # UltraViCo-enabled SageAttention with memory-efficient Triton kernels
+        # Uses INT8 quantization and inline decay computation (no bias matrix)
+        assert not causal, "sage_ultravico does not support causal attention."
+        if not SAGE_ULTRAVICO_AVAILABLE:
+            raise RuntimeError(
+                "sage_ultravico attention mode requires the local sageattn module. "
+                "Check that wan/modules/sageattn/ exists and triton is installed."
+            )
+        # Reshape from flattened [B*L, H, C] to [B, H, L, C] for sage_ultravico_attention
+        q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)  # [B, H, L, C]
+        k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
+        v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
+        x = sage_ultravico_attention(
+            q_reshaped, k_reshaped, v_reshaped,
+            tensor_layout="HND",
+            is_causal=False,
+            sm_scale=softmax_scale,
+            multi_factor=multi_factor,
+            frame_tokens=frame_tokens,
+            training_frames=training_frames,
+        )
+        del q, k, v, q_reshaped, k_reshaped, v_reshaped  # Free tensors to prevent memory accumulation
+        x = x.transpose(1, 2)  # [B, L, H, C]
     else:
         raise ValueError(f"Unknown attention mode: {attn_mode}")
 

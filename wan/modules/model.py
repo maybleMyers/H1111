@@ -19,7 +19,12 @@ from utils.device_utils import clean_memory_on_device
 
 from .compile_config import maybe_compile
 from .attention import flash_attention
-from .ultravico import get_ultravico_bias_auto, is_ultravico_enabled
+from .ultravico import (
+    get_ultravico_bias_auto,
+    is_ultravico_enabled,
+    is_sage_ultravico_enabled,
+    get_sage_ultravico_params,
+)
 from utils.device_utils import clean_memory_on_device
 from modules.custom_offloading_utils import ModelOffloader
 from modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -257,15 +262,24 @@ class WanSelfAttention(nn.Module):
         del q, k, v
 
         # Get UltraViCo attention bias if enabled (only for self-attention on visual tokens)
+        # Note: sage_ultravico mode uses inline decay in Triton kernel, not a bias matrix
         ultravico_bias = None
-        if is_ultravico_enabled():
+        if is_ultravico_enabled() and self.attn_mode != "sage_ultravico":
             # seq_lens contains the actual sequence lengths for each batch item
             # For self-attention, we use the full visual token sequence length
             ultravico_bias = get_ultravico_bias_auto(s, qkv[0].device, qkv[0].dtype)
 
+        # Get sage_ultravico parameters if that mode is enabled
+        multi_factor, frame_tokens, training_frames = None, 1560, 21
+        if self.attn_mode == "sage_ultravico" and is_sage_ultravico_enabled():
+            multi_factor, frame_tokens, training_frames = get_sage_ultravico_params()
+
         x = flash_attention(
             qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn,
-            attn_bias=ultravico_bias
+            attn_bias=ultravico_bias,
+            multi_factor=multi_factor,
+            frame_tokens=frame_tokens,
+            training_frames=training_frames,
         )
 
         # output

@@ -10732,7 +10732,7 @@ with gr.Blocks(
             
             with gr.Accordion("Model Paths & Performance", open=True):
                 with gr.Row():
-                    wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4")
+                    wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3", "sage_ultravico"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4, sage_ultravico=memory-efficient UltraViCo")
                     wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
