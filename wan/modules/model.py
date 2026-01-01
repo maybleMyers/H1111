@@ -567,8 +567,9 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         eps=1e-6,
         attn_mode=None,
         split_attn=False,
-        add_ref_conv=False, 
+        add_ref_conv=False,
         in_dim_ref_conv=16,
+        ntk_scale=1.0,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -652,8 +653,14 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
+        # NTK-aware RoPE scaling: multiply base theta by ntk_scale to extend effective context
+        theta_scaled = 10000 * ntk_scale
+        if ntk_scale != 1.0:
+            logger.info(f"NTK RoPE scaling enabled: theta={theta_scaled} (scale={ntk_scale}x)")
         self.freqs = torch.cat(
-            [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))], dim=1
+            [rope_params(1024, d - 4 * (d // 6), theta=theta_scaled),
+             rope_params(1024, 2 * (d // 6), theta=theta_scaled),
+             rope_params(1024, 2 * (d // 6), theta=theta_scaled)], dim=1
         )
         self.freqs_fhw = {}
 
@@ -1102,6 +1109,7 @@ def load_wan_model(
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
+    ntk_scale: float = 1.0,
 ) -> WanModel:
     # dit_weight_dtype is None for fp8_scaled or fp8_prescaled
     assert fp8_scaled or fp8_prescaled or dit_weight_dtype is not None or dit_weight_dtype is None  # Always true, effectively disables assertion
@@ -1185,8 +1193,9 @@ def load_wan_model(
             text_len=config.text_len,
             attn_mode=attn_mode,
             split_attn=split_attn,
-            add_ref_conv=has_ref_conv,             # <<< Pass detected flag
-            in_dim_ref_conv=in_dim_ref_conv,             
+            add_ref_conv=has_ref_conv,
+            in_dim_ref_conv=in_dim_ref_conv,
+            ntk_scale=ntk_scale,
         )
         if dit_weight_dtype is not None and not fp8_scaled and not fp8_prescaled: # Don't pre-cast if using FP8
             model.to(dit_weight_dtype)
