@@ -51,6 +51,7 @@ UI_CONFIGS_DIR = "ui_configs"
 FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json")
 SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
 STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
+WAN22_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "wan22_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -10810,6 +10811,10 @@ with gr.Blocks(
                         interactive=True
                     )
                 wan22_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    wan22_save_defaults_btn = gr.Button("Save Defaults")
+                    wan22_load_defaults_btn = gr.Button("Load Defaults")
+                    wan22_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
             with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
                 gr.Markdown("""
@@ -15436,6 +15441,124 @@ with gr.Blocks(
         fn=initial_load_svi_defaults,
         inputs=None,
         outputs=svi_ui_default_components_ORDERED_LIST
+    )
+
+    # ===== Wan2.2 Save/Load Defaults =====
+    wan22_ui_default_components_ORDERED_LIST = [
+        wan22_model_folder,
+        wan22_dit_low_noise_path,
+        wan22_dit_high_noise_path,
+        wan22_clip_path,
+        wan22_vae_path,
+        wan22_t5_path,
+        wan22_attn_mode,
+        wan22_block_swap,
+        wan22_fp8,
+        wan22_fp8_scaled,
+        wan22_fp8_prescaled,
+        wan22_fp8_fast,
+        wan22_fp8_t5,
+        wan22_mixed_dtype,
+        wan22_vae_fp32,
+        wan22_compile,
+        wan22_save_path,
+        wan22_lora_folder,
+    ] + wan22_lora_weights + wan22_lora_multipliers + wan22_lora_apply_low + wan22_lora_apply_high
+
+    wan22_ui_default_keys = [
+        "wan22_model_folder",
+        "wan22_dit_low_noise_path",
+        "wan22_dit_high_noise_path",
+        "wan22_clip_path",
+        "wan22_vae_path",
+        "wan22_t5_path",
+        "wan22_attn_mode",
+        "wan22_block_swap",
+        "wan22_fp8",
+        "wan22_fp8_scaled",
+        "wan22_fp8_prescaled",
+        "wan22_fp8_fast",
+        "wan22_fp8_t5",
+        "wan22_mixed_dtype",
+        "wan22_vae_fp32",
+        "wan22_compile",
+        "wan22_save_path",
+        "wan22_lora_folder",
+    ] + [f"wan22_lora_weight_{i+1}" for i in range(8)] + \
+        [f"wan22_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"wan22_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"wan22_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_wan22_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(wan22_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(WAN22_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "Wan2.2 defaults saved successfully."
+        except Exception as e:
+            return f"Error saving Wan2.2 defaults: {e}"
+
+    def load_wan22_defaults(request: gr.Request):
+        lora_folder = "lora"
+        lora_choices = get_lora_options(lora_folder)
+
+        if not os.path.exists(WAN22_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(wan22_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(wan22_ui_default_keys) + [""]
+
+        try:
+            with open(WAN22_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(wan22_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        # Update lora folder from settings
+        lora_folder = loaded_settings.get("wan22_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(wan22_ui_default_keys):
+            component = wan22_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            # Special handling for LoRA dropdowns
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["Wan2.2 defaults loaded successfully."]
+
+    wan22_save_defaults_btn.click(
+        fn=save_wan22_defaults,
+        inputs=wan22_ui_default_components_ORDERED_LIST,
+        outputs=[wan22_defaults_status]
+    )
+    wan22_load_defaults_btn.click(
+        fn=load_wan22_defaults,
+        inputs=None,
+        outputs=wan22_ui_default_components_ORDERED_LIST + [wan22_defaults_status]
+    )
+
+    def initial_load_wan22_defaults():
+        results_and_status = load_wan22_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_wan22_defaults,
+        inputs=None,
+        outputs=wan22_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====
