@@ -1362,11 +1362,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ultravico_gamma", type=int, default=4,
                        help="UltraViCo: Number of frames around harmonic peaks to suppress. Default: 4")
 
-    # NTK RoPE scaling for video length extrapolation
-    parser.add_argument("--ntk_scale", type=float, default=1.0,
-                       help="NTK-aware RoPE scaling factor to extend effective context window. "
-                            "Use 2.0-4.0 for longer videos to prevent looping. Default: 1.0 (no scaling)")
-
     # ========================= SVI (Stable-Video-Infinity) Arguments =========================
     # Anchor mechanism for cross-clip consistency
     parser.add_argument("--anchor_image", type=str, default=None,
@@ -1738,8 +1733,7 @@ class DynamicModelManager:
             fp8_scaled=False,  # handled in optimize_model
             fp8_prescaled=getattr(self.args, 'fp8_prescaled', False),
             lora_weights_list=lora_weights_list, lora_multipliers=lora_multipliers,
-            use_scaled_mm=getattr(self.args, 'fp8_fast', False),
-            ntk_scale=getattr(self.args, 'ntk_scale', 1.0)
+            use_scaled_mm=getattr(self.args, 'fp8_fast', False)
         )
         
         # Optimize model
@@ -2580,8 +2574,7 @@ def load_dit_model(
         fp8_scaled=False,  # handled in optimize_model
         fp8_prescaled=getattr(args, 'fp8_prescaled', False),
         lora_weights_list=lora_weights_list_low, lora_multipliers=lora_multipliers_low,
-        use_scaled_mm=getattr(args, 'fp8_fast', False),
-        ntk_scale=getattr(args, 'ntk_scale', 1.0)
+        use_scaled_mm=getattr(args, 'fp8_fast', False)
     )
     return model
 
@@ -6931,8 +6924,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     dit_weight_dtype,
                     fp8_scaled=getattr(args, 'fp8_scaled', False),
                     fp8_prescaled=getattr(args, 'fp8_prescaled', False),
-                    use_scaled_mm=getattr(args, 'fp8_fast', False),
-                    ntk_scale=getattr(args, 'ntk_scale', 1.0)
+                    use_scaled_mm=getattr(args, 'fp8_fast', False)
                 )
 
                 dit_high_noise = load_wan_model(
@@ -6943,8 +6935,7 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
                     dit_weight_dtype,
                     fp8_scaled=getattr(args, 'fp8_scaled', False),
                     fp8_prescaled=getattr(args, 'fp8_prescaled', False),
-                    use_scaled_mm=getattr(args, 'fp8_fast', False),
-                    ntk_scale=getattr(args, 'ntk_scale', 1.0)
+                    use_scaled_mm=getattr(args, 'fp8_fast', False)
                 )
 
                 dit_low_noise.eval().requires_grad_(False)

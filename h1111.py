@@ -496,7 +496,7 @@ def wan22_batch_handler(
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
-    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int, ntk_scale: float
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     global stop_event
     stop_event.clear()
@@ -641,10 +641,6 @@ def wan22_batch_handler(
                 command.append("--ultravico_suppress_harmonics")
                 command.extend(["--ultravico_beta", str(ultravico_beta)])
                 command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
-
-        # NTK Scale (applies even without ultravico for RoPE context extension)
-        if ntk_scale > 1.0:
-            command.extend(["--ntk_scale", str(ntk_scale)])
 
         # --- LoRA Handling ---
         lora_weights_paths = []
@@ -1100,7 +1096,7 @@ def wan22_submit_to_queue(
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
-    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int, ntk_scale: float
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
 ) -> Tuple[str, List[str]]:
     """Submit Wan2.2 generation job(s) to the queue.
 
@@ -1242,10 +1238,6 @@ def wan22_submit_to_queue(
                 command.extend(["--ultravico_beta", str(ultravico_beta)])
                 command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
 
-        # NTK Scale (applies even without ultravico for RoPE context extension)
-        if ntk_scale > 1.0:
-            command.extend(["--ntk_scale", str(ntk_scale)])
-
         # LoRA Handling
         lora_weights_paths = []
         lora_multipliers_values = []
@@ -1383,7 +1375,7 @@ def wan22_generate_via_queue(
     # Context Windows parameters
     use_context_windows: bool, context_length: int, context_overlap: int, context_schedule: str, context_stride: int, context_closed_loop: bool, context_fuse_method: str, context_end_image: str,
     # UltraViCo parameters
-    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int, ntk_scale: float
+    ultravico_enabled: bool, ultravico_alpha: float, ultravico_training_frames: int, ultravico_suppress_harmonics: bool, ultravico_beta: float, ultravico_gamma: int
 ):
     """Queue-based generation that returns immediately and uses Timer for polling.
 
@@ -1412,7 +1404,7 @@ def wan22_generate_via_queue(
         use_context_windows, context_length, context_overlap, context_schedule,
         context_stride, context_closed_loop, context_fuse_method, context_end_image,
         ultravico_enabled, ultravico_alpha, ultravico_training_frames,
-        ultravico_suppress_harmonics, ultravico_beta, ultravico_gamma, ntk_scale
+        ultravico_suppress_harmonics, ultravico_beta, ultravico_gamma
     )
 
     first_job_id = job_ids[0] if job_ids else ""
@@ -10826,11 +10818,11 @@ with gr.Blocks(
 
             with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
                 gr.Markdown("""
-                **UltraViCo** prevents quality degradation and looping in long videos.
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
 
-                **Attention Modes:** Use `sage_ultravico` for memory-efficient mode, or `torch`/`sdpa` for bias-matrix mode.
-
-                **NTK Scale:** Extends RoPE context window. Use 2.0-4.0 if video loops back to initial frame.
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
                 """)
                 wan22_ultravico_enabled = gr.Checkbox(
                     label="Enable UltraViCo",
@@ -10851,19 +10843,19 @@ with gr.Blocks(
                             minimum=5,
                             maximum=100,
                             step=1,
-                            info="Training window in latent frames. Default: 21 (~5s)."
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
                         )
                     with gr.Row():
                         wan22_ultravico_suppress_harmonics = gr.Checkbox(
                             label="Suppress Harmonics",
                             value=False,
-                            info="Stronger suppression at harmonic positions. Use if you see content repetition."
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
                         )
                         wan22_ultravico_beta = gr.Slider(
                             minimum=0.1, maximum=1.0, step=0.05,
                             label="Beta (Harmonic Decay)",
                             value=0.6,
-                            info="Decay factor for harmonic positions (only with Suppress Harmonics)"
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
                         )
                         wan22_ultravico_gamma = gr.Number(
                             label="Gamma (Harmonic Window)",
@@ -10872,13 +10864,6 @@ with gr.Blocks(
                             maximum=20,
                             step=1,
                             info="Frames around harmonic peaks to suppress"
-                        )
-                    with gr.Row():
-                        wan22_ntk_scale = gr.Slider(
-                            minimum=1.0, maximum=8.0, step=0.5,
-                            label="NTK Scale",
-                            value=1.0,
-                            info="RoPE context scaling. Use 2.0-4.0 if video loops to initial frame around 7s."
                         )
 
         # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
@@ -11467,11 +11452,11 @@ with gr.Blocks(
 
             with gr.Accordion("UltraViCo (Long Video Extrapolation)", open=False):
                 gr.Markdown("""
-                **UltraViCo** prevents quality degradation and looping in long videos.
+                **UltraViCo** helps prevent quality degradation and content repetition when generating videos
+                longer than the model's training length. Based on the paper:
+                [UltraViCo: Breaking Extrapolation Limits in Video Diffusion Transformers](https://arxiv.org/abs/2511.20123)
 
-                **Attention Modes:** Use `sage_ultravico` for memory-efficient mode, or `torch`/`sdpa` for bias-matrix mode.
-
-                **NTK Scale:** Extends RoPE context window. Use 2.0-4.0 if video loops back to initial frame.
+                ⚠️ **Note:** Requires `Attention Mode` set to `torch` or `sdpa` (not flash/xformers).
                 """)
                 svi_ultravico_enabled = gr.Checkbox(
                     label="Enable UltraViCo",
@@ -11492,19 +11477,19 @@ with gr.Blocks(
                             minimum=5,
                             maximum=100,
                             step=1,
-                            info="Training window in latent frames. Default: 21 (~5s)."
+                            info="Training window in latent frames. Default: 21 (~5s). Leave as-is unless you know the model's training length."
                         )
                     with gr.Row():
                         svi_ultravico_suppress_harmonics = gr.Checkbox(
                             label="Suppress Harmonics",
                             value=False,
-                            info="Stronger suppression at harmonic positions. Use if you see content repetition."
+                            info="Enable stronger suppression at harmonic positions. Use if you see content repetition/looping."
                         )
                         svi_ultravico_beta = gr.Slider(
                             minimum=0.1, maximum=1.0, step=0.05,
                             label="Beta (Harmonic Decay)",
                             value=0.6,
-                            info="Decay factor for harmonic positions (only with Suppress Harmonics)"
+                            info="Decay factor for harmonic risk positions (only with Suppress Harmonics)"
                         )
                         svi_ultravico_gamma = gr.Number(
                             label="Gamma (Harmonic Window)",
@@ -11513,13 +11498,6 @@ with gr.Blocks(
                             maximum=20,
                             step=1,
                             info="Frames around harmonic peaks to suppress"
-                        )
-                    with gr.Row():
-                        svi_ntk_scale = gr.Slider(
-                            minimum=1.0, maximum=8.0, step=0.5,
-                            label="NTK Scale",
-                            value=1.0,
-                            info="RoPE context scaling. Use 2.0-4.0 if video loops to initial frame around 7s."
                         )
 
         # HoloCine Tab - Multi-Shot Scenecut Video Generation
@@ -14856,7 +14834,6 @@ with gr.Blocks(
             wan22_ultravico_suppress_harmonics,
             wan22_ultravico_beta,
             wan22_ultravico_gamma,
-            wan22_ntk_scale,
         ],
         outputs=[wan22_output, wan22_preview_output, wan22_batch_progress, wan22_progress_text,
                  wan22_job_id_state, wan22_batch_id_state, wan22_poll_timer],
