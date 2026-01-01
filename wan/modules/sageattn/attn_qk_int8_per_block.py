@@ -45,19 +45,20 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
 
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
 
-        # UltraViCo: Apply decay to tokens beyond training window
+        # UltraViCo: Apply decay to tokens beyond training window (only if multi_factor is set)
         # window_th is computed dynamically as frame_tokens * training_frames / 2
-        dist2 = tl.abs(m - n).to(tl.int32)
-        dist_mask = dist2 <= window_th
+        if multi_factor is not None:
+            dist2 = tl.abs(m - n).to(tl.int32)
+            dist_mask = dist2 <= window_th
 
-        negative_mask = (qk < 0)
+            negative_mask = (qk < 0)
 
-        # Apply decay factor to out-of-window tokens
-        qk = tl.where(dist_mask | negative_mask, qk, qk * multi_factor)
+            # Apply decay factor to out-of-window tokens
+            qk = tl.where(dist_mask | negative_mask, qk, qk * multi_factor)
 
-        # Additional masking for extreme positions (prevent attention to very distant future)
-        window3 = (m <= frame_tokens) & (n > training_frames * frame_tokens)
-        qk = tl.where(window3, -1e4, qk)
+            # Additional masking for extreme positions (prevent attention to very distant future)
+            window3 = (m <= frame_tokens) & (n > training_frames * frame_tokens)
+            qk = tl.where(window3, -1e4, qk)
 
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
