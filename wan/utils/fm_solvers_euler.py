@@ -86,3 +86,28 @@ class EulerScheduler(FlowMatchEulerDiscreteScheduler):
         x_t_next = sample + (sigma_next - sigma) * model_output
         self._step_index += 1
         return (x_t_next,)  # Return as tuple for compatibility with wan2_generate_video.py
+
+    def add_noise(
+        self,
+        original_samples: torch.FloatTensor,
+        noise: torch.FloatTensor,
+        timesteps: torch.IntTensor | torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        """Add noise to original samples for V2V using flow-matching formula.
+
+        For flow-matching: noisy_sample = (1 - sigma) * original + sigma * noise
+        """
+        # Get sigma from timestep (timestep / num_train_timesteps, then apply shift)
+        if timesteps.dim() == 0:
+            timesteps = timesteps.unsqueeze(0)
+
+        sigma = timesteps.float() / self.num_train_timesteps
+        sigma = timestep_shift(sigma, shift=self._shift)
+
+        # Expand sigma to match sample dimensions
+        sigma = unsqueeze_to_ndim(sigma, original_samples.ndim).to(original_samples.device)
+
+        # Flow-matching noise addition formula
+        noisy_samples = (1.0 - sigma) * original_samples + sigma * noise
+
+        return noisy_samples
