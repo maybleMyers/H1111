@@ -16,8 +16,18 @@ Most warnings are safe to ignore and will probably be removed later.
 
 A cool thing to try are the mixed weight models, I preserved all the weights that would not safely convert to fp16 in fp32 without increasing model size very much. Select preserve mixed weight dtype at the bottom of the page, download the models named like this: wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors.
 
-You will probably need to mess with the requirements to get this to work.
-pip install librosa at least. I will update the installation soon.
+To install on linux:
+
+```
+python3.10 -m venv env
+source env/bin/activate
+pip install typing-extensions  
+pip install torch==2.8.0+cu128 torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+python h1111.py
+```
+
+Windows should be similar, just make sure you use python3.10 for your env, other versions of torch and python could work, but they are not tested and you will need to mess with the requirements.  
 
 ### SVI Long Video generation
 
