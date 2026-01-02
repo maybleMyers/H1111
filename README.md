@@ -16,6 +16,9 @@ Most warnings are safe to ignore and will probably be removed later.
 
 A cool thing to try are the mixed weight models, I preserved all the weights that would not safely convert to fp16 in fp32 without increasing model size very much. Select preserve mixed weight dtype at the bottom of the page, download the models named like this: wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors.
 
+You will probably need to mess with the requirements to get this to work.
+pip install librosa at least. I will update the installation soon.
+
 ### SVI Long Video generation
 
 Download loras from https://huggingface.co/vita-video-gen/svi-model/tree/main/version-2.0 and use them in the svi tab of the gui. Lightx latest i2v 10lora seems to work with cfg distill sampler.  wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/tree/main  
