@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 from typing import Dict, List, Optional, Union
 import torch
 from tqdm import tqdm
@@ -109,7 +110,7 @@ def load_safetensors_with_lora_and_fp8(
         state_dict = {}
         for model_file in model_files:
             with MemoryEfficientSafeOpen(model_file) as f:
-                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False):
+                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
                     value = f.get_tensor(key)
                     if move_to_device:
                         value = value.to(calc_device)
@@ -343,7 +344,7 @@ def load_safetensors_with_lora_and_fp8(
     state_dict = {}
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file) as f:
-            for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False):
+            for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
                 value = f.get_tensor(key)
                 
                 # Apply the hook to merge LoRA weights

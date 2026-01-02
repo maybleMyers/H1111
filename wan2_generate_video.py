@@ -8460,6 +8460,17 @@ def save_output(
             if args.lora_weight:
                 metadata["lora_weights"] = ", ".join([os.path.basename(p) for p in args.lora_weight])
                 metadata["lora_multipliers"] = ", ".join(map(str, args.lora_multiplier))
+            # Add UltraViCo info if used
+            if args.ultravico:
+                metadata["ultravico_enabled"] = "True"
+                metadata["ultravico_alpha"] = f"{args.ultravico_alpha}"
+                metadata["ultravico_training_frames"] = f"{args.ultravico_training_frames}"
+                metadata["ultravico_suppress_harmonics"] = f"{args.ultravico_suppress_harmonics}"
+                metadata["ultravico_beta"] = f"{args.ultravico_beta}"
+                metadata["ultravico_gamma"] = f"{args.ultravico_gamma}"
+            # Add NTK scale if used
+            if args.ntk_scale > 1.0:
+                metadata["ntk_scale"] = f"{args.ntk_scale}"
 
 
         # Ensure latent is on CPU for saving
