@@ -73,7 +73,6 @@ class Worker:
         self.current_job_id: Optional[str] = None
         self.current_clip_info: Optional[str] = None  # Track current clip progress (e.g., "Clip 2/4")
         self._last_loading_step = -100  # Track last printed loading step for filtering
-        self._was_loading_line = False  # Track if last printed line was loading progress
 
         # Only setup signal handlers when running as main process (not in thread)
         if use_signals:
@@ -249,7 +248,6 @@ class Worker:
         self.current_job_id = job.id
         self.current_clip_info = None  # Reset clip tracking for new job
         self._last_loading_step = -100  # Reset loading progress tracking
-        self._was_loading_line = False  # Reset loading line tracking
         print(f"\n[Worker] Starting job {job.id}")
         print(f"[Worker] Command: {' '.join(job.command)}")
 
@@ -304,17 +302,7 @@ class Worker:
                     line = line.strip()
                     output_lines.append(line)
                     if self._should_print_line(line):
-                        # Use carriage return for loading progress to stay on same line
-                        is_loading_line = "Loading" in line and "with LoRA merge" in line and "|" in line
-                        if is_loading_line:
-                            print(f"\r[Job {job.id}] {line}", end="", flush=True)
-                            self._was_loading_line = True
-                        else:
-                            # Print newline first if transitioning from loading progress
-                            if self._was_loading_line:
-                                print()  # End the loading progress line
-                                self._was_loading_line = False
-                            print(f"[Job {job.id}] {line}")
+                        print(f"[Job {job.id}] {line}")
 
                     # Parse progress
                     progress, progress_text, current_step, total_steps = self.parse_progress_line(line)

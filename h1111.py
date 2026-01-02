@@ -772,6 +772,17 @@ def wan22_batch_handler(
                 "lora_apply_low": [lora1_apply_low, lora2_apply_low, lora3_apply_low, lora4_apply_low, lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low],
                 "lora_apply_high": [lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high, lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high],
             }
+            # Add UltraViCo info to metadata
+            if ultravico_enabled:
+                params_for_meta["ultravico_enabled"] = True
+                params_for_meta["ultravico_alpha"] = ultravico_alpha
+                params_for_meta["ultravico_training_frames"] = int(ultravico_training_frames)
+                params_for_meta["ultravico_suppress_harmonics"] = ultravico_suppress_harmonics
+                params_for_meta["ultravico_beta"] = ultravico_beta
+                params_for_meta["ultravico_gamma"] = int(ultravico_gamma)
+            # Add NTK scale to metadata
+            if ntk_scale > 1.0:
+                params_for_meta["ntk_scale"] = ntk_scale
             try:
                 add_metadata_to_video(current_video_file_for_item, params_for_meta)
             except Exception as meta_err:
@@ -1310,6 +1321,17 @@ def wan22_submit_to_queue(
         if lora_weights_paths_high:
             parameters["lora_weights_high"] = lora_weights_paths_high
             parameters["lora_multipliers_high"] = lora_multipliers_values_high
+        # Add UltraViCo info to metadata
+        if ultravico_enabled:
+            parameters["ultravico_enabled"] = True
+            parameters["ultravico_alpha"] = ultravico_alpha
+            parameters["ultravico_training_frames"] = int(ultravico_training_frames)
+            parameters["ultravico_suppress_harmonics"] = ultravico_suppress_harmonics
+            parameters["ultravico_beta"] = ultravico_beta
+            parameters["ultravico_gamma"] = int(ultravico_gamma)
+        # Add NTK scale to metadata
+        if ntk_scale > 1.0:
+            parameters["ntk_scale"] = ntk_scale
 
         # Submit job to queue
         job = queue.add_job(
@@ -1874,6 +1896,17 @@ def svi_submit_to_queue(
         if lora_weights_paths_high:
             parameters["lora_weights_high"] = lora_weights_paths_high
             parameters["lora_multipliers_high"] = lora_multipliers_values_high
+        # Add UltraViCo info to metadata
+        if ultravico_enabled:
+            parameters["ultravico_enabled"] = True
+            parameters["ultravico_alpha"] = ultravico_alpha
+            parameters["ultravico_training_frames"] = int(ultravico_training_frames)
+            parameters["ultravico_suppress_harmonics"] = ultravico_suppress_harmonics
+            parameters["ultravico_beta"] = ultravico_beta
+            parameters["ultravico_gamma"] = int(ultravico_gamma)
+        # Add NTK scale to metadata
+        if ntk_scale > 1.0:
+            parameters["ntk_scale"] = ntk_scale
 
         # Submit job to queue
         job = queue.add_job(
