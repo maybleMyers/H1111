@@ -10908,7 +10908,7 @@ with gr.Blocks(
                         )
                     with gr.Row():
                         wan22_ntk_scale = gr.Slider(
-                            minimum=1.0, maximum=8.0, step=0.5,
+                            minimum=1.0, maximum=20.0, step=0.5,
                             label="NTK Scale",
                             value=1.0,
                             info="RoPE context scaling. Use 2.0-4.0 if video loops to initial frame around 7s."
@@ -11549,7 +11549,7 @@ with gr.Blocks(
                         )
                     with gr.Row():
                         svi_ntk_scale = gr.Slider(
-                            minimum=1.0, maximum=8.0, step=0.5,
+                            minimum=1.0, maximum=20.0, step=0.5,
                             label="NTK Scale",
                             value=1.0,
                             info="RoPE context scaling. Use 2.0-4.0 if video loops to initial frame around 7s."

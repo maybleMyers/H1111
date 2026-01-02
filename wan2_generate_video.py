@@ -8117,10 +8117,14 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
                 multi_factor=args.ultravico_alpha,
                 frame_tokens=frame_tokens,
                 training_frames=training_frames,
+                suppress_harmonics=args.ultravico_suppress_harmonics,
+                beta=args.ultravico_beta,
+                gamma=args.ultravico_gamma,
             )
 
             logger.info(f"UltraViCo (sage_ultravico mode) enabled: training_frames={training_frames}, "
                        f"alpha={args.ultravico_alpha}, frame_tokens={frame_tokens}, "
+                       f"suppress_harmonics={args.ultravico_suppress_harmonics}, beta={args.ultravico_beta}, gamma={args.ultravico_gamma}, "
                        f"visual_shape=({lat_f_uv}, {lat_h_uv}, {lat_w_uv})")
         else:
             # Standard SDPA path requires attention bias matrix

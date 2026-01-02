@@ -30,6 +30,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
                     entropy_factor: tl.constexpr = None,
                     frame_tokens: tl.constexpr = 1560,
                     training_frames: tl.constexpr = 21,
+                    suppress_harmonics: tl.constexpr = False,
+                    harmonic_beta: tl.constexpr = 0.6,
+                    harmonic_gamma: tl.constexpr = 4,
                     ):
 
     lo, hi = 0, kv_len
@@ -55,6 +58,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
 
             # Apply decay factor to out-of-window tokens
             qk = tl.where(dist_mask | negative_mask, qk, qk * multi_factor)
+
+            # Harmonic suppression: apply stronger decay (beta) at harmonic positions
+            # Harmonics occur at multiples of training_frames * frame_tokens
+            if suppress_harmonics:
+                harmonic_period = training_frames * frame_tokens
+                harmonic_gamma_tokens = harmonic_gamma * frame_tokens
+                # Check distance to nearest harmonic (1x, 2x, 3x, 4x training length)
+                # We check up to 4 harmonics which covers up to 4x extrapolation
+                for harmonic_mult in range(1, 5):
+                    harmonic_center = harmonic_mult * harmonic_period
+                    near_harmonic = (dist2 >= harmonic_center - harmonic_gamma_tokens) & \
+                                   (dist2 <= harmonic_center + harmonic_gamma_tokens)
+                    # Apply beta (stronger decay) to harmonic risk positions that are out of window
+                    harmonic_risk = near_harmonic & (~dist_mask) & (~negative_mask)
+                    qk = tl.where(harmonic_risk, qk * (harmonic_beta / multi_factor), qk)
 
             # Additional masking for extreme positions (prevent attention to very distant future)
             window3 = (m <= frame_tokens) & (n > training_frames * frame_tokens)
@@ -107,6 +125,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
               entropy_factor: tl.constexpr = None,
               frame_tokens: tl.constexpr = 1560,
               training_frames: tl.constexpr = 21,
+              suppress_harmonics: tl.constexpr = False,
+              harmonic_beta: tl.constexpr = 0.6,
+              harmonic_gamma: tl.constexpr = 4,
               ):
     start_m = tl.program_id(0)
 
@@ -159,6 +180,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
                                 entropy_factor=entropy_factor,
                                 frame_tokens=frame_tokens,
                                 training_frames=training_frames,
+                                suppress_harmonics=suppress_harmonics,
+                                harmonic_beta=harmonic_beta,
+                                harmonic_gamma=harmonic_gamma,
                                 )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -176,6 +200,9 @@ def forward(q, k, v, flags, block_bias, decay_mask, q_scale, k_scale, tensor_lay
               window_width: int = 16,
               multi_factor: float = None,
               entropy_factor: float = None,
+              suppress_harmonics: bool = False,
+              harmonic_beta: float = 0.6,
+              harmonic_gamma: int = 4,
               ):
     """
     Forward pass for UltraViCo-enabled INT8 attention.
@@ -190,6 +217,9 @@ def forward(q, k, v, flags, block_bias, decay_mask, q_scale, k_scale, tensor_lay
         frame_tokens: Tokens per latent frame (resolution-dependent)
         training_frames: Training window in latent frames (default: 21 for Wan)
         multi_factor: UltraViCo decay factor (alpha), e.g., 0.9
+        suppress_harmonics: Whether to apply stronger decay at harmonic positions
+        harmonic_beta: Decay factor for harmonic risk positions (stronger than alpha)
+        harmonic_gamma: Number of frames around harmonic peaks to suppress
 
     Returns:
         Output attention tensor
@@ -255,5 +285,8 @@ def forward(q, k, v, flags, block_bias, decay_mask, q_scale, k_scale, tensor_lay
         entropy_factor=entropy_factor,
         frame_tokens=frame_tokens,
         training_frames=training_frames,
+        suppress_harmonics=suppress_harmonics,
+        harmonic_beta=harmonic_beta,
+        harmonic_gamma=harmonic_gamma,
         )
     return o

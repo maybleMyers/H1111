@@ -271,8 +271,9 @@ class WanSelfAttention(nn.Module):
 
         # Get sage_ultravico parameters if that mode is enabled
         multi_factor, frame_tokens, training_frames = None, 1560, 21
+        suppress_harmonics, beta, gamma = False, 0.6, 4
         if self.attn_mode == "sage_ultravico" and is_sage_ultravico_enabled():
-            multi_factor, frame_tokens, training_frames = get_sage_ultravico_params()
+            multi_factor, frame_tokens, training_frames, suppress_harmonics, beta, gamma = get_sage_ultravico_params()
 
         x = flash_attention(
             qkv, k_lens=seq_lens, window_size=self.window_size, attn_mode=self.attn_mode, split_attn=self.split_attn,
@@ -280,6 +281,9 @@ class WanSelfAttention(nn.Module):
             multi_factor=multi_factor,
             frame_tokens=frame_tokens,
             training_frames=training_frames,
+            suppress_harmonics=suppress_harmonics,
+            beta=beta,
+            gamma=gamma,
         )
 
         # output

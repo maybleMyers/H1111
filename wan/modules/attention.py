@@ -89,6 +89,9 @@ def flash_attention(
     multi_factor: Optional[float] = None,  # UltraViCo decay factor (alpha), e.g., 0.9
     frame_tokens: int = 1560,  # Tokens per latent frame (resolution-dependent)
     training_frames: int = 21,  # Training window in latent frames
+    suppress_harmonics: bool = False,  # Whether to apply stronger decay at harmonic positions
+    beta: float = 0.6,  # Decay factor for harmonic risk positions
+    gamma: int = 4,  # Frames around harmonic peaks to suppress
 ):
     """
     q:              [B, Lq, Nq, C1].
@@ -344,6 +347,9 @@ def flash_attention(
             multi_factor=multi_factor,
             frame_tokens=frame_tokens,
             training_frames=training_frames,
+            suppress_harmonics=suppress_harmonics,
+            beta=beta,
+            gamma=gamma,
         )
         del q, k, v, q_reshaped, k_reshaped, v_reshaped  # Free tensors to prevent memory accumulation
         x = x.transpose(1, 2)  # [B, L, H, C]

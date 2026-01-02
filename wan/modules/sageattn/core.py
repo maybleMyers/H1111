@@ -37,6 +37,9 @@ def sage_attention(
     entropy_factor: Optional[float] = None,
     frame_tokens: int = 1560,
     training_frames: int = 21,
+    suppress_harmonics: bool = False,
+    beta: float = 0.6,
+    gamma: int = 4,
     text_false_length: int = 0,
     **kwargs
 ) -> torch.Tensor:
@@ -140,6 +143,9 @@ def sage_attention(
             window_width=window_width,
             multi_factor=multi_factor,
             entropy_factor=entropy_factor,
+            suppress_harmonics=suppress_harmonics,
+            harmonic_beta=beta,
+            harmonic_gamma=gamma,
         )
 
     return o

@@ -162,6 +162,9 @@ _sage_ultravico_enabled: bool = False
 _sage_multi_factor: float = 0.9  # UltraViCo decay factor (alpha)
 _sage_frame_tokens: int = 1560  # Tokens per latent frame (resolution-dependent)
 _sage_training_frames: int = 21  # Training window in latent frames
+_sage_suppress_harmonics: bool = False  # Whether to apply stronger decay at harmonic positions
+_sage_beta: float = 0.6  # Decay factor for harmonic risk positions
+_sage_gamma: int = 4  # Frames around harmonic peaks to suppress
 
 
 def set_ultravico_config(config: UltraViCoConfig):
@@ -289,7 +292,10 @@ def set_sage_ultravico_config(
     enabled: bool,
     multi_factor: float = 0.9,
     frame_tokens: int = 1560,
-    training_frames: int = 21
+    training_frames: int = 21,
+    suppress_harmonics: bool = False,
+    beta: float = 0.6,
+    gamma: int = 4
 ):
     """
     Set configuration for sage_ultravico attention mode.
@@ -304,12 +310,19 @@ def set_sage_ultravico_config(
             - 720x1280: 3600
             - 480x854: ~1605
         training_frames: Training window in latent frames (default: 21 for Wan)
+        suppress_harmonics: Whether to apply stronger decay at harmonic positions (multiples of training_frames)
+        beta: Decay factor for harmonic risk positions (stronger than alpha), typically 0.3-0.6
+        gamma: Number of frames around harmonic peaks to suppress
     """
     global _sage_ultravico_enabled, _sage_multi_factor, _sage_frame_tokens, _sage_training_frames
+    global _sage_suppress_harmonics, _sage_beta, _sage_gamma
     _sage_ultravico_enabled = enabled
     _sage_multi_factor = multi_factor
     _sage_frame_tokens = frame_tokens
     _sage_training_frames = training_frames
+    _sage_suppress_harmonics = suppress_harmonics
+    _sage_beta = beta
+    _sage_gamma = gamma
 
 
 def is_sage_ultravico_enabled() -> bool:
@@ -317,14 +330,14 @@ def is_sage_ultravico_enabled() -> bool:
     return _sage_ultravico_enabled
 
 
-def get_sage_ultravico_params() -> Tuple[float, int, int]:
+def get_sage_ultravico_params() -> Tuple[float, int, int, bool, float, int]:
     """
     Get sage_ultravico parameters.
 
     Returns:
-        Tuple of (multi_factor, frame_tokens, training_frames)
+        Tuple of (multi_factor, frame_tokens, training_frames, suppress_harmonics, beta, gamma)
     """
-    return _sage_multi_factor, _sage_frame_tokens, _sage_training_frames
+    return _sage_multi_factor, _sage_frame_tokens, _sage_training_frames, _sage_suppress_harmonics, _sage_beta, _sage_gamma
 
 
 def calculate_frame_tokens(height: int, width: int, vae_stride: Tuple[int, int, int] = (4, 8, 8), patch_size: Tuple[int, int, int] = (1, 2, 2)) -> int:
