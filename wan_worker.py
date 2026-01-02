@@ -72,6 +72,7 @@ class Worker:
         self.current_process: Optional[subprocess.Popen] = None
         self.current_job_id: Optional[str] = None
         self.current_clip_info: Optional[str] = None  # Track current clip progress (e.g., "Clip 2/4")
+        self._last_loading_step = -100  # Track last printed loading step for filtering
 
         # Only setup signal handlers when running as main process (not in thread)
         if use_signals:
@@ -99,6 +100,29 @@ class Worker:
         """Handle shutdown signals gracefully."""
         print(f"\n[Worker] Received signal {signum}, shutting down...")
         self.stop()
+
+    def _should_print_line(self, line: str) -> bool:
+        """
+        Filter rapid progress updates for model loading.
+        Only print every 100 steps to avoid console spam.
+        """
+        # Check for model loading progress bars (tqdm format)
+        # e.g., "Loading wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors with LoRA merge:  69%|██████▊   | 752/1095"
+        if "Loading" in line and ("with LoRA merge" in line or "safetensors" in line):
+            # Extract current step from tqdm format: | current/total
+            match = re.search(r'\|\s*(\d+)/(\d+)', line)
+            if match:
+                current_step = int(match.group(1))
+                total_steps = int(match.group(2))
+                # Only print at 0%, every 100 steps, or at 100%
+                if current_step == 0 or current_step >= total_steps or current_step - self._last_loading_step >= 100:
+                    self._last_loading_step = current_step
+                    return True
+                return False
+        # Reset tracking when not a loading line
+        if "Loading" not in line:
+            self._last_loading_step = -100
+        return True
 
     def parse_progress_line(self, line: str) -> Tuple[Optional[float], Optional[str], int, int]:
         """
@@ -223,6 +247,7 @@ class Worker:
         """
         self.current_job_id = job.id
         self.current_clip_info = None  # Reset clip tracking for new job
+        self._last_loading_step = -100  # Reset loading progress tracking
         print(f"\n[Worker] Starting job {job.id}")
         print(f"[Worker] Command: {' '.join(job.command)}")
 
@@ -276,7 +301,8 @@ class Worker:
                 if line:
                     line = line.strip()
                     output_lines.append(line)
-                    print(f"[Job {job.id}] {line}")
+                    if self._should_print_line(line):
+                        print(f"[Job {job.id}] {line}")
 
                     # Parse progress
                     progress, progress_text, current_step, total_steps = self.parse_progress_line(line)
@@ -308,8 +334,9 @@ class Worker:
             remaining = self.current_process.stdout.read()
             if remaining:
                 for line in remaining.strip().split('\n'):
-                    print(f"[Job {job.id}] {line}")
                     output_lines.append(line)
+                    if self._should_print_line(line):
+                        print(f"[Job {job.id}] {line}")
 
             return_code = self.current_process.returncode
             self.current_process = None
