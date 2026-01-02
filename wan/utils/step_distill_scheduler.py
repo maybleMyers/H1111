@@ -102,19 +102,25 @@ class StepDistillScheduler:
             # If not found, assume we're at the beginning
             self._step_index = 0
 
-    def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, sigma: float) -> torch.Tensor:
-        """
-        Add noise to samples using the flow matching formula.
+    def add_noise(
+        self,
+        original_samples: torch.Tensor,
+        noise: torch.Tensor,
+        sigma: Optional[float] = None,
+        timesteps: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if timesteps is not None:
+            if timesteps.dim() == 0:
+                timesteps = timesteps.unsqueeze(0)
+            sigma_val = timesteps.float() / self.num_train_timesteps
+            sigma_val = self.shift * sigma_val / (1 + (self.shift - 1) * sigma_val)
+            while sigma_val.dim() < original_samples.dim():
+                sigma_val = sigma_val.unsqueeze(-1)
+            sigma_val = sigma_val.to(original_samples.device)
+            sample = (1.0 - sigma_val) * original_samples + sigma_val * noise
+        else:
+            sample = (1 - sigma) * original_samples + sigma * noise
 
-        Args:
-            original_samples: Clean samples
-            noise: Random noise
-            sigma: Noise level
-
-        Returns:
-            Noisy samples
-        """
-        sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
 
     def step(
