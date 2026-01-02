@@ -28,8 +28,14 @@ import subprocess
 import threading
 from typing import Optional, Tuple
 from datetime import datetime
+import imageio_ffmpeg
 
 from wan_job_queue import get_queue, JobQueue, JobStatus, Job
+
+
+def get_ffmpeg_path():
+    """Get ffmpeg executable path from imageio-ffmpeg."""
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def add_metadata_to_video(video_path: str, parameters: dict) -> None:
@@ -38,7 +44,7 @@ def add_metadata_to_video(video_path: str, parameters: dict) -> None:
     temp_path = video_path.replace(".mp4", "_temp.mp4")
 
     cmd = [
-        'ffmpeg', '-y',
+        get_ffmpeg_path(), '-y',
         '-i', video_path,
         '-metadata', f'comment={params_json}',
         '-codec', 'copy',

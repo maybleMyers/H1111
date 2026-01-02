@@ -9,6 +9,11 @@ import time
 import math
 from typing import Tuple, Optional, List, Union, Any
 from pathlib import Path # Added for glob_images in V2V
+import imageio_ffmpeg
+
+def get_ffmpeg_path():
+    """Get ffmpeg executable path from imageio-ffmpeg."""
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 # Set PyTorch CUDA allocator to reduce memory fragmentation
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -1085,7 +1090,7 @@ def concatenate_story_videos(video_paths: List[str], output_path: str) -> bool:
 
     # Try stream copy first (fastest)
     ret = subprocess.run(
-        ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-y", output_path],
+        [get_ffmpeg_path(), "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-y", output_path],
         capture_output=True
     )
 
@@ -1093,7 +1098,7 @@ def concatenate_story_videos(video_paths: List[str], output_path: str) -> bool:
         logger.info("Stream copy failed, re-encoding...")
         # Fallback to re-encoding
         ret = subprocess.run([
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path,
+            get_ffmpeg_path(), "-f", "concat", "-safe", "0", "-i", list_path,
             "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-r", "16", "-y", output_path
         ], capture_output=True)

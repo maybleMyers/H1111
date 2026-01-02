@@ -9,6 +9,7 @@ import random
 import tiktoken
 import sys
 import ffmpeg
+import imageio_ffmpeg
 from typing import List, Tuple, Optional, Generator, Dict, Any
 import json
 from gradio import themes
@@ -27,6 +28,10 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 import time
 from gradio_image_annotation import image_annotator
 
+
+def get_ffmpeg_path():
+    """Get ffmpeg executable path from imageio-ffmpeg."""
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 # Add global stop event
 stop_event = threading.Event()
@@ -5836,7 +5841,7 @@ def wanx_extend_video_wrapper(
 
             # Run ffmpeg concatenation command
             concat_command = [
-                "ffmpeg",
+                get_ffmpeg_path(),
                 "-f", "concat",
                 "-safe", "0",       # Allow relative paths if needed, but we use absolute
                 "-i", list_file,
@@ -7283,7 +7288,7 @@ def add_metadata_to_video(video_path: str, parameters: dict) -> None:
     
     # FFmpeg command to add metadata without re-encoding
     cmd = [
-        'ffmpeg',
+        get_ffmpeg_path(),
         '-i', video_path,
         '-metadata', f'comment={params_json}',
         '-codec', 'copy',
@@ -9056,14 +9061,14 @@ def concat_batch_videos(base_video_path, generated_videos, save_path, original_v
             
             # Run ffmpeg concatenation
             command = [
-                "ffmpeg",
+                get_ffmpeg_path(),
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
                 "-c", "copy",
                 output_path
             ]
-            
+
             subprocess.run(command, check=True, capture_output=True)
             
             # Clean up temporary file
@@ -9161,7 +9166,7 @@ def wanx_extend_single_video(
             
             # Run ffmpeg concatenation
             command = [
-                "ffmpeg",
+                get_ffmpeg_path(),
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
@@ -9169,7 +9174,7 @@ def wanx_extend_single_video(
                 "-y",
                 output_path
             ]
-            
+
             subprocess.run(command, check=True, capture_output=True)
             
             # Clean up temporary file
@@ -14450,7 +14455,7 @@ with gr.Blocks(
         frame_rate = 24
         duration = frames / frame_rate
         command = [
-            "ffmpeg", "-loop", "1", "-i", temp_image_path, "-c:v", "libx264",
+            get_ffmpeg_path(), "-loop", "1", "-i", temp_image_path, "-c:v", "libx264",
             "-t", str(duration), "-pix_fmt", "yuv420p",
             "-vf", f"fps={frame_rate}", output_path
         ]
@@ -15695,22 +15700,25 @@ with gr.Blocks(
     
     def get_video_info(video_path: str) -> dict:
         try:
-            probe = ffmpeg.probe(video_path)
-            video_info = next(stream for stream in probe['streams'] if stream['codec_type'] == 'video')
-            
-            width = int(video_info['width'])
-            height = int(video_info['height'])
-            fps = eval(video_info['r_frame_rate'])  # This converts '30/1' to 30.0
-            
-            # Calculate total frames
-            duration = float(probe['format']['duration'])
-            total_frames = int(duration * fps)
-            
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"Error: Could not open video file: {video_path}")
+                return {}
+
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+            # Calculate duration
+            duration = total_frames / fps if fps > 0 else 0
+
             # Ensure video length does not exceed 201 frames
             if total_frames > 201:
                 total_frames = 201
                 duration = total_frames / fps  # Adjust duration accordingly
-    
+
             return {
                 'width': width,
                 'height': height,
