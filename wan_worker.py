@@ -79,6 +79,8 @@ class Worker:
         self.current_job_id: Optional[str] = None
         self.current_clip_info: Optional[str] = None  # Track current clip progress (e.g., "Clip 2/4")
         self._last_loading_step = -100  # Track last printed loading step for filtering
+        self._cancellation_stop_event = threading.Event()  # Signal to stop cancellation monitor
+        self._was_cancelled = False  # Flag to indicate job was cancelled
 
         # Only setup signal handlers when running as main process (not in thread)
         if use_signals:
@@ -244,6 +246,33 @@ class Worker:
         job = self.queue.get_job(job_id)
         return job is None or job.status == JobStatus.CANCELLED.value
 
+    def _cancellation_monitor(self, job_id: str):
+        """
+        Background thread that monitors for job cancellation and immediately
+        terminates the subprocess when cancellation is detected.
+
+        This runs in parallel with the main output-reading loop, checking for
+        cancellation every 2 seconds so stops are near-instant instead of
+        waiting for the next step output.
+        """
+        while not self._cancellation_stop_event.is_set():
+            if self.check_cancellation(job_id):
+                print(f"[Worker] Job {job_id} cancellation detected, terminating immediately...")
+                self._was_cancelled = True
+                if self.current_process:
+                    try:
+                        self.current_process.terminate()
+                        try:
+                            self.current_process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            print(f"[Worker] Process didn't terminate, killing...")
+                            self.current_process.kill()
+                    except Exception as e:
+                        print(f"[Worker] Error terminating process: {e}")
+                return
+            # Check every 2 seconds for cancellation
+            self._cancellation_stop_event.wait(2.0)
+
     def run_job(self, job: Job) -> bool:
         """
         Execute a single job.
@@ -254,6 +283,9 @@ class Worker:
         self.current_job_id = job.id
         self.current_clip_info = None  # Reset clip tracking for new job
         self._last_loading_step = -100  # Reset loading progress tracking
+        self._was_cancelled = False  # Reset cancellation flag
+        self._cancellation_stop_event.clear()  # Reset stop event
+        monitor_thread = None  # Will hold the cancellation monitor thread
         print(f"\n[Worker] Starting job {job.id}")
         print(f"[Worker] Command: {' '.join(job.command)}")
 
@@ -283,22 +315,20 @@ class Worker:
             # Mark job as running
             self.queue.mark_running(job.id, self.current_process.pid)
 
+            # Start cancellation monitor thread for immediate stop response
+            monitor_thread = threading.Thread(
+                target=self._cancellation_monitor,
+                args=(job.id,),
+                daemon=True
+            )
+            monitor_thread.start()
+
             last_preview_mtime = 0
             output_lines = []
 
             # Monitor the process
             while True:
-                # Check for cancellation
-                if self.check_cancellation(job.id):
-                    print(f"[Worker] Job {job.id} cancelled, terminating...")
-                    self.current_process.terminate()
-                    try:
-                        self.current_process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self.current_process.kill()
-                    return False
-
-                # Check if process has finished
+                # Check if process has finished (either normally or via cancellation monitor)
                 if self.current_process.poll() is not None:
                     break
 
@@ -335,6 +365,18 @@ class Worker:
                 else:
                     # No output, sleep briefly
                     time.sleep(0.1)
+
+            # Stop the cancellation monitor thread
+            self._cancellation_stop_event.set()
+            if monitor_thread and monitor_thread.is_alive():
+                monitor_thread.join(timeout=1.0)
+
+            # Check if job was cancelled by the monitor thread
+            if self._was_cancelled:
+                self.current_process = None
+                self.current_job_id = None
+                print(f"[Worker] Job {job.id} was cancelled")
+                return False
 
             # Process finished - read any remaining output
             remaining = self.current_process.stdout.read()
@@ -376,6 +418,10 @@ class Worker:
                 return False
 
         except Exception as e:
+            # Stop the cancellation monitor thread if running
+            self._cancellation_stop_event.set()
+            if monitor_thread and monitor_thread.is_alive():
+                monitor_thread.join(timeout=1.0)
             self.current_process = None
             self.current_job_id = None
             self.queue.mark_failed(job.id, str(e))
