@@ -597,9 +597,11 @@ def wan22_batch_handler(
                     command.append("--v2v_low_noise_only")
                 if v2v_use_i2v:
                     command.append("--v2v_use_i2v")
-        elif "i2v" in task and image_path:
-            command.extend(["--image_path", str(image_path)])
-            # Add ending image for i2v mode if provided
+        elif "i2v" in task and (image_path or end_image_path):
+            # Add start image if provided
+            if image_path:
+                command.extend(["--image_path", str(image_path)])
+            # Add ending image for i2v mode if provided (also supports end-only mode)
             if end_image_path:
                 command.extend(["--end_image_path", str(end_image_path)])
 
@@ -1200,8 +1202,11 @@ def wan22_submit_to_queue(
                     command.append("--v2v_low_noise_only")
                 if v2v_use_i2v:
                     command.append("--v2v_use_i2v")
-        elif image_path:
-            command.extend(["--image_path", image_path])
+        elif image_path or end_image_path:
+            # Add start image if provided
+            if image_path:
+                command.extend(["--image_path", image_path])
+            # Add ending image (also supports end-only mode for reverse i2v)
             if end_image_path:
                 command.extend(["--end_image_path", end_image_path])
 
