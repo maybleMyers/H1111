@@ -3140,14 +3140,24 @@ def prepare_i2v_inputs(
         frames = args.video_length # Should be set by now
         max_area = width * height
 
+        # Check for end-only mode (reverse i2v)
+        end_only_mode = args.image_path is None and args.end_image_path is not None
+
         # load image
-        if not args.image_path:
-            raise ValueError("--image_path is required for standard I2V mode.")
-        img = Image.open(args.image_path).convert("RGB")
+        if end_only_mode:
+            # Reverse I2V: use end_image as the conditioning source
+            logger.info("End-only I2V mode: Video will evolve from noise to target end image")
+            img = Image.open(args.end_image_path).convert("RGB")
+            # Clear end_image_path so rest of code doesn't try to use it as second frame
+            args.end_image_path = None
+        elif not args.image_path:
+            raise ValueError("--image_path or --end_image_path is required for I2V mode.")
+        else:
+            img = Image.open(args.image_path).convert("RGB")
         img_cv2 = np.array(img)  # PIL to numpy
         img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device) # For CLIP
 
-        # end frame image
+        # end frame image (for FLF mode, not used in end-only mode)
         end_img = None
         end_img_cv2 = None
         if args.end_image_path is not None:
@@ -3459,7 +3469,13 @@ def prepare_i2v_inputs(
                                 img_resized.shape[0], padding_frames_needed, img_resized.shape[2], img_resized.shape[3],
                                 device=device, dtype=img_resized.dtype
                             )
-                        img_padded = torch.cat([img_resized, padding_tensor], dim=1)
+                        if end_only_mode:
+                            # Reverse I2V: target image at END of sequence
+                            img_padded = torch.cat([padding_tensor, img_resized], dim=1)
+                            logger.info(f"End-only I2V: Pixel sequence [zeros({padding_frames_needed}), target]")
+                        else:
+                            # Standard I2V: start image at BEGINNING
+                            img_padded = torch.cat([img_resized, padding_tensor], dim=1)
 
                     # Encode with OOM fallback to tiled encode
                     try:
@@ -3531,9 +3547,15 @@ def prepare_i2v_inputs(
 
             logger.info(f"FLF mask (Wan 2.2 style). Shape: {msk.shape}, lat_f={lat_f_from_mask}")
         else:
-            # Standard mask: only first frame is conditioned
+            # Standard mask construction
             msk_frames = torch.ones(1, frames, lat_h, lat_w, device=device, dtype=vae.dtype)
-            msk_frames[:, 1:] = 0  # All except first = 0
+            if end_only_mode:
+                # Reverse I2V: only LAST frame conditioned
+                msk_frames[:, :-1] = 0  # All except last = 0
+                logger.info("End-only I2V mask: last frame = 1, rest = 0")
+            else:
+                # Standard I2V: only FIRST frame conditioned
+                msk_frames[:, 1:] = 0  # All except first = 0
 
             # Apply temporal interleaving
             msk_interleaved = torch.cat([
@@ -7107,7 +7129,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         logger.info("Running StoryMem story generation mode")
         return generate_story_video(args)
 
-    is_i2v = args.image_path is not None and "i2v" in args.task
+    is_i2v = (args.image_path is not None or args.end_image_path is not None) and "i2v" in args.task
     is_ti2v = args.image_path is not None and "ti2v" in args.task  # Text+Image-to-Video
     is_v2v_i2v = args.video_path is not None and args.v2v_use_i2v  # V2V using i2v model
     is_v2v = args.video_path is not None
