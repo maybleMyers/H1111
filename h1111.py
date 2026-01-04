@@ -14707,13 +14707,48 @@ with gr.Blocks(
     )
     
     
-    # Image input handling for wan22
+    # Image input handling for wan22 with fallback priority: input_image > end_image > video
+    def update_wan22_dimensions_with_fallback(input_image, end_image, input_video):
+        """Update dimensions with fallback: input_image > end_image > video"""
+        # Priority 1: Input image
+        if input_image is not None:
+            img = Image.open(input_image)
+            w, h = img.size
+            w = (w // 32) * 32
+            h = (h // 32) * 32
+            return f"{w}x{h}", w, h
+
+        # Priority 2: End image
+        if end_image is not None:
+            img = Image.open(end_image)
+            w, h = img.size
+            w = (w // 32) * 32
+            h = (h // 32) * 32
+            return f"{w}x{h}", w, h
+
+        # Priority 3: Video
+        if input_video is not None:
+            info = get_video_info(input_video)
+            if info:
+                w = (info['width'] // 32) * 32
+                h = (info['height'] // 32) * 32
+                return f"{w}x{h}", w, h
+
+        # No source available - return defaults
+        return "", gr.update(), gr.update()
+
     wan22_input_image.change(
-        fn=update_wanx_image_dimensions,  # Reuse the same function
-        inputs=[wan22_input_image],
+        fn=update_wan22_dimensions_with_fallback,
+        inputs=[wan22_input_image, wan22_end_image, wan22_input_video],
         outputs=[wan22_original_dims, wan22_width, wan22_height]
     )
-    
+
+    wan22_end_image.change(
+        fn=update_wan22_dimensions_with_fallback,
+        inputs=[wan22_input_image, wan22_end_image, wan22_input_video],
+        outputs=[wan22_original_dims, wan22_width, wan22_height]
+    )
+
     # Width/height calculation buttons
     wan22_calc_width_btn.click(
         fn=calculate_wanx_width,  # Reuse function from WanX
@@ -14727,25 +14762,42 @@ with gr.Blocks(
         outputs=[wan22_height]
     )
     
-    # Video input handling for wan22 V2V
-    def update_wan22_video_dimensions(video_path):
-        """Extract video dimensions and update UI"""
+    # Video input handling for wan22 V2V (respects image priority for dimensions)
+    def update_wan22_video_dimensions_with_fallback(input_image, end_image, video_path):
+        """Extract video dimensions with fallback priority"""
+        # If input_image or end_image exists, don't override dimensions from video
+        if input_image is not None or end_image is not None:
+            # Just update frame_num and fps from video, not dimensions
+            if video_path:
+                info = get_video_info(video_path)
+                if info:
+                    return (
+                        gr.update(),  # Don't change width
+                        gr.update(),  # Don't change height
+                        gr.update(value=min(info['total_frames'], 201)),
+                        gr.update(value=info['fps'])
+                    )
+            return gr.update(), gr.update(), gr.update(), gr.update()
+
+        # No image sources, use video dimensions
         if not video_path:
             return gr.update(), gr.update(), gr.update(), gr.update()
-        
-        info = get_video_info(video_path)  # This function already exists
+
+        info = get_video_info(video_path)
         if info:
+            w = (info['width'] // 32) * 32
+            h = (info['height'] // 32) * 32
             return (
-                gr.update(value=info['width']),
-                gr.update(value=info['height']), 
-                gr.update(value=min(info['total_frames'], 201)),  # Cap at 201 frames
+                gr.update(value=w),
+                gr.update(value=h),
+                gr.update(value=min(info['total_frames'], 201)),
                 gr.update(value=info['fps'])
             )
         return gr.update(), gr.update(), gr.update(), gr.update()
 
     wan22_input_video.change(
-        fn=update_wan22_video_dimensions,
-        inputs=[wan22_input_video],
+        fn=update_wan22_video_dimensions_with_fallback,
+        inputs=[wan22_input_image, wan22_end_image, wan22_input_video],
         outputs=[wan22_width, wan22_height, wan22_frame_num, wan22_fps]
     )
 
