@@ -6330,9 +6330,27 @@ def generate_svi_video_extension(
         logger.info(f"Extension tensor shape: {extension_tensor.shape}")
 
         if prepend_original and original_video_tensor is not None:
-            extension_without_overlap = extension_tensor[:, :, overlap_frames:, :, :]
-            final_video = torch.cat([original_video_tensor, extension_without_overlap], dim=2)
-            logger.info(f"Concatenated: {original_video_tensor.shape[2]} + {extension_without_overlap.shape[2]} = {final_video.shape[2]} frames")
+            if overlap_frames > 0 and original_video_tensor.shape[2] >= overlap_frames:
+                # Blend the overlap region instead of cutting (prevents jump at transition)
+                overlap_original = original_video_tensor[:, :, -overlap_frames:, :, :]
+                overlap_extension = extension_tensor[:, :, :overlap_frames, :, :]
+
+                # Linear crossfade blend: original fades out, extension fades in
+                weights = torch.linspace(1, 0, overlap_frames, device=extension_tensor.device, dtype=extension_tensor.dtype)
+                weights = weights.view(1, 1, -1, 1, 1)
+                blended_overlap = overlap_original * weights + overlap_extension * (1 - weights)
+
+                # Concatenate: original[:-overlap] + blended + extension[overlap:]
+                final_video = torch.cat([
+                    original_video_tensor[:, :, :-overlap_frames, :, :],
+                    blended_overlap,
+                    extension_tensor[:, :, overlap_frames:, :, :]
+                ], dim=2)
+                logger.info(f"Blended transition: {original_video_tensor.shape[2] - overlap_frames} + {overlap_frames} (blended) + {extension_tensor.shape[2] - overlap_frames} = {final_video.shape[2]} frames")
+            else:
+                # No overlap or original too short - just concatenate
+                final_video = torch.cat([original_video_tensor, extension_tensor], dim=2)
+                logger.info(f"Concatenated: {original_video_tensor.shape[2]} + {extension_tensor.shape[2]} = {final_video.shape[2]} frames")
         else:
             final_video = extension_tensor
 
