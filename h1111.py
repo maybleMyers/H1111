@@ -1659,7 +1659,6 @@ def svi_submit_to_queue(
     # Model Paths & Performance
     attn_mode: str,
     mixed_dtype: bool,
-    keep_dit_loaded: bool,
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
@@ -1837,7 +1836,6 @@ def svi_submit_to_queue(
         if fp8_prescaled: command.append("--fp8_prescaled")
         if fp8_fast: command.append("--fp8_fast")
         if mixed_dtype: command.append("--mixed_dtype")
-        if keep_dit_loaded: command.append("--keep_dit_loaded")
         if fp8_t5: command.append("--fp8_t5")
         if vae_fp32:
             command.extend(["--vae_dtype", "float32"])
@@ -2002,7 +2000,6 @@ def svi_generate_via_queue(
     # Model Paths & Performance
     attn_mode: str,
     mixed_dtype: bool,
-    keep_dit_loaded: bool,
     block_swap: int,
     fp8: bool,
     fp8_scaled: bool,
@@ -2052,7 +2049,7 @@ def svi_generate_via_queue(
         cfg_merge, sliding_window_enabled, sliding_window_size, sliding_window_stride,
         width, height, frame_num, fps, base_seed, sample_solver, sample_steps,
         flow_shift, sample_guide_scale, dual_dit_boundary, batch_size, save_path,
-        attn_mode, mixed_dtype, keep_dit_loaded, block_swap, fp8, fp8_scaled, fp8_prescaled, fp8_fast, fp8_t5,
+        attn_mode, mixed_dtype, block_swap, fp8, fp8_scaled, fp8_prescaled, fp8_fast, fp8_t5,
         dit_low_noise_path, dit_high_noise_path, clip_path, vae_path, t5_path,
         lora_folder,
         lora1_str, lora2_str, lora3_str, lora4_str, lora5_str, lora6_str, lora7_str, lora8_str,
@@ -11477,11 +11474,6 @@ with gr.Blocks(
                         value=False, visible=False
                     )
                     svi_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
-                    svi_keep_dit_loaded = gr.Checkbox(
-                        label="Keep DiT Loaded",
-                        value=False,
-                        info="Keep DiT model in RAM between clips (faster multi-clip generation)"
-                    )
                     svi_vae_fp32 = gr.Checkbox(
                         label="Use FP32 VAE (higher quality, more VRAM)",
                         value=True,
@@ -15427,7 +15419,6 @@ with gr.Blocks(
             # Model Paths & Performance
             svi_attn_mode,
             svi_mixed_dtype,
-            svi_keep_dit_loaded,
             svi_block_swap,
             svi_fp8,
             svi_fp8_scaled,
@@ -15488,7 +15479,6 @@ with gr.Blocks(
         svi_fp8_fast,
         svi_fp8_t5,
         svi_mixed_dtype,
-        svi_keep_dit_loaded,
         svi_vae_fp32,
         svi_compile,
         svi_lora_folder,
@@ -15509,7 +15499,6 @@ with gr.Blocks(
         "svi_fp8_fast",
         "svi_fp8_t5",
         "svi_mixed_dtype",
-        "svi_keep_dit_loaded",
         "svi_vae_fp32",
         "svi_compile",
         "svi_lora_folder",
