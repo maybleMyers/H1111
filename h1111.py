@@ -1685,6 +1685,14 @@ def svi_submit_to_queue(
     preview_steps: int,
     vae_fp32: bool,
     compile_enabled: bool,
+    # UltraViCo
+    ultravico_enabled: bool,
+    ultravico_alpha: float,
+    ultravico_training_frames: int,
+    ultravico_suppress_harmonics: bool,
+    ultravico_beta: float,
+    ultravico_gamma: int,
+    ntk_scale: float,
 ) -> Tuple[str, List[str]]:
     """Submit SVI generation job(s) to the queue.
 
@@ -1833,6 +1841,20 @@ def svi_submit_to_queue(
             command.extend(["--vae_dtype", "float32"])
         if compile_enabled:
             command.append("--compile")
+
+        # UltraViCo options
+        if ultravico_enabled:
+            command.append("--ultravico")
+            command.extend(["--ultravico_alpha", str(ultravico_alpha)])
+            command.extend(["--ultravico_training_frames", str(int(ultravico_training_frames))])
+            if ultravico_suppress_harmonics:
+                command.append("--ultravico_suppress_harmonics")
+                command.extend(["--ultravico_beta", str(ultravico_beta)])
+                command.extend(["--ultravico_gamma", str(int(ultravico_gamma))])
+
+        # NTK Scale (applies even without ultravico for RoPE context extension)
+        if ntk_scale > 1.0:
+            command.extend(["--ntk_scale", str(ntk_scale)])
 
         if enable_preview and preview_steps > 0:
             command.extend(["--preview", str(preview_steps)])
@@ -2004,6 +2026,14 @@ def svi_generate_via_queue(
     preview_steps: int,
     vae_fp32: bool,
     compile_enabled: bool,
+    # UltraViCo
+    ultravico_enabled: bool,
+    ultravico_alpha: float,
+    ultravico_training_frames: int,
+    ultravico_suppress_harmonics: bool,
+    ultravico_beta: float,
+    ultravico_gamma: int,
+    ntk_scale: float,
 ):
     """Queue-based SVI generation that returns immediately and uses Timer for polling.
 
@@ -2028,7 +2058,9 @@ def svi_generate_via_queue(
         lora5_apply_low, lora6_apply_low, lora7_apply_low, lora8_apply_low,
         lora1_apply_high, lora2_apply_high, lora3_apply_high, lora4_apply_high,
         lora5_apply_high, lora6_apply_high, lora7_apply_high, lora8_apply_high,
-        enable_preview, preview_steps, vae_fp32, compile_enabled
+        enable_preview, preview_steps, vae_fp32, compile_enabled,
+        ultravico_enabled, ultravico_alpha, ultravico_training_frames,
+        ultravico_suppress_harmonics, ultravico_beta, ultravico_gamma, ntk_scale
     )
 
     first_job_id = job_ids[0] if job_ids else ""
@@ -15409,6 +15441,14 @@ with gr.Blocks(
             svi_preview_steps,
             svi_vae_fp32,
             svi_compile,
+            # UltraViCo
+            svi_ultravico_enabled,
+            svi_ultravico_alpha,
+            svi_ultravico_training_frames,
+            svi_ultravico_suppress_harmonics,
+            svi_ultravico_beta,
+            svi_ultravico_gamma,
+            svi_ntk_scale,
         ],
         outputs=[svi_output, svi_preview_output, svi_batch_progress, svi_progress_text,
                  svi_job_id_state, svi_batch_id_state, svi_poll_timer],
