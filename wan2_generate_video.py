@@ -6021,6 +6021,7 @@ def generate_svi_multi_clip(
     num_motion_latent: int = 1,
     num_motion_frame: int = 1,
     seed_multiplier: int = 42,
+    initial_prev_last_latent: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Generate multi-clip streaming video using SVI Pro (Stable-Video-Infinity) approach.
 
@@ -6041,6 +6042,9 @@ def generate_svi_multi_clip(
         num_motion_latent: Number of latent frames from previous clip for motion context (0=disable)
         num_motion_frame: Frame offset from end of clip to use as next input (1=last frame, 4=4th from last)
         seed_multiplier: Multiplier for per-clip seed variation (seed = base + clip_idx * multiplier)
+        initial_prev_last_latent: Optional latent tensor from input video for video extension.
+            When provided, the first clip is treated as "clip 2" with motion continuity
+            from the input video, allowing the anchor to be used for style consistency.
 
     Returns:
         torch.Tensor: Combined video tensor [1, C, F, H, W]
@@ -6052,6 +6056,9 @@ def generate_svi_multi_clip(
     logger.info(f"Starting SVI Pro multi-clip generation: {num_clips} clips from {initial_image_path}")
     logger.info(f"Each clip will have {args.video_length} frames with {overlap_frames} frame overlap")
     logger.info(f"SVI Pro mode: num_motion_latent={num_motion_latent}, num_motion_frame={num_motion_frame}, seed_multiplier={seed_multiplier}")
+    if initial_prev_last_latent is not None:
+        logger.info(f"Video extension mode: initial_prev_last_latent provided with shape {initial_prev_last_latent.shape}")
+        logger.info("First extension clip will be treated as clip 2 (with motion continuity from input video)")
 
     # Store original values
     original_image_path = args.image_path
@@ -6070,7 +6077,9 @@ def generate_svi_multi_clip(
     anchor_image = getattr(args, 'anchor_image', None) or initial_image_path
 
     # SVI Pro: Track latent for passing between clips
-    prev_last_latent = None
+    # If initial_prev_last_latent is provided (e.g., from video extension), use it
+    # This allows the first clip to be treated as "clip 2" with motion continuity
+    prev_last_latent = initial_prev_last_latent
 
     try:
         # Enable SVI mode for anchor padding
@@ -6240,6 +6249,73 @@ def generate_svi_video_extension(
         args.anchor_image = anchor_path
         args.svi_mode = True
 
+        # === VIDEO EXTENSION: Encode input video frames as initial_prev_last_latent ===
+        # This allows the first extension clip to be treated as "clip 2" with motion continuity
+        # from the input video, while using the anchor image for style consistency
+        initial_prev_last_latent = None
+        if num_motion_latent > 0:
+            logger.info(f"Encoding input video frames for motion latent (num_motion_latent={num_motion_latent})...")
+
+            # Load VAE and config
+            from Wan2_2.wan.configs import WAN_CONFIGS as WAN22_CONFIGS
+            cfg = WAN22_CONFIGS[args.task]
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            vae_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+            # Load VAE (will be reused by generate_svi_multi_clip via args._vae)
+            vae = getattr(args, '_vae', None)
+            if vae is None:
+                vae = load_vae(args, cfg, device, vae_dtype)
+                args._vae = vae
+
+            # Calculate how many pixel frames we need for the desired latent frames
+            # Latent formula: lat_f = (pixel_f - 1) // vae_stride + 1
+            # So for num_motion_latent latent frames, we need approximately:
+            # pixel_f = (num_motion_latent - 1) * vae_stride + 1
+            # But we want a full clip's worth to get the last num_motion_latent frames
+            vae_temporal_stride = cfg.vae_stride[0]  # typically 4
+            # Extract enough frames to ensure we have at least num_motion_latent latent frames
+            # Using a small clip (e.g., 9 frames = 3 latent frames for stride 4)
+            pixel_frames_needed = num_motion_latent * vae_temporal_stride + 1
+            pixel_frames_needed = max(pixel_frames_needed, 9)  # minimum 9 frames for VAE
+
+            # Extract frames ending at best_frame_idx (the transition point)
+            start_extract = max(0, best_frame_idx - pixel_frames_needed + 1)
+            end_extract = best_frame_idx + 1
+
+            logger.info(f"Extracting frames {start_extract} to {end_extract} from input video for motion latent...")
+            motion_frames = hv_load_video(
+                input_video_path, start_extract, end_extract,
+                bucket_reso=(args.video_size[1], args.video_size[0])
+            )
+
+            if len(motion_frames) > 0:
+                # Convert frames to tensor [C, F, H, W] format for VAE encoding
+                motion_tensor = torch.stack([
+                    torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
+                    for f in motion_frames
+                ], dim=0)  # [F, C, H, W]
+
+                # Normalize to [-1, 1] range for VAE
+                motion_tensor = motion_tensor * 2.0 - 1.0
+
+                # Reshape to [C, F, H, W] for VAE
+                motion_tensor = motion_tensor.permute(1, 0, 2, 3).to(device=device, dtype=vae_dtype)
+
+                logger.info(f"Motion tensor shape before VAE: {motion_tensor.shape}")
+
+                # Encode with VAE
+                try:
+                    with torch.no_grad():
+                        # VAE expects [C, F, H, W] and returns [C, lat_F, lat_H, lat_W]
+                        initial_prev_last_latent = vae.encode([motion_tensor])[0]
+                        logger.info(f"Encoded initial_prev_last_latent shape: {initial_prev_last_latent.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to encode input video frames: {e}. Falling back to clip 1 mode.")
+                    initial_prev_last_latent = None
+            else:
+                logger.warning("No frames extracted from input video. Falling back to clip 1 mode.")
+
         extension_tensor = generate_svi_multi_clip(
             args=args,
             initial_image_path=start_image_path,
@@ -6249,6 +6325,7 @@ def generate_svi_video_extension(
             num_motion_latent=num_motion_latent,
             num_motion_frame=num_motion_frame,
             seed_multiplier=seed_multiplier,
+            initial_prev_last_latent=initial_prev_last_latent,
         )
         logger.info(f"Extension tensor shape: {extension_tensor.shape}")
 
