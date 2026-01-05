@@ -1282,6 +1282,8 @@ def parse_args() -> argparse.Namespace:
         help="attention mode (sageattn=auto SageAttn, sageattn3=Blackwell FP4, sage_ultravico=memory-efficient UltraViCo with Triton)",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
+    parser.add_argument("--keep_dit_loaded", action="store_true",
+        help="Keep DiT model loaded in RAM between SVI clips (saves reload time for multi-clip generation)")
     parser.add_argument(
         "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
     )
@@ -2439,6 +2441,35 @@ def load_clip_model(args: argparse.Namespace, config, device: torch.device) -> C
     )
 
     return clip
+
+
+def _compute_dit_config_hash(args: argparse.Namespace) -> str:
+    """Compute hash of DiT-affecting config to detect when model reload is needed.
+
+    This is used for --keep_dit_loaded to determine if the cached model can be reused
+    or if it needs to be reloaded due to config changes.
+
+    Args:
+        args: Command line arguments
+
+    Returns:
+        str: 12-character hash of the config
+    """
+    import hashlib
+    config_items = [
+        args.dit,
+        getattr(args, 'dit_low_noise', None),
+        getattr(args, 'dit_high_noise', None),
+        tuple(getattr(args, 'lora_weight', []) or []),
+        tuple(getattr(args, 'lora_multiplier', []) or []),
+        getattr(args, 'fp8', False),
+        getattr(args, 'fp8_scaled', False),
+        getattr(args, 'mixed_dtype', False),
+        getattr(args, 'blocks_to_swap', 0),
+        args.task,
+    ]
+    content = str(config_items)
+    return hashlib.md5(content.encode()).hexdigest()[:12]
 
 
 def load_dit_model(
@@ -6173,6 +6204,20 @@ def generate_svi_multi_clip(
             shutil.rmtree(temp_dir)
             logger.info(f"Cleaned up temp directory: {temp_dir}")
 
+        # Cleanup cached DiT models at end of SVI session
+        if hasattr(args, '_cached_dit_model') or hasattr(args, '_cached_model_manager'):
+            logger.info("Cleaning up cached DiT model at end of SVI session")
+            if hasattr(args, '_cached_model_manager') and args._cached_model_manager is not None:
+                args._cached_model_manager.cleanup()
+            if hasattr(args, '_cached_dit_model') and args._cached_dit_model is not None:
+                del args._cached_dit_model
+            if hasattr(args, '_cached_model_manager'):
+                del args._cached_model_manager
+            if hasattr(args, '_cached_model_hash'):
+                del args._cached_model_hash
+            device = torch.device(args.device if args.device else "cuda")
+            clean_memory_on_device(device)
+
     return final_video
 
 
@@ -8005,40 +8050,63 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # If VAE wasn't loaded early (standard T2V), vae is still None
 
     # --- Load DiT Model(s) ---
-    model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
-    
-    # Handle dual-dit models
-    is_dual_dit = isinstance(model_result, tuple)
-    model_manager = None
-    
-    if is_dual_dit:
-        # Set up dynamic model manager
-        if len(model_result) == 6:
-            # New format with LoRA weights
-            model_low_path, model_high_path, lora_weights_list_low, lora_multipliers_low, \
-                lora_weights_list_high, lora_multipliers_high = model_result
-        else:
-            # Old format compatibility
-            model_low_path, model_high_path = model_result
-            lora_weights_list_low = lora_multipliers_low = None
-            lora_weights_list_high = lora_multipliers_high = None
-            
-        model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
-        model_manager.set_model_paths(model_low_path, model_high_path)
-        
-        # Set LoRA weights if available
-        if lora_weights_list_low is not None or lora_weights_list_high is not None:
-            model_manager.set_lora_weights(lora_weights_list_low, lora_multipliers_low,
-                                          lora_weights_list_high, lora_multipliers_high)
-        
-        # Don't load any model initially - let the sampling loop load the appropriate one
-        # This avoids loading low noise model just to immediately swap to high noise
-        model = None
-        model_low = model_high = None  # Not used anymore
-        logger.info("Using dynamic model loading for dual-dit architecture (default)")
+    # Check for cached model (for SVI multi-clip mode with --keep_dit_loaded)
+    keep_dit_loaded = getattr(args, 'keep_dit_loaded', False)
+    cached_model = getattr(args, '_cached_dit_model', None)
+    cached_model_manager = getattr(args, '_cached_model_manager', None)
+    cached_model_hash = getattr(args, '_cached_model_hash', None)
+    current_hash = _compute_dit_config_hash(args)
+
+    if keep_dit_loaded and cached_model_hash == current_hash and (cached_model is not None or cached_model_manager is not None):
+        logger.info(f"Reusing cached DiT model (hash: {current_hash})")
+        model = cached_model
+        model_manager = cached_model_manager
+        is_dual_dit = model_manager is not None
     else:
-        model = model_result
-        model_low = model_high = None
+        if keep_dit_loaded and cached_model_hash is not None and cached_model_hash != current_hash:
+            logger.info(f"DiT config changed (old: {cached_model_hash}, new: {current_hash}), reloading model")
+
+        model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
+
+        # Handle dual-dit models
+        is_dual_dit = isinstance(model_result, tuple)
+        model_manager = None
+
+        if is_dual_dit:
+            # Set up dynamic model manager
+            if len(model_result) == 6:
+                # New format with LoRA weights
+                model_low_path, model_high_path, lora_weights_list_low, lora_multipliers_low, \
+                    lora_weights_list_high, lora_multipliers_high = model_result
+            else:
+                # Old format compatibility
+                model_low_path, model_high_path = model_result
+                lora_weights_list_low = lora_multipliers_low = None
+                lora_weights_list_high = lora_multipliers_high = None
+
+            model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+            model_manager.set_model_paths(model_low_path, model_high_path)
+
+            # Set LoRA weights if available
+            if lora_weights_list_low is not None or lora_weights_list_high is not None:
+                model_manager.set_lora_weights(lora_weights_list_low, lora_multipliers_low,
+                                              lora_weights_list_high, lora_multipliers_high)
+
+            # Don't load any model initially - let the sampling loop load the appropriate one
+            # This avoids loading low noise model just to immediately swap to high noise
+            model = None
+            model_low = model_high = None  # Not used anymore
+            logger.info("Using dynamic model loading for dual-dit architecture (default)")
+        else:
+            model = model_result
+            model_low = model_high = None
+
+        # Cache model if requested (for SVI multi-clip mode)
+        if keep_dit_loaded:
+            args._cached_dit_model = model
+            args._cached_model_manager = model_manager
+            args._cached_model_hash = current_hash
+            logger.info(f"Cached DiT model for future clips (hash: {current_hash})")
 
     # --- Verify LoRA Merge (if applicable) ---
     if args.lora_weight is not None and len(args.lora_weight) > 0:
@@ -8307,13 +8375,18 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if args.ultravico:
         clear_ultravico_cache()
 
-    if model_manager:
-        model_manager.cleanup()
+    # Skip model cleanup if keep_dit_loaded is enabled (model persists for next SVI clip)
+    keep_dit_loaded = getattr(args, 'keep_dit_loaded', False)
+    if not keep_dit_loaded:
+        if model_manager:
+            model_manager.cleanup()
 
-    # Only delete model if it exists
-    if model is not None:
-        del model
-        
+        # Only delete model if it exists
+        if model is not None:
+            del model
+    else:
+        logger.info("Keeping DiT model loaded for next clip (--keep_dit_loaded enabled)")
+
     if 'scheduler' in locals(): del scheduler
     if 'context' in locals(): del context
     if 'context_null' in locals(): del context_null
@@ -8323,7 +8396,7 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
 
     synchronize_device(device)
 
-    if args.blocks_to_swap > 0:
+    if args.blocks_to_swap > 0 and not keep_dit_loaded:
         logger.info("Waiting for 5 seconds to ensure block swap finishes...")
         time.sleep(5)
 
