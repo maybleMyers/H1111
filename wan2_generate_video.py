@@ -7341,7 +7341,12 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     # VAE is needed early for V2V, I2V, TI2V, FunControl T2V, and HuMo
     needs_vae_early = is_v2v or is_i2v or is_ti2v or is_v2v_i2v or (is_fun_control and is_t2v) or (is_fun_control and is_i2v) or is_humo
     if needs_vae_early:
-        vae = load_vae(args, cfg, device, vae_dtype)
+        # Reuse existing VAE if available (e.g., from SVI extension pipeline)
+        if hasattr(args, '_vae') and args._vae is not None:
+            vae = args._vae
+            logger.info("Reusing existing VAE instance from args._vae")
+        else:
+            vae = load_vae(args, cfg, device, vae_dtype)
         # Keep VAE on specified device for now, will be moved as needed
 
     # Handle video join mode - must be before extension as it takes priority
