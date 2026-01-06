@@ -644,9 +644,12 @@ def run_inference(
     runner = global_state.runner
     device = get_device()
 
-    # Reset max memory tracking
+    # Reset max memory tracking and clean up any residual memory from previous runs
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     print(f"\n{'='*60}")
     print(f"STARTING INFERENCE PIPELINE")
@@ -742,6 +745,11 @@ def run_inference(
         print("\n[OFFLOAD] Moving VAE to CPU...")
         runner.vae.to("cpu")
         torch.cuda.synchronize()
+
+        # Delete large tensors we no longer need
+        del cond_video
+        del video  # Original video tensor
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -796,6 +804,13 @@ def run_inference(
 
         # Run PATCHED official inference (skips the problematic dit.to(get_device()) at the end)
         print("\n[DiT] Running patched official inference...")
+
+        # Clear fragmented memory before the heavy forward pass
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        log_memory("Step 5c: After pre-inference cleanup")
+
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
             # The patched inference handles:
             # 1. Sampling with DiT
@@ -851,8 +866,14 @@ def run_inference(
                 sample.to("cpu"),
                 input_for_colorfix[:sample.size(0)].to("cpu")
             )
+            del input_for_colorfix
         else:
             sample = sample.to("cpu")
+
+        # Clean up input_video now that we're done with it
+        del input_video
+        gc.collect()
+        torch.cuda.empty_cache()
 
         log_memory("Step 9: After post-processing")
 
