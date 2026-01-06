@@ -6316,6 +6316,13 @@ def generate_svi_video_extension(
             else:
                 logger.warning("No frames extracted from input video. Falling back to clip 1 mode.")
 
+            # Move VAE to CPU to free GPU memory for T5/CLIP/DiT during generation
+            vae.to_device("cpu")
+            clean_memory_on_device(device)
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Moved VAE to CPU after encoding motion frames")
+
         extension_tensor = generate_svi_multi_clip(
             args=args,
             initial_image_path=start_image_path,

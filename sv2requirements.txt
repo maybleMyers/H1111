@@ -1,4 +1,9 @@
 omegaconf
 mediapy
 rotary_embedding_torch
-apex
+
+git clone https://github.com/NVIDIA/apex.git nvidia_apex
+install it, this is an example for 50xx gpu, 40xx is 8.9 arch list.
+TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS=8 pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings="--build-option=--cpp_ext" --config-settings="--build-option=--cuda_ext" .
+
+pip install -U bitsandbytes
