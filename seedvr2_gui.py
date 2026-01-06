@@ -385,6 +385,9 @@ def load_model(
             patch_nadit_forward_for_block_swap(runner.dit)
             print("[LOAD] Patched NaDiT forward for block swap")
 
+            # Patch inference method to skip final dit.to(get_device())
+            patch_runner_inference_for_block_swap(runner)
+
             # Move to device except swap blocks
             print("[LOAD] Moving non-swap parts to GPU...")
             move_to_device_except_swap_blocks(runner.dit, device)
@@ -498,99 +501,124 @@ def cut_videos_for_sp(videos: torch.Tensor, sp_size: int = 1) -> torch.Tensor:
 # Inference Pipeline
 # ============================================================================
 
-def run_inference_custom(
-    runner,
-    noises: List[torch.Tensor],
-    conditions: List[torch.Tensor],
-    texts_pos: List[torch.Tensor],
-    texts_neg: List[torch.Tensor],
-    blocks_to_swap: int,
-    device: torch.device,
-) -> List[torch.Tensor]:
+def patch_runner_inference_for_block_swap(runner):
     """
-    Custom inference that handles block swap properly.
+    Patch the runner's inference method to skip the final dit.to(get_device())
+    call that causes OOM when using block swap.
 
-    This bypasses the upstream runner.inference() method which has
-    a problematic self.dit.to(get_device()) call at the end that
-    ignores block swap and causes OOM.
+    The upstream inference method (infer.py line 347) does:
+        if dit_offload:
+            self.dit.to(get_device())
+
+    This ignores block swap and tries to load the entire 8B model to GPU.
+    Our patched version skips this when block swap is enabled.
     """
+    from typing import List, Optional, Union, Tuple
+    from torch import Tensor
     from models.dit_v2 import na
     from common.diffusion import classifier_free_guidance_dispatcher
+    from common.distributed import get_device as seedvr_get_device
 
-    batch_size = len(noises)
-    cfg_scale = runner.config.diffusion.cfg.scale
+    original_inference = runner.inference
 
-    print(f"\n{'='*60}")
-    print(f"[CUSTOM INFERENCE] Starting with {batch_size} samples")
-    print(f"[CUSTOM INFERENCE] Blocks to swap: {blocks_to_swap}")
-    log_memory("Before inference setup")
-    get_dit_block_distribution(runner.dit)
-    print(f"{'='*60}\n")
+    @torch.no_grad()
+    def patched_inference(
+        noises: List[Tensor],
+        conditions: List[Tensor],
+        texts_pos: Union[List[str], List[Tensor], List[Tuple[Tensor]]],
+        texts_neg: Union[List[str], List[Tensor], List[Tuple[Tensor]]],
+        cfg_scale: Optional[float] = None,
+        dit_offload: bool = False,
+        skip_final_dit_to_gpu: bool = False,  # New parameter
+    ) -> List[Tensor]:
+        """Patched inference that respects block swap."""
+        assert len(noises) == len(conditions) == len(texts_pos) == len(texts_neg)
+        batch_size = len(noises)
 
-    # Text embeddings - flatten
-    text_pos_embeds, text_pos_shapes = na.flatten(texts_pos)
-    text_neg_embeds, text_neg_shapes = na.flatten(texts_neg)
+        if batch_size == 0:
+            return []
 
-    # Flatten latents
-    latents, latents_shapes = na.flatten(noises)
-    latents_cond, _ = na.flatten(conditions)
+        if cfg_scale is None:
+            cfg_scale = runner.config.diffusion.cfg.scale
 
-    log_memory("After flattening tensors")
+        # Text embeddings
+        assert type(texts_pos[0]) is type(texts_neg[0])
+        if isinstance(texts_pos[0], str):
+            text_pos_embeds, text_pos_shapes = runner.text_encode(texts_pos)
+            text_neg_embeds, text_neg_shapes = runner.text_encode(texts_neg)
+        elif isinstance(texts_pos[0], tuple):
+            text_pos_embeds, text_pos_shapes = [], []
+            text_neg_embeds, text_neg_shapes = [], []
+            for pos in zip(*texts_pos):
+                emb, shape = na.flatten(pos)
+                text_pos_embeds.append(emb)
+                text_pos_shapes.append(shape)
+            for neg in zip(*texts_neg):
+                emb, shape = na.flatten(neg)
+                text_neg_embeds.append(emb)
+                text_neg_shapes.append(shape)
+        else:
+            text_pos_embeds, text_pos_shapes = na.flatten(texts_pos)
+            text_neg_embeds, text_neg_shapes = na.flatten(texts_neg)
 
-    # Enter eval mode
-    was_training = runner.dit.training
-    runner.dit.eval()
+        # Flatten
+        latents, latents_shapes = na.flatten(noises)
+        latents_cond, _ = na.flatten(conditions)
 
-    # Sampling with detailed logging
-    print(f"\n[CUSTOM INFERENCE] Starting sampler...")
-    log_memory("Before sampling")
+        # Enter eval mode
+        was_training = runner.dit.training
+        runner.dit.eval()
 
-    def forward_with_logging(args):
-        """Wrapper that logs memory during forward pass."""
-        log_memory(f"CFG forward step {args.i}", verbose=False)
-
-        result = classifier_free_guidance_dispatcher(
-            pos=lambda: runner.dit(
-                vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                txt=text_pos_embeds,
-                vid_shape=latents_shapes,
-                txt_shape=text_pos_shapes,
-                timestep=args.t.repeat(batch_size),
-            ).vid_sample,
-            neg=lambda: runner.dit(
-                vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                txt=text_neg_embeds,
-                vid_shape=latents_shapes,
-                txt_shape=text_neg_shapes,
-                timestep=args.t.repeat(batch_size),
-            ).vid_sample,
-            scale=(
-                cfg_scale
-                if (args.i + 1) / len(runner.sampler.timesteps)
-                <= runner.config.diffusion.cfg.get("partial", 1)
-                else 1.0
+        # Sampling
+        latents = runner.sampler.sample(
+            x=latents,
+            f=lambda args: classifier_free_guidance_dispatcher(
+                pos=lambda: runner.dit(
+                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
+                    txt=text_pos_embeds,
+                    vid_shape=latents_shapes,
+                    txt_shape=text_pos_shapes,
+                    timestep=args.t.repeat(batch_size),
+                ).vid_sample,
+                neg=lambda: runner.dit(
+                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
+                    txt=text_neg_embeds,
+                    vid_shape=latents_shapes,
+                    txt_shape=text_neg_shapes,
+                    timestep=args.t.repeat(batch_size),
+                ).vid_sample,
+                scale=(
+                    cfg_scale
+                    if (args.i + 1) / len(runner.sampler.timesteps)
+                    <= runner.config.diffusion.cfg.get("partial", 1)
+                    else 1.0
+                ),
+                rescale=runner.config.diffusion.cfg.rescale,
             ),
-            rescale=runner.config.diffusion.cfg.rescale,
         )
 
-        log_memory(f"After CFG forward step {args.i}", verbose=False)
-        return result
+        # Exit eval mode
+        runner.dit.train(was_training)
 
-    latents = runner.sampler.sample(x=latents, f=forward_with_logging)
+        # Unflatten
+        latents = na.unflatten(latents, latents_shapes)
 
-    log_memory("After sampling complete")
+        if dit_offload:
+            runner.dit.to("cpu")
 
-    # Exit eval mode
-    runner.dit.train(was_training)
+        # VAE decode
+        runner.vae.to(seedvr_get_device())
+        samples = runner.vae_decode(latents)
 
-    # Unflatten
-    latents = na.unflatten(latents, latents_shapes)
+        # PATCHED: Skip moving DiT back to GPU when block swap is enabled
+        if dit_offload and not skip_final_dit_to_gpu:
+            runner.dit.to(seedvr_get_device())
 
-    print(f"\n[CUSTOM INFERENCE] Sampling complete!")
-    log_memory("After unflatten")
-    get_dit_block_distribution(runner.dit)
+        return samples
 
-    return latents
+    runner.inference = patched_inference
+    runner._original_inference = original_inference
+    print("[PATCH] Runner inference method patched to support block swap")
 
 
 def run_inference(
@@ -766,53 +794,32 @@ def run_inference(
         ]
         log_memory("Step 5b: After conditions built")
 
-        # Run custom inference (bypasses problematic upstream dit.to() call)
-        print("\n[DiT] Running custom inference...")
+        # Run PATCHED official inference (skips the problematic dit.to(get_device()) at the end)
+        print("\n[DiT] Running patched official inference...")
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            latent_outputs = run_inference_custom(
-                runner=runner,
+            # The patched inference handles:
+            # 1. Sampling with DiT
+            # 2. DiT offload to CPU
+            # 3. VAE decode
+            # 4. SKIPS moving DiT back to GPU (the OOM cause)
+            samples = runner.inference(
                 noises=noises,
                 conditions=conditions,
                 texts_pos=texts_pos,
                 texts_neg=texts_neg,
-                blocks_to_swap=global_state.blocks_to_swap,
-                device=device,
+                dit_offload=True,
+                skip_final_dit_to_gpu=True,  # Key: skip the problematic dit.to(get_device())
             )
 
-        log_memory("Step 6: After DiT inference complete")
+        log_memory("Step 6: After inference complete (DiT sampling + VAE decode)")
 
-        # ============== VAE DECODING ==============
-        progress(0.7, desc="VAE decoding...")
-        yield "Decoding with VAE...", None
-
-        print(f"\n{'='*60}")
-        print(f"VAE DECODING PHASE")
-        print(f"{'='*60}")
-
-        # Move DiT to CPU before VAE decode
-        print("\n[OFFLOAD] Moving DiT to CPU for VAE decode...")
-        runner.dit.to("cpu")
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        log_memory("Step 7: After DiT to CPU")
-
-        # Move VAE to GPU
-        print("\n[OFFLOAD] Moving VAE to GPU...")
-        runner.vae.to(device)
-        log_memory("Step 7b: After VAE to GPU")
-
-        # Decode
-        print("\n[VAE] Decoding...")
-        samples = runner.vae_decode(latent_outputs)
-        log_memory("Step 7c: After VAE decode")
-
-        # Move VAE back to CPU
+        # Move VAE back to CPU (inference leaves it on GPU)
+        print("\n[OFFLOAD] Moving VAE to CPU...")
         runner.vae.to("cpu")
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
-        log_memory("Step 7d: After VAE to CPU")
+        log_memory("Step 7: After VAE to CPU")
 
         # Rearrange output
         print("\n[OUTPUT] Rearranging samples...")
@@ -823,7 +830,7 @@ def run_inference(
         ]
 
         # Cleanup intermediate tensors
-        del latent_outputs, noises, conditions, cond_latents_gpu, cond_latents
+        del noises, conditions, cond_latents_gpu, cond_latents
         gc.collect()
         torch.cuda.empty_cache()
         log_memory("Step 8: After cleanup")
