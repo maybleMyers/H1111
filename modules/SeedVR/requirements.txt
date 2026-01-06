@@ -1,0 +1,18 @@
+# Common
+einops==0.7.0                   # Tensor operations
+
+# Training
+torch==2.3.0                    # Torch
+omegaconf==2.3.0                # Configuration system.
+
+# Dataloading
+opencv-python==4.9.0.80         # OpenCV
+
+# Modeling
+diffusers==0.29.1               # Diffusers
+rotary-embedding-torch==0.5.3   # Rotary positional embedding
+transformers==4.38.2            # Transformers
+torchvision==0.18.0             # Torchvision
+
+# Notebook
+mediapy==1.2.0                  # Notebook Visualization
