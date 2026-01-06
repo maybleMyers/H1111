@@ -529,9 +529,9 @@ def patch_runner_inference_for_block_swap(runner):
         texts_neg: Union[List[str], List[Tensor], List[Tuple[Tensor]]],
         cfg_scale: Optional[float] = None,
         dit_offload: bool = False,
-        skip_final_dit_to_gpu: bool = False,  # New parameter
+        skip_final_dit_to_gpu: bool = False,
+        return_latents_only: bool = False,
     ) -> List[Tensor]:
-        """Patched inference that respects block swap."""
         assert len(noises) == len(conditions) == len(texts_pos) == len(texts_neg)
         batch_size = len(noises)
 
@@ -606,11 +606,12 @@ def patch_runner_inference_for_block_swap(runner):
         if dit_offload:
             runner.dit.to("cpu")
 
-        # VAE decode
+        if return_latents_only:
+            return latents
+
         runner.vae.to(seedvr_get_device())
         samples = runner.vae_decode(latents)
 
-        # PATCHED: Skip moving DiT back to GPU when block swap is enabled
         if dit_offload and not skip_final_dit_to_gpu:
             runner.dit.to(seedvr_get_device())
 
@@ -802,39 +803,48 @@ def run_inference(
         ]
         log_memory("Step 5b: After conditions built")
 
-        # Run PATCHED official inference (skips the problematic dit.to(get_device()) at the end)
-        print("\n[DiT] Running patched official inference...")
+        print("\n[PHASE 2] DiT upscaling (returns latents only)...")
 
-        # Clear fragmented memory before the heavy forward pass
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         log_memory("Step 5c: After pre-inference cleanup")
 
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            # The patched inference handles:
-            # 1. Sampling with DiT
-            # 2. DiT offload to CPU
-            # 3. VAE decode
-            # 4. SKIPS moving DiT back to GPU (the OOM cause)
-            samples = runner.inference(
+            latents = runner.inference(
                 noises=noises,
                 conditions=conditions,
                 texts_pos=texts_pos,
                 texts_neg=texts_neg,
                 dit_offload=True,
-                skip_final_dit_to_gpu=True,  # Key: skip the problematic dit.to(get_device())
+                return_latents_only=True,
             )
 
-        log_memory("Step 6: After inference complete (DiT sampling + VAE decode)")
+        log_memory("Step 6: After DiT sampling (latents only)")
 
-        # Move VAE back to CPU (inference leaves it on GPU)
+        print("\n[PHASE 2.5] Fully offloading DiT to CPU...")
+        runner.dit.to("cpu")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Step 6b: After DiT fully offloaded")
+
+        print("\n[PHASE 3] VAE decode (GPU now fully available)...")
+        runner.vae.to(device)
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
+            samples = runner.vae_decode(latents)
+
+        del latents
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Step 7: After VAE decode")
+
         print("\n[OFFLOAD] Moving VAE to CPU...")
         runner.vae.to("cpu")
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
-        log_memory("Step 7: After VAE to CPU")
+        log_memory("Step 7b: After VAE to CPU")
 
         # Rearrange output
         print("\n[OUTPUT] Rearranging samples...")
