@@ -39,6 +39,90 @@ from data.video.transforms.rearrange import Rearrange
 # Block swapping utilities
 from modules.custom_offloading_utils import ModelOffloader
 
+# ============================================================================
+# Memory Debugging Utilities
+# ============================================================================
+
+def get_memory_stats() -> dict:
+    """Get current GPU memory statistics."""
+    if not torch.cuda.is_available():
+        return {"available": False}
+
+    allocated = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    max_allocated = torch.cuda.max_memory_allocated() / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    free = total - reserved
+
+    return {
+        "available": True,
+        "allocated_gb": allocated,
+        "reserved_gb": reserved,
+        "max_allocated_gb": max_allocated,
+        "total_gb": total,
+        "free_gb": free,
+    }
+
+def log_memory(stage: str, verbose: bool = True):
+    """Log memory usage at a specific stage."""
+    stats = get_memory_stats()
+    if not stats["available"]:
+        return
+
+    msg = f"[MEMORY] {stage}: Allocated={stats['allocated_gb']:.2f}GB, Reserved={stats['reserved_gb']:.2f}GB, Free={stats['free_gb']:.2f}GB"
+    print(msg)
+    if verbose:
+        print(f"         Max allocated so far: {stats['max_allocated_gb']:.2f}GB")
+    return stats
+
+def get_model_memory_footprint(model: torch.nn.Module, name: str = "Model") -> float:
+    """Calculate memory footprint of a model in GB."""
+    total_bytes = 0
+    device_breakdown = {}
+
+    for param in model.parameters():
+        param_bytes = param.numel() * param.element_size()
+        total_bytes += param_bytes
+        device = str(param.device)
+        device_breakdown[device] = device_breakdown.get(device, 0) + param_bytes
+
+    for buffer in model.buffers():
+        buffer_bytes = buffer.numel() * buffer.element_size()
+        total_bytes += buffer_bytes
+        device = str(buffer.device)
+        device_breakdown[device] = device_breakdown.get(device, 0) + buffer_bytes
+
+    print(f"[MODEL] {name} total: {total_bytes / 1e9:.2f}GB")
+    for device, bytes_on_device in device_breakdown.items():
+        print(f"         {device}: {bytes_on_device / 1e9:.2f}GB")
+
+    return total_bytes / 1e9
+
+def get_dit_block_distribution(dit_model) -> dict:
+    """Get the device distribution of DiT blocks."""
+    if not hasattr(dit_model, 'blocks'):
+        return {"error": "No blocks attribute"}
+
+    distribution = {"cuda": 0, "cpu": 0, "meta": 0, "other": 0}
+    block_devices = []
+
+    for i, block in enumerate(dit_model.blocks):
+        # Check first parameter's device
+        first_param = next(block.parameters(), None)
+        if first_param is not None:
+            device_type = first_param.device.type
+            block_devices.append((i, device_type))
+            if device_type in distribution:
+                distribution[device_type] += 1
+            else:
+                distribution["other"] += 1
+
+    print(f"[DiT BLOCKS] Distribution: {distribution}")
+    print(f"         First 5 blocks: {[f'B{i}:{d}' for i, d in block_devices[:5]]}")
+    print(f"         Last 5 blocks: {[f'B{i}:{d}' for i, d in block_devices[-5:]]}")
+
+    return distribution
+
 # Optional color fix
 try:
     from projects.video_diffusion_sr.color_fix import wavelet_reconstruction
@@ -237,15 +321,23 @@ def load_model(
     """Load SeedVR2 model with block swap support."""
     global global_state
 
+    print(f"\n{'='*60}")
+    print(f"LOADING MODEL")
+    print(f"Blocks to swap: {blocks_to_swap}")
+    print(f"{'='*60}\n")
+
     try:
         progress(0, desc="Initializing...")
+        log_memory("Load: Initial state")
 
         # Clean up existing model
         if global_state.runner is not None:
+            print("[LOAD] Cleaning up existing model...")
             del global_state.runner
             global_state.runner = None
             gc.collect()
             torch.cuda.empty_cache()
+            log_memory("Load: After cleanup")
 
         progress(0.1, desc="Loading config...")
 
@@ -267,10 +359,15 @@ def load_model(
             runner.config.vae.checkpoint = os.path.join(SCRIPT_DIR, vae_path)
 
         progress(0.2, desc="Loading DiT model (this takes a while)...")
+        print("\n[LOAD] Loading DiT model to CPU...")
+        log_memory("Load: Before DiT load")
 
         # Load DiT to CPU first (make checkpoint path absolute)
         checkpoint_abs = os.path.join(SCRIPT_DIR, checkpoint_path)
         runner.configure_dit_model(device="cpu", checkpoint=checkpoint_abs)
+
+        log_memory("Load: After DiT load to CPU")
+        get_model_memory_footprint(runner.dit, "DiT (on CPU)")
 
         device = get_device()
         global_state.blocks_to_swap = blocks_to_swap
@@ -278,24 +375,45 @@ def load_model(
         progress(0.5, desc="Setting up block swap...")
 
         if blocks_to_swap > 0:
+            print(f"\n[LOAD] Setting up block swap with {blocks_to_swap} blocks...")
+
             # Enable block swapping
             enable_block_swap_for_nadit(runner.dit, blocks_to_swap, device)
+            log_memory("Load: After enable_block_swap_for_nadit")
+
             # Patch forward for block swap
             patch_nadit_forward_for_block_swap(runner.dit)
+            print("[LOAD] Patched NaDiT forward for block swap")
+
             # Move to device except swap blocks
+            print("[LOAD] Moving non-swap parts to GPU...")
             move_to_device_except_swap_blocks(runner.dit, device)
+            log_memory("Load: After move_to_device_except_swap_blocks")
+            get_dit_block_distribution(runner.dit)
         else:
+            print("\n[LOAD] Moving entire DiT to GPU (no block swap)...")
             runner.dit.to(device)
+            log_memory("Load: After DiT to GPU")
 
         progress(0.7, desc="Loading VAE...")
+        print("\n[LOAD] Loading VAE...")
+        log_memory("Load: Before VAE load")
 
         # Load VAE
         runner.configure_vae_model()
         if hasattr(runner.vae, "set_memory_limit"):
             runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
 
+        log_memory("Load: After VAE load (on GPU by default)")
+        get_model_memory_footprint(runner.vae, "VAE")
+
         # Move VAE to CPU initially
+        print("[LOAD] Moving VAE to CPU...")
         runner.vae.to("cpu")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Load: After VAE to CPU")
 
         progress(0.9, desc="Loading text embeddings...")
 
@@ -305,6 +423,7 @@ def load_model(
 
         runner.pos_emb = torch.load(pos_emb_path, map_location="cpu")
         runner.neg_emb = torch.load(neg_emb_path, map_location="cpu")
+        print(f"[LOAD] Text embeddings loaded: pos={runner.pos_emb.shape}, neg={runner.neg_emb.shape}")
 
         global_state.runner = runner
         global_state.is_loaded = True
@@ -312,6 +431,13 @@ def load_model(
         progress(1.0, desc="Done!")
 
         num_params = sum(p.numel() for p in runner.dit.parameters()) / 1e9
+        print(f"\n{'='*60}")
+        print(f"MODEL LOADED SUCCESSFULLY")
+        print(f"DiT: {num_params:.1f}B params, Block swap: {blocks_to_swap} blocks")
+        log_memory("Load: Final state")
+        get_dit_block_distribution(runner.dit)
+        print(f"{'='*60}\n")
+
         return f"Model loaded successfully! DiT: {num_params:.1f}B params, Block swap: {blocks_to_swap} blocks", True
 
     except Exception as e:
@@ -319,6 +445,7 @@ def load_model(
         print(f"\n{'='*60}")
         print(f"ERROR loading model:")
         print(f"{'='*60}")
+        log_memory("Load: Error state")
         traceback.print_exc()
         print(f"{'='*60}\n")
 
@@ -371,6 +498,101 @@ def cut_videos_for_sp(videos: torch.Tensor, sp_size: int = 1) -> torch.Tensor:
 # Inference Pipeline
 # ============================================================================
 
+def run_inference_custom(
+    runner,
+    noises: List[torch.Tensor],
+    conditions: List[torch.Tensor],
+    texts_pos: List[torch.Tensor],
+    texts_neg: List[torch.Tensor],
+    blocks_to_swap: int,
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """
+    Custom inference that handles block swap properly.
+
+    This bypasses the upstream runner.inference() method which has
+    a problematic self.dit.to(get_device()) call at the end that
+    ignores block swap and causes OOM.
+    """
+    from models.dit_v2 import na
+    from common.diffusion import classifier_free_guidance_dispatcher
+
+    batch_size = len(noises)
+    cfg_scale = runner.config.diffusion.cfg.scale
+
+    print(f"\n{'='*60}")
+    print(f"[CUSTOM INFERENCE] Starting with {batch_size} samples")
+    print(f"[CUSTOM INFERENCE] Blocks to swap: {blocks_to_swap}")
+    log_memory("Before inference setup")
+    get_dit_block_distribution(runner.dit)
+    print(f"{'='*60}\n")
+
+    # Text embeddings - flatten
+    text_pos_embeds, text_pos_shapes = na.flatten(texts_pos)
+    text_neg_embeds, text_neg_shapes = na.flatten(texts_neg)
+
+    # Flatten latents
+    latents, latents_shapes = na.flatten(noises)
+    latents_cond, _ = na.flatten(conditions)
+
+    log_memory("After flattening tensors")
+
+    # Enter eval mode
+    was_training = runner.dit.training
+    runner.dit.eval()
+
+    # Sampling with detailed logging
+    print(f"\n[CUSTOM INFERENCE] Starting sampler...")
+    log_memory("Before sampling")
+
+    def forward_with_logging(args):
+        """Wrapper that logs memory during forward pass."""
+        log_memory(f"CFG forward step {args.i}", verbose=False)
+
+        result = classifier_free_guidance_dispatcher(
+            pos=lambda: runner.dit(
+                vid=torch.cat([args.x_t, latents_cond], dim=-1),
+                txt=text_pos_embeds,
+                vid_shape=latents_shapes,
+                txt_shape=text_pos_shapes,
+                timestep=args.t.repeat(batch_size),
+            ).vid_sample,
+            neg=lambda: runner.dit(
+                vid=torch.cat([args.x_t, latents_cond], dim=-1),
+                txt=text_neg_embeds,
+                vid_shape=latents_shapes,
+                txt_shape=text_neg_shapes,
+                timestep=args.t.repeat(batch_size),
+            ).vid_sample,
+            scale=(
+                cfg_scale
+                if (args.i + 1) / len(runner.sampler.timesteps)
+                <= runner.config.diffusion.cfg.get("partial", 1)
+                else 1.0
+            ),
+            rescale=runner.config.diffusion.cfg.rescale,
+        )
+
+        log_memory(f"After CFG forward step {args.i}", verbose=False)
+        return result
+
+    latents = runner.sampler.sample(x=latents, f=forward_with_logging)
+
+    log_memory("After sampling complete")
+
+    # Exit eval mode
+    runner.dit.train(was_training)
+
+    # Unflatten
+    latents = na.unflatten(latents, latents_shapes)
+
+    print(f"\n[CUSTOM INFERENCE] Sampling complete!")
+    log_memory("After unflatten")
+    get_dit_block_distribution(runner.dit)
+
+    return latents
+
+
 def run_inference(
     input_path: str,
     res_h: int,
@@ -384,7 +606,7 @@ def run_inference(
     output_dir: str,
     progress=gr.Progress()
 ) -> Generator[Tuple[str, Optional[str]], None, None]:
-    """Run SeedVR2 inference pipeline."""
+    """Run SeedVR2 inference pipeline with comprehensive memory debugging."""
     global global_state
 
     if not global_state.is_loaded or global_state.runner is None:
@@ -394,6 +616,15 @@ def run_inference(
     runner = global_state.runner
     device = get_device()
 
+    # Reset max memory tracking
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    print(f"\n{'='*60}")
+    print(f"STARTING INFERENCE PIPELINE")
+    print(f"Resolution: {res_w}x{res_h}, Blocks to swap: {global_state.blocks_to_swap}")
+    print(f"{'='*60}\n")
+
     try:
         # Set seed
         if seed == -1:
@@ -401,6 +632,7 @@ def run_inference(
         set_seed(seed, same_across_ranks=True)
 
         progress(0.05, desc="Configuring diffusion...")
+        log_memory("Step 1: Configure diffusion")
 
         # Configure diffusion parameters
         runner.config.diffusion.cfg.scale = cfg_scale
@@ -410,6 +642,7 @@ def run_inference(
 
         progress(0.1, desc="Loading input...")
         yield "Loading input video/image...", None
+        log_memory("Step 2: Loading input")
 
         # Build transform
         transform = build_video_transform(res_h, res_w)
@@ -425,84 +658,175 @@ def run_inference(
             input_fps = info["video_fps"]
 
         ori_length = video.size(0)
+        log_memory(f"Step 2b: Loaded {ori_length} frames")
+
         input_video = transform(video.to(device))
         cond_video = cut_videos_for_sp(input_video, sp_size=1)
 
+        print(f"[INPUT] Original: {ori_length} frames, {video.shape[-2]}x{video.shape[-1]}")
+        print(f"[INPUT] Transformed: {cond_video.shape}")
+        log_memory("Step 2c: After transform")
+
         yield f"Input: {ori_length} frames, {video.shape[-2]}x{video.shape[-1]}", None
 
+        # ============== VAE ENCODING ==============
         progress(0.2, desc="VAE encoding...")
         yield "Encoding with VAE...", None
 
-        # Move DiT to CPU, VAE to GPU for encoding
+        print(f"\n{'='*60}")
+        print(f"VAE ENCODING PHASE")
+        print(f"{'='*60}")
+        log_memory("Step 3: Before VAE encode setup")
+        get_dit_block_distribution(runner.dit)
+
+        # Move DiT to CPU for VAE encoding
+        print("\n[OFFLOAD] Moving DiT to CPU for VAE encoding...")
+
         if global_state.blocks_to_swap > 0:
             # Wait for any pending block swaps
             if hasattr(runner.dit, 'offloader') and runner.dit.offloader is not None:
+                print("[OFFLOAD] Waiting for pending block swaps...")
                 for idx in range(len(runner.dit.blocks)):
                     runner.dit.offloader.wait_for_block(idx)
 
+        # Move entire DiT to CPU (including blocks)
         runner.dit.to("cpu")
-        runner.vae.to(device)
-
-        cond_latents = runner.vae_encode([cond_video])
-
-        runner.vae.to("cpu")
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
 
+        log_memory("Step 3b: After DiT to CPU")
+        get_dit_block_distribution(runner.dit)
+
+        # Move VAE to GPU
+        print("\n[OFFLOAD] Moving VAE to GPU...")
+        runner.vae.to(device)
+        log_memory("Step 3c: After VAE to GPU")
+        get_model_memory_footprint(runner.vae, "VAE")
+
+        # Encode
+        print("\n[VAE] Encoding...")
+        cond_latents = runner.vae_encode([cond_video])
+        print(f"[VAE] Encoded latent shape: {cond_latents[0].shape}")
+        log_memory("Step 3d: After VAE encode")
+
+        # Move VAE back to CPU
+        print("\n[OFFLOAD] Moving VAE to CPU...")
+        runner.vae.to("cpu")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        log_memory("Step 3e: After VAE to CPU, before DiT setup")
+
+        # ============== DiT INFERENCE ==============
         progress(0.4, desc="Preparing DiT...")
         yield "Preparing DiT inference...", None
 
-        # Prepare DiT for inference
+        print(f"\n{'='*60}")
+        print(f"DiT INFERENCE PHASE")
+        print(f"{'='*60}")
+
+        # Prepare DiT for inference with block swap
         if global_state.blocks_to_swap > 0:
+            print(f"\n[DiT] Setting up block swap ({global_state.blocks_to_swap} blocks)...")
             move_to_device_except_swap_blocks(runner.dit, device)
+            log_memory("Step 4a: After move_to_device_except_swap_blocks")
+            get_dit_block_distribution(runner.dit)
+
             prepare_block_swap_before_forward(runner.dit)
+            log_memory("Step 4b: After prepare_block_swap_before_forward")
+            get_dit_block_distribution(runner.dit)
         else:
+            print("\n[DiT] Moving entire model to GPU (no block swap)...")
             runner.dit.to(device)
+            log_memory("Step 4: After DiT to GPU (no block swap)")
 
         # Prepare text embeddings
-        text_embeds = {
-            "texts_pos": [runner.pos_emb.to(device)],
-            "texts_neg": [runner.neg_emb.to(device)],
-        }
+        print("\n[DiT] Preparing text embeddings...")
+        texts_pos = [runner.pos_emb.to(device)]
+        texts_neg = [runner.neg_emb.to(device)]
+        log_memory("Step 4c: After text embeddings to GPU")
 
         progress(0.5, desc="Running DiT inference...")
         yield "Running diffusion sampling...", None
 
         # Generation step
+        print("\n[DiT] Creating noise tensors...")
         noises = [torch.randn_like(lat) for lat in cond_latents]
-        aug_noises = [torch.randn_like(lat) for lat in cond_latents]
-
-        # Move to device
         noises = [n.to(device) for n in noises]
-        aug_noises = [n.to(device) for n in aug_noises]
-        cond_latents = [lat.to(device) for lat in cond_latents]
+        cond_latents_gpu = [lat.to(device) for lat in cond_latents]
+        log_memory("Step 5: After noise tensors created")
 
         # Build conditions (no noise for SR)
+        print("\n[DiT] Building conditions...")
         conditions = [
             runner.get_condition(noise, task="sr", latent_blur=lat)
-            for noise, lat in zip(noises, cond_latents)
+            for noise, lat in zip(noises, cond_latents_gpu)
         ]
+        log_memory("Step 5b: After conditions built")
 
-        # Run inference
+        # Run custom inference (bypasses problematic upstream dit.to() call)
+        print("\n[DiT] Running custom inference...")
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            video_tensors = runner.inference(
+            latent_outputs = run_inference_custom(
+                runner=runner,
                 noises=noises,
                 conditions=conditions,
-                dit_offload=True,
-                **text_embeds,
+                texts_pos=texts_pos,
+                texts_neg=texts_neg,
+                blocks_to_swap=global_state.blocks_to_swap,
+                device=device,
             )
 
+        log_memory("Step 6: After DiT inference complete")
+
+        # ============== VAE DECODING ==============
         progress(0.7, desc="VAE decoding...")
         yield "Decoding with VAE...", None
 
+        print(f"\n{'='*60}")
+        print(f"VAE DECODING PHASE")
+        print(f"{'='*60}")
+
+        # Move DiT to CPU before VAE decode
+        print("\n[OFFLOAD] Moving DiT to CPU for VAE decode...")
+        runner.dit.to("cpu")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Step 7: After DiT to CPU")
+
+        # Move VAE to GPU
+        print("\n[OFFLOAD] Moving VAE to GPU...")
+        runner.vae.to(device)
+        log_memory("Step 7b: After VAE to GPU")
+
+        # Decode
+        print("\n[VAE] Decoding...")
+        samples = runner.vae_decode(latent_outputs)
+        log_memory("Step 7c: After VAE decode")
+
+        # Move VAE back to CPU
+        runner.vae.to("cpu")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Step 7d: After VAE to CPU")
+
         # Rearrange output
+        print("\n[OUTPUT] Rearranging samples...")
         samples = [
             rearrange(v[:, None], "c t h w -> t c h w") if v.ndim == 3
             else rearrange(v, "c t h w -> t c h w")
-            for v in video_tensors
+            for v in samples
         ]
 
-        del video_tensors, noises, aug_noises, conditions, cond_latents
+        # Cleanup intermediate tensors
+        del latent_outputs, noises, conditions, cond_latents_gpu, cond_latents
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_memory("Step 8: After cleanup")
 
         # Trim to original length
         sample = samples[0]
@@ -514,6 +838,7 @@ def run_inference(
         # Apply color fix if enabled
         if use_colorfix and USE_COLORFIX:
             yield "Applying color correction...", None
+            print("\n[POST] Applying wavelet color fix...")
             input_for_colorfix = rearrange(input_video, "c t h w -> t c h w")
             sample = wavelet_reconstruction(
                 sample.to("cpu"),
@@ -521,6 +846,8 @@ def run_inference(
             )
         else:
             sample = sample.to("cpu")
+
+        log_memory("Step 9: After post-processing")
 
         progress(0.9, desc="Saving output...")
         yield "Saving output...", None
@@ -543,9 +870,15 @@ def run_inference(
             output_path = os.path.join(output_dir, f"seedvr2_{timestamp}_{seed}.mp4")
             mediapy.write_video(output_path, sample, fps=save_fps)
 
-        # Cleanup
+        # Final cleanup
         gc.collect()
         torch.cuda.empty_cache()
+
+        print(f"\n{'='*60}")
+        print(f"INFERENCE COMPLETE")
+        log_memory("Final state")
+        print(f"Output saved to: {output_path}")
+        print(f"{'='*60}\n")
 
         progress(1.0, desc="Done!")
         yield f"Done! Saved to {output_path}", output_path
@@ -554,15 +887,18 @@ def run_inference(
         print(f"\n{'='*60}")
         print(f"CUDA OUT OF MEMORY:")
         print(f"{'='*60}")
+        log_memory("OOM state")
+        get_dit_block_distribution(runner.dit)
         traceback.print_exc()
         print(f"{'='*60}\n")
         gc.collect()
         torch.cuda.empty_cache()
-        yield "CUDA out of memory! Try increasing 'Blocks to Swap' or reducing scale. Check console.", None
+        yield "CUDA out of memory! Try increasing 'Blocks to Swap' or reducing resolution. Check console for memory details.", None
     except Exception as e:
         print(f"\n{'='*60}")
         print(f"ERROR during inference:")
         print(f"{'='*60}")
+        log_memory("Error state")
         traceback.print_exc()
         print(f"{'='*60}\n")
         gc.collect()
