@@ -1334,7 +1334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--join_frames_ending", type=int, default=30, help="Number of frames from start of ending video to check for best transition frame")
 
     # Context Windows Arguments
-    parser.add_argument("--use_context_windows", action="store_true", 
+    parser.add_argument("--context_windows", action="store_true", dest="use_context_windows",
                        help="Enable sliding context windows for long video generation")
     parser.add_argument("--context_length", type=int, default=81, 
                        help="Length of context window in frames (default: 81)")
