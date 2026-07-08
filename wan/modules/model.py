@@ -746,7 +746,14 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         print(f"WanModel: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(
+        self,
+        blocks_to_swap: int,
+        device: torch.device,
+        supports_backward: bool,
+        fixed_resident: bool = False,
+        auto_tune_reserve_gb: Optional[float] = None,
+    ):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.blocks)
 
@@ -755,7 +762,14 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
 
         self.offloader = ModelOffloader(
-            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device  # , debug=True
+            "wan_attn_block",
+            self.blocks,
+            self.num_blocks,
+            self.blocks_to_swap,
+            supports_backward,
+            device,  # , debug=True
+            fixed_resident=fixed_resident,
+            auto_tune_reserve_gb=auto_tune_reserve_gb,
         )
         print(
             f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
@@ -789,7 +803,26 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
 
-    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, fun_ref=None):
+    def forward(self, *args, **kwargs):
+        offloader = getattr(self, "offloader", None)
+        fixed_swap = bool(self.blocks_to_swap) and offloader is not None and getattr(offloader, "fixed_resident", False)
+        # with fixed-resident swap we can recover from a CUDA OOM by demoting resident blocks back to
+        # CPU streaming and retrying the step; otherwise allow a single retry after a cache flush
+        max_retries = 3 if fixed_swap else 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._forward_inner(*args, **kwargs)
+            except torch.cuda.OutOfMemoryError:
+                if attempt >= max_retries or not torch.cuda.is_available():
+                    raise
+                logger.warning(f"WanModel: CUDA OOM during forward (attempt {attempt + 1}/{max_retries + 1}), attempting recovery")
+                device = offloader.device if offloader is not None else next(self.parameters()).device
+                if fixed_swap:
+                    offloader.reset_fixed_state()
+                    offloader.demote_blocks(self.blocks, max(1, self.num_blocks // 10))
+                clean_memory_on_device(device)
+
+    def _forward_inner(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, fun_ref=None):
         r"""
         Forward pass through the diffusion model
 
@@ -916,7 +949,11 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs_list, context=context, context_lens=context_lens)
 
         if self.blocks_to_swap:
-            clean_memory_on_device(device)
+            if getattr(self.offloader, "fixed_resident", False):
+                # kicks off the first staging uploads; no per-step gc/empty_cache needed in this mode
+                self.offloader.begin_forward(self.blocks)
+            else:
+                clean_memory_on_device(device)
 
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
         for block_idx, block in enumerate(self.blocks):

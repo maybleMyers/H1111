@@ -1083,6 +1083,7 @@ def wan22_submit_to_queue(
     attn_mode: str,
     mixed_dtype: bool,
     block_swap: int,
+    auto_block_swap: bool,
     fp8: bool,
     fp8_scaled: bool,
     fp8_prescaled: bool,
@@ -1216,6 +1217,8 @@ def wan22_submit_to_queue(
         # Precision flags
         if mixed_dtype:
             command.append("--mixed_dtype")
+        if auto_block_swap and int(block_swap) > 0:
+            command.append("--auto_block_swap")
         if fp8:
             command.append("--fp8")
         if fp8_scaled:
@@ -1380,6 +1383,7 @@ def wan22_generate_via_queue(
     attn_mode: str,
     mixed_dtype: bool,
     block_swap: int,
+    auto_block_swap: bool,
     fp8: bool,
     fp8_scaled: bool,
     fp8_prescaled: bool,
@@ -1426,7 +1430,7 @@ def wan22_generate_via_queue(
         prompt, negative_prompt, image_path, end_image_path, task, width, height,
         frame_num, fps, base_seed, sample_solver, sample_steps, flow_shift,
         sample_guide_scale, dual_dit_boundary, batch_size, save_path,
-        attn_mode, mixed_dtype, block_swap, fp8, fp8_scaled, fp8_prescaled,
+        attn_mode, mixed_dtype, block_swap, auto_block_swap, fp8, fp8_scaled, fp8_prescaled,
         fp8_fast, fp8_t5, dit_low_noise_path, dit_high_noise_path, clip_path,
         dit_path, vae_path, t5_path, lora_folder,
         lora1_str, lora2_str, lora3_str, lora4_str,
@@ -10817,6 +10821,11 @@ with gr.Blocks(
                 with gr.Row():
                     wan22_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3", "sage_ultravico"], label="Attention Mode", value="sdpa", info="sageattn=auto, sageattn3=Blackwell FP4, sage_ultravico=memory-efficient UltraViCo")
                     wan22_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                    wan22_auto_block_swap = gr.Checkbox(
+                        label="Auto Block Swap",
+                        value=False,
+                        info="Faster swap (upload-only streaming), auto-promotes blocks to GPU based on free VRAM after step 1, and recovers from CUDA OOM by demoting blocks. Set Block Swap high (e.g. 30) and let it tune down."
+                    )
                 with gr.Row():
                     wan22_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     wan22_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
@@ -14926,6 +14935,7 @@ with gr.Blocks(
             wan22_attn_mode,
             wan22_mixed_dtype,
             wan22_block_swap,
+            wan22_auto_block_swap,
             wan22_fp8,
             wan22_fp8_scaled,
             wan22_fp8_prescaled,
@@ -15611,6 +15621,7 @@ with gr.Blocks(
         wan22_t5_path,
         wan22_attn_mode,
         wan22_block_swap,
+        wan22_auto_block_swap,
         wan22_fp8,
         wan22_fp8_scaled,
         wan22_fp8_prescaled,
@@ -15632,6 +15643,7 @@ with gr.Blocks(
         "wan22_t5_path",
         "wan22_attn_mode",
         "wan22_block_swap",
+        "wan22_auto_block_swap",
         "wan22_fp8",
         "wan22_fp8_scaled",
         "wan22_fp8_prescaled",

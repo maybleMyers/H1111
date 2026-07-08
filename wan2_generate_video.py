@@ -1283,6 +1283,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
+        "--auto_block_swap",
+        action="store_true",
+        help="optimized inference block swap: resident blocks stay on GPU (upload-only streaming for the rest), "
+        "blocks are auto-promoted to GPU after the first step based on measured free VRAM, and CUDA OOMs are "
+        "recovered by demoting blocks and retrying. Use with --blocks_to_swap set conservatively high (e.g. 30).",
+    )
+    parser.add_argument(
+        "--auto_block_swap_reserve_gb",
+        type=float,
+        default=1.5,
+        help="VRAM (in GB) to keep free when --auto_block_swap promotes blocks to GPU",
+    )
+    parser.add_argument(
         "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
@@ -1618,6 +1631,15 @@ class DynamicModelManager:
             cpu_memory_before = psutil.Process().memory_info().rss / 1024**3
             logger.info(f"CPU memory before model unload: {cpu_memory_before:.2f} GB")
             
+            # Carry the auto-tuned swap count over to the next model (identical architecture),
+            # so the low-noise model starts with the count learned on the high-noise model
+            if getattr(self.args, 'auto_block_swap', False):
+                _offloader = getattr(self.current_model, 'offloader', None)
+                _tuned = getattr(_offloader, 'blocks_to_swap', None) if _offloader is not None else None
+                if _tuned and _tuned > 0 and _tuned != self.args.blocks_to_swap:
+                    logger.info(f"auto_block_swap: carrying tuned blocks_to_swap={_tuned} over to the next model")
+                    self.args.blocks_to_swap = _tuned
+
             # Handle block swapping cleanup if enabled
             if hasattr(self.current_model, 'blocks_to_swap') and self.current_model.blocks_to_swap is not None:
                 if self.current_model.blocks_to_swap > 0:
@@ -2824,7 +2846,15 @@ def optimize_model(
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        model.enable_block_swap(
+            args.blocks_to_swap,
+            device,
+            supports_backward=False,
+            fixed_resident=getattr(args, "auto_block_swap", False),
+            auto_tune_reserve_gb=getattr(args, "auto_block_swap_reserve_gb", None)
+            if getattr(args, "auto_block_swap", False)
+            else None,
+        )
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
@@ -7445,7 +7475,15 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
         # Handle block swap vs full GPU load (same as Wan2.2)
         if args.blocks_to_swap > 0:
             logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-            model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+            model.enable_block_swap(
+                args.blocks_to_swap,
+                device,
+                supports_backward=False,
+                fixed_resident=getattr(args, "auto_block_swap", False),
+                auto_tune_reserve_gb=getattr(args, "auto_block_swap_reserve_gb", None)
+                if getattr(args, "auto_block_swap", False)
+                else None,
+            )
             model.move_to_device_except_swap_blocks(device)
             model.prepare_block_swap_before_forward()
         else:
