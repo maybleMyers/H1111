@@ -667,6 +667,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
              rope_params(1024, 2 * (d // 6), theta=theta_scaled)], dim=1
         )
         self.freqs_fhw = {}
+        self.rope_theta = theta_scaled
 
         if model_type == "i2v":
             self.img_emb = MLPProj(1280, dim)
@@ -980,6 +981,127 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        return [u.float() for u in x]
+
+    def _bernini_freqs(self, fhw, source_id):
+        """Rope freqs for one Bernini token segment: per-position 3D freqs times a
+        per-source phasor (Bernini source-id rotary embedding).
+
+        `source_id` may be fractional (interpolated reference ids); the noisy target
+        uses 0.0 (identity phasor). `source_id=None` disables the phasor entirely
+        (--no-use_src_tgt_id parity)."""
+        c = self.dim // self.num_heads // 2
+        key = (tuple(fhw), None if source_id is None else float(source_id))
+        if key not in self.freqs_fhw:
+            freqs_i = calculate_freqs_i(fhw, c, self.freqs)
+            if source_id is not None:
+                # matches diffusers get_1d_rotary_pos_embed(head_dim, [source_id], theta):
+                # angle_k = source_id / theta^(k/c) for k in [0, c)
+                inv_freq = 1.0 / torch.pow(
+                    torch.tensor(self.rope_theta, dtype=torch.float64),
+                    torch.arange(c, dtype=torch.float64).div(c),
+                )
+                angles = float(source_id) * inv_freq
+                phasor = torch.polar(torch.ones_like(angles), angles).to(freqs_i.device)
+                freqs_i = freqs_i * phasor.view(1, 1, c)
+            self.freqs_fhw[key] = freqs_i
+        return self.freqs_fhw[key]
+
+    def forward_bernini(self, *args, **kwargs):
+        # same OOM-recovery wrapper as forward()
+        offloader = getattr(self, "offloader", None)
+        fixed_swap = bool(self.blocks_to_swap) and offloader is not None and getattr(offloader, "fixed_resident", False)
+        max_retries = 3 if fixed_swap else 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._forward_bernini_inner(*args, **kwargs)
+            except torch.cuda.OutOfMemoryError:
+                if attempt >= max_retries or not torch.cuda.is_available():
+                    raise
+                logger.warning(f"WanModel: CUDA OOM during Bernini forward (attempt {attempt + 1}/{max_retries + 1}), attempting recovery")
+                device = offloader.device if offloader is not None else next(self.parameters()).device
+                if fixed_swap:
+                    offloader.reset_fixed_state()
+                    offloader.demote_blocks(self.blocks, max(1, self.num_blocks // 10))
+                clean_memory_on_device(device)
+
+    def _forward_bernini_inner(self, x, t, context, cond_latents=None, use_src_id_rotary_emb=True):
+        r"""
+        Bernini multi-source forward: conditioning latents are patch-embedded into
+        clean token segments (each with its own source-id rotary phase) and
+        concatenated in front of the noisy target tokens in one packed sequence,
+        exactly as in ByteDance's GEN_Wanx22/WanTransformer3DModel. All tokens share
+        the timestep `t`; self-attention spans the whole packed sequence; only the
+        target tokens go through the head.
+
+        Args:
+            x (List[Tensor]): single noisy target latent, [C, F, H, W]
+            t (Tensor): timestep, shape [1]
+            context (List[Tensor]): text embeddings, each [L, C] (zero-padded to text_len)
+            cond_latents (List[Tuple[Tensor, float]]): clean conditioning latents
+                ([C, F, H, W], source_id), source ids starting at 1; may be empty
+            use_src_id_rotary_emb (bool): apply the per-source rotary phasor
+
+        Returns:
+            List[Tensor]: denoised target latent, [C_out, F, H, W]
+        """
+        device = self.patch_embedding.weight.device
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+        cond_latents = cond_latents or []
+
+        assert isinstance(x, list) and len(x) == 1, "Bernini forward expects a single sample"
+
+        tokens, freqs_parts = [], []
+        for lat, sid in cond_latents:
+            lat = lat.to(device=device, dtype=self.patch_embedding.weight.dtype)
+            u = self.patch_embedding(lat.unsqueeze(0))
+            freqs_parts.append(self._bernini_freqs(u.shape[2:], sid if use_src_id_rotary_emb else None))
+            tokens.append(u.flatten(2).transpose(1, 2))
+
+        tgt = self.patch_embedding(x[0].unsqueeze(0).to(device=device, dtype=self.patch_embedding.weight.dtype))
+        target_grid = torch.stack([torch.tensor(tgt.shape[2:], dtype=torch.long)])
+        freqs_parts.append(self._bernini_freqs(tgt.shape[2:], 0.0 if use_src_id_rotary_emb else None))
+        tokens.append(tgt.flatten(2).transpose(1, 2))
+
+        x = torch.cat(tokens, dim=1)
+        num_cond_tokens = x.shape[1] - tokens[-1].shape[1]
+        total_len = x.shape[1]
+        freqs_list = [torch.cat(freqs_parts, dim=0)]
+        # rope/attention treat the packed sequence as one flat grid of total_len tokens
+        grid_sizes = torch.tensor([[1, 1, total_len]], dtype=torch.long)
+        seq_lens = torch.tensor([total_len], dtype=torch.long)
+
+        # time embeddings (shared by conditioning and target tokens, as in Bernini)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # context
+        if type(context) is list:
+            context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+        context = self.text_embedding(context)
+
+        kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs_list, context=context, context_lens=None)
+
+        if self.blocks_to_swap:
+            if getattr(self.offloader, "fixed_resident", False):
+                self.offloader.begin_forward(self.blocks)
+            else:
+                clean_memory_on_device(device)
+
+        for block_idx, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_idx)
+            x = block(x, **kwargs)
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+
+        # only the target tokens are decoded
+        x = x[:, num_cond_tokens:, :]
+        x = self.head(x, e)
+        x = self.unpatchify(x, target_grid)
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes):

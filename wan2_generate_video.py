@@ -1523,6 +1523,43 @@ def parse_args() -> argparse.Namespace:
                        help="List of memory files (images or videos) for M2V generation")
     # ========================= End StoryMem Arguments =========================
 
+    # ========================= Bernini (ByteDance Bernini-R 14B) =========================
+    # Renderer-only Bernini: Wan2.2-A14B fine-tune with source-id rotary conditioning
+    # and APG/chained guidance. Activated by --bernini_task; use with converted native
+    # checkpoints via --dit_high_noise / --dit_low_noise (see convert_bernini_to_native.py).
+    parser.add_argument("--bernini_task", type=str, default=None,
+                        choices=["t2i", "t2v", "i2i", "v2v", "mv2v", "r2v", "rv2v", "ads2v"],
+                        help="Bernini task type; enables the Bernini generation path")
+    parser.add_argument("--source_videos", type=str, nargs="+", default=None,
+                        help="Bernini: source video path(s) for editing (v2v/mv2v/rv2v/ads2v)")
+    parser.add_argument("--source_image", type=str, default=None,
+                        help="Bernini: single source image for image editing (i2i)")
+    parser.add_argument("--ref_images", type=str, nargs="+", default=None,
+                        help="Bernini: reference image(s) (r2v/rv2v/ads2v)")
+    parser.add_argument("--guidance_mode", type=str, default=None,
+                        choices=["rv2v", "v2v", "v2v_chain", "t2v", "r2v_apg", "v2v_apg", "t2v_apg"],
+                        help="Bernini guidance mode (default: auto-selected from --bernini_task)")
+    parser.add_argument("--omega_vid", type=float, default=None, help="Bernini: video-condition guidance scale")
+    parser.add_argument("--omega_img", type=float, default=None, help="Bernini: image-condition guidance scale")
+    parser.add_argument("--omega_txt", type=float, default=None, help="Bernini: text guidance scale")
+    parser.add_argument("--omega_scale", type=float, default=None,
+                        help="Bernini: omega multiplier applied at the high->low expert switch")
+    parser.add_argument("--eta", type=float, default=None, help="Bernini APG: parallel-component weight")
+    parser.add_argument("--norm_threshold", type=float, nargs="+", default=[50.0, 50.0, 50.0],
+                        help="Bernini APG: per-condition guidance norm thresholds")
+    parser.add_argument("--momentum", type=float, default=None, help="Bernini APG: momentum")
+    parser.add_argument("--max_image_size", type=int, default=None,
+                        help="Bernini: long-edge cap for conditioning inputs (default 848)")
+    parser.add_argument("--use_src_tgt_id", action=argparse.BooleanOptionalAction, default=True,
+                        help="Bernini: source-id rotary embeddings (default on)")
+    parser.add_argument("--interpolate_src_id", action=argparse.BooleanOptionalAction, default=True,
+                        help="Bernini: map >max_trained_src_id sources into the trained id range")
+    parser.add_argument("--max_trained_src_id", type=int, default=5,
+                        help="Bernini: largest source_id seen during training")
+    parser.add_argument("--bernini_system_prompt", type=str, default=None,
+                        help="Bernini: system-prompt prefix (default: auto-selected from task)")
+    # ========================= End Bernini Arguments =========================
+
     args = parser.parse_args()
 
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
@@ -2219,6 +2256,19 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
     Returns:
         argparse.Namespace: updated arguments
     """
+    # Bernini defaults must be resolved before the generic task defaults so that
+    # e.g. flow_shift keeps the official Bernini value (5.0) instead of t2v-A14B's 1.0
+    if getattr(args, "bernini_task", None):
+        from wan.utils.bernini_inference import resolve_bernini_defaults
+
+        resolve_bernini_defaults(args)
+        # target size when no source medium dictates it: official default 480x848 (H, W)
+        if args.video_size == [256, 256] and "--video_size" not in sys.argv:
+            args.video_size = [480, 848]
+        if args.bernini_task in ("t2i", "i2i") and args.output_type in ("video", "both"):
+            logger.info("Bernini image task: switching output_type to 'images'")
+            args.output_type = "images"
+
     # Get default values for the task
     infer_steps, flow_shift, video_length, _ = get_task_defaults(args.task, tuple(args.video_size))
 
@@ -7252,6 +7302,345 @@ def generate_story_video(args: argparse.Namespace) -> Optional[torch.Tensor]:
     return None
 
 
+def run_bernini_sampling(
+    args: argparse.Namespace,
+    model_manager,
+    single_model,
+    accelerator,
+    device: torch.device,
+    context,
+    context_null,
+    video_latents,
+    image_latents,
+    ref_image_latents,
+    latent_shape,
+) -> torch.Tensor:
+    """Bernini-R guided sampling loop, an exact port of GEN_Wanx22.sample
+    (bernini_repo/bernini/models/wan_diffusion.py:227) onto the native WanModel.
+
+    The latent is kept in spatial form [1, C, T, H, W] throughout (the official
+    code packs/unpacks tokens around an elementwise scheduler, which is
+    equivalent); conditioning latents are passed raw to model.forward_bernini,
+    which patch-embeds them per expert like patch_vae_latent does."""
+    from wan.utils import bernini_inference as bern
+
+    guidance_mode = args.guidance_mode
+    omega_vid, omega_img, omega_txt = args.omega_vid, args.omega_img, args.omega_txt
+    omega_scale = args.omega_scale
+    eta, momentum = args.eta, args.momentum
+    norm_threshold = list(args.norm_threshold)
+
+    use_unipc = args.sample_solver in (None, "unipc")
+    if use_unipc:
+        scheduler = bern.make_unipc_scheduler(args.flow_shift)
+        scheduler.set_timesteps(args.infer_steps)
+        num_train_timesteps = scheduler.config.num_train_timesteps
+    else:
+        if guidance_mode.endswith("_apg"):
+            logger.warning("Bernini *_apg guidance modes are tuned for the UniPC scheduler (--sample_solver unipc)")
+        scheduler = bern.FlowMatchScheduler(shift=args.flow_shift, sigma_min=0.0, extra_one_step=False)
+        scheduler.set_timesteps(args.infer_steps, shift=args.flow_shift)
+        num_train_timesteps = scheduler.num_train_timesteps
+
+    timesteps = scheduler.timesteps.to(device)
+    boundary = args.dual_dit_boundary if args.dual_dit_boundary is not None else 0.875
+    boundary_timestep = boundary * num_train_timesteps
+
+    # initial noise: CPU generator in float32, exactly like diffusers randn_tensor
+    gen = torch.Generator(device="cpu").manual_seed(args.seed)
+    latent = torch.randn(latent_shape, generator=gen, dtype=torch.float32).to(device)
+
+    # APG momentum buffers / per-condition norm thresholds
+    momentum_buffer = momentum_buffer1 = momentum_buffer2 = None
+    if guidance_mode == "r2v_apg":
+        if len(norm_threshold) == 1:
+            norm_threshold = [norm_threshold[0], norm_threshold[0]]
+        momentum_buffer1 = bern.MomentumBuffer(momentum)
+        momentum_buffer2 = bern.MomentumBuffer(momentum)
+    elif guidance_mode in ("v2v_apg", "t2v_apg"):
+        momentum_buffer = bern.MomentumBuffer(momentum)
+    nt0 = norm_threshold[0]
+
+    # conditioning combos with source-id assignment (constant across steps).
+    # VI combo holds videos then images on a shared id axis; the image-only
+    # combo holds just the images on its own axis; V holds only the first video.
+    images = list(image_latents) + list(ref_image_latents)
+    num_videos, num_images = len(video_latents), len(images)
+    vi_sids = bern.make_source_ids(num_videos + num_images, args.interpolate_src_id, args.max_trained_src_id)
+    i_sids = bern.make_source_ids(num_images, args.interpolate_src_id, args.max_trained_src_id)
+    vid_segments = [(lat, vi_sids[k]) for k, lat in enumerate(video_latents)]
+    img_vi_segments = [(lat, vi_sids[num_videos + k]) for k, lat in enumerate(images)]
+    img_i_segments = [(lat, i_sids[k]) for k, lat in enumerate(images)]
+    combo_none = []
+    combo_v = vid_segments[:1]
+    combo_i = img_i_segments
+    combo_vi = vid_segments + img_vi_segments
+
+    switched = False
+    dual = model_manager is not None
+    model = single_model
+
+    for t_idx, t in enumerate(tqdm(timesteps, desc="Bernini sampling")):
+        high_phase = t.item() >= boundary_timestep
+        if dual:
+            model = model_manager.get_model("high" if high_phase else "low")
+        if dual and not high_phase and not switched:
+            switched = True
+            omega_vid *= omega_scale
+            omega_img *= omega_scale
+            omega_txt *= omega_scale
+            logger.info(f"Expert switch at t={t.item():.1f}: omegas scaled by {omega_scale}")
+
+        timestep = t.unsqueeze(0).to(device)
+
+        def _fwd(cond_segments, text):
+            with accelerator.autocast(), torch.no_grad():
+                pred = model.forward_bernini(
+                    [latent[0]],
+                    timestep,
+                    text,
+                    cond_latents=cond_segments,
+                    use_src_id_rotary_emb=args.use_src_tgt_id,
+                )
+            return torch.stack(pred, dim=0)  # [1, C, T, H, W] float32
+
+        if guidance_mode == "rv2v":
+            # ε̂ = ε_∅ + ω_V(ε_V-ε_∅) + ω_I(ε_VI-ε_V) + ω_TI(ε_VTI-ε_VI)
+            eps_uncond = _fwd(combo_none, context_null)
+            eps_V = _fwd(combo_v, context_null)
+            eps_VI = _fwd(combo_vi, context_null)
+            eps_VTI = _fwd(combo_vi, context)
+            noise_pred = (
+                eps_uncond
+                + omega_vid * (eps_V - eps_uncond)
+                + omega_img * (eps_VI - eps_V)
+                + omega_txt * (eps_VTI - eps_VI)
+            )
+        elif guidance_mode == "v2v":
+            eps_uncond = _fwd(combo_vi, context_null)
+            eps_VTI = _fwd(combo_vi, context)
+            noise_pred = eps_uncond + omega_txt * (eps_VTI - eps_uncond)
+        elif guidance_mode == "v2v_chain":
+            eps_uncond = _fwd(combo_none, context_null)
+            eps_V = _fwd(combo_v, context_null)
+            eps_VTI = _fwd(combo_vi, context)
+            noise_pred = eps_uncond + omega_vid * (eps_V - eps_uncond) + omega_txt * (eps_VTI - eps_V)
+        elif guidance_mode == "t2v":
+            eps_uncond = _fwd(combo_none, context_null)
+            eps_T = _fwd(combo_none, context)
+            noise_pred = eps_uncond + omega_txt * (eps_T - eps_uncond)
+        elif guidance_mode in ("r2v_apg", "v2v_apg", "t2v_apg"):
+            # noise level for converting the flow prediction to x-space
+            if use_unipc:
+                idx = 0 if scheduler.step_index is None else scheduler.step_index
+                sigma_apg = scheduler.sigmas[idx]
+            else:
+                sigma_apg = scheduler.sigmas[t_idx]
+
+            if guidance_mode == "r2v_apg":
+                eps_uncond = _fwd(combo_none, context_null)
+                eps_I = _fwd(combo_i, context_null)
+                eps_TI = _fwd(combo_i, context)
+                x_uncond = latent - sigma_apg * eps_uncond
+                x_I = latent - sigma_apg * eps_I
+                x_TI = latent - sigma_apg * eps_TI
+                x_guided = bern.normalized_guidance_chain(
+                    pred_uncond=x_uncond,
+                    preds=[x_I, x_TI],
+                    scales=[omega_img, omega_txt],
+                    momentum_buffers=[momentum_buffer1, momentum_buffer2],
+                    eta=eta,
+                    norm_thresholds=norm_threshold,
+                )
+            else:
+                cond_segments = combo_vi if guidance_mode == "v2v_apg" else combo_none
+                eps_uncond = _fwd(cond_segments, context_null)
+                eps_cond = _fwd(cond_segments, context)
+                x_uncond = latent - sigma_apg * eps_uncond
+                x_cond = latent - sigma_apg * eps_cond
+                x_guided = bern.normalized_guidance(
+                    pred_cond=x_cond,
+                    pred_uncond=x_uncond,
+                    guidance_scale=omega_txt,
+                    momentum_buffer=momentum_buffer,
+                    eta=eta,
+                    norm_threshold=nt0,
+                )
+            noise_pred = (latent - x_guided) / sigma_apg
+        else:
+            raise ValueError(f"Unknown Bernini guidance_mode '{guidance_mode}'")
+
+        if use_unipc:
+            latent = scheduler.step(noise_pred, t, latent, return_dict=False)[0]
+        else:
+            latent = scheduler.step(noise_pred, t, latent)
+
+    return latent
+
+
+def generate_bernini(args: argparse.Namespace) -> Optional[torch.Tensor]:
+    """Bernini-R (ByteDance) generation path: port of BerniniRendererPipeline.__call__
+    driving the native WanModel/dual-expert infrastructure of this script."""
+    from wan.utils import bernini_inference as bern
+
+    device = torch.device(args.device)
+    cfg = WAN_CONFIGS[args.task]
+    task = args.bernini_task
+    logger.info(f"Running Bernini-R generation (task: {task}, guidance_mode: {args.guidance_mode})")
+
+    if args.dit_high_noise is None or args.dit_low_noise is None:
+        raise ValueError(
+            "Bernini requires both --dit_high_noise and --dit_low_noise "
+            "(converted checkpoints, see convert_bernini_to_native.py)"
+        )
+    if task in ("v2v", "mv2v") and not args.source_videos:
+        raise ValueError(f"Bernini task '{task}' requires --source_videos")
+    if task == "i2i" and args.source_image is None:
+        raise ValueError("Bernini task 'i2i' requires --source_image")
+    if task in ("r2v",) and not args.ref_images:
+        raise ValueError("Bernini task 'r2v' requires --ref_images")
+    if task in ("rv2v", "ads2v") and (not args.source_videos or not args.ref_images):
+        raise ValueError(f"Bernini task '{task}' requires --source_videos and --ref_images")
+
+    # --- Data types (mirrors generate()) ---
+    if args.dit is not None:
+        dit_dtype = detect_wan_sd_dtype(args.dit)
+    else:
+        dit_dtype = detect_wan_sd_dtype(args.dit_high_noise)
+    if args.mixed_dtype:
+        dit_dtype = torch.float16
+        logger.info("Mixed dtype mode: Using fp16 for activations, preserving original weight dtypes")
+        dit_weight_dtype = None
+    elif dit_dtype.itemsize == 1:
+        dit_dtype = torch.bfloat16
+        dit_weight_dtype = torch.float8_e4m3fn
+    elif args.fp8_scaled:
+        dit_weight_dtype = None
+    elif args.fp8:
+        dit_weight_dtype = torch.float8_e4m3fn
+    else:
+        dit_weight_dtype = dit_dtype
+
+    mixed_precision = "bf16" if dit_dtype == torch.bfloat16 else "fp16"
+    accelerator = accelerate.Accelerator(mixed_precision=mixed_precision)
+
+    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    args.seed = seed
+    logger.info(f"Using seed: {seed}")
+
+    # --- VAE + conditioning inputs (official pipeline uses an fp32 VAE) ---
+    vae_dtype = str_to_dtype(args.vae_dtype) if args.vae_dtype is not None else torch.float32
+    vae = load_vae(args, cfg, device, vae_dtype)
+    vae.to_device(device)
+
+    def _encode(pixels):  # pixels [1, 3, T, H, W] in [-1, 1]
+        with torch.no_grad():
+            lat = vae.encode([pixels[0].to(device=device, dtype=vae.dtype)])[0]
+        return lat.float()  # [16, T', H/8, W/8], normalized by latents mean/std
+
+    t_frames, h, w = args.video_length, None, None
+    video_latents = []
+    if args.source_videos:
+        for i, vp in enumerate(args.source_videos):
+            pixels = bern.preprocess_video(
+                vp, fps=args.fps, max_image_size=args.max_image_size,
+                max_image_num=args.video_length, device=device,
+            )
+            if i == 0:
+                t_frames, h, w = pixels.shape[-3], pixels.shape[-2], pixels.shape[-1]
+            video_latents.append(_encode(pixels))
+            del pixels
+    image_latents = []
+    if args.source_image is not None:
+        pixels = bern.preprocess_image(args.source_image, max_image_size=args.max_image_size, device=device)
+        if h is None:
+            h, w = pixels.shape[-2], pixels.shape[-1]
+        image_latents.append(_encode(pixels))
+        del pixels
+    ref_image_latents = []
+    for p in args.ref_images or []:
+        pixels = bern.preprocess_image(p, max_image_size=args.max_image_size, device=device)
+        ref_image_latents.append(_encode(pixels))
+        del pixels
+
+    vae.to_device("cpu")
+    args._vae = vae  # reused by decode_latent
+    clean_memory_on_device(device)
+
+    if h is None:
+        h, w = args.video_size
+    h, w = bern.make_divisible(h, 16), bern.make_divisible(w, 16)
+    t_frames = max(t_frames // 4 * 4 + 1, 1)
+    args.video_size = [h, w]
+    args.video_length = t_frames
+    lat_t = (t_frames - 1) // 4 + 1
+    latent_shape = (1, 16, lat_t, h // 8, w // 8)
+    logger.info(f"Bernini output: {t_frames} frames at {w}x{h} (latent {latent_shape})")
+
+    # --- T5 text encoding ---
+    prompt = args.bernini_system_prompt + bern.prompt_clean(args.prompt)
+    n_prompt = args.negative_prompt
+    logger.info(f"Prompt (with system prefix): {prompt}")
+    text_encoder = load_text_encoder(args, cfg, device)
+    text_encoder.model.to(device)
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=cfg.t5_dtype):
+                context = text_encoder([prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        else:
+            context = text_encoder([prompt], device)
+            context_null = text_encoder([n_prompt], device)
+    del text_encoder
+    clean_memory_on_device(device)
+    gc.collect()
+
+    # --- DiT model(s): reuse the dual-expert dynamic loading machinery ---
+    model_result = load_dit_model(args, cfg, device, dit_dtype, dit_weight_dtype, False)
+    model_manager = None
+    model = None
+    if isinstance(model_result, tuple):
+        if len(model_result) == 6:
+            (model_low_path, model_high_path, lora_weights_list_low, lora_multipliers_low,
+             lora_weights_list_high, lora_multipliers_high) = model_result
+        else:
+            model_low_path, model_high_path = model_result
+            lora_weights_list_low = lora_multipliers_low = None
+            lora_weights_list_high = lora_multipliers_high = None
+        model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+        model_manager.set_model_paths(model_low_path, model_high_path)
+        if lora_weights_list_low is not None or lora_weights_list_high is not None:
+            model_manager.set_lora_weights(lora_weights_list_low, lora_multipliers_low,
+                                           lora_weights_list_high, lora_multipliers_high)
+        logger.info("Using dynamic model loading for Bernini dual-expert sampling")
+    else:
+        model = model_result
+        optimize_model(model, args, device, dit_dtype, dit_weight_dtype)
+
+    # --- Sampling ---
+    latent = run_bernini_sampling(
+        args, model_manager, model, accelerator, device,
+        context, context_null,
+        video_latents, image_latents, ref_image_latents,
+        latent_shape,
+    )
+
+    # --- Cleanup ---
+    if model_manager is not None:
+        model_manager.cleanup()
+    if model is not None:
+        del model
+    del context, context_null, video_latents, image_latents, ref_image_latents
+    synchronize_device(device)
+    if args.blocks_to_swap > 0:
+        logger.info("Waiting for 5 seconds to ensure block swap finishes...")
+        time.sleep(5)
+    gc.collect()
+    clean_memory_on_device(device)
+
+    return latent.cpu()
+
+
 def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     device = torch.device(args.device)
     cfg = WAN_CONFIGS[args.task]
@@ -7260,6 +7649,9 @@ def generate(args: argparse.Namespace) -> Optional[torch.Tensor]:
     if is_story_mode:
         logger.info("Running StoryMem story generation mode")
         return generate_story_video(args)
+
+    if getattr(args, "bernini_task", None):
+        return generate_bernini(args)
 
     is_i2v = (args.image_path is not None or args.end_image_path is not None) and "i2v" in args.task
     is_ti2v = args.image_path is not None and "ti2v" in args.task  # Text+Image-to-Video
@@ -8698,6 +9090,19 @@ def save_output(
              logger.info(f"Image frames saved to directory: {image_save_dir}")
         except Exception as e:
             logger.error(f"Failed to save image files: {e}")
+
+        # Queue-system coordination: also write the first frame to --output_filename (as PNG)
+        if getattr(args, 'output_filename', None):
+            try:
+                from PIL import Image as PILImage
+
+                single_path = os.path.splitext(args.output_filename)[0] + ".png"
+                os.makedirs(os.path.dirname(single_path), exist_ok=True)
+                frame = video_tensor[0, :, 0].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                PILImage.fromarray((frame * 255).round().astype(np.uint8)).save(single_path)
+                logger.info(f"Image saved to: {single_path}")
+            except Exception as e:
+                logger.error(f"Failed to save single image to output_filename: {e}")
 
 
 def main():

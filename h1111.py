@@ -1599,6 +1599,268 @@ def wan22_stop_and_decode():
     return "No active generation to stop"
 
 
+def bernini_submit_to_queue(
+    prompt: str,
+    negative_prompt: str,
+    task: str,
+    guidance_mode: str,
+    system_prompt: str,
+    source_videos,
+    source_image: str,
+    ref_images,
+    width: int,
+    height: int,
+    frame_num: int,
+    fps: int,
+    base_seed: int,
+    sample_solver: str,
+    sample_steps: int,
+    flow_shift: float,
+    dual_dit_boundary: float,
+    omega_vid: float,
+    omega_img: float,
+    omega_txt: float,
+    omega_scale: float,
+    eta: float,
+    momentum: float,
+    norm_threshold: str,
+    max_image_size: int,
+    use_src_tgt_id: bool,
+    interpolate_src_id: bool,
+    max_trained_src_id: int,
+    batch_size: int,
+    save_path: str,
+    # Model Paths & Performance
+    attn_mode: str,
+    mixed_dtype: bool,
+    block_swap: int,
+    auto_block_swap: bool,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_fast: bool,
+    fp8_t5: bool,
+    model_folder: str,
+    dit_low_noise_path: str,
+    dit_high_noise_path: str,
+    vae_path: str,
+    t5_path: str,
+    vae_fp32: bool,
+    compile_enabled: bool,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora5_str: str, lora6_str: str, lora7_str: str, lora8_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    lora5_mult: float, lora6_mult: float, lora7_mult: float, lora8_mult: float,
+    lora1_apply_low: bool, lora2_apply_low: bool, lora3_apply_low: bool, lora4_apply_low: bool,
+    lora5_apply_low: bool, lora6_apply_low: bool, lora7_apply_low: bool, lora8_apply_low: bool,
+    lora1_apply_high: bool, lora2_apply_high: bool, lora3_apply_high: bool, lora4_apply_high: bool,
+    lora5_apply_high: bool, lora6_apply_high: bool, lora7_apply_high: bool, lora8_apply_high: bool,
+) -> Tuple[str, List[str]]:
+    """Submit Bernini-R generation job(s) to the shared queue."""
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    def resolve_model_path(p: str) -> str:
+        if not p:
+            return p
+        if os.path.isabs(p) or os.path.exists(p):
+            return p
+        return os.path.join(model_folder, p)
+
+    def file_list(files):
+        # gr.File with file_count="multiple" yields a list of paths (or None)
+        if not files:
+            return []
+        return [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in files]
+
+    src_videos = file_list(source_videos)
+    refs = file_list(ref_images)
+    is_image_task = task in ("t2i", "i2i")
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "png" if is_image_task else "mp4"
+        output_filename = os.path.join(save_path, f"bernini_{task}_{timestamp}_{current_seed}.{ext}")
+
+        command = [
+            sys.executable, "wan2_generate_video.py",
+            "--task", "t2v-A14B",
+            "--bernini_task", str(task),
+            "--prompt", str(prompt),
+            "--video_size", str(int(height)), str(int(width)),
+            "--video_length", str(int(frame_num)),
+            "--fps", str(int(fps)),
+            "--infer_steps", str(int(sample_steps)),
+            "--flow_shift", str(flow_shift),
+            "--dual_dit_boundary", str(dual_dit_boundary),
+            "--sample_solver", str(sample_solver),
+            "--seed", str(current_seed),
+            "--save_path", str(save_path),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(int(block_swap)),
+            "--omega_vid", str(omega_vid),
+            "--omega_img", str(omega_img),
+            "--omega_txt", str(omega_txt),
+            "--omega_scale", str(omega_scale),
+            "--eta", str(eta),
+            "--momentum", str(momentum),
+            "--max_image_size", str(int(max_image_size)),
+            "--max_trained_src_id", str(int(max_trained_src_id)),
+            "--dit_low_noise", resolve_model_path(dit_low_noise_path),
+            "--dit_high_noise", resolve_model_path(dit_high_noise_path),
+            "--vae", resolve_model_path(vae_path),
+            "--t5", resolve_model_path(t5_path),
+            "--output_filename", output_filename,
+        ]
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+        if guidance_mode and guidance_mode != "Auto (task default)":
+            command.extend(["--guidance_mode", str(guidance_mode)])
+        if system_prompt and system_prompt.strip():
+            command.extend(["--bernini_system_prompt", str(system_prompt)])
+
+        nt_values = [v.strip() for v in str(norm_threshold).replace(",", " ").split() if v.strip()]
+        if nt_values:
+            command.extend(["--norm_threshold"] + nt_values)
+
+        if src_videos:
+            command.extend(["--source_videos"] + src_videos)
+        if source_image:
+            command.extend(["--source_image", str(source_image)])
+        if refs:
+            command.extend(["--ref_images"] + refs)
+
+        if not use_src_tgt_id:
+            command.append("--no-use_src_tgt_id")
+        if not interpolate_src_id:
+            command.append("--no-interpolate_src_id")
+
+        if mixed_dtype:
+            command.append("--mixed_dtype")
+        if auto_block_swap and int(block_swap) > 0:
+            command.append("--auto_block_swap")
+        if fp8:
+            command.append("--fp8")
+        if fp8_scaled:
+            command.append("--fp8_scaled")
+        if fp8_fast:
+            command.append("--fp8_fast")
+        if fp8_t5:
+            command.append("--fp8_t5")
+        if vae_fp32:
+            command.extend(["--vae_dtype", "float32"])
+        if compile_enabled:
+            command.append("--compile")
+
+        # LoRA handling (identical to the Wan2.2 tab, applied to the converted native weights)
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_weights_paths_high = []
+        lora_multipliers_values_high = []
+        lora_inputs = [
+            (lora1_str, lora1_mult, lora1_apply_low, lora1_apply_high),
+            (lora2_str, lora2_mult, lora2_apply_low, lora2_apply_high),
+            (lora3_str, lora3_mult, lora3_apply_low, lora3_apply_high),
+            (lora4_str, lora4_mult, lora4_apply_low, lora4_apply_high),
+            (lora5_str, lora5_mult, lora5_apply_low, lora5_apply_high),
+            (lora6_str, lora6_mult, lora6_apply_low, lora6_apply_high),
+            (lora7_str, lora7_mult, lora7_apply_low, lora7_apply_high),
+            (lora8_str, lora8_mult, lora8_apply_low, lora8_apply_high),
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult, apply_low, apply_high in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        if apply_low:
+                            lora_weights_paths.append(path)
+                            lora_multipliers_values.append(str(mult))
+                        if apply_high:
+                            lora_weights_paths_high.append(path)
+                            lora_multipliers_values_high.append(str(mult))
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+        if lora_weights_paths_high:
+            command.extend(["--lora_weight_high"] + lora_weights_paths_high)
+            command.extend(["--lora_multiplier_high"] + lora_multipliers_values_high)
+
+        parameters = {
+            "model_type": "Bernini-R",
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "task": task,
+            "guidance_mode": guidance_mode,
+            "width": width,
+            "height": height,
+            "frame_num": frame_num,
+            "fps": fps,
+            "seed": current_seed,
+            "sample_solver": sample_solver,
+            "sample_steps": sample_steps,
+            "flow_shift": flow_shift,
+            "dual_dit_boundary": dual_dit_boundary,
+            "omega_vid": omega_vid,
+            "omega_img": omega_img,
+            "omega_txt": omega_txt,
+            "omega_scale": omega_scale,
+            "eta": eta,
+            "momentum": momentum,
+            "norm_threshold": norm_threshold,
+            "max_image_size": max_image_size,
+            "attn_mode": attn_mode,
+            "blocks_to_swap": block_swap,
+            "save_path": save_path,
+        }
+        if src_videos:
+            parameters["source_videos"] = src_videos
+        if source_image:
+            parameters["source_image"] = source_image
+        if refs:
+            parameters["ref_images"] = refs
+
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[Queue] Bernini job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def bernini_generate_via_queue(*args):
+    """Queue-based Bernini generation; returns immediately and polls via Timer."""
+    batch_id, job_ids = bernini_submit_to_queue(*args)
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+    return (
+        [],
+        [],
+        status_msg,
+        "Waiting for worker to start...",
+        first_job_id,
+        batch_id,
+        gr.Timer(value=2.0, active=True),
+    )
+
+
 def start_wan22_worker():
     """Start the background worker thread for processing Wan2.2 queue jobs."""
     global wan22_worker_thread, wan22_worker_instance
@@ -10965,6 +11227,207 @@ with gr.Blocks(
                             info="RoPE context scaling. Use 2.0-4.0 if video loops to initial frame around 7s."
                         )
 
+        # Bernini Tab - ByteDance Bernini-R 14B (Wan2.2-A14B fine-tune) unified generation/editing
+        with gr.Tab(id=19, label="Bernini") as bernini_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    bernini_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt / editing instruction",
+                        value="A cat wearing a chef hat, cooking pizza.",
+                        lines=5
+                    )
+                    bernini_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt",
+                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    bernini_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    bernini_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    bernini_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="bernini_progress_text")
+
+            with gr.Row():
+                bernini_generate_btn = gr.Button("Generate", elem_classes="green-btn")
+                bernini_stop_btn = gr.Button("Stop Generation", variant="stop")
+                bernini_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            # Queue system state components
+            bernini_job_id_state = gr.State(value="")
+            bernini_batch_id_state = gr.State(value="")
+            bernini_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                with gr.Column():
+                    bernini_task = gr.Dropdown(
+                        label="Bernini Task",
+                        choices=["t2v", "t2i", "v2v", "i2i", "mv2v", "r2v", "rv2v", "ads2v"],
+                        value="v2v",
+                        info="t2v/t2i: generation | v2v/mv2v: video editing | i2i: image editing | r2v: reference images → video | rv2v/ads2v: video editing with reference images"
+                    )
+                    bernini_guidance_mode = gr.Dropdown(
+                        label="Guidance Mode",
+                        choices=["Auto (task default)", "rv2v", "v2v", "v2v_chain", "t2v", "r2v_apg", "v2v_apg", "t2v_apg"],
+                        value="Auto (task default)",
+                        info="Auto uses the official per-task mode (t2v/t2i→t2v_apg, i2i→v2v, v2v/mv2v/ads2v→v2v_apg, r2v→r2v_apg, rv2v→rv2v)"
+                    )
+                    bernini_system_prompt = gr.Textbox(
+                        label="System Prompt Override (blank = auto per task)",
+                        value="",
+                        lines=2,
+                        info="Prefix prepended to the prompt; the official per-task prefix is used when blank"
+                    )
+
+                    gr.Markdown("### Conditioning Inputs")
+                    bernini_source_videos = gr.File(
+                        label="Source Video(s) (v2v/mv2v/rv2v/ads2v; first video sets output size & length)",
+                        file_count="multiple",
+                        file_types=["video"],
+                        type="filepath",
+                    )
+                    bernini_source_image = gr.Image(label="Source Image (i2i)", type="filepath")
+                    bernini_ref_images = gr.File(
+                        label="Reference Image(s) (r2v/rv2v/ads2v)",
+                        file_count="multiple",
+                        file_types=["image"],
+                        type="filepath",
+                    )
+
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        bernini_width = gr.Number(label="Width (used when no source video/image)", value=848, step=16, interactive=True)
+                        bernini_height = gr.Number(label="Height", value=480, step=16, interactive=True)
+                    bernini_frame_num = gr.Slider(minimum=1, maximum=241, step=4, label="Frame Count (4n+1; 1 for images)", value=81)
+                    bernini_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                    bernini_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                    bernini_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                    bernini_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise expert used below this timestep threshold")
+                    bernini_sample_solver = gr.Radio(choices=["unipc", "vanilla"], label="Sample Solver", value="unipc", info="unipc = official (required for *_apg modes); vanilla = Bernini FlowMatchScheduler")
+                    with gr.Row():
+                        bernini_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        bernini_random_seed_btn = gr.Button("🎲")
+
+                    with gr.Accordion("Bernini Guidance (APG / omegas)", open=True):
+                        with gr.Row():
+                            bernini_omega_vid = gr.Slider(minimum=0.0, maximum=10.0, step=0.05, label="Omega Video", value=1.25)
+                            bernini_omega_img = gr.Slider(minimum=0.0, maximum=10.0, step=0.05, label="Omega Image", value=4.5)
+                        with gr.Row():
+                            bernini_omega_txt = gr.Slider(minimum=0.0, maximum=10.0, step=0.05, label="Omega Text", value=4.0)
+                            bernini_omega_scale = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, label="Omega Scale (at expert switch)", value=0.8)
+                        with gr.Row():
+                            bernini_eta = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, label="Eta (APG parallel weight)", value=0.5)
+                            bernini_momentum = gr.Slider(minimum=-1.0, maximum=1.0, step=0.05, label="Momentum (APG)", value=0.0)
+                        with gr.Row():
+                            bernini_norm_threshold = gr.Textbox(label="Norm Thresholds", value="50, 50, 50", info="Per-condition guidance norm caps")
+                            bernini_max_image_size = gr.Number(label="Max Image Size (long edge)", value=848, step=16)
+                        with gr.Row():
+                            bernini_use_src_tgt_id = gr.Checkbox(label="Source-ID Rotary Embeddings", value=True)
+                            bernini_interpolate_src_id = gr.Checkbox(label="Interpolate Source IDs", value=True, info="Map many references into the trained id range")
+                            bernini_max_trained_src_id = gr.Number(label="Max Trained Source ID", value=5, step=1)
+
+                with gr.Column():
+                    bernini_output = gr.Gallery(
+                        label="Generated Output (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_bernini", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("LoRA", open=False):
+                        with gr.Row():
+                            bernini_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            bernini_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        bernini_lora_weights = []
+                        bernini_lora_multipliers = []
+                        bernini_lora_apply_low = []
+                        bernini_lora_apply_high = []
+                        for i in range(4):
+                            with gr.Row():
+                                bernini_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                bernini_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                bernini_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                bernini_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+                    with gr.Accordion("Additional LoRAs (5-8)", open=False):
+                        for i in range(4, 8):
+                            with gr.Row():
+                                bernini_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                bernini_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                ))
+                            with gr.Row():
+                                bernini_lora_apply_low.append(gr.Checkbox(
+                                    label="Apply to Low Noise", value=True, scale=1
+                                ))
+                                bernini_lora_apply_high.append(gr.Checkbox(
+                                    label="Apply to High Noise", value=False, scale=1
+                                ))
+
+            with gr.Accordion("Model Paths & Performance", open=True):
+                with gr.Row():
+                    bernini_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn", "sageattn3"], label="Attention Mode", value="sdpa")
+                    bernini_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                    bernini_auto_block_swap = gr.Checkbox(
+                        label="Auto Block Swap",
+                        value=False,
+                        info="Auto-promotes blocks to GPU based on free VRAM and recovers from CUDA OOM. Set Block Swap high (e.g. 30) and let it tune down."
+                    )
+                with gr.Row():
+                    bernini_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    bernini_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    bernini_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
+                    bernini_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                with gr.Row():
+                    bernini_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=True, info="Recommended for the converted fp32_and_fp16 Bernini checkpoints")
+                    bernini_vae_fp32 = gr.Checkbox(label="Use FP32 VAE (official Bernini setting)", value=True)
+                    bernini_compile = gr.Checkbox(label="Enable torch.compile", value=False)
+                with gr.Row():
+                    bernini_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                    bernini_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                with gr.Row():
+                    bernini_dit_low_noise_path = gr.Dropdown(
+                        label="Bernini DiT Low Noise Model (.safetensors, converted)",
+                        choices=get_wan_of_low_noise_models("wan"),
+                        value="/media/mayble/External/bernini_r_14B_low_noise_fp32_and_fp16.safetensors",
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    bernini_dit_high_noise_path = gr.Dropdown(
+                        label="Bernini DiT High Noise Model (.safetensors, converted)",
+                        choices=get_wan_of_high_noise_models("wan"),
+                        value="/media/mayble/External/bernini_r_14B_high_noise_fp32_and_fp16.safetensors",
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                with gr.Row():
+                    bernini_vae_path = gr.Dropdown(
+                        label="VAE Model (.pth)",
+                        choices=get_wan_of_vae_models("wan"),
+                        value=get_default_vae_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    bernini_t5_path = gr.Dropdown(
+                        label="T5 Model (.pth/.safetensors)",
+                        choices=get_wan_of_t5_models("wan"),
+                        value=get_default_t5_model("wan"),
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                bernini_save_path = gr.Textbox(label="Save Path", value="outputs")
+
         # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
         with gr.Tab(id=17, label="StoryMem") as storymem_tab:
             gr.Markdown("""
@@ -11607,473 +12070,665 @@ with gr.Blocks(
                         )
 
         # HoloCine Tab - Multi-Shot Scenecut Video Generation
-        with gr.Tab(id=15, label="HoloCine") as holocine_tab:
-            with gr.Row():
-                with gr.Column(scale=4):
-                    holocine_global_caption = gr.Textbox(
-                        label="Global Caption (Scene Description)",
-                        value="The scene features a young painter, [character1], with paint-smudged cheeks and intense, focused eyes. Her hair is tied up messily. The setting is a bright, sun-drenched art studio with large windows, canvases, and the smell of oil paint.",
-                        lines=4,
-                        info="Describe the overall scene, characters, and setting. Use [character1], [character2], etc. for consistency."
-                    )
-                    holocine_shot_captions = gr.Textbox(
-                        label="Shot Captions (One Per Line)",
-                        value="Medium shot of [character1] standing back from a large canvas, brush in hand, critically observing her work.\nClose-up of her hand holding the brush, dabbing it thoughtfully onto a palette of vibrant colors.\nExtreme close-up of her eyes, narrowed in concentration as she studies the canvas.\nClose-up on the canvas, showing a detailed, textured brushstroke being slowly applied.\nMedium close-up of [character1]'s face, a small, satisfied smile appears as she finds the right color.\nOver-the-shoulder shot showing her add a final, delicate highlight to the painting.",
-                        lines=8,
-                        info="Enter one shot caption per line. Each describes what happens in that shot."
-                    )
-                    holocine_negative_prompt = gr.Textbox(
-                        label="Negative Prompt",
-                        value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
-                        lines=3,
-                    )
-                with gr.Column(scale=1):
-                    holocine_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                with gr.Column(scale=2):
-                    holocine_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
-                    holocine_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
-
-            with gr.Row():
-                holocine_generate_btn = gr.Button("Generate Multi-Shot Video", elem_classes="green-btn")
-                holocine_stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Generation Parameters")
+        with gr.Tab(id=18, label="old") as old_tab:
+            with gr.Tabs():
+                with gr.Tab(id=15, label="HoloCine") as holocine_tab:
                     with gr.Row():
-                        holocine_width = gr.Number(label="Width", value=832, step=32, interactive=True)
-                        holocine_height = gr.Number(label="Height", value=480, step=32, interactive=True)
-                    holocine_frame_num = gr.Slider(minimum=81, maximum=611, step=4, label="Frame Count", value=241, info="Must be 4n+1. Default: 241 (15s @ 16fps)")
-                    holocine_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    holocine_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=50)
-                    holocine_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0, info="HoloCine default: 5.0")
-                    holocine_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
-                    holocine_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise model used after this threshold")
-                    holocine_sample_solver = gr.Radio(
-                        choices=["unipc", "dpm++", "vanilla", "euler", "flowmatch"],
-                        label="Sample Solver",
-                        value="unipc",
-                        info="Use 'flowmatch' for HoloCine-style scheduling"
-                    )
+                        with gr.Column(scale=4):
+                            holocine_global_caption = gr.Textbox(
+                                label="Global Caption (Scene Description)",
+                                value="The scene features a young painter, [character1], with paint-smudged cheeks and intense, focused eyes. Her hair is tied up messily. The setting is a bright, sun-drenched art studio with large windows, canvases, and the smell of oil paint.",
+                                lines=4,
+                                info="Describe the overall scene, characters, and setting. Use [character1], [character2], etc. for consistency."
+                            )
+                            holocine_shot_captions = gr.Textbox(
+                                label="Shot Captions (One Per Line)",
+                                value="Medium shot of [character1] standing back from a large canvas, brush in hand, critically observing her work.\nClose-up of her hand holding the brush, dabbing it thoughtfully onto a palette of vibrant colors.\nExtreme close-up of her eyes, narrowed in concentration as she studies the canvas.\nClose-up on the canvas, showing a detailed, textured brushstroke being slowly applied.\nMedium close-up of [character1]'s face, a small, satisfied smile appears as she finds the right color.\nOver-the-shoulder shot showing her add a final, delicate highlight to the painting.",
+                                lines=8,
+                                info="Enter one shot caption per line. Each describes what happens in that shot."
+                            )
+                            holocine_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, distorted view.",
+                                lines=3,
+                            )
+                        with gr.Column(scale=1):
+                            holocine_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                        with gr.Column(scale=2):
+                            holocine_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                            holocine_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
                     with gr.Row():
-                        holocine_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        holocine_random_seed_btn = gr.Button("🎲")
+                        holocine_generate_btn = gr.Button("Generate Multi-Shot Video", elem_classes="green-btn")
+                        holocine_stop_btn = gr.Button("Stop Generation", variant="stop")
 
-                    gr.Markdown("### Advanced Options")
-                    holocine_shot_cut_frames = gr.Textbox(
-                        label="Shot Cut Frames (Optional, Comma-separated)",
-                        value="",
-                        placeholder="e.g., 37, 73, 113, 169, 205",
-                        info="Leave empty for automatic calculation. Must be 4n+1 format."
-                    )
-
-                with gr.Column():
-                    holocine_output = gr.Gallery(
-                        label="Generated Videos",
-                        columns=[2], rows=[2], object_fit="contain", height="auto",
-                        show_label=True, allow_preview=True, preview=True
-                    )
-
-            with gr.Accordion("Model Paths & Performance", open=True):
-                with gr.Row():
-                    holocine_attn_mode = gr.Radio(
-                        choices=["sdpa", "flash", "torch", "xformers"],
-                        label="Attention Mode",
-                        value="sdpa",
-                        info="Use 'flash' for FlashAttention (faster)"
-                    )
-                    holocine_block_swap = gr.Slider(
-                        minimum=0, maximum=39, step=1,
-                        label="Block Swap to Save VRAM",
-                        value=0,
-                        info="Offload N blocks to CPU. Try 30 if low on VRAM"
-                    )
-                with gr.Row():
-                    holocine_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-                with gr.Row():
-                    holocine_model_folder = gr.Textbox(label="Model Folder", value="wan")
-                    holocine_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
-                with gr.Row():
-                    holocine_dit_low_noise_path = gr.Dropdown(
-                        label="DiT Low Noise Model (.safetensors)",
-                        choices=get_wan_of_low_noise_models("wan"),
-                        value=get_default_low_noise_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True,
-                        info="HoloCine fine-tuned models (e.g., full_low_noise.safetensors)"
-                    )
-                    holocine_dit_high_noise_path = gr.Dropdown(
-                        label="DiT High Noise Model (.safetensors)",
-                        choices=get_wan_of_high_noise_models("wan"),
-                        value=get_default_high_noise_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True,
-                        info="HoloCine fine-tuned models (e.g., full_high_noise.safetensors)"
-                    )
-                with gr.Row():
-                    holocine_vae_path = gr.Dropdown(
-                        label="VAE Model (.pth)",
-                        choices=get_wan_of_vae_models("wan"),
-                        value=get_default_vae_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    holocine_t5_path = gr.Dropdown(
-                        label="T5 Model (.pth/.safetensors)",
-                        choices=get_wan_of_t5_models("wan"),
-                        value=get_default_t5_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                holocine_save_path = gr.Textbox(label="Save Path", value="outputs/holocine")
-
-# Phantom Tab (Subject-to-Video style)
-        with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
-            with gr.Row():
-                with gr.Column(scale=4):
-                    phantom_prompt = gr.Textbox(
-                        scale=3,
-                        label="Enter your prompt",
-                        value="A cute kitty is preparing a spicy breakfast meal for her brother in law.",
-                        lines=5,
-                        info="Describe the scene and subject. Use a unique token for your subject if fine-tuned."
-                    )
-                    phantom_negative_prompt = gr.Textbox(
-                        scale=3,
-                        label="Negative Prompt",
-                        value="low quality, blurry, watermark, text, signature, ugly, deformed",
-                        lines=3,
-                    )
-
-                with gr.Column(scale=1):
-                    phantom_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    phantom_batch_size = gr.Number(label="Batch Count (Seed Variations)", value=1, minimum=1, step=1)
-
-                with gr.Column(scale=2):
-                    phantom_batch_progress = gr.Textbox(label="Status", interactive=False, value="", elem_id="phantom_batch_progress")
-                    phantom_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="phantom_progress_text")
-
-            with gr.Row():
-                phantom_generate_btn = gr.Button("Generate Phantom Video", elem_classes="green-btn")
-                phantom_stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                with gr.Column():
-                    phantom_input_images = gr.Gallery(
-                        label="Reference Images",
-                        type="filepath",  # CHANGED from "pil" to "filepath"
-                        show_label=True,
-                        columns=3,  # Adjusted for potentially more images
-                        rows="auto", # Let rows adjust
-                        object_fit="contain",
-                        height="auto",
-                        selected_index=0,
-                        interactive=True
-                    )
-                    phantom_add_more_images_btn = gr.UploadButton(
-                        "Upload/Add More Reference Images",
-                        file_types=["image"],
-                        file_count="multiple",
-                        type="filepath" # Ensures it provides file paths
-                    )
-                    # Simplified dimension inputs, no automatic aspect ratio from single image
                     with gr.Row():
-                        phantom_width = gr.Number(label="Width", value=832, interactive=True, step=32, info="Should be divisible by 32")
-                        phantom_height = gr.Number(label="Height", value=480, interactive=True, step=32, info="Should be divisible by 32")
-                        phantom_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
-
-                    phantom_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
-                    phantom_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    phantom_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=50) # S2V default is 50
-                    phantom_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0,
-                                            info="Recommended: 3.0 for 480p, 5.0 for others. S2V default often 5.0 or 3.0.")
-                    # S2V has separate guidance scales for image and text
-                    phantom_guide_scale_img = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Image Guidance Scale", value=5.0)
-                    phantom_guide_scale_text = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Text Guidance Scale", value=7.5)
-                    # General guidance_scale (used by non-S2V CFG, but S2V has its own way)
-                    # For clarity, let's call the script's main --guidance_scale `phantom_cfg_scale_main`
-                    # S2V's internal CFG is driven by guide_scale_img and guide_scale_text
-                    phantom_cfg_scale_main = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Main CFG Scale (Script Default)", value=5.0, visible=False, info="Usually not directly used by S2V logic if task is S2V.")
-
-
-                with gr.Column():
-                    phantom_output = gr.Gallery(
-                        label="Generated Videos (Click to select)",
-                        columns=[2], rows=[2], object_fit="contain", height="auto",
-                        show_label=True, elem_id="gallery_phantom", allow_preview=True, preview=True
-                    )
-                    with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        phantom_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
-                        phantom_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                       label="Preview Every N Steps", info="Generates previews during the sampling loop.")
-                        phantom_preview_output = gr.Gallery(
-                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="phantom_preview_gallery"
-                        )
-                    phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
-                    phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
-
-                    phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-                    phantom_lora_weights_ui = []
-                    phantom_lora_multipliers_ui = []
-                    for i in range(4):
                         with gr.Column():
-                            phantom_lora_weights_ui.append(gr.Dropdown(
-                                label=f"LoRA {i+1}", choices=get_lora_options(), value="None",
-                                allow_custom_value=True, interactive=True
-                            ))
-                            phantom_lora_multipliers_ui.append(gr.Slider(
-                                label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0
-                            ))
-
-            with gr.Row():
-                phantom_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
-                phantom_task = gr.Dropdown(
-                    label="Task (S2V variant)",
-                    choices=["s2v-14B-phantom", "s2v-1.3B-phantom"], # Example S2V tasks
-                    value="s2v-14B-phantom", # Default to an S2V task
-                    info="Select S2V model type. This task determines internal model configuration."
-                )
-                phantom_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
-                phantom_dit_path = gr.Dropdown( # This will be the --phantom_ckpt path
-                    label="Phantom DiT Model (.pth or .safetensors)",
-                    choices=get_dit_models("wan"), # User should place Phantom model here
-                    value="phantom14B.safetensors", # Example name
-                    allow_custom_value=True, interactive=True
-                )
-                phantom_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
-                phantom_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
-                # CLIP path is not typically used for S2V's image features, as VAE features are used.
-                # However, the WanModel `model_type="i2v"` might expect CLIP features if not careful.
-                # The `prepare_s2v_inputs` function in `wan_generate_video.py` does not use CLIP.
-                phantom_clip_path = gr.Textbox(label="CLIP Path (for text or non-S2V I2V)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=False)
-                phantom_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                phantom_save_path = gr.Textbox(label="Save Path", value="outputs/phantom")
-
-            with gr.Row():
-                phantom_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
-                phantom_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                phantom_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
-                phantom_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=26)
-
-                with gr.Column():
-                    phantom_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    phantom_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="For mixing fp16/bf16 and fp8 weights")
-                    phantom_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-            # SLG options can be kept as they are model-agnostic ways to modify CFG
-            with gr.Row():
-                phantom_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated, e.g. 1,5,10")
-                phantom_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0)
-                phantom_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0)
-
-            with gr.Row():
-                phantom_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip", value=False)
-                with gr.Column(visible=False) as phantom_cfg_skip_options:
-                    phantom_cfg_skip_mode = gr.Radio(
-                        choices=["early", "late", "middle", "early_late", "alternate", "none"],
-                        label="CFG Skip Mode", value="none"
-                    )
-                    phantom_cfg_apply_ratio = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
-                    )
-
-        with gr.Tab(id=4, label="HuMo") as humo_tab:
-            with gr.Row():
-                with gr.Column(scale=4):
-                    humo_prompt = gr.Textbox(
-                        scale=3,
-                        label="Enter your prompt",
-                        value="A person speaking naturally with clear lip movements",
-                        lines=5
-                    )
-                    humo_negative_prompt = gr.Textbox(
-                        scale=3,
-                        label="Negative Prompt",
-                        value="blurry, distorted face, unnatural lip sync, static, low quality",
-                        lines=3,
-                    )
-
-                with gr.Column(scale=1):
-                    humo_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    humo_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-
-                with gr.Column(scale=2):
-                    humo_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
-                    humo_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
-
-            with gr.Row():
-                humo_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
-                humo_stop_btn = gr.Button("Stop Generation", variant="stop")
-
-            with gr.Row():
-                with gr.Column():
-                    # HuMo Mode Selection
-                    humo_mode = gr.Radio(
-                        choices=["TIA", "TA"],
-                        label="Generation Mode",
-                        value="TIA",
-                        info="TIA = Text+Image+Audio, TA = Text+Audio only"
-                    )
-
-                    humo_input_image = gr.Image(label="Reference Image (for TIA mode)", type="filepath")
-                    humo_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
-
-                    with gr.Accordion("I2V Mode", open=False):
-                        humo_i2v_image = gr.Image(label="I2V Start Image", type="filepath")
-                    with gr.Accordion("Audio Input", open=True):
-                        humo_audio_source = gr.Radio(
-                            choices=["Audio File", "Pre-extracted Features"],
-                            label="Audio Source",
-                            value="Pre-extracted Features",
-                            info="Use audio file with Whisper extraction or pre-extracted .pt features"
-                        )
-                        humo_audio_path = gr.File(
-                            label="Audio File (.wav)",
-                            file_types=[".wav", ".mp3", ".flac"],
-                            visible=False
-                        )
-                        humo_audio_feat_path = gr.File(
-                            label="Pre-extracted Audio Features (.pt)",
-                            file_types=[".pt"],
-                            visible=True
-                        )
-                        humo_whisper_model = gr.Textbox(
-                            label="Whisper Model Path",
-                            value="openai/whisper-large-v3",
-                            visible=False,
-                            info="HuggingFace model ID or local path"
-                        )
-
-                    # HuMo CFG Settings
-                    with gr.Accordion("HuMo CFG Settings", open=True):
-                        humo_scale_a = gr.Slider(
-                            minimum=0.0, maximum=15.0, step=0.1, value=5.5,
-                            label="Audio Guidance Scale (scale_a)",
-                            info="Controls audio influence on generation"
-                        )
-                        humo_scale_t = gr.Slider(
-                            minimum=0.0, maximum=15.0, step=0.1, value=5.0,
-                            label="Text Guidance Scale (scale_t)",
-                            info="Controls text influence on generation"
-                        )
-                        humo_step_change = gr.Slider(
-                            minimum=0, maximum=1000, step=10, value=980,
-                            label="CFG Step Change",
-                            info="Timestep where CFG formula changes (default: 980)"
-                        )
-
-                    # Zero VAE Cache
-                    with gr.Accordion("Zero VAE Cache (Optional)", open=False):
-                        gr.Markdown("Pre-computed zero latents for better conditioning. Leave empty to use zeros.")
-                        humo_zero_vae_path = gr.Textbox(
-                            label="Zero VAE Cache (480p)",
-                            value="wan/zero_vae_129frame.pt",
-                            info="Path to zero_vae_129frame.pt"
-                        )
-                        humo_zero_vae_720p_path = gr.Textbox(
-                            label="Zero VAE Cache (720p)",
-                            value="wan/zero_vae_720p_161frame.pt",
-                            info="Path to zero_vae_720p_161frame.pt"
-                        )
-                        humo_audio_separator = gr.Textbox(
-                            label="Audio Separator Model (ONNX)",
-                            value="wan/Kim_Vocal_2.onnx",
-                            info="Optional: Kim_Vocal_2.onnx for vocal separation"
-                        )
-
-                    gr.Markdown("### Generation Parameters")
-                    # Width and height inputs
-                    with gr.Row():
-                        humo_width = gr.Number(label="Width", value=832, step=32, interactive=True)
-                        humo_calc_height_btn = gr.Button("→")
-                        humo_calc_width_btn = gr.Button("←")
-                        humo_height = gr.Number(label="Height", value=480, step=32, interactive=True)
-
-                    humo_frame_num = gr.Slider(minimum=9, maximum=401, step=4, label="Frame Count", value=81, info="Must be 4n+1")
-                    humo_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=25, info="HuMo default: 25 FPS")
-                    humo_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
-                    humo_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
-                    humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
-                    with gr.Row():
-                        humo_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        humo_random_seed_btn = gr.Button("🎲")
-
-                with gr.Column():
-                    humo_output = gr.Gallery(
-                        label="Generated Videos (Click to select)",
-                        columns=[2], rows=[2], object_fit="contain", height="auto",
-                        show_label=True, elem_id="gallery_humo", allow_preview=True, preview=True
-                    )
-                    with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        humo_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
-                        humo_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
-                                                       label="Preview Every N Steps")
-                        humo_preview_output = gr.Gallery(
-                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
-                            allow_preview=True, preview=True, show_label=True, elem_id="humo_preview_gallery"
-                        )
-
-                    # LoRA Section
-                    with gr.Accordion("LoRA", open=True):
-                        with gr.Row():
-                            humo_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            humo_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
-                        humo_lora_weights = []
-                        humo_lora_multipliers = []
-                        for i in range(4):
+                            gr.Markdown("### Generation Parameters")
                             with gr.Row():
-                                humo_lora_weights.append(gr.Dropdown(
-                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
-                                    value="None", allow_custom_value=False, interactive=True, scale=2
-                                ))
-                                humo_lora_multipliers.append(gr.Slider(
-                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
-                                ))
+                                holocine_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                                holocine_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+                            holocine_frame_num = gr.Slider(minimum=81, maximum=611, step=4, label="Frame Count", value=241, info="Must be 4n+1. Default: 241 (15s @ 16fps)")
+                            holocine_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                            holocine_sample_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Sampling Steps", value=50)
+                            holocine_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0, info="HoloCine default: 5.0")
+                            holocine_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=5.0)
+                            holocine_dual_dit_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Dual-DiT Boundary", value=0.875, info="Low noise model used after this threshold")
+                            holocine_sample_solver = gr.Radio(
+                                choices=["unipc", "dpm++", "vanilla", "euler", "flowmatch"],
+                                label="Sample Solver",
+                                value="unipc",
+                                info="Use 'flowmatch' for HoloCine-style scheduling"
+                            )
+                            with gr.Row():
+                                holocine_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                                holocine_random_seed_btn = gr.Button("🎲")
 
-            with gr.Accordion("Model Paths & Performance", open=True):
-                humo_task = gr.Dropdown(
-                    label="Task",
-                    choices=["humo-17B-TIA", "humo-17B-TA"],
-                    value="humo-17B-TIA",
-                    info="HuMo model configuration"
-                )
-                with gr.Row():
-                    humo_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn"], label="Attention Mode", value="sdpa")
-                    humo_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
-                with gr.Row():
-                    humo_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    humo_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
-                    humo_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-                with gr.Row():
-                    humo_model_folder = gr.Textbox(label="Model Folder", value="wan")
-                    humo_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
-                with gr.Row():
-                    humo_dit_path = gr.Dropdown(
-                        label="HuMo DiT Model (.safetensors)",
-                        choices=get_dit_models("wan"),
-                        value="humo_17b_fp32_low_noise.safetensors",
-                        allow_custom_value=True,
-                        interactive=True,
-                        info="17B HuMo model checkpoint"
-                    )
-                with gr.Row():
-                    humo_vae_path = gr.Dropdown(
-                        label="VAE Model (.pth)",
-                        choices=get_wan_of_vae_models("wan"),
-                        value=get_default_vae_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    humo_t5_path = gr.Dropdown(
-                        label="T5 Model (.pth/.safetensors)",
-                        choices=get_wan_of_t5_models("wan"),
-                        value=get_default_t5_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                humo_save_path = gr.Textbox(label="Save Path", value="outputs")
+                            gr.Markdown("### Advanced Options")
+                            holocine_shot_cut_frames = gr.Textbox(
+                                label="Shot Cut Frames (Optional, Comma-separated)",
+                                value="",
+                                placeholder="e.g., 37, 73, 113, 169, 205",
+                                info="Leave empty for automatic calculation. Must be 4n+1 format."
+                            )
 
-        #WanX-v2v Tab
+                        with gr.Column():
+                            holocine_output = gr.Gallery(
+                                label="Generated Videos",
+                                columns=[2], rows=[2], object_fit="contain", height="auto",
+                                show_label=True, allow_preview=True, preview=True
+                            )
+
+                    with gr.Accordion("Model Paths & Performance", open=True):
+                        with gr.Row():
+                            holocine_attn_mode = gr.Radio(
+                                choices=["sdpa", "flash", "torch", "xformers"],
+                                label="Attention Mode",
+                                value="sdpa",
+                                info="Use 'flash' for FlashAttention (faster)"
+                            )
+                            holocine_block_swap = gr.Slider(
+                                minimum=0, maximum=39, step=1,
+                                label="Block Swap to Save VRAM",
+                                value=0,
+                                info="Offload N blocks to CPU. Try 30 if low on VRAM"
+                            )
+                        with gr.Row():
+                            holocine_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                        with gr.Row():
+                            holocine_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                            holocine_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                        with gr.Row():
+                            holocine_dit_low_noise_path = gr.Dropdown(
+                                label="DiT Low Noise Model (.safetensors)",
+                                choices=get_wan_of_low_noise_models("wan"),
+                                value=get_default_low_noise_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True,
+                                info="HoloCine fine-tuned models (e.g., full_low_noise.safetensors)"
+                            )
+                            holocine_dit_high_noise_path = gr.Dropdown(
+                                label="DiT High Noise Model (.safetensors)",
+                                choices=get_wan_of_high_noise_models("wan"),
+                                value=get_default_high_noise_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True,
+                                info="HoloCine fine-tuned models (e.g., full_high_noise.safetensors)"
+                            )
+                        with gr.Row():
+                            holocine_vae_path = gr.Dropdown(
+                                label="VAE Model (.pth)",
+                                choices=get_wan_of_vae_models("wan"),
+                                value=get_default_vae_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            holocine_t5_path = gr.Dropdown(
+                                label="T5 Model (.pth/.safetensors)",
+                                choices=get_wan_of_t5_models("wan"),
+                                value=get_default_t5_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                        holocine_save_path = gr.Textbox(label="Save Path", value="outputs/holocine")
+
+        # Phantom Tab (Subject-to-Video style)
+                with gr.Tab(id=7, label="Phantom") as phantom_tab: # Assign a unique ID
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            phantom_prompt = gr.Textbox(
+                                scale=3,
+                                label="Enter your prompt",
+                                value="A cute kitty is preparing a spicy breakfast meal for her brother in law.",
+                                lines=5,
+                                info="Describe the scene and subject. Use a unique token for your subject if fine-tuned."
+                            )
+                            phantom_negative_prompt = gr.Textbox(
+                                scale=3,
+                                label="Negative Prompt",
+                                value="low quality, blurry, watermark, text, signature, ugly, deformed",
+                                lines=3,
+                            )
+
+                        with gr.Column(scale=1):
+                            phantom_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                            phantom_batch_size = gr.Number(label="Batch Count (Seed Variations)", value=1, minimum=1, step=1)
+
+                        with gr.Column(scale=2):
+                            phantom_batch_progress = gr.Textbox(label="Status", interactive=False, value="", elem_id="phantom_batch_progress")
+                            phantom_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="phantom_progress_text")
+
+                    with gr.Row():
+                        phantom_generate_btn = gr.Button("Generate Phantom Video", elem_classes="green-btn")
+                        phantom_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+                    with gr.Row():
+                        with gr.Column():
+                            phantom_input_images = gr.Gallery(
+                                label="Reference Images",
+                                type="filepath",  # CHANGED from "pil" to "filepath"
+                                show_label=True,
+                                columns=3,  # Adjusted for potentially more images
+                                rows="auto", # Let rows adjust
+                                object_fit="contain",
+                                height="auto",
+                                selected_index=0,
+                                interactive=True
+                            )
+                            phantom_add_more_images_btn = gr.UploadButton(
+                                "Upload/Add More Reference Images",
+                                file_types=["image"],
+                                file_count="multiple",
+                                type="filepath" # Ensures it provides file paths
+                            )
+                            # Simplified dimension inputs, no automatic aspect ratio from single image
+                            with gr.Row():
+                                phantom_width = gr.Number(label="Width", value=832, interactive=True, step=32, info="Should be divisible by 32")
+                                phantom_height = gr.Number(label="Height", value=480, interactive=True, step=32, info="Should be divisible by 32")
+                                phantom_recommend_flow_btn = gr.Button("Recommend Flow Shift", size="sm")
+
+                            phantom_video_length = gr.Slider(minimum=1, maximum=201, step=4, label="Video Length in Frames", value=81)
+                            phantom_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                            phantom_infer_steps = gr.Slider(minimum=10, maximum=100, step=1, label="Inference Steps", value=50) # S2V default is 50
+                            phantom_flow_shift = gr.Slider(minimum=0.0, maximum=28.0, step=0.5, label="Flow Shift", value=5.0,
+                                                    info="Recommended: 3.0 for 480p, 5.0 for others. S2V default often 5.0 or 3.0.")
+                            # S2V has separate guidance scales for image and text
+                            phantom_guide_scale_img = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Image Guidance Scale", value=5.0)
+                            phantom_guide_scale_text = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Text Guidance Scale", value=7.5)
+                            # General guidance_scale (used by non-S2V CFG, but S2V has its own way)
+                            # For clarity, let's call the script's main --guidance_scale `phantom_cfg_scale_main`
+                            # S2V's internal CFG is driven by guide_scale_img and guide_scale_text
+                            phantom_cfg_scale_main = gr.Slider(minimum=1.0, maximum=20.0, step=0.5, label="Main CFG Scale (Script Default)", value=5.0, visible=False, info="Usually not directly used by S2V logic if task is S2V.")
+
+
+                        with gr.Column():
+                            phantom_output = gr.Gallery(
+                                label="Generated Videos (Click to select)",
+                                columns=[2], rows=[2], object_fit="contain", height="auto",
+                                show_label=True, elem_id="gallery_phantom", allow_preview=True, preview=True
+                            )
+                            with gr.Accordion("Latent Preview (During Generation)", open=True):
+                                phantom_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                                phantom_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                               label="Preview Every N Steps", info="Generates previews during the sampling loop.")
+                                phantom_preview_output = gr.Gallery(
+                                    label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                                    allow_preview=True, preview=True, show_label=True, elem_id="phantom_preview_gallery"
+                                )
+                            phantom_send_to_hunyuan_v2v_btn = gr.Button("Send Selected to Hunyuan-v2v")
+                            phantom_send_to_wanx_v2v_btn = gr.Button("Send Selected to WanX-v2v")
+
+                            phantom_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                            phantom_lora_weights_ui = []
+                            phantom_lora_multipliers_ui = []
+                            for i in range(4):
+                                with gr.Column():
+                                    phantom_lora_weights_ui.append(gr.Dropdown(
+                                        label=f"LoRA {i+1}", choices=get_lora_options(), value="None",
+                                        allow_custom_value=True, interactive=True
+                                    ))
+                                    phantom_lora_multipliers_ui.append(gr.Slider(
+                                        label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0
+                                    ))
+
+                    with gr.Row():
+                        phantom_seed = gr.Number(label="Seed (use -1 for random)", value=-1)
+                        phantom_task = gr.Dropdown(
+                            label="Task (S2V variant)",
+                            choices=["s2v-14B-phantom", "s2v-1.3B-phantom"], # Example S2V tasks
+                            value="s2v-14B-phantom", # Default to an S2V task
+                            info="Select S2V model type. This task determines internal model configuration."
+                        )
+                        phantom_dit_folder = gr.Textbox(label="DiT Model Folder", value="wan")
+                        phantom_dit_path = gr.Dropdown( # This will be the --phantom_ckpt path
+                            label="Phantom DiT Model (.pth or .safetensors)",
+                            choices=get_dit_models("wan"), # User should place Phantom model here
+                            value="phantom14B.safetensors", # Example name
+                            allow_custom_value=True, interactive=True
+                        )
+                        phantom_vae_path = gr.Textbox(label="VAE Path", value="wan/Wan2.1_VAE.pth")
+                        phantom_t5_path = gr.Textbox(label="T5 Path", value="wan/models_t5_umt5-xxl-enc-bf16.pth")
+                        # CLIP path is not typically used for S2V's image features, as VAE features are used.
+                        # However, the WanModel `model_type="i2v"` might expect CLIP features if not careful.
+                        # The `prepare_s2v_inputs` function in `wan_generate_video.py` does not use CLIP.
+                        phantom_clip_path = gr.Textbox(label="CLIP Path (for text or non-S2V I2V)", value="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", visible=False)
+                        phantom_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                        phantom_save_path = gr.Textbox(label="Save Path", value="outputs/phantom")
+
+                    with gr.Row():
+                        phantom_output_type = gr.Radio(choices=["video", "images", "latent", "both"], label="Output Type", value="video")
+                        phantom_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                        phantom_attn_mode = gr.Radio(choices=["sdpa", "flash", "sageattn", "xformers", "torch"], label="Attention Mode", value="sdpa")
+                        phantom_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=26)
+
+                        with gr.Column():
+                            phantom_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                            phantom_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="For mixing fp16/bf16 and fp8 weights")
+                            phantom_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                    # SLG options can be kept as they are model-agnostic ways to modify CFG
+                    with gr.Row():
+                        phantom_slg_layers = gr.Textbox(label="SLG Layers", value="", placeholder="Comma-separated, e.g. 1,5,10")
+                        phantom_slg_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG Start", value=0.0)
+                        phantom_slg_end = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SLG End", value=1.0)
+
+                    with gr.Row():
+                        phantom_enable_cfg_skip = gr.Checkbox(label="Enable CFG Skip", value=False)
+                        with gr.Column(visible=False) as phantom_cfg_skip_options:
+                            phantom_cfg_skip_mode = gr.Radio(
+                                choices=["early", "late", "middle", "early_late", "alternate", "none"],
+                                label="CFG Skip Mode", value="none"
+                            )
+                            phantom_cfg_apply_ratio = gr.Slider(
+                                minimum=0.0, maximum=1.0, step=0.05, value=0.7, label="CFG Apply Ratio"
+                            )
+
+                with gr.Tab(id=4, label="HuMo") as humo_tab:
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            humo_prompt = gr.Textbox(
+                                scale=3,
+                                label="Enter your prompt",
+                                value="A person speaking naturally with clear lip movements",
+                                lines=5
+                            )
+                            humo_negative_prompt = gr.Textbox(
+                                scale=3,
+                                label="Negative Prompt",
+                                value="blurry, distorted face, unnatural lip sync, static, low quality",
+                                lines=3,
+                            )
+
+                        with gr.Column(scale=1):
+                            humo_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                            humo_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+
+                        with gr.Column(scale=2):
+                            humo_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                            humo_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+                    with gr.Row():
+                        humo_generate_btn = gr.Button("Generate Video", elem_classes="green-btn")
+                        humo_stop_btn = gr.Button("Stop Generation", variant="stop")
+
+                    with gr.Row():
+                        with gr.Column():
+                            # HuMo Mode Selection
+                            humo_mode = gr.Radio(
+                                choices=["TIA", "TA"],
+                                label="Generation Mode",
+                                value="TIA",
+                                info="TIA = Text+Image+Audio, TA = Text+Audio only"
+                            )
+
+                            humo_input_image = gr.Image(label="Reference Image (for TIA mode)", type="filepath")
+                            humo_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                            with gr.Accordion("I2V Mode", open=False):
+                                humo_i2v_image = gr.Image(label="I2V Start Image", type="filepath")
+                            with gr.Accordion("Audio Input", open=True):
+                                humo_audio_source = gr.Radio(
+                                    choices=["Audio File", "Pre-extracted Features"],
+                                    label="Audio Source",
+                                    value="Pre-extracted Features",
+                                    info="Use audio file with Whisper extraction or pre-extracted .pt features"
+                                )
+                                humo_audio_path = gr.File(
+                                    label="Audio File (.wav)",
+                                    file_types=[".wav", ".mp3", ".flac"],
+                                    visible=False
+                                )
+                                humo_audio_feat_path = gr.File(
+                                    label="Pre-extracted Audio Features (.pt)",
+                                    file_types=[".pt"],
+                                    visible=True
+                                )
+                                humo_whisper_model = gr.Textbox(
+                                    label="Whisper Model Path",
+                                    value="openai/whisper-large-v3",
+                                    visible=False,
+                                    info="HuggingFace model ID or local path"
+                                )
+
+                            # HuMo CFG Settings
+                            with gr.Accordion("HuMo CFG Settings", open=True):
+                                humo_scale_a = gr.Slider(
+                                    minimum=0.0, maximum=15.0, step=0.1, value=5.5,
+                                    label="Audio Guidance Scale (scale_a)",
+                                    info="Controls audio influence on generation"
+                                )
+                                humo_scale_t = gr.Slider(
+                                    minimum=0.0, maximum=15.0, step=0.1, value=5.0,
+                                    label="Text Guidance Scale (scale_t)",
+                                    info="Controls text influence on generation"
+                                )
+                                humo_step_change = gr.Slider(
+                                    minimum=0, maximum=1000, step=10, value=980,
+                                    label="CFG Step Change",
+                                    info="Timestep where CFG formula changes (default: 980)"
+                                )
+
+                            # Zero VAE Cache
+                            with gr.Accordion("Zero VAE Cache (Optional)", open=False):
+                                gr.Markdown("Pre-computed zero latents for better conditioning. Leave empty to use zeros.")
+                                humo_zero_vae_path = gr.Textbox(
+                                    label="Zero VAE Cache (480p)",
+                                    value="wan/zero_vae_129frame.pt",
+                                    info="Path to zero_vae_129frame.pt"
+                                )
+                                humo_zero_vae_720p_path = gr.Textbox(
+                                    label="Zero VAE Cache (720p)",
+                                    value="wan/zero_vae_720p_161frame.pt",
+                                    info="Path to zero_vae_720p_161frame.pt"
+                                )
+                                humo_audio_separator = gr.Textbox(
+                                    label="Audio Separator Model (ONNX)",
+                                    value="wan/Kim_Vocal_2.onnx",
+                                    info="Optional: Kim_Vocal_2.onnx for vocal separation"
+                                )
+
+                            gr.Markdown("### Generation Parameters")
+                            # Width and height inputs
+                            with gr.Row():
+                                humo_width = gr.Number(label="Width", value=832, step=32, interactive=True)
+                                humo_calc_height_btn = gr.Button("→")
+                                humo_calc_width_btn = gr.Button("←")
+                                humo_height = gr.Number(label="Height", value=480, step=32, interactive=True)
+
+                            humo_frame_num = gr.Slider(minimum=9, maximum=401, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                            humo_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=25, info="HuMo default: 25 FPS")
+                            humo_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=50)
+                            humo_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                            humo_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla", "euler", "step_distill"], label="Sample Solver", value="unipc")
+                            with gr.Row():
+                                humo_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                                humo_random_seed_btn = gr.Button("🎲")
+
+                        with gr.Column():
+                            humo_output = gr.Gallery(
+                                label="Generated Videos (Click to select)",
+                                columns=[2], rows=[2], object_fit="contain", height="auto",
+                                show_label=True, elem_id="gallery_humo", allow_preview=True, preview=True
+                            )
+                            with gr.Accordion("Latent Preview (During Generation)", open=True):
+                                humo_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                                humo_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                               label="Preview Every N Steps")
+                                humo_preview_output = gr.Gallery(
+                                    label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                                    allow_preview=True, preview=True, show_label=True, elem_id="humo_preview_gallery"
+                                )
+
+                            # LoRA Section
+                            with gr.Accordion("LoRA", open=True):
+                                with gr.Row():
+                                    humo_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                                    humo_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                                humo_lora_weights = []
+                                humo_lora_multipliers = []
+                                for i in range(4):
+                                    with gr.Row():
+                                        humo_lora_weights.append(gr.Dropdown(
+                                            label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                            value="None", allow_custom_value=False, interactive=True, scale=2
+                                        ))
+                                        humo_lora_multipliers.append(gr.Slider(
+                                            label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                        ))
+
+                    with gr.Accordion("Model Paths & Performance", open=True):
+                        humo_task = gr.Dropdown(
+                            label="Task",
+                            choices=["humo-17B-TIA", "humo-17B-TA"],
+                            value="humo-17B-TIA",
+                            info="HuMo model configuration"
+                        )
+                        with gr.Row():
+                            humo_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers", "sageattn"], label="Attention Mode", value="sdpa")
+                            humo_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                        with gr.Row():
+                            humo_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                            humo_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                            humo_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                        with gr.Row():
+                            humo_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                            humo_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                        with gr.Row():
+                            humo_dit_path = gr.Dropdown(
+                                label="HuMo DiT Model (.safetensors)",
+                                choices=get_dit_models("wan"),
+                                value="humo_17b_fp32_low_noise.safetensors",
+                                allow_custom_value=True,
+                                interactive=True,
+                                info="17B HuMo model checkpoint"
+                            )
+                        with gr.Row():
+                            humo_vae_path = gr.Dropdown(
+                                label="VAE Model (.pth)",
+                                choices=get_wan_of_vae_models("wan"),
+                                value=get_default_vae_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            humo_t5_path = gr.Dropdown(
+                                label="T5 Model (.pth/.safetensors)",
+                                choices=get_wan_of_t5_models("wan"),
+                                value=get_default_t5_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                        humo_save_path = gr.Textbox(label="Save Path", value="outputs")
+
+                #WanX-v2v Tab
+                # Wan One Frame Inference Tab
+                with gr.Tab(id=13, label="Wan One Frame") as wan_one_frame_tab:
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            wan_of_prompt = gr.Textbox(
+                                scale=3, 
+                                label="Enter your prompt", 
+                                value="A cat wearing a chef hat, cooking pizza.", 
+                                lines=5
+                            )
+                            wan_of_negative_prompt = gr.Textbox(
+                                scale=3,
+                                label="Negative Prompt",
+                                value="low quality, blurry, watermark, text, signature, ugly, deformed",
+                                lines=3,
+                            )
+                        with gr.Column(scale=1):
+                            wan_of_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
+                            wan_of_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                        with gr.Column(scale=2):
+                            wan_of_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                            wan_of_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wan_of_progress_text")
+
+                    with gr.Row():
+                        wan_of_generate_btn = gr.Button("Generate One Frame", elem_classes="green-btn")
+                        wan_of_stop_btn = gr.Button("Stop Generation", variant="stop")
+            
+                    with gr.Row():
+                        with gr.Column():
+                            wan_of_input_image = gr.Image(label="Control Image (Optional)", type="filepath")
+                            wan_of_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+                    
+                            # One Frame Inference Options
+                            with gr.Group():
+                                gr.Markdown("### One Frame Inference Options")
+                                with gr.Row():
+                                    wan_of_target_index = gr.Number(
+                                        label="Target Index",
+                                        value=1,
+                                        minimum=0,
+                                        maximum=15,
+                                        step=1,
+                                        info="Target frame index for generation"
+                                    )
+                                    wan_of_control_index = gr.Textbox(
+                                        label="Control Index",
+                                        value="0",
+                                        info="Control frame indices (e.g., '0' or '0;2')"
+                                    )
+                                wan_of_inference_options = gr.CheckboxGroup(
+                                    label="One Frame Options",
+                                    choices=["no_post", "no_2x", "no_4x", "default"],
+                                    value=["default"],
+                                    info="One frame inference options"
+                                )
+                        
+                                # Control Images for One Frame Inference
+                                with gr.Row():
+                                    wan_of_control_images = gr.File(
+                                        label="Control Images (Optional)",
+                                        file_types=["image"],
+                                        file_count="multiple"
+                                    )
+                                with gr.Row():
+                                    wan_of_control_masks = gr.File(
+                                        label="Control Image Masks (Optional)", 
+                                        file_types=["image"],
+                                        file_count="multiple"
+                                    )
+                    
+                            gr.Markdown("### Generation Parameters")
+                            wan_of_task = gr.Dropdown(
+                                label="Task", 
+                                choices=["i2v-A14B", "t2v-A14B", "ti2v-5B"], 
+                                value="i2v-A14B",
+                                info="Selects the model architecture and configuration to use."
+                            )
+                            wan_of_conditioning_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, step=0.01, 
+                                label="Image Conditioning Strength", 
+                                value=0.3,
+                                info="For T2V with image: 0.0 = preserve original image, 1.0 = ignore image (full generation)",
+                                visible=False
+                            )
+                            # Width and height inputs
+                            with gr.Row():
+                                wan_of_width = gr.Number(label="Width", value=832, interactive=True)
+                                wan_of_calc_height_btn = gr.Button("→")
+                                wan_of_calc_width_btn = gr.Button("←")
+                                wan_of_height = gr.Number(label="Height", value=480, interactive=True)
+                            wan_of_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
+                            wan_of_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
+                            wan_of_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                            wan_of_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
+                            wan_of_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
+                            wan_of_timestep_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Timestep Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%)")
+                            wan_of_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
+                            with gr.Row():
+                                wan_of_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                                wan_of_random_seed_btn = gr.Button("🎲")
+
+                        with gr.Column():
+                            wan_of_output = gr.Gallery(
+                                label="Generated Images (Click to select)",
+                                columns=[2], rows=[2], object_fit="contain", height="auto",
+                                show_label=True, elem_id="gallery_wan_of", allow_preview=True, preview=True
+                            )
+                            with gr.Accordion("LoRA", open=True):
+                                with gr.Row():
+                                    wan_of_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                                    wan_of_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                                wan_of_lora_weights = []
+                                wan_of_lora_multipliers = []
+                                wan_of_lora_apply_low = []
+                                wan_of_lora_apply_high = []
+                                for i in range(4):
+                                    with gr.Row():
+                                        wan_of_lora_weights.append(gr.Dropdown(
+                                            label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                            value="None", allow_custom_value=False, interactive=True, scale=2
+                                        ))
+                                        wan_of_lora_multipliers.append(gr.Slider(
+                                            label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
+                                        ))
+                                    with gr.Row():
+                                        wan_of_lora_apply_low.append(gr.Checkbox(
+                                            label="Apply to Low Noise", value=True, scale=1
+                                        ))
+                                        wan_of_lora_apply_high.append(gr.Checkbox(
+                                            label="Apply to High Noise", value=False, scale=1
+                                        ))
+            
+                    with gr.Accordion("Model Paths & Performance", open=True):
+                        with gr.Row():
+                            wan_of_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
+                            wan_of_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
+                        with gr.Row():
+                            wan_of_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                            wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime conversion to FP8")
+                            wan_of_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
+                            wan_of_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
+                        with gr.Row():
+                            wan_of_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
+                            wan_of_vae_fp32 = gr.Checkbox(
+                                label="Use FP32 VAE (higher quality, more VRAM)",
+                                value=True,
+                            )
+                        with gr.Row():
+                            wan_of_model_folder = gr.Textbox(label="Model Folder", value="wan")
+                            wan_of_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
+                        with gr.Row():
+                            wan_of_dit_low_noise_path = gr.Dropdown(
+                                label="DiT Low Noise Model (.safetensors)",
+                                choices=get_wan_of_low_noise_models("wan"),
+                                value=get_default_low_noise_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            wan_of_dit_high_noise_path = gr.Dropdown(
+                                label="DiT High Noise Model (.safetensors)",
+                                choices=get_wan_of_high_noise_models("wan"),
+                                value=get_default_high_noise_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                        with gr.Row():
+                            wan_of_clip_path = gr.Dropdown(
+                                label="CLIP Model (.pth)",
+                                choices=get_wan_of_clip_models("wan"),
+                                value=get_default_clip_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            wan_of_vae_path = gr.Dropdown(
+                                label="VAE Model (.pth)",
+                                choices=get_wan_of_vae_models("wan"),
+                                value=get_default_vae_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                        with gr.Row():
+                            wan_of_t5_path = gr.Dropdown(
+                                label="T5 Model (.pth)",
+                                choices=get_wan_of_t5_models("wan"),
+                                value=get_default_t5_model("wan"),
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            wan_of_save_path = gr.Textbox(label="Save Path", value="outputs/wan_one_frame")
+
         with gr.Tab(id=6, label="WanX-v2v", visible=False) as wanx_v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
@@ -12392,196 +13047,6 @@ with gr.Blocks(
                     merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                     dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
 
-
-        # Wan One Frame Inference Tab
-        with gr.Tab(id=13, label="Wan One Frame") as wan_one_frame_tab:
-            with gr.Row():
-                with gr.Column(scale=4):
-                    wan_of_prompt = gr.Textbox(
-                        scale=3, 
-                        label="Enter your prompt", 
-                        value="A cat wearing a chef hat, cooking pizza.", 
-                        lines=5
-                    )
-                    wan_of_negative_prompt = gr.Textbox(
-                        scale=3,
-                        label="Negative Prompt",
-                        value="low quality, blurry, watermark, text, signature, ugly, deformed",
-                        lines=3,
-                    )
-                with gr.Column(scale=1):
-                    wan_of_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    wan_of_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
-                with gr.Column(scale=2):
-                    wan_of_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
-                    wan_of_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="wan_of_progress_text")
-
-            with gr.Row():
-                wan_of_generate_btn = gr.Button("Generate One Frame", elem_classes="green-btn")
-                wan_of_stop_btn = gr.Button("Stop Generation", variant="stop")
-            
-            with gr.Row():
-                with gr.Column():
-                    wan_of_input_image = gr.Image(label="Control Image (Optional)", type="filepath")
-                    wan_of_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
-                    
-                    # One Frame Inference Options
-                    with gr.Group():
-                        gr.Markdown("### One Frame Inference Options")
-                        with gr.Row():
-                            wan_of_target_index = gr.Number(
-                                label="Target Index",
-                                value=1,
-                                minimum=0,
-                                maximum=15,
-                                step=1,
-                                info="Target frame index for generation"
-                            )
-                            wan_of_control_index = gr.Textbox(
-                                label="Control Index",
-                                value="0",
-                                info="Control frame indices (e.g., '0' or '0;2')"
-                            )
-                        wan_of_inference_options = gr.CheckboxGroup(
-                            label="One Frame Options",
-                            choices=["no_post", "no_2x", "no_4x", "default"],
-                            value=["default"],
-                            info="One frame inference options"
-                        )
-                        
-                        # Control Images for One Frame Inference
-                        with gr.Row():
-                            wan_of_control_images = gr.File(
-                                label="Control Images (Optional)",
-                                file_types=["image"],
-                                file_count="multiple"
-                            )
-                        with gr.Row():
-                            wan_of_control_masks = gr.File(
-                                label="Control Image Masks (Optional)", 
-                                file_types=["image"],
-                                file_count="multiple"
-                            )
-                    
-                    gr.Markdown("### Generation Parameters")
-                    wan_of_task = gr.Dropdown(
-                        label="Task", 
-                        choices=["i2v-A14B", "t2v-A14B", "ti2v-5B"], 
-                        value="i2v-A14B",
-                        info="Selects the model architecture and configuration to use."
-                    )
-                    wan_of_conditioning_strength = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.01, 
-                        label="Image Conditioning Strength", 
-                        value=0.3,
-                        info="For T2V with image: 0.0 = preserve original image, 1.0 = ignore image (full generation)",
-                        visible=False
-                    )
-                    # Width and height inputs
-                    with gr.Row():
-                        wan_of_width = gr.Number(label="Width", value=832, interactive=True)
-                        wan_of_calc_height_btn = gr.Button("→")
-                        wan_of_calc_width_btn = gr.Button("←")
-                        wan_of_height = gr.Number(label="Height", value=480, interactive=True)
-                    wan_of_frame_num = gr.Slider(minimum=9, maximum=201, step=4, label="Frame Count", value=81, info="Must be 4n+1")
-                    wan_of_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
-                    wan_of_sample_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
-                    wan_of_flow_shift = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Flow Shift", value=5.0)
-                    wan_of_sample_guide_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=3.5)
-                    wan_of_timestep_boundary = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Timestep Boundary", value=0.875, visible=True, info="Low noise model used after this threshold (0.875 = 87.5%)")
-                    wan_of_sample_solver = gr.Radio(choices=["unipc", "dpm++", "vanilla"], label="Sample Solver", value="unipc")
-                    with gr.Row():
-                        wan_of_seed = gr.Number(label="Seed (-1 for random)", value=-1)
-                        wan_of_random_seed_btn = gr.Button("🎲")
-
-                with gr.Column():
-                    wan_of_output = gr.Gallery(
-                        label="Generated Images (Click to select)",
-                        columns=[2], rows=[2], object_fit="contain", height="auto",
-                        show_label=True, elem_id="gallery_wan_of", allow_preview=True, preview=True
-                    )
-                    with gr.Accordion("LoRA", open=True):
-                        with gr.Row():
-                            wan_of_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            wan_of_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
-                        wan_of_lora_weights = []
-                        wan_of_lora_multipliers = []
-                        wan_of_lora_apply_low = []
-                        wan_of_lora_apply_high = []
-                        for i in range(4):
-                            with gr.Row():
-                                wan_of_lora_weights.append(gr.Dropdown(
-                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
-                                    value="None", allow_custom_value=False, interactive=True, scale=2
-                                ))
-                                wan_of_lora_multipliers.append(gr.Slider(
-                                    label=f"Multiplier", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=1, interactive=True
-                                ))
-                            with gr.Row():
-                                wan_of_lora_apply_low.append(gr.Checkbox(
-                                    label="Apply to Low Noise", value=True, scale=1
-                                ))
-                                wan_of_lora_apply_high.append(gr.Checkbox(
-                                    label="Apply to High Noise", value=False, scale=1
-                                ))
-            
-            with gr.Accordion("Model Paths & Performance", open=True):
-                with gr.Row():
-                    wan_of_attn_mode = gr.Radio(choices=["sdpa", "flash", "torch", "xformers"], label="Attention Mode", value="sdpa")
-                    wan_of_block_swap = gr.Slider(minimum=0, maximum=39, step=1, label="Block Swap to Save VRAM", value=30)
-                with gr.Row():
-                    wan_of_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
-                    wan_of_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime conversion to FP8")
-                    wan_of_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
-                    wan_of_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
-                with gr.Row():
-                    wan_of_mixed_dtype = gr.Checkbox(label="Mixed Dtype (preserve fp32 weights)", value=False)
-                    wan_of_vae_fp32 = gr.Checkbox(
-                        label="Use FP32 VAE (higher quality, more VRAM)",
-                        value=True,
-                    )
-                with gr.Row():
-                    wan_of_model_folder = gr.Textbox(label="Model Folder", value="wan")
-                    wan_of_refresh_models_btn = gr.Button("🔄 Models", elem_classes="refresh-btn")
-                with gr.Row():
-                    wan_of_dit_low_noise_path = gr.Dropdown(
-                        label="DiT Low Noise Model (.safetensors)",
-                        choices=get_wan_of_low_noise_models("wan"),
-                        value=get_default_low_noise_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    wan_of_dit_high_noise_path = gr.Dropdown(
-                        label="DiT High Noise Model (.safetensors)",
-                        choices=get_wan_of_high_noise_models("wan"),
-                        value=get_default_high_noise_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                with gr.Row():
-                    wan_of_clip_path = gr.Dropdown(
-                        label="CLIP Model (.pth)",
-                        choices=get_wan_of_clip_models("wan"),
-                        value=get_default_clip_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    wan_of_vae_path = gr.Dropdown(
-                        label="VAE Model (.pth)",
-                        choices=get_wan_of_vae_models("wan"),
-                        value=get_default_vae_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                with gr.Row():
-                    wan_of_t5_path = gr.Dropdown(
-                        label="T5 Model (.pth)",
-                        choices=get_wan_of_t5_models("wan"),
-                        value=get_default_t5_model("wan"),
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    wan_of_save_path = gr.Textbox(label="Save Path", value="outputs/wan_one_frame")
 
     #Event handlers etc
     
@@ -15045,6 +15510,129 @@ with gr.Blocks(
         fn=refresh_8_loras,
         inputs=[wan22_lora_folder],
         outputs=wan22_lora_refresh_outputs_list
+    )
+
+    # ===== Bernini Event Handlers =====
+    # The Bernini tab reuses the shared job queue; wrappers drop the preview-gallery
+    # element from the generic wan22 poll/stop return tuples (no preview UI here).
+    def bernini_generate_wrapper(*a):
+        r = bernini_generate_via_queue(*a)
+        return r[0], r[2], r[3], r[4], r[5], r[6]
+
+    def bernini_poll_wrapper(job_id, batch_id):
+        r = wan22_poll_active_job(job_id, batch_id)
+        return r[0], r[2], r[3], r[4], r[5], r[6]
+
+    def bernini_stop_wrapper(batch_id):
+        r = wan22_stop_queue_generation(batch_id)
+        return r[0], r[2], r[3], r[4], r[5], r[6]
+
+    bernini_generate_btn.click(
+        fn=bernini_generate_wrapper,
+        inputs=[
+            bernini_prompt,
+            bernini_negative_prompt,
+            bernini_task,
+            bernini_guidance_mode,
+            bernini_system_prompt,
+            bernini_source_videos,
+            bernini_source_image,
+            bernini_ref_images,
+            bernini_width,
+            bernini_height,
+            bernini_frame_num,
+            bernini_fps,
+            bernini_seed,
+            bernini_sample_solver,
+            bernini_sample_steps,
+            bernini_flow_shift,
+            bernini_dual_dit_boundary,
+            bernini_omega_vid,
+            bernini_omega_img,
+            bernini_omega_txt,
+            bernini_omega_scale,
+            bernini_eta,
+            bernini_momentum,
+            bernini_norm_threshold,
+            bernini_max_image_size,
+            bernini_use_src_tgt_id,
+            bernini_interpolate_src_id,
+            bernini_max_trained_src_id,
+            bernini_batch_size,
+            bernini_save_path,
+            # Model Paths & Performance
+            bernini_attn_mode,
+            bernini_mixed_dtype,
+            bernini_block_swap,
+            bernini_auto_block_swap,
+            bernini_fp8,
+            bernini_fp8_scaled,
+            bernini_fp8_fast,
+            bernini_fp8_t5,
+            bernini_model_folder,
+            bernini_dit_low_noise_path,
+            bernini_dit_high_noise_path,
+            bernini_vae_path,
+            bernini_t5_path,
+            bernini_vae_fp32,
+            bernini_compile,
+            # LoRAs
+            bernini_lora_folder,
+            *bernini_lora_weights,
+            *bernini_lora_multipliers,
+            *bernini_lora_apply_low,
+            *bernini_lora_apply_high,
+        ],
+        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+                 bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer],
+        queue=True
+    )
+
+    bernini_poll_timer.tick(
+        fn=bernini_poll_wrapper,
+        inputs=[bernini_job_id_state, bernini_batch_id_state],
+        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+                 bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer]
+    )
+
+    bernini_stop_btn.click(
+        fn=bernini_stop_wrapper,
+        inputs=[bernini_batch_id_state],
+        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+                 bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer],
+        queue=False
+    )
+
+    bernini_stop_decode_btn.click(
+        fn=wan22_stop_and_decode,
+        outputs=[bernini_batch_progress],
+        queue=False
+    )
+
+    bernini_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[bernini_seed])
+
+    bernini_lora_refresh_outputs_list = []
+    for i in range(len(bernini_lora_weights)):
+        bernini_lora_refresh_outputs_list.extend([bernini_lora_weights[i], bernini_lora_multipliers[i]])
+
+    bernini_lora_refresh_btn.click(
+        fn=refresh_8_loras,
+        inputs=[bernini_lora_folder],
+        outputs=bernini_lora_refresh_outputs_list
+    )
+
+    def refresh_bernini_models(folder: str):
+        return (
+            gr.update(choices=get_wan_of_low_noise_models(folder)),
+            gr.update(choices=get_wan_of_high_noise_models(folder)),
+            gr.update(choices=get_wan_of_vae_models(folder)),
+            gr.update(choices=get_wan_of_t5_models(folder)),
+        )
+
+    bernini_refresh_models_btn.click(
+        fn=refresh_bernini_models,
+        inputs=[bernini_model_folder],
+        outputs=[bernini_dit_low_noise_path, bernini_dit_high_noise_path, bernini_vae_path, bernini_t5_path]
     )
 
     # ===== StoryMem Event Handlers =====
