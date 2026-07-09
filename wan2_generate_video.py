@@ -7350,6 +7350,18 @@ def run_bernini_sampling(
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     latent = torch.randn(latent_shape, generator=gen, dtype=torch.float32).to(device)
 
+    # latent preview (same mechanism as the other pipelines); with --mixed_dtype the
+    # weights have no single dtype, so use the activation/autocast dtype here
+    previewer = None
+    if args.preview is not None:
+        try:
+            preview_dtype = torch.bfloat16 if accelerator.mixed_precision == "bf16" else torch.float16
+            previewer = LatentPreviewer(args, latent.clone().squeeze(0), timesteps, device, preview_dtype, model_type="wan")
+            logger.info("Bernini Latent Previewer initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Bernini Latent Previewer: {e}")
+            previewer = None
+
     # APG momentum buffers / per-condition norm thresholds
     momentum_buffer = momentum_buffer1 = momentum_buffer2 = None
     if guidance_mode == "r2v_apg":
@@ -7474,6 +7486,12 @@ def run_bernini_sampling(
             latent = scheduler.step(noise_pred, t, latent, return_dict=False)[0]
         else:
             latent = scheduler.step(noise_pred, t, latent)
+
+        if previewer is not None and (t_idx + 1) % args.preview == 0 and (t_idx + 1) < len(timesteps):
+            try:
+                previewer.preview(latent[0], t_idx, preview_suffix=args.preview_suffix)
+            except Exception as e:
+                logger.warning(f"Bernini latent preview failed at step {t_idx + 1}: {e}")
 
     return latent
 

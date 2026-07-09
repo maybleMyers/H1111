@@ -1630,6 +1630,8 @@ def bernini_submit_to_queue(
     max_trained_src_id: int,
     batch_size: int,
     save_path: str,
+    enable_preview: bool,
+    preview_steps: int,
     # Model Paths & Performance
     attn_mode: str,
     mixed_dtype: bool,
@@ -1692,6 +1694,8 @@ def bernini_submit_to_queue(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         ext = "png" if is_image_task else "mp4"
         output_filename = os.path.join(save_path, f"bernini_{task}_{timestamp}_{current_seed}.{ext}")
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"bernini_{run_id}"
 
         command = [
             sys.executable, "wan2_generate_video.py",
@@ -1763,6 +1767,10 @@ def bernini_submit_to_queue(
             command.extend(["--vae_dtype", "float32"])
         if compile_enabled:
             command.append("--compile")
+
+        if enable_preview:
+            command.extend(["--preview", str(max(1, int(preview_steps)))])
+            command.extend(["--preview_suffix", unique_preview_suffix])
 
         # LoRA handling (identical to the Wan2.2 tab, applied to the converted native weights)
         lora_weights_paths = []
@@ -11244,6 +11252,7 @@ with gr.Blocks(
                         lines=3,
                     )
                 with gr.Column(scale=1):
+                    bernini_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     bernini_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
                     bernini_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -11296,8 +11305,11 @@ with gr.Blocks(
                     )
 
                     gr.Markdown("### Generation Parameters")
+                    bernini_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
                     with gr.Row():
                         bernini_width = gr.Number(label="Width (used when no source video/image)", value=848, step=16, interactive=True)
+                        bernini_calc_height_btn = gr.Button("→")
+                        bernini_calc_width_btn = gr.Button("←")
                         bernini_height = gr.Number(label="Height", value=480, step=16, interactive=True)
                     bernini_frame_num = gr.Slider(minimum=1, maximum=241, step=4, label="Frame Count (4n+1; 1 for images)", value=81)
                     bernini_fps = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=16)
@@ -11333,6 +11345,14 @@ with gr.Blocks(
                         columns=[2], rows=[2], object_fit="contain", height="auto",
                         show_label=True, elem_id="gallery_bernini", allow_preview=True, preview=True
                     )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        bernini_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        bernini_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                          label="Preview Every N Steps")
+                        bernini_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="bernini_preview_gallery"
+                        )
                     with gr.Accordion("LoRA", open=False):
                         with gr.Row():
                             bernini_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
@@ -15513,22 +15533,52 @@ with gr.Blocks(
     )
 
     # ===== Bernini Event Handlers =====
-    # The Bernini tab reuses the shared job queue; wrappers drop the preview-gallery
-    # element from the generic wan22 poll/stop return tuples (no preview UI here).
-    def bernini_generate_wrapper(*a):
-        r = bernini_generate_via_queue(*a)
-        return r[0], r[2], r[3], r[4], r[5], r[6]
+    # The Bernini tab reuses the shared job queue and the generic wan22 poll/stop
+    # handlers directly (same 7-slot output layout as the Wan2.2 tab).
+    bernini_prompt.change(fn=count_prompt_tokens, inputs=bernini_prompt, outputs=bernini_token_counter)
 
-    def bernini_poll_wrapper(job_id, batch_id):
-        r = wan22_poll_active_job(job_id, batch_id)
-        return r[0], r[2], r[3], r[4], r[5], r[6]
+    def update_bernini_dimensions(source_image, source_videos):
+        """Fill width/height from the source image (i2i) or the first source video."""
+        if source_image is not None:
+            img = Image.open(source_image)
+            w, h = img.size
+            w = (w // 16) * 16
+            h = (h // 16) * 16
+            return f"{w}x{h}", w, h
+        if source_videos:
+            first = source_videos[0]
+            first = first if isinstance(first, str) else getattr(first, "name", str(first))
+            info = get_video_info(first)
+            if info:
+                w = (info['width'] // 16) * 16
+                h = (info['height'] // 16) * 16
+                return f"{w}x{h}", w, h
+        return "", gr.update(), gr.update()
 
-    def bernini_stop_wrapper(batch_id):
-        r = wan22_stop_queue_generation(batch_id)
-        return r[0], r[2], r[3], r[4], r[5], r[6]
+    bernini_source_image.change(
+        fn=update_bernini_dimensions,
+        inputs=[bernini_source_image, bernini_source_videos],
+        outputs=[bernini_original_dims, bernini_width, bernini_height]
+    )
+    bernini_source_videos.change(
+        fn=update_bernini_dimensions,
+        inputs=[bernini_source_image, bernini_source_videos],
+        outputs=[bernini_original_dims, bernini_width, bernini_height]
+    )
+
+    bernini_calc_width_btn.click(
+        fn=calculate_wanx_width,
+        inputs=[bernini_height, bernini_original_dims],
+        outputs=[bernini_width]
+    )
+    bernini_calc_height_btn.click(
+        fn=calculate_wanx_height,
+        inputs=[bernini_width, bernini_original_dims],
+        outputs=[bernini_height]
+    )
 
     bernini_generate_btn.click(
-        fn=bernini_generate_wrapper,
+        fn=bernini_generate_via_queue,
         inputs=[
             bernini_prompt,
             bernini_negative_prompt,
@@ -15560,6 +15610,8 @@ with gr.Blocks(
             bernini_max_trained_src_id,
             bernini_batch_size,
             bernini_save_path,
+            bernini_enable_preview,
+            bernini_preview_steps,
             # Model Paths & Performance
             bernini_attn_mode,
             bernini_mixed_dtype,
@@ -15583,22 +15635,22 @@ with gr.Blocks(
             *bernini_lora_apply_low,
             *bernini_lora_apply_high,
         ],
-        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+        outputs=[bernini_output, bernini_preview_output, bernini_batch_progress, bernini_progress_text,
                  bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer],
         queue=True
     )
 
     bernini_poll_timer.tick(
-        fn=bernini_poll_wrapper,
+        fn=wan22_poll_active_job,
         inputs=[bernini_job_id_state, bernini_batch_id_state],
-        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+        outputs=[bernini_output, bernini_preview_output, bernini_batch_progress, bernini_progress_text,
                  bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer]
     )
 
     bernini_stop_btn.click(
-        fn=bernini_stop_wrapper,
+        fn=wan22_stop_queue_generation,
         inputs=[bernini_batch_id_state],
-        outputs=[bernini_output, bernini_batch_progress, bernini_progress_text,
+        outputs=[bernini_output, bernini_preview_output, bernini_batch_progress, bernini_progress_text,
                  bernini_job_id_state, bernini_batch_id_state, bernini_poll_timer],
         queue=False
     )
