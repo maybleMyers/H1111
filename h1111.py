@@ -57,6 +57,7 @@ FRAMEPROK_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "framepack_defaults.json"
 SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
 STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
 WAN22_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "wan22_defaults.json")
+BERNINI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "bernini_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -1639,6 +1640,7 @@ def bernini_submit_to_queue(
     auto_block_swap: bool,
     fp8: bool,
     fp8_scaled: bool,
+    fp8_prescaled: bool,
     fp8_fast: bool,
     fp8_t5: bool,
     model_folder: str,
@@ -1759,6 +1761,8 @@ def bernini_submit_to_queue(
             command.append("--fp8")
         if fp8_scaled:
             command.append("--fp8_scaled")
+        if fp8_prescaled:
+            command.append("--fp8_prescaled")
         if fp8_fast:
             command.append("--fp8_fast")
         if fp8_t5:
@@ -11407,6 +11411,7 @@ with gr.Blocks(
                 with gr.Row():
                     bernini_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     bernini_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    bernini_fp8_prescaled = gr.Checkbox(label="Prescaled FP8", value=False, info="For models with embedded scale tensors (auto-detected)")
                     bernini_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="Enable fast FP8 arithmetic (RTX 4XXX+)")
                     bernini_fp8_t5 = gr.Checkbox(label="Use FP8 for T5", value=False)
                 with gr.Row():
@@ -11447,6 +11452,10 @@ with gr.Blocks(
                         interactive=True
                     )
                 bernini_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    bernini_save_defaults_btn = gr.Button("Save Defaults")
+                    bernini_load_defaults_btn = gr.Button("Load Defaults")
+                    bernini_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
         # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
         with gr.Tab(id=17, label="StoryMem") as storymem_tab:
@@ -15619,6 +15628,7 @@ with gr.Blocks(
             bernini_auto_block_swap,
             bernini_fp8,
             bernini_fp8_scaled,
+            bernini_fp8_prescaled,
             bernini_fp8_fast,
             bernini_fp8_t5,
             bernini_model_folder,
@@ -16369,6 +16379,145 @@ with gr.Blocks(
         fn=initial_load_wan22_defaults,
         inputs=None,
         outputs=wan22_ui_default_components_ORDERED_LIST
+    )
+
+    # ===== Bernini Save/Load Defaults =====
+    bernini_ui_default_components_ORDERED_LIST = [
+        bernini_model_folder,
+        bernini_dit_low_noise_path,
+        bernini_dit_high_noise_path,
+        bernini_vae_path,
+        bernini_t5_path,
+        bernini_attn_mode,
+        bernini_block_swap,
+        bernini_auto_block_swap,
+        bernini_fp8,
+        bernini_fp8_scaled,
+        bernini_fp8_prescaled,
+        bernini_fp8_fast,
+        bernini_fp8_t5,
+        bernini_mixed_dtype,
+        bernini_vae_fp32,
+        bernini_compile,
+        bernini_save_path,
+        bernini_lora_folder,
+        bernini_task,
+        bernini_guidance_mode,
+        bernini_max_image_size,
+        bernini_omega_vid,
+        bernini_omega_img,
+        bernini_omega_txt,
+        bernini_omega_scale,
+        bernini_eta,
+        bernini_momentum,
+        bernini_norm_threshold,
+        bernini_use_src_tgt_id,
+        bernini_interpolate_src_id,
+        bernini_max_trained_src_id,
+    ] + bernini_lora_weights + bernini_lora_multipliers + bernini_lora_apply_low + bernini_lora_apply_high
+
+    bernini_ui_default_keys = [
+        "bernini_model_folder",
+        "bernini_dit_low_noise_path",
+        "bernini_dit_high_noise_path",
+        "bernini_vae_path",
+        "bernini_t5_path",
+        "bernini_attn_mode",
+        "bernini_block_swap",
+        "bernini_auto_block_swap",
+        "bernini_fp8",
+        "bernini_fp8_scaled",
+        "bernini_fp8_prescaled",
+        "bernini_fp8_fast",
+        "bernini_fp8_t5",
+        "bernini_mixed_dtype",
+        "bernini_vae_fp32",
+        "bernini_compile",
+        "bernini_save_path",
+        "bernini_lora_folder",
+        "bernini_task",
+        "bernini_guidance_mode",
+        "bernini_max_image_size",
+        "bernini_omega_vid",
+        "bernini_omega_img",
+        "bernini_omega_txt",
+        "bernini_omega_scale",
+        "bernini_eta",
+        "bernini_momentum",
+        "bernini_norm_threshold",
+        "bernini_use_src_tgt_id",
+        "bernini_interpolate_src_id",
+        "bernini_max_trained_src_id",
+    ] + [f"bernini_lora_weight_{i+1}" for i in range(8)] + \
+        [f"bernini_lora_multiplier_{i+1}" for i in range(8)] + \
+        [f"bernini_lora_apply_low_{i+1}" for i in range(8)] + \
+        [f"bernini_lora_apply_high_{i+1}" for i in range(8)]
+
+    def save_bernini_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(bernini_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(BERNINI_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "Bernini defaults saved successfully."
+        except Exception as e:
+            return f"Error saving Bernini defaults: {e}"
+
+    def load_bernini_defaults(request: gr.Request):
+        if not os.path.exists(BERNINI_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(bernini_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(bernini_ui_default_keys) + [""]
+
+        try:
+            with open(BERNINI_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(bernini_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        lora_folder = loaded_settings.get("bernini_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(bernini_ui_default_keys):
+            component = bernini_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["Bernini defaults loaded successfully."]
+
+    bernini_save_defaults_btn.click(
+        fn=save_bernini_defaults,
+        inputs=bernini_ui_default_components_ORDERED_LIST,
+        outputs=[bernini_defaults_status]
+    )
+    bernini_load_defaults_btn.click(
+        fn=load_bernini_defaults,
+        inputs=None,
+        outputs=bernini_ui_default_components_ORDERED_LIST + [bernini_defaults_status]
+    )
+
+    def initial_load_bernini_defaults():
+        results_and_status = load_bernini_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_bernini_defaults,
+        inputs=None,
+        outputs=bernini_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====
