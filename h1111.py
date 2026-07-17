@@ -1609,6 +1609,9 @@ def bernini_submit_to_queue(
     source_videos,
     source_image: str,
     ref_images,
+    start_image: str,
+    start_image_strength: float,
+    start_image_as_ref: bool,
     width: int,
     height: int,
     frame_num: int,
@@ -1747,6 +1750,11 @@ def bernini_submit_to_queue(
             command.extend(["--source_image", str(source_image)])
         if refs:
             command.extend(["--ref_images"] + refs)
+        if start_image:
+            command.extend(["--start_image", str(start_image)])
+            command.extend(["--start_image_strength", str(start_image_strength)])
+            if not start_image_as_ref:
+                command.append("--no-start_image_as_ref")
 
         if not use_src_tgt_id:
             command.append("--no-use_src_tgt_id")
@@ -1842,6 +1850,10 @@ def bernini_submit_to_queue(
             parameters["source_image"] = source_image
         if refs:
             parameters["ref_images"] = refs
+        if start_image:
+            parameters["start_image"] = start_image
+            parameters["start_image_strength"] = start_image_strength
+            parameters["start_image_as_ref"] = start_image_as_ref
 
         job = queue.add_job(
             command=command,
@@ -11276,15 +11288,15 @@ with gr.Blocks(
                 with gr.Column():
                     bernini_task = gr.Dropdown(
                         label="Bernini Task",
-                        choices=["t2v", "t2i", "v2v", "i2i", "mv2v", "r2v", "rv2v", "ads2v"],
+                        choices=["t2v", "t2i", "i2v", "v2v", "i2i", "mv2v", "r2v", "rv2v", "ads2v"],
                         value="v2v",
-                        info="t2v/t2i: generation | v2v/mv2v: video editing | i2i: image editing | r2v: reference images → video | rv2v/ads2v: video editing with reference images"
+                        info="t2v/t2i: generation | i2v: start image → video (latent injection) | v2v/mv2v: video editing | i2i: image editing | r2v: reference images → video | rv2v/ads2v: video editing with reference images"
                     )
                     bernini_guidance_mode = gr.Dropdown(
                         label="Guidance Mode",
                         choices=["Auto (task default)", "rv2v", "v2v", "v2v_chain", "t2v", "r2v_apg", "v2v_apg", "t2v_apg"],
                         value="Auto (task default)",
-                        info="Auto uses the official per-task mode (t2v/t2i→t2v_apg, i2i→v2v, v2v/mv2v/ads2v→v2v_apg, r2v→r2v_apg, rv2v→rv2v)"
+                        info="Auto uses the official per-task mode (t2v/t2i→t2v_apg, i2i→v2v, v2v/mv2v/ads2v→v2v_apg, r2v→r2v_apg, rv2v→rv2v, i2v→r2v_apg or t2v_apg without 'as reference')"
                     )
                     bernini_system_prompt = gr.Textbox(
                         label="System Prompt Override (blank = auto per task)",
@@ -11307,6 +11319,20 @@ with gr.Blocks(
                         file_types=["image"],
                         type="filepath",
                     )
+                    bernini_start_image = gr.Image(
+                        label="Start Image (i2v: pinned as the first frame via latent injection)",
+                        type="filepath",
+                    )
+                    with gr.Row():
+                        bernini_start_image_strength = gr.Slider(
+                            minimum=0.0, maximum=1.0, step=0.05, value=1.0,
+                            label="Start Image Strength",
+                            info="Fraction of steps with the first frame pinned; 1.0 = exact first frame, lower frees it up earlier"
+                        )
+                        bernini_start_image_as_ref = gr.Checkbox(
+                            label="Also Send as Reference", value=True,
+                            info="Feeds the start image as a reference segment too (identity conditioning; uses r2v_apg guidance)"
+                        )
 
                     gr.Markdown("### Generation Parameters")
                     bernini_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
@@ -15546,8 +15572,8 @@ with gr.Blocks(
     # handlers directly (same 7-slot output layout as the Wan2.2 tab).
     bernini_prompt.change(fn=count_prompt_tokens, inputs=bernini_prompt, outputs=bernini_token_counter)
 
-    def update_bernini_dimensions(source_image, source_videos):
-        """Fill width/height from the source image (i2i) or the first source video."""
+    def update_bernini_dimensions(source_image, source_videos, start_image):
+        """Fill width/height from the source image (i2i), the first source video, or the start image (i2v)."""
         if source_image is not None:
             img = Image.open(source_image)
             w, h = img.size
@@ -15562,16 +15588,27 @@ with gr.Blocks(
                 w = (info['width'] // 16) * 16
                 h = (info['height'] // 16) * 16
                 return f"{w}x{h}", w, h
+        if start_image is not None:
+            img = Image.open(start_image)
+            w, h = img.size
+            w = (w // 16) * 16
+            h = (h // 16) * 16
+            return f"{w}x{h}", w, h
         return "", gr.update(), gr.update()
 
     bernini_source_image.change(
         fn=update_bernini_dimensions,
-        inputs=[bernini_source_image, bernini_source_videos],
+        inputs=[bernini_source_image, bernini_source_videos, bernini_start_image],
         outputs=[bernini_original_dims, bernini_width, bernini_height]
     )
     bernini_source_videos.change(
         fn=update_bernini_dimensions,
-        inputs=[bernini_source_image, bernini_source_videos],
+        inputs=[bernini_source_image, bernini_source_videos, bernini_start_image],
+        outputs=[bernini_original_dims, bernini_width, bernini_height]
+    )
+    bernini_start_image.change(
+        fn=update_bernini_dimensions,
+        inputs=[bernini_source_image, bernini_source_videos, bernini_start_image],
         outputs=[bernini_original_dims, bernini_width, bernini_height]
     )
 
@@ -15597,6 +15634,9 @@ with gr.Blocks(
             bernini_source_videos,
             bernini_source_image,
             bernini_ref_images,
+            bernini_start_image,
+            bernini_start_image_strength,
+            bernini_start_image_as_ref,
             bernini_width,
             bernini_height,
             bernini_frame_num,
@@ -16414,6 +16454,8 @@ with gr.Blocks(
         bernini_use_src_tgt_id,
         bernini_interpolate_src_id,
         bernini_max_trained_src_id,
+        bernini_start_image_strength,
+        bernini_start_image_as_ref,
     ] + bernini_lora_weights + bernini_lora_multipliers + bernini_lora_apply_low + bernini_lora_apply_high
 
     bernini_ui_default_keys = [
@@ -16448,6 +16490,8 @@ with gr.Blocks(
         "bernini_use_src_tgt_id",
         "bernini_interpolate_src_id",
         "bernini_max_trained_src_id",
+        "bernini_start_image_strength",
+        "bernini_start_image_as_ref",
     ] + [f"bernini_lora_weight_{i+1}" for i in range(8)] + \
         [f"bernini_lora_multiplier_{i+1}" for i in range(8)] + \
         [f"bernini_lora_apply_low_{i+1}" for i in range(8)] + \

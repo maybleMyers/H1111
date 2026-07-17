@@ -78,13 +78,14 @@ def get_system_prompt_for_task(task_type: str) -> str:
     return SYSTEM_PROMPTS.get(task_type, SYSTEM_PROMPTS["default"])
 
 
-BERNINI_TASKS = ["t2i", "t2v", "i2i", "v2v", "mv2v", "r2v", "rv2v", "ads2v"]
+BERNINI_TASKS = ["t2i", "t2v", "i2v", "i2i", "v2v", "mv2v", "r2v", "rv2v", "ads2v"]
 GUIDANCE_MODES = ["rv2v", "v2v", "v2v_chain", "t2v", "r2v_apg", "v2v_apg", "t2v_apg"]
 IMAGE_TASKS = {"t2i", "i2i"}
 
 GUIDANCE_MODE_BY_TASK = {
     "t2i": "t2v_apg",
     "t2v": "t2v_apg",
+    "i2v": "r2v_apg",
     "i2i": "v2v",
     "v2v": "v2v_apg",
     "mv2v": "v2v_apg",
@@ -113,6 +114,7 @@ TASK_DEFAULTS = {
     "t2i": {"video_length": 1},
     "i2i": {"video_length": 1},
     "t2v": {},
+    "i2v": {},
     "v2v": {},
     "mv2v": {},
     "r2v": {},
@@ -435,7 +437,11 @@ def resolve_bernini_defaults(args) -> None:
     merged.update(TASK_DEFAULTS.get(task, {}))
 
     if args.guidance_mode is None:
-        args.guidance_mode = GUIDANCE_MODE_BY_TASK[task]
+        if task == "i2v" and not getattr(args, "start_image_as_ref", True):
+            # injection-only i2v: no reference segment, so image guidance has nothing to act on
+            args.guidance_mode = "t2v_apg"
+        else:
+            args.guidance_mode = GUIDANCE_MODE_BY_TASK[task]
     if args.infer_steps is None:
         args.infer_steps = merged["infer_steps"]
     if args.flow_shift is None:

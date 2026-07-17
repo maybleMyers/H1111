@@ -1528,7 +1528,7 @@ def parse_args() -> argparse.Namespace:
     # and APG/chained guidance. Activated by --bernini_task; use with converted native
     # checkpoints via --dit_high_noise / --dit_low_noise (see convert_bernini_to_native.py).
     parser.add_argument("--bernini_task", type=str, default=None,
-                        choices=["t2i", "t2v", "i2i", "v2v", "mv2v", "r2v", "rv2v", "ads2v"],
+                        choices=["t2i", "t2v", "i2v", "i2i", "v2v", "mv2v", "r2v", "rv2v", "ads2v"],
                         help="Bernini task type; enables the Bernini generation path")
     parser.add_argument("--source_videos", type=str, nargs="+", default=None,
                         help="Bernini: source video path(s) for editing (v2v/mv2v/rv2v/ads2v)")
@@ -1536,6 +1536,12 @@ def parse_args() -> argparse.Namespace:
                         help="Bernini: single source image for image editing (i2i)")
     parser.add_argument("--ref_images", type=str, nargs="+", default=None,
                         help="Bernini: reference image(s) (r2v/rv2v/ads2v)")
+    parser.add_argument("--start_image", type=str, default=None,
+                        help="Bernini: starting image pinned as the first video frame via latent injection (i2v)")
+    parser.add_argument("--start_image_strength", type=float, default=1.0,
+                        help="Bernini: fraction of steps the start image stays injected (1.0 = all steps + exact first frame)")
+    parser.add_argument("--start_image_as_ref", action=argparse.BooleanOptionalAction, default=True,
+                        help="Bernini: also feed the start image as a reference segment for identity conditioning")
     parser.add_argument("--guidance_mode", type=str, default=None,
                         choices=["rv2v", "v2v", "v2v_chain", "t2v", "r2v_apg", "v2v_apg", "t2v_apg"],
                         help="Bernini guidance mode (default: auto-selected from --bernini_task)")
@@ -2262,8 +2268,10 @@ def setup_args(args: argparse.Namespace) -> argparse.Namespace:
         from wan.utils.bernini_inference import resolve_bernini_defaults
 
         resolve_bernini_defaults(args)
-        # target size when no source medium dictates it: official default 480x848 (H, W)
-        if args.video_size == [256, 256] and "--video_size" not in sys.argv:
+        # target size when no source medium dictates it: official default 480x848 (H, W).
+        # An explicitly passed --video_size is authoritative for the start image (i2v).
+        args._video_size_explicit = "--video_size" in sys.argv
+        if args.video_size == [256, 256] and not args._video_size_explicit:
             args.video_size = [480, 848]
         if args.bernini_task in ("t2i", "i2i") and args.output_type in ("video", "both"):
             logger.info("Bernini image task: switching output_type to 'images'")
@@ -7314,6 +7322,7 @@ def run_bernini_sampling(
     image_latents,
     ref_image_latents,
     latent_shape,
+    start_latent=None,
 ) -> torch.Tensor:
     """Bernini-R guided sampling loop, an exact port of GEN_Wanx22.sample
     (bernini_repo/bernini/models/wan_diffusion.py:227) onto the native WanModel.
@@ -7321,7 +7330,13 @@ def run_bernini_sampling(
     The latent is kept in spatial form [1, C, T, H, W] throughout (the official
     code packs/unpacks tokens around an elementwise scheduler, which is
     equivalent); conditioning latents are passed raw to model.forward_bernini,
-    which patch-embeds them per expert like patch_vae_latent does."""
+    which patch-embeds them per expert like patch_vae_latent does.
+
+    `start_latent` ([16, 1, H/8, W/8]) pins the first output frame: at each step
+    the target latent's first temporal slice is replaced with the start image
+    re-noised to the current sigma (flow-matching forward process), so the model
+    inpaints the remaining frames around it. Bernini has no native i2v path;
+    this is the standard Wan T2V first-frame injection."""
     from wan.utils import bernini_inference as bern
 
     guidance_mode = args.guidance_mode
@@ -7349,6 +7364,16 @@ def run_bernini_sampling(
     # initial noise: CPU generator in float32, exactly like diffusers randn_tensor
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     latent = torch.randn(latent_shape, generator=gen, dtype=torch.float32).to(device)
+
+    # first-frame injection state (start image re-noised with a fixed noise slice)
+    inject_steps = 0
+    start_lat = noise0 = None
+    if start_latent is not None:
+        start_lat = start_latent.unsqueeze(0).to(device=device, dtype=torch.float32)  # [1, 16, 1, h, w]
+        noise0 = latent[:, :, 0:1].clone()
+        strength = min(max(float(args.start_image_strength), 0.0), 1.0)
+        inject_steps = int(round(strength * len(timesteps)))
+        logger.info(f"Start-image first-frame injection: {inject_steps}/{len(timesteps)} steps (strength {strength})")
 
     # latent preview (same mechanism as the other pipelines); with --mixed_dtype the
     # weights have no single dtype, so use the activation/autocast dtype here
@@ -7393,6 +7418,11 @@ def run_bernini_sampling(
     model = single_model
 
     for t_idx, t in enumerate(tqdm(timesteps, desc="Bernini sampling")):
+        if start_lat is not None and t_idx < inject_steps:
+            # flow-matching forward process at the current noise level
+            sigma_t = float(scheduler.sigmas[t_idx])
+            latent[:, :, 0:1] = (1.0 - sigma_t) * start_lat + sigma_t * noise0
+
         high_phase = t.item() >= boundary_timestep
         if dual:
             model = model_manager.get_model("high" if high_phase else "low")
@@ -7493,6 +7523,10 @@ def run_bernini_sampling(
             except Exception as e:
                 logger.warning(f"Bernini latent preview failed at step {t_idx + 1}: {e}")
 
+    if start_lat is not None and inject_steps >= len(timesteps):
+        # full-strength injection: make frame 0 exactly the start image
+        latent[:, :, 0:1] = start_lat
+
     return latent
 
 
@@ -7519,6 +7553,15 @@ def generate_bernini(args: argparse.Namespace) -> Optional[torch.Tensor]:
         raise ValueError("Bernini task 'r2v' requires --ref_images")
     if task in ("rv2v", "ads2v") and (not args.source_videos or not args.ref_images):
         raise ValueError(f"Bernini task '{task}' requires --source_videos and --ref_images")
+    if task == "i2v" and args.start_image is None:
+        raise ValueError("Bernini task 'i2v' requires --start_image")
+    if args.start_image is not None and task in ("t2i", "i2i"):
+        raise ValueError("--start_image is only supported for video tasks")
+    if args.start_image is not None and args.start_image_as_ref and args.guidance_mode in ("t2v", "t2v_apg"):
+        logger.warning(
+            "start_image_as_ref has no effect with guidance_mode '%s' (no image-conditioned forward); "
+            "use r2v_apg (or rv2v with a source video) for reference conditioning", args.guidance_mode
+        )
 
     # --- Data types (mirrors generate()) ---
     if args.dit is not None:
@@ -7579,6 +7622,27 @@ def generate_bernini(args: argparse.Namespace) -> Optional[torch.Tensor]:
     for p in args.ref_images or []:
         pixels = bern.preprocess_image(p, max_image_size=args.max_image_size, device=device)
         ref_image_latents.append(_encode(pixels))
+        del pixels
+    start_latent = None
+    if args.start_image is not None:
+        if h is None and getattr(args, "_video_size_explicit", False):
+            # explicit --video_size is authoritative for i2v (the UI fills it from the image)
+            h, w = args.video_size
+        # avoid an intermediate downscale below the final target size when loading
+        load_cap = max(args.max_image_size, h or 0, w or 0)
+        pixels = bern.preprocess_image(args.start_image, max_image_size=load_cap, device=device)
+        if h is None:
+            h, w = pixels.shape[-2], pixels.shape[-1]
+        # the injected first frame must match the output latent grid exactly; conditioning
+        # segments keep their own size, but this one is written into the target latent
+        th, tw = bern.make_divisible(h, 16), bern.make_divisible(w, 16)
+        if pixels.shape[-2:] != (th, tw):
+            pixels = torch.nn.functional.interpolate(
+                pixels[:, :, 0], size=(th, tw), mode="bicubic", antialias=True
+            ).unsqueeze(2).clamp_(-1, 1)
+        start_latent = _encode(pixels)  # [16, 1, th/8, tw/8]
+        if args.start_image_as_ref:
+            ref_image_latents.append(start_latent)
         del pixels
 
     vae.to_device("cpu")
@@ -7641,6 +7705,7 @@ def generate_bernini(args: argparse.Namespace) -> Optional[torch.Tensor]:
         context, context_null,
         video_latents, image_latents, ref_image_latents,
         latent_shape,
+        start_latent=start_latent,
     )
 
     # --- Cleanup ---
