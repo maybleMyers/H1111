@@ -100,8 +100,11 @@ def load_safetensors_with_lora_and_fp8(
                     raise FileNotFoundError(f"File {filepath} not found")
         else:
             extended_model_files.append(model_file)
-    
-    model_files = extended_model_files
+
+    # Deduplicate while preserving order: when a caller passes every shard of a
+    # sharded checkpoint, the pattern expansion above would otherwise repeat the
+    # full shard set once per input file (N^2 loads).
+    model_files = list(dict.fromkeys(extended_model_files))
     logger.info(f"Loading model files: {model_files}")
 
     # Prepare LoRA weights

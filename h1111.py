@@ -1949,10 +1949,15 @@ def cosmos_submit_to_queue(
     os.makedirs(save_path, exist_ok=True)
 
     def opt_number(v):
-        # gr.Number left blank yields None (or "" in some gradio versions)
+        # gr.Number left blank yields None, "" or 0 depending on gradio version.
+        # 0 is never a valid value for these optional fields (flow_shift/sigma_max
+        # must be > 0; a [0,0] guidance interval would disable CFG), so treat it
+        # as unset too.
         if v is None:
             return None
         if isinstance(v, str) and not v.strip():
+            return None
+        if float(v) == 0:
             return None
         return v
 
@@ -1960,6 +1965,9 @@ def cosmos_submit_to_queue(
     sigma_max = opt_number(sigma_max)
     guidance_interval_lo = opt_number(guidance_interval_lo)
     guidance_interval_hi = opt_number(guidance_interval_hi)
+    if guidance_interval_lo is not None and guidance_interval_hi is not None:
+        if float(guidance_interval_hi) <= float(guidance_interval_lo):
+            guidance_interval_lo = guidance_interval_hi = None
 
     if input_video:
         task_name = "v2v"

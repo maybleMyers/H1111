@@ -246,6 +246,17 @@ def setup_args(args, task: str):
         width, height = cfg.resolve_video_size(resolution, args.aspect_ratio)
     args.height, args.width = height, width
 
+    # 0/negative means "unset" for these (a zero sigma_max corrupts the sigma
+    # ramp and a degenerate guidance interval silently disables CFG)
+    if args.flow_shift is not None and args.flow_shift <= 0:
+        logger.warning("ignoring non-positive --flow_shift; using per-resolution default")
+        args.flow_shift = None
+    if args.sigma_max is not None and args.sigma_max <= 0:
+        logger.warning("ignoring non-positive --sigma_max; using checkpoint default")
+        args.sigma_max = None
+    if args.guidance_interval is not None and args.guidance_interval[1] <= args.guidance_interval[0]:
+        logger.warning("ignoring degenerate --guidance_interval; CFG applies at every step")
+        args.guidance_interval = None
     if args.flow_shift is None:
         args.flow_shift = cfg.resolve_flow_shift(args.height, args.width)
 
