@@ -136,4 +136,14 @@ a = r.action[0]
 print("id action shape:", tuple(a.shape))
 assert a.shape[-1] == 9, "av raw dim should be 9"
 
+# und-cache parity: t2v with the text (und) K/V cache must be BIT-IDENTICAL to the uncached run.
+r_cached = pipe(prompt="a red ball", negative_prompt="blurry", num_frames=5, height=64, width=64,
+                fps=24.0, output_type="latent", num_inference_steps=2, guidance_scale=6.0,
+                generator=torch.Generator().manual_seed(123), use_und_cache=True, return_dict=True)
+r_uncached = pipe(prompt="a red ball", negative_prompt="blurry", num_frames=5, height=64, width=64,
+                  fps=24.0, output_type="latent", num_inference_steps=2, guidance_scale=6.0,
+                  generator=torch.Generator().manual_seed(123), use_und_cache=False, return_dict=True)
+assert torch.equal(r_cached.video, r_uncached.video), "und cache broke bit-exactness for t2v"
+print("und-cache t2v parity: bit-identical OK")
+
 print("MICRO-E2E: ALL PASS")

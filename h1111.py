@@ -1928,6 +1928,7 @@ def cosmos_submit_to_queue(
     fp8_scaled: bool,
     fp8_fast: bool,
     vae_tiling: bool,
+    no_text_cache: bool,
     dit_dtype: str,
     vae_dtype: str,
     # LoRAs
@@ -2059,6 +2060,8 @@ def cosmos_submit_to_queue(
             command.append("--fp8_fast")
         if vae_tiling:
             command.append("--vae_tiling")
+        if no_text_cache:
+            command.append("--no_text_cache")
 
         if enable_preview:
             command.extend(["--preview", str(max(1, int(preview_steps)))])
@@ -11873,6 +11876,7 @@ with gr.Blocks(
                     cosmos_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
                     cosmos_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="scaled_mm fp8 matmul (with Scaled FP8)")
                     cosmos_vae_tiling = gr.Checkbox(label="VAE Tiling", value=False)
+                    cosmos_no_text_cache = gr.Checkbox(label="Disable Text KV Cache", value=False, info="debug switch; cache is bit-identical and faster")
                 with gr.Row():
                     cosmos_dit_dtype = gr.Dropdown(label="DiT Dtype", choices=["bfloat16", "float16"], value="bfloat16")
                     cosmos_vae_dtype = gr.Dropdown(label="VAE Dtype", choices=["float32", "bfloat16", "float16"], value="float32")
@@ -16183,6 +16187,7 @@ with gr.Blocks(
             cosmos_fp8_scaled,
             cosmos_fp8_fast,
             cosmos_vae_tiling,
+            cosmos_no_text_cache,
             cosmos_dit_dtype,
             cosmos_vae_dtype,
             # LoRAs
@@ -17073,6 +17078,7 @@ with gr.Blocks(
         cosmos_fp8_scaled,
         cosmos_fp8_fast,
         cosmos_vae_tiling,
+        cosmos_no_text_cache,
         cosmos_dit_dtype,
         cosmos_vae_dtype,
         cosmos_save_path,
@@ -17108,6 +17114,7 @@ with gr.Blocks(
         "cosmos_fp8_scaled",
         "cosmos_fp8_fast",
         "cosmos_vae_tiling",
+        "cosmos_no_text_cache",
         "cosmos_dit_dtype",
         "cosmos_vae_dtype",
         "cosmos_save_path",

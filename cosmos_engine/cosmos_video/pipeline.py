@@ -36,6 +36,7 @@ from diffusers.video_processor import VideoProcessor
 from .configs import TRANSFER_HINTS
 from .sound_tokenizer import Cosmos3AVAEAudioTokenizer
 from .transformer import Cosmos3OmniTransformer
+from .und_cache import UndKVCache
 from .vae import AutoencoderKLWan
 from .scheduler_unipc import UniPCMultistepScheduler
 
@@ -1401,6 +1402,7 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         add_resolution_template: bool = True,
         add_duration_template: bool = True,
+        use_und_cache: bool = True,
     ) -> Cosmos3OmniPipelineOutput:
         r"""
         Run the Cosmos 3 omni pipeline end-to-end: encode the (optional) conditioning image/video, denoise vision and
@@ -1509,6 +1511,13 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
                 When `True`, appends the duration metadata sentence (e.g. *"The video is 7.9 seconds long and is of 24
                 FPS."*) to the positive prompt, and its inverse to the negative prompt. Has no effect when `num_frames
                 == 1` (image mode).
+            use_und_cache (`bool`, *optional*, defaults to `True`):
+                Cache the text (und) pathway K/V per packed prompt: the first denoising step computes the und
+                pathway normally and captures each layer's post-RoPE `k_und_for_gen` / `v_und`; every later step
+                skips the und pathway entirely and reuses the cached tensors. Bit-identical to `False` (the und
+                tokens are text-only, receive no timestep embedding, and never attend to gen tokens, so their
+                hidden states are constant across denoising steps). Cond / uncond / no-control passes each keep
+                their own cache, scoped to this call.
 
         Returns:
             [`Cosmos3OmniPipelineOutput`] or `tuple`:
@@ -1796,6 +1805,14 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
                 "sequence_length": cond_text_segment["und_len"] + nc_vision_segment["num_vision_tokens"],
             }
 
+        # Text (und) pathway K/V caches — one per packed static, since cond / uncond / no-control
+        # pack different (or differently positioned) text. The packed text is fixed for the whole
+        # call, so the caches are simply scoped to this call: the first denoising iteration runs in
+        # capture mode, later iterations skip the und pathway (bit-identical, see transformer docs).
+        cond_und_cache = UndKVCache() if use_und_cache else None
+        uncond_und_cache = UndKVCache() if use_und_cache else None
+        nc_und_cache = UndKVCache() if (use_und_cache and nc_packed_static is not None) else None
+
         # 6. Set timesteps. UniPCMultistepScheduler keeps per-step state (_step_index,
         # model_outputs history) on the instance, so sound/action each get their own copy.
         if self.config.use_native_flow_schedule:
@@ -1867,6 +1884,7 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
                     action_domain_ids=[action_domain_id] if action_domain_id is not None else None,
                     vision_item_spans=cond_packed_static.get("vision_item_spans"),
                     control_weights=transfer_weights if is_transfer else None,
+                    und_cache=cond_und_cache,
                     return_dict=False,
                 )
                 # The target vision item is the last one (identical to [0] outside transfer).
@@ -1899,6 +1917,7 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
                         vision_mse_loss_indexes=nc_packed_static["vision_mse_loss_indexes"],
                         vision_timesteps=vision_timesteps,
                         vision_noisy_frame_indexes=nc_packed_static["vision_noisy_frame_indexes"],
+                        und_cache=nc_und_cache,
                         return_dict=False,
                     )
                     nc_v_vision, _, _ = self._mask_velocity_predictions(
@@ -1938,6 +1957,7 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
                         action_domain_ids=[action_domain_id] if action_domain_id is not None else None,
                         vision_item_spans=uncond_packed_static.get("vision_item_spans"),
                         control_weights=transfer_weights if is_transfer else None,
+                        und_cache=uncond_und_cache,
                         return_dict=False,
                     )
                     uncond_v_vision, uncond_v_sound, uncond_v_action = self._mask_velocity_predictions(

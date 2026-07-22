@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     # core sampling
     parser.add_argument("--prompt", type=str, default=None, help="prompt text, JSON caption string, or path to .json/.txt")
     parser.add_argument("--negative_prompt", type=str, default=None, help="negative prompt (same forms as --prompt)")
+    parser.add_argument("--no_default_negative_prompt", action="store_true",
+                        help="do not auto-load <ckpt_dir>/assets/negative_prompt.json when --negative_prompt is unset")
     parser.add_argument("--video_size", type=int, nargs=2, default=None, metavar=("H", "W"))
     parser.add_argument("--resolution", type=str, default=None, choices=sorted(cfg.VIDEO_RES_SIZE_INFO))
     parser.add_argument("--aspect_ratio", type=str, default="16:9", choices=["1:1", "4:3", "3:4", "16:9", "9:16"])
@@ -141,6 +143,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_mode", type=str, default="torch",
                         choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"])
     parser.add_argument("--blocks_to_swap", type=int, default=0)
+    parser.add_argument("--no_text_cache", action="store_true",
+                        help="disable the text (und) pathway K/V cache (cache is bit-identical; this is a debug switch)")
     parser.add_argument("--fp8", action="store_true", help="cast transformer linear weights to e4m3")
     parser.add_argument("--fp8_scaled", action="store_true", help="scaled fp8 quantization with monkey patch")
     parser.add_argument("--fp8_fast", action="store_true", help="use scaled_mm fp8 matmul (with --fp8_scaled)")
@@ -290,6 +294,25 @@ def read_text_or_path(value: Optional[str]) -> Optional[str]:
             return json.dumps(json.loads(content))
         return content
     return value
+
+
+def resolve_negative_prompt(args) -> Optional[str]:
+    """Resolve the negative prompt: explicit --negative_prompt (text or file) wins; otherwise,
+    for non-distilled checkpoints, fall back to <ckpt_dir>/assets/negative_prompt.json when it
+    exists (disable with --no_default_negative_prompt). Distilled checkpoints run without CFG,
+    so the default negative prompt is never loaded for them."""
+    negative_prompt = read_text_or_path(args.negative_prompt)
+    if (
+        negative_prompt is None
+        and not getattr(args, "distilled", False)
+        and not getattr(args, "no_default_negative_prompt", False)
+        and args.ckpt_dir
+    ):
+        default_path = os.path.join(args.ckpt_dir, "assets", "negative_prompt.json")
+        if os.path.exists(default_path):
+            negative_prompt = read_text_or_path(default_path)
+            logger.info(f"using default negative prompt from {default_path}")
+    return negative_prompt
 
 
 def load_image(path: str) -> Image.Image:
@@ -540,13 +563,25 @@ def make_step_callback(args, previewer_holder: dict, total_steps: int):
         latents = callback_kwargs.get("latents")
         if args.preview and latents is not None and (step + 1) % args.preview == 0 and step + 1 < total_steps:
             try:
+                # Preview the scheduler's clean-image (x0) estimate, not the noisy
+                # sample x_t: UniPC runs in predict_x0 mode and keeps its converted
+                # model outputs, so mid-denoise previews show content instead of noise.
+                preview_latents = latents
+                model_outputs = getattr(pipe.scheduler, "model_outputs", None)
+                if model_outputs:
+                    for m in reversed(model_outputs):
+                        if m is not None:
+                            preview_latents = m
+                            break
+                while preview_latents.ndim > 5:  # scheduler stores an extra batch dim
+                    preview_latents = preview_latents.squeeze(0)
                 if previewer_holder.get("previewer") is None:
                     from blissful_tuner.latent_preview import LatentPreviewer
 
                     previewer_holder["previewer"] = LatentPreviewer(
                         args, None, None, latents.device, torch.float32, model_type="cosmos"
                     )
-                previewer_holder["previewer"].preview(latents.float(), step, preview_suffix=args.preview_suffix)
+                previewer_holder["previewer"].preview(preview_latents.float(), step, preview_suffix=args.preview_suffix)
             except Exception as e:  # previews must never kill a run
                 logger.warning(f"preview failed at step {step}: {e}")
         if stop_base is not None and os.path.exists(stop_base + ".stop_decode"):
@@ -565,7 +600,7 @@ def run_generation(args, pipe, task: str, device: torch.device, seed: int):
     from cosmos_video.pipeline import CosmosActionCondition
 
     prompt = read_text_or_path(args.prompt)
-    negative_prompt = read_text_or_path(args.negative_prompt)
+    negative_prompt = resolve_negative_prompt(args)
 
     image = load_image(args.image_path) if args.image_path else None
     video = None
@@ -648,6 +683,7 @@ def run_generation(args, pipe, task: str, device: torch.device, seed: int):
         callback_on_step_end=callback,
         add_resolution_template=not args.no_resolution_template,
         add_duration_template=not args.no_duration_template,
+        use_und_cache=not args.no_text_cache,
     )
     if args.condition_frame_indexes is not None:
         call_kwargs["condition_frame_indexes_vision"] = tuple(args.condition_frame_indexes)

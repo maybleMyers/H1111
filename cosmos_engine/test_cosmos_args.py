@@ -17,6 +17,7 @@ from cosmos_generate_video import (
     get_num_chunks,
     load_actions,
     parse_args,
+    resolve_negative_prompt,
     run_transfer_chunks,
     setup_args,
 )
@@ -198,6 +199,48 @@ def test_transfer_chunk_loop():
     print("transfer chunk loop: OK")
 
 
+def test_text_cache_flag():
+    args = make_args()
+    assert args.no_text_cache is False  # cache is ON by default
+    args = make_args("--no_text_cache")
+    assert args.no_text_cache is True
+    print("text cache flag: OK")
+
+
+def test_default_negative_prompt():
+    neg_content = {"negative_prompt": "blurry, low quality, distorted"}
+    with tempfile.TemporaryDirectory() as ckpt:
+        os.makedirs(os.path.join(ckpt, "assets"))
+        with open(os.path.join(ckpt, "assets", "negative_prompt.json"), "w", encoding="utf-8") as f:
+            json.dump(neg_content, f)
+
+        # unset negative prompt + assets file present -> auto-loaded (json.dumps of parsed content)
+        args = make_args()
+        assert args.no_default_negative_prompt is False
+        args.ckpt_dir = ckpt
+        assert resolve_negative_prompt(args) == json.dumps(neg_content)
+
+        # explicit --negative_prompt wins over the default
+        args = make_args("--negative_prompt", "explicit neg")
+        args.ckpt_dir = ckpt
+        assert resolve_negative_prompt(args) == "explicit neg"
+
+        # --no_default_negative_prompt disables the auto-load
+        args = make_args("--no_default_negative_prompt")
+        args.ckpt_dir = ckpt
+        assert resolve_negative_prompt(args) is None
+
+        # distilled checkpoints never load the default (no CFG)
+        args = make_args("--distilled")
+        args.ckpt_dir = ckpt
+        assert resolve_negative_prompt(args) is None
+
+    # no assets file -> None (pipeline falls back to empty string)
+    args = make_args()
+    assert resolve_negative_prompt(args) is None
+    print("default negative prompt: OK")
+
+
 def test_control_preprocessors():
     from PIL import Image
 
@@ -227,5 +270,7 @@ if __name__ == "__main__":
     test_transfer_args()
     test_transfer_chunk_math()
     test_transfer_chunk_loop()
+    test_text_cache_flag()
+    test_default_negative_prompt()
     test_control_preprocessors()
     print("ALL TESTS PASSED")
