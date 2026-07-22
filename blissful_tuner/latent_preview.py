@@ -40,7 +40,7 @@ class LatentPreviewer():
         # Add Framepack check here too if needed for original_latents/timesteps later
         # elif model_type == "framepack" and ...
 
-        if self.model_type not in ["hunyuan", "wan", "framepack"]:
+        if self.model_type not in ["hunyuan", "wan", "framepack", "cosmos"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         if self.mode == "taehv":
@@ -55,7 +55,8 @@ class LatentPreviewer():
             self.fps = args.fps
         elif self.mode == "latent2rgb":
             self.decoder = self.decode_latent2rgb
-            self.scale_factor = 8
+            # cosmos (Wan2.2 48ch VAE) compresses 16x spatially, others 8x
+            self.scale_factor = 16 if self.model_type == "cosmos" else 8
             # Adjust FPS for latent2rgb preview if necessary
             # Original code had / 4, but maybe match output FPS is better?
             # Let's keep the / 4 logic for now as it was there before.
@@ -272,6 +273,37 @@ class LatentPreviewer():
                     [ 0.3477,  0.2275,  0.2950], [ 0.1984,  0.0913,  0.1861]
                 ],
                 "bias": [-0.1835, -0.0868, -0.3360],
+            },
+            # Wan2.2 48ch VAE latents (Cosmos3 / ti2v-5B latent space), factors for
+            # normalized latents ((x - mean) / std), from ComfyUI latent_formats.Wan22
+            "cosmos": {
+                "rgb_factors": [
+                    [ 0.0119,  0.0103,  0.0046], [-0.1062, -0.0504,  0.0165],
+                    [ 0.0140,  0.0409,  0.0491], [-0.0813, -0.0677,  0.0607],
+                    [ 0.0656,  0.0851,  0.0808], [ 0.0264,  0.0463,  0.0912],
+                    [ 0.0295,  0.0326,  0.0590], [-0.0244, -0.0270,  0.0025],
+                    [ 0.0443, -0.0102,  0.0288], [-0.0465, -0.0090, -0.0205],
+                    [ 0.0359,  0.0236,  0.0082], [-0.0776,  0.0854,  0.1048],
+                    [ 0.0564,  0.0264,  0.0561], [ 0.0006,  0.0594,  0.0418],
+                    [-0.0319, -0.0542, -0.0637], [-0.0268,  0.0024,  0.0260],
+                    [ 0.0539,  0.0265,  0.0358], [-0.0359, -0.0312, -0.0287],
+                    [-0.0285, -0.1032, -0.1237], [ 0.1041,  0.0537,  0.0622],
+                    [-0.0086, -0.0374, -0.0051], [ 0.0390,  0.0670,  0.2863],
+                    [ 0.0069,  0.0144,  0.0082], [ 0.0006, -0.0167,  0.0079],
+                    [ 0.0313, -0.0574, -0.0232], [-0.1454, -0.0902, -0.0481],
+                    [ 0.0714,  0.0827,  0.0447], [-0.0304, -0.0574, -0.0196],
+                    [ 0.0401,  0.0384,  0.0204], [-0.0758, -0.0297, -0.0014],
+                    [ 0.0568,  0.1307,  0.1372], [-0.0055, -0.0310, -0.0380],
+                    [ 0.0239, -0.0305,  0.0325], [-0.0663, -0.0673, -0.0140],
+                    [-0.0416, -0.0047, -0.0023], [ 0.0166,  0.0112, -0.0093],
+                    [-0.0211,  0.0011,  0.0331], [ 0.1833,  0.1466,  0.2250],
+                    [-0.0368,  0.0370,  0.0295], [-0.3441, -0.3543, -0.2008],
+                    [-0.0479, -0.0489, -0.0420], [-0.0660, -0.0153,  0.0800],
+                    [-0.0101,  0.0068,  0.0156], [-0.0690, -0.0452, -0.0927],
+                    [-0.0145,  0.0041,  0.0015], [ 0.0421,  0.0451,  0.0373],
+                    [ 0.0504, -0.0483, -0.0356], [-0.0837,  0.0168,  0.0055]
+                ],
+                "bias": [0.0317, -0.0878, -0.1388],
             },
             # No 'framepack' key needed, will map to 'hunyuan' below
         }

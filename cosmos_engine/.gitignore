@@ -1,0 +1,7 @@
+# Reference-only upstream clones (re-fetch: git clone --depth 1 <url>)
+cosmos_diffusers_repo/
+cosmos_framework_repo/
+vllm_omni_repo/
+# Weights-free validation skeleton (re-fetch: huggingface_hub.snapshot_download
+# with ignore_patterns=["*.safetensors", "*.mp4", "*.png", "*.jpg"])
+Cosmos3-Super-Image2Video-skeleton/

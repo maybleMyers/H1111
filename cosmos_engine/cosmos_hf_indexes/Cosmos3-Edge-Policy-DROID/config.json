@@ -1,0 +1,244 @@
+{
+  "allow_patterns_overrides": [
+    "*/*.safetensors"
+  ],
+  "architectures": [
+    "Cosmos3ForConditionalGeneration"
+  ],
+  "image_token_id": 19,
+  "model": {
+    "_recursive_": false,
+    "_target": "omni_mot_model",
+    "config": {
+      "_type": "omni_mot_model_config",
+      "action_gen": true,
+      "activation_checkpointing": {
+        "_type": "activation_checkpointing_config",
+        "determinism_check": "default",
+        "mode": "full",
+        "preserve_rng_state": true,
+        "save_ops_regex": [
+          "fmha"
+        ]
+      },
+      "causal_training_strategy": "none",
+      "compile": {
+        "_type": "compile_config",
+        "compile_dynamic": true,
+        "compiled_region": "language",
+        "coordinate_descent_tuning": false,
+        "enabled": false,
+        "max_autotune_pointwise": false,
+        "use_cuda_graphs": false
+      },
+      "diffusion_expert_config": {
+        "_type": "diffusion_expert_config",
+        "base_fps": 24,
+        "enable_fps_modulation": true,
+        "load_weights_from_pretrained": false,
+        "max_vae_latent_side_after_patchify": 20,
+        "patch_spatial": 2,
+        "sound_base_temporal_compression_factor": null,
+        "timestep_range": 1.0,
+        "unified_3d_mrope_reset_spatial_ids": true,
+        "unified_3d_mrope_temporal_modality_margin": 15000,
+        "vision_temporal_position_mode": "latent_index"
+      },
+      "ema": {
+        "_type": "ema_config",
+        "enabled": false,
+        "iteration_shift": 0,
+        "rate": 0.1
+      },
+      "enable_input_bias": true,
+      "exclude_reasoner_weights_from_checkpoint": false,
+      "fixed_step_sampler_config": null,
+      "input_caption_key": "ai_caption",
+      "input_image_key": "images",
+      "input_video_key": "video",
+      "joint_attn_implementation": "two_way",
+      "latent_downsample_factor": 16,
+      "lbl": {
+        "_type": "lbl_config",
+        "coeff_gen": null,
+        "coeff_und": null,
+        "method": "local"
+      },
+      "log_enc_time_every_n": 100,
+      "lora_alpha": 32,
+      "lora_enabled": false,
+      "lora_rank": 16,
+      "lora_target_modules": "q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen",
+      "max_action_dim": 64,
+      "max_num_tokens_after_packing": -1,
+      "natten_parameter_list": null,
+      "net": null,
+      "num_embodiment_domains": 32,
+      "parallelism": {
+        "_type": "parallelism_config",
+        "attention_io_layout": "sequence_sharded",
+        "cfg_parallel_shard_degree": 1,
+        "context_parallel_shard_degree": 1,
+        "data_parallel_replicate_degree": 1,
+        "data_parallel_shard_degree": 8,
+        "enable_inference_mode": false,
+        "fsdp_master_dtype": "float32"
+      },
+      "precision": "bfloat16",
+      "rectified_flow_inference_config": {
+        "_type": "rectified_flow_inference_config",
+        "num_train_timesteps": 1000,
+        "scheduler_type": "unipc",
+        "shift": 1,
+        "use_dynamic_shifting": false
+      },
+      "rectified_flow_training_config": {
+        "_type": "rectified_flow_training_config",
+        "action_loss_weight": 10.0,
+        "image_loss_scale": null,
+        "independent_action_schedule": false,
+        "independent_sound_schedule": false,
+        "loss_scale": 10.0,
+        "normalize_loss_by_active": false,
+        "shift": {
+          "256": 3,
+          "480": 5
+        },
+        "shift_action": null,
+        "shift_sound": null,
+        "sound_loss_scale": null,
+        "train_time_action_distribution": "logitnormal",
+        "train_time_image_distribution": "logitnormal",
+        "train_time_sound_distribution": "logitnormal",
+        "train_time_video_distribution": "waver",
+        "train_time_weight": "uniform",
+        "use_discrete_rf": false,
+        "use_dynamic_shift": false
+      },
+      "resolution": "480",
+      "sound_dim": null,
+      "sound_gen": false,
+      "sound_latent_fps": 25,
+      "sound_tokenizer": null,
+      "state_ch": 48,
+      "state_t": 300,
+      "tokenizer": {
+        "_target": "wan2pt2_vae_interface",
+        "bucket_name": "",
+        "causal": true,
+        "chunk_duration": 93,
+        "encode_chunk_frames": {
+          "256": 68,
+          "480": 24,
+          "720": 12
+        },
+        "encode_exact_durations": [
+          33
+        ],
+        "keep_decoder_cache": false,
+        "object_store_credential_path_pretrained": "",
+        "spatial_compression_factor": 16,
+        "temporal_compression_factor": 4,
+        "use_streaming_encode": false,
+        "vae_path": "pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth"
+      },
+      "video_temporal_causal": false,
+      "vision_gen": true,
+      "vlm_config": {
+        "_type": "vlm_config",
+        "layer_module": null,
+        "model_instance": {
+          "_target": "nemotron3_dense_vl_text_for_causal_lm",
+          "config": {
+            "_target": "create_vlm_config",
+            "base_config": {
+              "_target": "nemotron3_dense_vl_mot_config_from_json_file",
+              "json_file": "cosmos3://vfm/models/vlm/nemotron_3_dense_vl/configs/Nemotron-2B-Dense-VL.json"
+            },
+            "qk_norm_for_text": false,
+            "use_und_k_norm_for_gen": true
+          }
+        },
+        "model_name": "nvidia/Cosmos3-Edge-Policy-DROID",
+        "pretrained_weights": {
+          "_type": "pretrained_weights_config",
+          "backbone_path": "",
+          "checkpoint_format": "nemotron_3_dense_vl",
+          "credentials_path": "",
+          "enable_gcs_patch_in_boto3": false,
+          "enabled": false
+        },
+        "qk_norm": false,
+        "safetensors_path": "",
+        "tie_word_embeddings": false,
+        "tokenizer": {
+          "_target": "build_processor_lazy",
+          "config_variant": "hf",
+          "repository": null,
+          "revision": null,
+          "subdir": "",
+          "tokenizer_type": "nvidia/Cosmos3-Edge-Policy-DROID"
+        },
+        "use_system_prompt": false
+      }
+    }
+  },
+  "model_type": "cosmos3_omni",
+  "projector_config": {
+    "input_hidden_size": 1152,
+    "merger_intermediate_size": 11520,
+    "model_type": "cosmos3_edge_projector",
+    "out_hidden_size": 2048,
+    "spatial_merge_size": 2,
+    "use_postshuffle_norm": false
+  },
+  "projector_hidden_size": 11520,
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "dtype": "bfloat16",
+    "eos_token_id": 11,
+    "head_dim": 128,
+    "hidden_act": "relu2",
+    "hidden_size": 2048,
+    "initializer_range": 0.02,
+    "intermediate_size": 9216,
+    "max_position_embeddings": 131072,
+    "mlp_bias": false,
+    "model_type": "cosmos3_edge_text",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {
+      "mrope_section": [
+        24,
+        20,
+        20
+      ],
+      "rope_theta": 100000000,
+      "rope_type": "default"
+    },
+    "use_cache": true,
+    "vocab_size": 131072
+  },
+  "tie_word_embeddings": false,
+  "transformers_version": "5.14.0.dev0",
+  "video_token_id": 18,
+  "vision_config": {
+    "attention_dropout": 0.0,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "layer_norm_eps": 1e-06,
+    "model_type": "cosmos3_edge_vision",
+    "num_attention_heads": 16,
+    "num_channels": 3,
+    "num_hidden_layers": 27,
+    "num_patches": 256,
+    "patch_size": 16,
+    "spatial_merge_size": 2
+  },
+  "vision_end_token_id": 21,
+  "vision_start_token_id": 20
+}

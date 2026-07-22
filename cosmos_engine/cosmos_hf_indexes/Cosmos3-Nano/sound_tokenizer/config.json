@@ -1,0 +1,64 @@
+{
+    "model_type": "autoencoder_v2",
+    "sampling_rate": 48000,
+    "stereo": true,
+    "use_wav_as_input": true,
+    "normalize_volume": true,
+    "hop_size": 1920,
+    "input_channels": 1,
+    "enc_type": "spec_convnext",
+    "enc_dim": 192,
+    "enc_intermediate_dim": 768,
+    "enc_num_layers": 12,
+    "enc_num_blocks": 2,
+    "enc_n_fft": 64,
+    "enc_hop_length": 16,
+    "enc_latent_dim": 128,
+    "enc_c_mults": [
+        1,
+        2,
+        4
+    ],
+    "enc_strides": [
+        4,
+        5,
+        6
+    ],
+    "enc_identity_init": false,
+    "enc_use_snake": true,
+    "dec_type": "oobleck",
+    "dec_dim": 320,
+    "dec_c_mults": [
+        1,
+        2,
+        4,
+        8,
+        16
+    ],
+    "dec_strides": [
+        2,
+        4,
+        5,
+        6,
+        8
+    ],
+    "dec_use_snake": true,
+    "dec_final_tanh": false,
+    "dec_out_channels": 2,
+    "dec_anti_aliasing": false,
+    "dec_use_nearest_upsample": false,
+    "dec_use_tanh_at_final": false,
+    "bottleneck_type": "vae",
+    "bottleneck": {
+        "type": "vae"
+    },
+    "activation": "snakebeta",
+    "snake_logscale": true,
+    "anti_aliasing": false,
+    "use_cuda_kernel": false,
+    "causal": false,
+    "padding_mode": "zeros",
+    "vocoder_input_dim": 64,
+    "latent_mean": null,
+    "latent_std": null
+}

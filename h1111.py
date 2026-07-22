@@ -58,6 +58,7 @@ SVI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_defaults.json")
 STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
 WAN22_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "wan22_defaults.json")
 BERNINI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "bernini_defaults.json")
+COSMOS_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "cosmos_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -1872,6 +1873,253 @@ def bernini_submit_to_queue(
 def bernini_generate_via_queue(*args):
     """Queue-based Bernini generation; returns immediately and polls via Timer."""
     batch_id, job_ids = bernini_submit_to_queue(*args)
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+    return (
+        [],
+        [],
+        status_msg,
+        "Waiting for worker to start...",
+        first_job_id,
+        batch_id,
+        gr.Timer(value=2.0, active=True),
+    )
+
+
+def cosmos_submit_to_queue(
+    prompt: str,
+    negative_prompt: str,
+    input_image: str,
+    input_video: str,
+    resolution: str,
+    aspect_ratio: str,
+    video_length: int,
+    fps: int,
+    infer_steps: int,
+    guidance_scale: float,
+    flow_shift,
+    base_seed: int,
+    enable_sound: bool,
+    batch_size: int,
+    save_path: str,
+    enable_preview: bool,
+    preview_steps: int,
+    # Model Paths
+    ckpt_dir: str,
+    dit_path: str,
+    vae_path: str,
+    # Advanced
+    guidance_interval_lo,
+    guidance_interval_hi,
+    normalize_cfg: bool,
+    sigma_max,
+    use_system_prompt: bool,
+    no_resolution_template: bool,
+    no_duration_template: bool,
+    condition_frame_indexes: str,
+    condition_video_keep: str,
+    num_outputs: int,
+    cpu_noise: bool,
+    distilled: bool,
+    # Performance
+    attn_mode: str,
+    blocks_to_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_fast: bool,
+    vae_tiling: bool,
+    dit_dtype: str,
+    vae_dtype: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+) -> Tuple[str, List[str]]:
+    """Submit Cosmos3 generation job(s) to the shared queue.
+
+    Drives cosmos_engine/cosmos_generate_video.py. This tab covers t2v/t2i/i2v/v2v;
+    the CLI also supports transfer (control videos) and action/policy modes — no UI
+    for those yet, a dedicated UI can come later.
+    """
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    def opt_number(v):
+        # gr.Number left blank yields None (or "" in some gradio versions)
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    flow_shift = opt_number(flow_shift)
+    sigma_max = opt_number(sigma_max)
+    guidance_interval_lo = opt_number(guidance_interval_lo)
+    guidance_interval_hi = opt_number(guidance_interval_hi)
+
+    if input_video:
+        task_name = "v2v"
+    elif input_image:
+        task_name = "i2v"
+    elif int(video_length) == 1:
+        task_name = "t2i"
+    else:
+        task_name = "t2v"
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(save_path, f"cosmos_{task_name}_{timestamp}_{current_seed}.mp4")
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"cosmos_{run_id}"
+
+        command = [
+            sys.executable, "cosmos_engine/cosmos_generate_video.py",
+            "--prompt", str(prompt),
+            "--ckpt_dir", str(ckpt_dir),
+            "--resolution", str(resolution),
+            "--aspect_ratio", str(aspect_ratio),
+            "--video_length", str(int(video_length)),
+            "--fps", str(int(fps)),
+            "--infer_steps", str(int(infer_steps)),
+            "--guidance_scale", str(guidance_scale),
+            "--num_outputs", str(int(num_outputs)),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(int(blocks_to_swap)),
+            "--dit_dtype", str(dit_dtype),
+            "--vae_dtype", str(vae_dtype),
+            "--save_path", str(save_path),
+            "--output_type", "video",
+            "--output_filename", output_filename,
+        ]
+
+        # -1 = random: the seed is resolved here so it is always >= 0 when passed
+        if current_seed >= 0:
+            command.extend(["--seed", str(current_seed)])
+
+        if negative_prompt:
+            command.extend(["--negative_prompt", str(negative_prompt)])
+        if input_image:
+            command.extend(["--image_path", str(input_image)])
+        if input_video:
+            command.extend(["--video_path", str(input_video)])
+            command.extend(["--condition_video_keep", str(condition_video_keep)])
+            cfi_values = [v.strip() for v in str(condition_frame_indexes or "").replace(",", " ").split() if v.strip()]
+            if cfi_values:
+                command.extend(["--condition_frame_indexes"] + cfi_values)
+
+        if flow_shift is not None:
+            command.extend(["--flow_shift", str(flow_shift)])
+        if sigma_max is not None:
+            command.extend(["--sigma_max", str(sigma_max)])
+        if guidance_interval_lo is not None and guidance_interval_hi is not None:
+            command.extend(["--guidance_interval", str(guidance_interval_lo), str(guidance_interval_hi)])
+
+        if dit_path and str(dit_path).strip():
+            command.extend(["--dit", str(dit_path).strip()])
+        if vae_path and str(vae_path).strip():
+            command.extend(["--vae", str(vae_path).strip()])
+
+        if enable_sound:
+            command.append("--enable_sound")
+        if normalize_cfg:
+            command.append("--normalize_cfg")
+        if use_system_prompt:
+            command.append("--use_system_prompt")
+        if no_resolution_template:
+            command.append("--no_resolution_template")
+        if no_duration_template:
+            command.append("--no_duration_template")
+        if cpu_noise:
+            command.append("--cpu_noise")
+        if distilled:
+            command.append("--distilled")
+        if fp8:
+            command.append("--fp8")
+        if fp8_scaled:
+            command.append("--fp8_scaled")
+        if fp8_fast:
+            command.append("--fp8_fast")
+        if vae_tiling:
+            command.append("--vae_tiling")
+
+        if enable_preview:
+            command.extend(["--preview", str(max(1, int(preview_steps)))])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling (shared lora folder listing, same as the Bernini tab)
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult),
+            (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult),
+            (lora4_str, lora4_mult),
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        parameters = {
+            "model_type": "Cosmos3",
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "task": task_name,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "video_length": video_length,
+            "fps": fps,
+            "infer_steps": infer_steps,
+            "guidance_scale": guidance_scale,
+            "flow_shift": flow_shift,
+            "seed": current_seed,
+            "enable_sound": enable_sound,
+            "num_outputs": num_outputs,
+            "ckpt_dir": ckpt_dir,
+            "attn_mode": attn_mode,
+            "blocks_to_swap": blocks_to_swap,
+            "save_path": save_path,
+        }
+        if input_image:
+            parameters["image_path"] = input_image
+        if input_video:
+            parameters["video_path"] = input_video
+            parameters["condition_video_keep"] = condition_video_keep
+            parameters["condition_frame_indexes"] = condition_frame_indexes
+
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[Queue] Cosmos job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def cosmos_generate_via_queue(*args):
+    """Queue-based Cosmos3 generation; returns immediately and polls via Timer."""
+    batch_id, job_ids = cosmos_submit_to_queue(*args)
     first_job_id = job_ids[0] if job_ids else ""
     status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
     return (
@@ -11483,6 +11731,149 @@ with gr.Blocks(
                     bernini_load_defaults_btn = gr.Button("Load Defaults")
                     bernini_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
+        # Cosmos3 tab — drives cosmos_engine/cosmos_generate_video.py (t2v/t2i/i2v/v2v).
+        # The CLI also supports transfer (control videos) and action/policy modes; no UI for those yet.
+        with gr.Tab(id=20, label="Cosmos") as cosmos_tab:
+            with gr.Row():
+                with gr.Column(scale=4):
+                    cosmos_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A cat wearing a chef hat, cooking pizza.",
+                        lines=5
+                    )
+                    cosmos_negative_prompt = gr.Textbox(
+                        scale=3,
+                        label="Negative Prompt (blank = model default)",
+                        value="",
+                        lines=3,
+                    )
+                with gr.Column(scale=1):
+                    cosmos_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    cosmos_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    cosmos_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="cosmos_progress_text")
+
+            with gr.Row():
+                cosmos_generate_btn = gr.Button("Generate", elem_classes="green-btn")
+                cosmos_stop_btn = gr.Button("Stop Generation", variant="stop")
+                cosmos_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            # Queue system state components
+            cosmos_job_id_state = gr.State(value="")
+            cosmos_batch_id_state = gr.State(value="")
+            cosmos_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Conditioning Inputs (both blank = t2v; length 1 = t2i)")
+                    cosmos_input_image = gr.Image(label="Input Image (i2v — first frame)", type="filepath")
+                    cosmos_input_video = gr.Video(label="Input Video (v2v — condition frames)")
+
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        cosmos_resolution = gr.Dropdown(
+                            label="Resolution",
+                            choices=["256", "480", "704", "720", "768"],
+                            value="720",
+                        )
+                        cosmos_aspect_ratio = gr.Dropdown(
+                            label="Aspect Ratio",
+                            choices=["16:9", "9:16", "1:1", "4:3", "3:4"],
+                            value="16:9",
+                        )
+                    with gr.Row():
+                        cosmos_video_length = gr.Number(label="Video Length (frames, 4n+1; 1 for image)", value=189, step=4)
+                        cosmos_fps = gr.Dropdown(label="FPS", choices=[10, 16, 24, 30], value=24)
+                    cosmos_infer_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Sampling Steps", value=35)
+                    cosmos_guidance_scale = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Guidance Scale", value=6.0)
+                    cosmos_flow_shift = gr.Number(label="Flow Shift (blank = auto per resolution: 256→3, 480→5, 720→10)", value=None)
+                    with gr.Row():
+                        cosmos_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        cosmos_random_seed_btn = gr.Button("🎲")
+                    cosmos_enable_sound = gr.Checkbox(label="Enable Sound (Super/Nano checkpoints only)", value=False)
+
+                    with gr.Accordion("Advanced", open=False):
+                        with gr.Row():
+                            cosmos_guidance_interval_lo = gr.Number(label="Guidance Interval Lo (blank = full range)", value=None)
+                            cosmos_guidance_interval_hi = gr.Number(label="Guidance Interval Hi", value=None)
+                        with gr.Row():
+                            cosmos_normalize_cfg = gr.Checkbox(label="Normalize CFG", value=False, info="Rescale CFG velocity to cond norm")
+                            cosmos_sigma_max = gr.Number(label="Sigma Max (blank = default)", value=None)
+                        with gr.Row():
+                            cosmos_use_system_prompt = gr.Checkbox(label="Use System Prompt", value=False, info="Prepend the model's system prompt")
+                            cosmos_no_resolution_template = gr.Checkbox(label="No Resolution Template", value=False)
+                            cosmos_no_duration_template = gr.Checkbox(label="No Duration Template", value=False)
+                        with gr.Row():
+                            cosmos_condition_frame_indexes = gr.Textbox(label="Condition Frame Indexes (space-separated ints, v2v only)", value="")
+                            cosmos_condition_video_keep = gr.Dropdown(label="Condition Video Keep", choices=["first", "last"], value="first")
+                        with gr.Row():
+                            cosmos_num_outputs = gr.Number(label="Num Outputs (per job)", value=1, minimum=1, step=1)
+                            cosmos_cpu_noise = gr.Checkbox(label="CPU Noise", value=False, info="Draw initial noise on CPU for reproducibility")
+                            cosmos_distilled = gr.Checkbox(label="Distilled (DMD2 4-step)", value=False)
+
+                with gr.Column():
+                    cosmos_output = gr.Gallery(
+                        label="Generated Output (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_cosmos", allow_preview=True, preview=True
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        cosmos_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        cosmos_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                         label="Preview Every N Steps")
+                        cosmos_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True, elem_id="cosmos_preview_gallery"
+                        )
+                    with gr.Accordion("LoRA", open=False):
+                        with gr.Row():
+                            cosmos_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            cosmos_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        cosmos_lora_weights = []
+                        cosmos_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                cosmos_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2
+                                ))
+                                cosmos_lora_multipliers.append(gr.Number(
+                                    label=f"Multiplier", value=1.0, scale=1, interactive=True
+                                ))
+
+            with gr.Accordion("Model Paths", open=True):
+                cosmos_ckpt_dir = gr.Textbox(
+                    label="Checkpoint Dir",
+                    value="Cosmos3-Super-Image2Video",
+                    info="path to the cloned HF snapshot dir"
+                )
+                with gr.Row():
+                    cosmos_dit_path = gr.Textbox(label="DiT Override (blank = ckpt_dir transformer)", value="")
+                    cosmos_vae_path = gr.Textbox(label="VAE Override (blank = ckpt_dir vae)", value="")
+
+            with gr.Accordion("Performance", open=True):
+                with gr.Row():
+                    cosmos_attn_mode = gr.Dropdown(
+                        label="Attention Mode",
+                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"],
+                        value="sdpa",
+                    )
+                    cosmos_blocks_to_swap = gr.Slider(minimum=0, maximum=35, step=1, label="Block Swap to Save VRAM", value=0)
+                with gr.Row():
+                    cosmos_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    cosmos_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
+                    cosmos_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="scaled_mm fp8 matmul (with Scaled FP8)")
+                    cosmos_vae_tiling = gr.Checkbox(label="VAE Tiling", value=False)
+                with gr.Row():
+                    cosmos_dit_dtype = gr.Dropdown(label="DiT Dtype", choices=["bfloat16", "float16"], value="bfloat16")
+                    cosmos_vae_dtype = gr.Dropdown(label="VAE Dtype", choices=["float32", "bfloat16", "float16"], value="float32")
+                cosmos_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    cosmos_save_defaults_btn = gr.Button("Save Defaults")
+                    cosmos_load_defaults_btn = gr.Button("Load Defaults")
+                    cosmos_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+
         # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
         with gr.Tab(id=17, label="StoryMem") as storymem_tab:
             gr.Markdown("""
@@ -15737,6 +16128,105 @@ with gr.Blocks(
         outputs=[bernini_dit_low_noise_path, bernini_dit_high_noise_path, bernini_vae_path, bernini_t5_path]
     )
 
+    # ===== Cosmos Event Handlers =====
+    # The Cosmos tab reuses the shared job queue and the generic wan22 poll/stop
+    # handlers directly (same 7-slot output layout as the Wan2.2/Bernini tabs).
+    cosmos_generate_btn.click(
+        fn=cosmos_generate_via_queue,
+        inputs=[
+            cosmos_prompt,
+            cosmos_negative_prompt,
+            cosmos_input_image,
+            cosmos_input_video,
+            cosmos_resolution,
+            cosmos_aspect_ratio,
+            cosmos_video_length,
+            cosmos_fps,
+            cosmos_infer_steps,
+            cosmos_guidance_scale,
+            cosmos_flow_shift,
+            cosmos_seed,
+            cosmos_enable_sound,
+            cosmos_batch_size,
+            cosmos_save_path,
+            cosmos_enable_preview,
+            cosmos_preview_steps,
+            # Model Paths
+            cosmos_ckpt_dir,
+            cosmos_dit_path,
+            cosmos_vae_path,
+            # Advanced
+            cosmos_guidance_interval_lo,
+            cosmos_guidance_interval_hi,
+            cosmos_normalize_cfg,
+            cosmos_sigma_max,
+            cosmos_use_system_prompt,
+            cosmos_no_resolution_template,
+            cosmos_no_duration_template,
+            cosmos_condition_frame_indexes,
+            cosmos_condition_video_keep,
+            cosmos_num_outputs,
+            cosmos_cpu_noise,
+            cosmos_distilled,
+            # Performance
+            cosmos_attn_mode,
+            cosmos_blocks_to_swap,
+            cosmos_fp8,
+            cosmos_fp8_scaled,
+            cosmos_fp8_fast,
+            cosmos_vae_tiling,
+            cosmos_dit_dtype,
+            cosmos_vae_dtype,
+            # LoRAs
+            cosmos_lora_folder,
+            *cosmos_lora_weights,
+            *cosmos_lora_multipliers,
+        ],
+        outputs=[cosmos_output, cosmos_preview_output, cosmos_batch_progress, cosmos_progress_text,
+                 cosmos_job_id_state, cosmos_batch_id_state, cosmos_poll_timer],
+        queue=True
+    )
+
+    cosmos_poll_timer.tick(
+        fn=wan22_poll_active_job,
+        inputs=[cosmos_job_id_state, cosmos_batch_id_state],
+        outputs=[cosmos_output, cosmos_preview_output, cosmos_batch_progress, cosmos_progress_text,
+                 cosmos_job_id_state, cosmos_batch_id_state, cosmos_poll_timer]
+    )
+
+    cosmos_stop_btn.click(
+        fn=wan22_stop_queue_generation,
+        inputs=[cosmos_batch_id_state],
+        outputs=[cosmos_output, cosmos_preview_output, cosmos_batch_progress, cosmos_progress_text,
+                 cosmos_job_id_state, cosmos_batch_id_state, cosmos_poll_timer],
+        queue=False
+    )
+
+    cosmos_stop_decode_btn.click(
+        fn=wan22_stop_and_decode,
+        outputs=[cosmos_batch_progress],
+        queue=False
+    )
+
+    cosmos_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[cosmos_seed])
+
+    cosmos_lora_refresh_outputs_list = []
+    for i in range(len(cosmos_lora_weights)):
+        cosmos_lora_refresh_outputs_list.extend([cosmos_lora_weights[i], cosmos_lora_multipliers[i]])
+
+    def refresh_cosmos_loras(folder: str) -> List[gr.update]:
+        choices = get_lora_options(folder)
+        updates = []
+        for _ in range(4):
+            updates.extend([gr.update(choices=choices, value="None"), gr.update(value=1.0)])
+        return updates
+
+    cosmos_lora_refresh_btn.click(
+        fn=refresh_cosmos_loras,
+        inputs=[cosmos_lora_folder],
+        outputs=cosmos_lora_refresh_outputs_list
+    )
+
     # ===== StoryMem Event Handlers =====
     storymem_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[storymem_seed])
 
@@ -16562,6 +17052,145 @@ with gr.Blocks(
         fn=initial_load_bernini_defaults,
         inputs=None,
         outputs=bernini_ui_default_components_ORDERED_LIST
+    )
+
+    # ===== Cosmos Save/Load Defaults =====
+    cosmos_ui_default_components_ORDERED_LIST = [
+        cosmos_ckpt_dir,
+        cosmos_dit_path,
+        cosmos_vae_path,
+        cosmos_attn_mode,
+        cosmos_blocks_to_swap,
+        cosmos_fp8,
+        cosmos_fp8_scaled,
+        cosmos_fp8_fast,
+        cosmos_vae_tiling,
+        cosmos_dit_dtype,
+        cosmos_vae_dtype,
+        cosmos_save_path,
+        cosmos_lora_folder,
+        cosmos_resolution,
+        cosmos_aspect_ratio,
+        cosmos_video_length,
+        cosmos_fps,
+        cosmos_infer_steps,
+        cosmos_guidance_scale,
+        cosmos_flow_shift,
+        cosmos_enable_sound,
+        cosmos_guidance_interval_lo,
+        cosmos_guidance_interval_hi,
+        cosmos_normalize_cfg,
+        cosmos_sigma_max,
+        cosmos_use_system_prompt,
+        cosmos_no_resolution_template,
+        cosmos_no_duration_template,
+        cosmos_condition_video_keep,
+        cosmos_num_outputs,
+        cosmos_cpu_noise,
+        cosmos_distilled,
+    ] + cosmos_lora_weights + cosmos_lora_multipliers
+
+    cosmos_ui_default_keys = [
+        "cosmos_ckpt_dir",
+        "cosmos_dit_path",
+        "cosmos_vae_path",
+        "cosmos_attn_mode",
+        "cosmos_blocks_to_swap",
+        "cosmos_fp8",
+        "cosmos_fp8_scaled",
+        "cosmos_fp8_fast",
+        "cosmos_vae_tiling",
+        "cosmos_dit_dtype",
+        "cosmos_vae_dtype",
+        "cosmos_save_path",
+        "cosmos_lora_folder",
+        "cosmos_resolution",
+        "cosmos_aspect_ratio",
+        "cosmos_video_length",
+        "cosmos_fps",
+        "cosmos_infer_steps",
+        "cosmos_guidance_scale",
+        "cosmos_flow_shift",
+        "cosmos_enable_sound",
+        "cosmos_guidance_interval_lo",
+        "cosmos_guidance_interval_hi",
+        "cosmos_normalize_cfg",
+        "cosmos_sigma_max",
+        "cosmos_use_system_prompt",
+        "cosmos_no_resolution_template",
+        "cosmos_no_duration_template",
+        "cosmos_condition_video_keep",
+        "cosmos_num_outputs",
+        "cosmos_cpu_noise",
+        "cosmos_distilled",
+    ] + [f"cosmos_lora_weight_{i+1}" for i in range(4)] + \
+        [f"cosmos_lora_multiplier_{i+1}" for i in range(4)]
+
+    def save_cosmos_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(cosmos_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(COSMOS_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "Cosmos defaults saved successfully."
+        except Exception as e:
+            return f"Error saving Cosmos defaults: {e}"
+
+    def load_cosmos_defaults(request: gr.Request):
+        if not os.path.exists(COSMOS_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(cosmos_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(cosmos_ui_default_keys) + [""]
+
+        try:
+            with open(COSMOS_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(cosmos_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        lora_folder = loaded_settings.get("cosmos_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(cosmos_ui_default_keys):
+            component = cosmos_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["Cosmos defaults loaded successfully."]
+
+    cosmos_save_defaults_btn.click(
+        fn=save_cosmos_defaults,
+        inputs=cosmos_ui_default_components_ORDERED_LIST,
+        outputs=[cosmos_defaults_status]
+    )
+    cosmos_load_defaults_btn.click(
+        fn=load_cosmos_defaults,
+        inputs=None,
+        outputs=cosmos_ui_default_components_ORDERED_LIST + [cosmos_defaults_status]
+    )
+
+    def initial_load_cosmos_defaults():
+        results_and_status = load_cosmos_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_cosmos_defaults,
+        inputs=None,
+        outputs=cosmos_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====

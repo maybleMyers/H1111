@@ -1,0 +1,31 @@
+{
+  "_class_name": "Cosmos3OmniPipeline",
+  "_diffusers_version": "0.40.0.dev0",
+  "default_use_system_prompt": false,
+  "enable_safety_checker": false,
+  "safety_checker": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "UniPCMultistepScheduler"
+  ],
+  "sound_tokenizer": [
+    null,
+    null
+  ],
+  "text_tokenizer": [
+    "transformers",
+    "PreTrainedTokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "Cosmos3OmniTransformer"
+  ],
+  "use_native_flow_schedule": true,
+  "vae": [
+    "diffusers",
+    "AutoencoderKLWan"
+  ]
+}

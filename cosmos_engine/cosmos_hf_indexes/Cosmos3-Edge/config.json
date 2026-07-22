@@ -1,0 +1,67 @@
+{
+  "allow_patterns_overrides": [
+    "*/*.safetensors"
+  ],
+  "architectures": [
+    "Cosmos3EdgeForConditionalGeneration"
+  ],
+  "image_token_id": 19,
+  "model_type": "cosmos3_edge",
+  "projector_config": {
+    "input_hidden_size": 1152,
+    "merger_intermediate_size": 11520,
+    "model_type": "cosmos3_edge_projector",
+    "out_hidden_size": 2048,
+    "spatial_merge_size": 2,
+    "use_postshuffle_norm": false
+  },
+  "projector_hidden_size": 11520,
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "dtype": "bfloat16",
+    "eos_token_id": 11,
+    "head_dim": 128,
+    "hidden_act": "relu2",
+    "hidden_size": 2048,
+    "initializer_range": 0.02,
+    "intermediate_size": 9216,
+    "max_position_embeddings": 131072,
+    "mlp_bias": false,
+    "model_type": "cosmos3_edge_text",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {
+      "mrope_section": [
+        24,
+        20,
+        20
+      ],
+      "rope_theta": 100000000,
+      "rope_type": "default"
+    },
+    "use_cache": true,
+    "vocab_size": 131072
+  },
+  "tie_word_embeddings": false,
+  "transformers_version": "4.57.1",
+  "video_token_id": 18,
+  "vision_config": {
+    "attention_dropout": 0.0,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "layer_norm_eps": 1e-06,
+    "model_type": "cosmos3_edge_vision",
+    "num_attention_heads": 16,
+    "num_channels": 3,
+    "num_hidden_layers": 27,
+    "num_patches": 256,
+    "patch_size": 16,
+    "spatial_merge_size": 2
+  },
+  "vision_end_token_id": 21,
+  "vision_start_token_id": 20
+}

@@ -1,0 +1,28 @@
+{
+  "_class_name": "Cosmos3OmniDiffusersPipeline",
+  "_diffusers_version": "0.37.1",
+  "scheduler": [
+    "diffusers",
+    "UniPCMultistepScheduler"
+  ],
+  "text_tokenizer": [
+    "transformers",
+    "Qwen2TokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "Cosmos3OmniTransformer"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLWan"
+  ],
+  "vision_encoder": [
+    "transformers",
+    "Qwen3VLVisionModel"
+  ],
+  "sound_tokenizer": [
+    "diffusers",
+    "Cosmos3AVAEAudioTokenizer"
+  ]
+}

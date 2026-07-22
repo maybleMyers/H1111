@@ -1,0 +1,46 @@
+{
+  "_class_name": "Cosmos3OmniTransformer",
+  "_diffusers_version": "0.40.0.dev0",
+  "action_dim": 64,
+  "action_gen": true,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "backbone_type": "cosmos3_edge_nemotron_dense",
+  "base_fps": 24,
+  "enable_fps_modulation": true,
+  "head_dim": 128,
+  "hidden_act": "relu2",
+  "hidden_size": 2048,
+  "intermediate_size": 9216,
+  "latent_channel": 48,
+  "latent_patch_size": 2,
+  "num_attention_heads": 16,
+  "num_embodiment_domains": 32,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 8,
+  "patch_latent_dim": 192,
+  "qk_norm_for_text": false,
+  "rms_norm_eps": 1e-05,
+  "rope_axes_dim": [
+    24,
+    20,
+    20
+  ],
+  "rope_scaling": {
+    "mrope_section": [
+      24,
+      20,
+      20
+    ]
+  },
+  "rope_theta": 100000000,
+  "sound_dim": null,
+  "sound_gen": false,
+  "sound_latent_fps": 25,
+  "temporal_compression_factor": 4,
+  "timestep_scale": 0.001,
+  "unified_3d_mrope_reset_spatial_ids": true,
+  "unified_3d_mrope_temporal_modality_margin": 15000,
+  "use_und_k_norm_for_gen": true,
+  "vocab_size": 131072
+}
