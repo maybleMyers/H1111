@@ -2144,6 +2144,70 @@ def cosmos_generate_via_queue(*args):
     )
 
 
+def cosmos_upsample_prompt_handler(
+    prompt: str,
+    input_image: str,
+    resolution: str,
+    aspect_ratio: str,
+    video_length,
+    fps,
+    endpoint_url: str,
+    model_name: str,
+    api_token: str,
+    mode: str,
+):
+    """Upsample the Cosmos prompt once via an external OpenAI-compatible VLM.
+
+    Runs before generation (never inside the queue worker) so the call is made
+    exactly once per prompt; the JSON result lands in the prompt/negative boxes
+    for the user to review or edit before clicking Generate.
+    Returns (prompt update, negative prompt update, status message).
+    """
+    cosmos_engine_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cosmos_engine")
+    if cosmos_engine_dir not in sys.path:
+        sys.path.insert(0, cosmos_engine_dir)
+    from cosmos_video.prompt_upsampler import is_upsampled_prompt, resolve_mode, upsample_prompt
+
+    if not (prompt or "").strip():
+        return gr.update(), gr.update(), "Upsampling failed: prompt is empty."
+    if not (endpoint_url or "").strip():
+        return gr.update(), gr.update(), "Upsampling failed: endpoint URL is empty."
+    if is_upsampled_prompt(prompt):
+        return gr.update(), gr.update(), (
+            "Prompt already looks like upsampled JSON — not re-upsampling. "
+            "Replace it with a plain-text instruction to upsample again."
+        )
+
+    try:
+        video_length = int(video_length) if video_length else 189
+        resolved_mode = resolve_mode(mode, has_image=bool(input_image), video_length=video_length)
+        start = time.time()
+        record = upsample_prompt(
+            prompt,
+            endpoint_url=endpoint_url,
+            model=model_name,
+            api_token=api_token,
+            mode=resolved_mode,
+            image_path=input_image or None,
+            resolution=str(resolution),
+            aspect_ratio=str(aspect_ratio),
+            video_length=int(video_length),
+            fps=int(fps),
+        )
+        elapsed = time.time() - start
+    except Exception as e:
+        return gr.update(), gr.update(), f"Upsampling failed: {e}"
+
+    negative = record.get("negative_prompt")
+    negative_update = gr.update(value=negative) if negative else gr.update()
+    negative_note = " and negative prompt" if negative else ""
+    status = (
+        f"Upsampled ({resolved_mode}) in {elapsed:.1f}s — review the JSON prompt{negative_note} "
+        f"before clicking Generate."
+    )
+    return gr.update(value=record["prompt"]), negative_update, status
+
+
 def start_wan22_worker():
     """Start the background worker thread for processing Wan2.2 queue jobs."""
     global wan22_worker_thread, wan22_worker_instance
@@ -11765,6 +11829,36 @@ with gr.Blocks(
                     cosmos_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
                     cosmos_progress_text = gr.Textbox(label="Progress", interactive=False, value="", elem_id="cosmos_progress_text")
 
+            with gr.Accordion("Prompt Upsampling (run once before generating)", open=False):
+                gr.Markdown(
+                    "Cosmos3 is trained on JSON-structured captions; upsampling rewrites the plain-text prompt "
+                    "above into that format via an external OpenAI-compatible VLM endpoint. The result replaces "
+                    "the prompt (and, for the image-to-video recipe, the negative prompt) so you can verify or "
+                    "edit it before generating — it is not re-run per queued job."
+                )
+                with gr.Row():
+                    cosmos_upsampler_endpoint = gr.Textbox(
+                        label="Endpoint URL (OpenAI-compatible)",
+                        value="https://api.anthropic.com/v1/",
+                        scale=2,
+                    )
+                    cosmos_upsampler_model = gr.Textbox(label="Model", value="claude-opus-4-8", scale=1)
+                    cosmos_upsampler_api_token = gr.Textbox(
+                        label="API Token (blank = $PROMPT_UPSAMPLER_API_TOKEN)",
+                        value="", type="password", scale=1,
+                    )
+                with gr.Row():
+                    cosmos_upsampler_mode = gr.Dropdown(
+                        label="Mode",
+                        choices=["auto", "posttrain_image2video", "image2video", "text2video", "text2image"],
+                        value="auto",
+                        info="auto: input image → posttrain_image2video (Cosmos3-Super-Image2Video recipe, "
+                             "returns a tailored negative prompt too); otherwise t2v, or t2i at length 1",
+                        scale=2,
+                    )
+                    cosmos_upsample_btn = gr.Button("Upsample Prompt", scale=1)
+                cosmos_upsampler_status = gr.Textbox(label="Upsampler Status", interactive=False, value="")
+
             with gr.Row():
                 cosmos_generate_btn = gr.Button("Generate", elem_classes="green-btn")
                 cosmos_stop_btn = gr.Button("Stop Generation", variant="stop")
@@ -16143,6 +16237,24 @@ with gr.Blocks(
     # ===== Cosmos Event Handlers =====
     # The Cosmos tab reuses the shared job queue and the generic wan22 poll/stop
     # handlers directly (same 7-slot output layout as the Wan2.2/Bernini tabs).
+    cosmos_upsample_btn.click(
+        fn=cosmos_upsample_prompt_handler,
+        inputs=[
+            cosmos_prompt,
+            cosmos_input_image,
+            cosmos_resolution,
+            cosmos_aspect_ratio,
+            cosmos_video_length,
+            cosmos_fps,
+            cosmos_upsampler_endpoint,
+            cosmos_upsampler_model,
+            cosmos_upsampler_api_token,
+            cosmos_upsampler_mode,
+        ],
+        outputs=[cosmos_prompt, cosmos_negative_prompt, cosmos_upsampler_status],
+        queue=True,
+    )
+
     cosmos_generate_btn.click(
         fn=cosmos_generate_via_queue,
         inputs=[
@@ -17102,7 +17214,12 @@ with gr.Blocks(
         cosmos_num_outputs,
         cosmos_cpu_noise,
         cosmos_distilled,
-    ] + cosmos_lora_weights + cosmos_lora_multipliers
+    ] + cosmos_lora_weights + cosmos_lora_multipliers + [
+        # Prompt upsampler settings (the API token is intentionally not persisted)
+        cosmos_upsampler_endpoint,
+        cosmos_upsampler_model,
+        cosmos_upsampler_mode,
+    ]
 
     cosmos_ui_default_keys = [
         "cosmos_ckpt_dir",
@@ -17139,7 +17256,11 @@ with gr.Blocks(
         "cosmos_cpu_noise",
         "cosmos_distilled",
     ] + [f"cosmos_lora_weight_{i+1}" for i in range(4)] + \
-        [f"cosmos_lora_multiplier_{i+1}" for i in range(4)]
+        [f"cosmos_lora_multiplier_{i+1}" for i in range(4)] + [
+        "cosmos_upsampler_endpoint",
+        "cosmos_upsampler_model",
+        "cosmos_upsampler_mode",
+    ]
 
     def save_cosmos_defaults(*values):
         os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
