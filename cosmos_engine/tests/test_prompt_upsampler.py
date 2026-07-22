@@ -1,202 +1,316 @@
-"""Offline tests for cosmos_video.prompt_upsampler (no network, no torch).
+"""CPU tests for the native Cosmos3 prompt upsampler (no GPU, no real weights).
+
+Covers the V4.2 template builder, response cleaner, mrope position ids,
+image preprocessing, the vendored vision tower, and — with a tiny
+random-weight transformer plus the real tokenizer — the KV-cached decode
+loop, including a prefill-vs-incremental logits parity check.
 
 Run from the repo root or cosmos_engine/:
 
     python3 cosmos_engine/tests/test_prompt_upsampler.py
 """
 
-import json
 import os
 import sys
-import tempfile
 import unittest
 
+import numpy as np
+import torch
+from PIL import Image
+
 _here = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(_here))  # cosmos_engine/
+_ENGINE = os.path.dirname(_here)
+for _p in (os.path.dirname(_ENGINE), _ENGINE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from cosmos_video import prompt_upsampler as pu
+from cosmos_video import upsampler_templates as templates
+from cosmos_video.reasoner import Cosmos3Reasoner, _KVCache, resolve_task, strip_generation_weights
+from cosmos_video.vision_encoder import Qwen3VLVisionModel, preprocess_image, smart_resize
 
+# The transformer pulls in diffusers; skip the decode-loop tests (not the
+# template/rope/vision ones) on machines whose diffusers install is broken.
+try:
+    from cosmos_video.transformer import Cosmos3OmniTransformer
 
-class FakeResponse:
-    def __init__(self, payload, status_code=200):
-        self._payload = payload
-        self.status_code = status_code
-        self.ok = 200 <= status_code < 300
-        self.text = json.dumps(payload)
+    _TRANSFORMER_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover
+    Cosmos3OmniTransformer = None
+    _TRANSFORMER_IMPORT_ERROR = str(e)
 
-    def json(self):
-        return self._payload
+torch.manual_seed(0)
 
+TOKENIZER_DIR = os.path.join(_ENGINE, "Cosmos3-Super-Image2Video-skeleton", "text_tokenizer")
 
-class FakeSession:
-    """Records requests and replays canned chat-completion responses."""
-
-    def __init__(self, contents):
-        # contents: list of assistant message strings, one per call
-        self.contents = list(contents)
-        self.requests = []
-
-    def request(self, method, url, json=None, headers=None, timeout=None):
-        self.requests.append({"method": method, "url": url, "payload": json, "headers": headers})
-        content = self.contents.pop(0)
-        return FakeResponse({"choices": [{"message": {"content": content}}]})
+_tokenizer = None
 
 
-def make_client(contents, **config_kwargs):
-    config = pu.PromptUpsamplerConfig(
-        endpoint_url="http://localhost:8000", model="test-model", retry_base_delay_s=0.0, **config_kwargs
-    )
-    session = FakeSession(contents)
-    client = pu.PromptUpsamplerClient(config, session=session, sleep=lambda s: None)
-    return client, session
+def get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        from transformers import AutoTokenizer
+
+        _tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+        if getattr(_tokenizer, "chat_template", None) is None:
+            with open(os.path.join(TOKENIZER_DIR, "chat_template.jinja"), "r", encoding="utf-8") as f:
+                _tokenizer.chat_template = f.read()
+    return _tokenizer
 
 
-POSTTRAIN_RESPONSE = (
-    "<final_prompt>\n"
-    '{"temporal_caption": "A dense caption.", "duration": "placeholder", "fps": "placeholder",'
-    ' "resolution": {"H": "placeholder", "W": "placeholder"}, "aspect_ratio": "placeholder"}\n'
-    "</final_prompt>\n"
-    "<negative_prompt>blurry, washed out colors</negative_prompt>"
-)
+def tiny_transformer(vocab_size: int) -> Cosmos3OmniTransformer:
+    return Cosmos3OmniTransformer(
+        hidden_size=64,
+        intermediate_size=128,
+        head_dim=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        latent_channel=48,
+        latent_patch_size=2,
+        patch_latent_dim=192,
+        vocab_size=vocab_size,
+        rope_scaling={"mrope_interleaved": True, "mrope_section": [4, 2, 2], "rope_type": "default"},
+    ).float().eval()
 
 
-class TestUrlNormalization(unittest.TestCase):
-    def test_variants(self):
-        f = pu._normalize_openai_base_url
-        self.assertEqual(f("http://localhost:8000"), "http://localhost:8000/v1")
-        self.assertEqual(f("https://api.anthropic.com/v1/"), "https://api.anthropic.com/v1")
-        self.assertEqual(f("https://x.test/v1/chat/completions"), "https://x.test/v1")
-        self.assertEqual(f("api.example.com"), "https://api.example.com/v1")
+def tiny_vision_encoder() -> Qwen3VLVisionModel:
+    return Qwen3VLVisionModel(
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        depth=3,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=64,  # must match the tiny LM hidden size
+        num_position_embeddings=2304,
+        deepstack_visual_indexes=[0, 1],
+    ).float().eval()
 
 
-class TestPromptDetection(unittest.TestCase):
-    def test_is_upsampled_prompt(self):
-        self.assertTrue(pu.is_upsampled_prompt('{"temporal_caption": "x"}'))
-        self.assertTrue(pu.is_upsampled_prompt('```json\n{"a": 1}\n```'))
-        self.assertFalse(pu.is_upsampled_prompt("a cat cooking pizza"))
-        self.assertFalse(pu.is_upsampled_prompt("{not valid json"))
-        self.assertFalse(pu.is_upsampled_prompt("[1, 2]"))
-        self.assertFalse(pu.is_upsampled_prompt(""))
-        self.assertFalse(pu.is_upsampled_prompt(None))
+TINY_PREPROC = {
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "image_mean": (0.5, 0.5, 0.5),
+    "image_std": (0.5, 0.5, 0.5),
+    "min_pixels": 1024,
+    "max_pixels": 16384,
+}
 
 
-class TestResolveMode(unittest.TestCase):
-    def test_auto(self):
-        self.assertEqual(pu.resolve_mode("auto", has_image=True, video_length=189), "posttrain_image2video")
-        self.assertEqual(pu.resolve_mode("auto", has_image=False, video_length=189), "text2video")
-        self.assertEqual(pu.resolve_mode("auto", has_image=False, video_length=1), "text2image")
-
-    def test_explicit_and_invalid(self):
-        self.assertEqual(pu.resolve_mode("image2video", has_image=True, video_length=189), "image2video")
-        with self.assertRaises(ValueError):
-            pu.resolve_mode("bogus", has_image=False, video_length=189)
+def make_reasoner(with_vision=False):
+    tokenizer = get_tokenizer()
+    transformer = tiny_transformer(len(tokenizer))
+    vision = tiny_vision_encoder() if with_vision else None
+    return Cosmos3Reasoner(transformer, tokenizer, vision_encoder=vision, preprocessor_config=TINY_PREPROC)
 
 
 class TestTemplates(unittest.TestCase):
-    def test_all_templates_render(self):
-        t2i = pu.build_t2i_prompt_text("a red cube", resolution="720", aspect_ratio="16,9")
-        self.assertIn("a red cube", t2i)
-        self.assertIn("resolution 720", t2i)
-
-        t2v = pu.build_t2v_prompt_text("a red cube spins", resolution="480", aspect_ratio="16,9", duration="7s", fps=24)
-        self.assertIn("a red cube spins", t2v)
-        self.assertIn("duration 7s", t2v)
-        self.assertNotIn("IMAGE INPUT", t2v)
-
-        i2v = pu.build_t2v_prompt_text(
-            "the cube melts", resolution="480", aspect_ratio="16,9", duration="7s", fps=24, image_conditioned=True
-        )
-        self.assertIn("IMAGE INPUT", i2v)
-
-        posttrain = pu.build_posttrain_i2v_prompt_text("the cube melts")
-        self.assertIn("the cube melts", posttrain)
-        self.assertIn("temporal_caption", posttrain)
-
-    def test_i2v_messages_carry_image(self):
-        messages = pu.build_i2v_messages(
-            "x", image_url="data:image/png;base64,AAAA", resolution="480", aspect_ratio="16,9", duration="7s", fps=24
-        )
-        self.assertEqual(messages[1]["content"][0]["type"], "image_url")
-
-    def test_posttrain_messages_have_no_system(self):
-        messages = pu.build_posttrain_i2v_messages("x", image_url="data:image/png;base64,AAAA")
-        self.assertEqual([m["role"] for m in messages], ["user"])
-
-
-class TestClient(unittest.TestCase):
-    def test_t2v_pins_output_parameters(self):
-        raw = '```json\n{"temporal_caption": "cap", "fps": 999, "duration": "bad"}\n```'
-        client, session = make_client([raw])
-        record = client.upsample_t2v("a cat", resolution="480", aspect_ratio="16,9", duration="7s", fps=24)
-        data = json.loads(record["prompt"])
-        self.assertEqual(data["fps"], 24)
-        self.assertEqual(data["duration"], "7s")
-        self.assertEqual(data["resolution"], {"H": 480, "W": 832})
-        self.assertEqual(data["aspect_ratio"], "16,9")
-        # top_k/top_p omitted by default so plain OpenAI-compatible gateways accept the payload
-        payload = session.requests[0]["payload"]
-        self.assertNotIn("top_k", payload)
-        self.assertNotIn("top_p", payload)
-        self.assertEqual(payload["model"], "test-model")
-
-    def test_posttrain_contract(self):
-        client, _ = make_client([POSTTRAIN_RESPONSE])
-        record = client.upsample_posttrain_i2v(
-            "melt it", image_url="data:image/png;base64,AAAA", resolution="480", aspect_ratio="16,9",
-            duration="7s", fps=24,
-        )
-        data = json.loads(record["prompt"])
-        self.assertEqual(data["temporal_caption"], "A dense caption.")
-        self.assertEqual(data["resolution"], {"H": 480, "W": 832})
-        self.assertEqual(record["negative_prompt"], "blurry, washed out colors")
-
-    def test_posttrain_missing_final_prompt_retries_then_fails(self):
-        client, session = make_client(["no tags here"] * 3)
-        with self.assertRaises(RuntimeError):
-            client.upsample_posttrain_i2v(
-                "x", image_url="d", resolution="480", aspect_ratio="16,9", duration="7s", fps=24
+    def test_substitution_all_tasks(self):
+        for task in ("t2v", "i2v"):
+            txt = templates.build_user_text(
+                task, "a red cube spins", aspect_ratio="16,9", resolution_w=832, resolution_h=480,
+                fps=24, duration_secs=7,
             )
-        self.assertEqual(len(session.requests), 3)
+            self.assertIn("a red cube spins", txt)
+            self.assertIn("832", txt)
+            self.assertIn("0:07", txt)
+            self.assertNotIn("{description}", txt)
+            self.assertNotIn("{aspect_ratio}", txt)
+        txt = templates.build_user_text("t2i", "a red cube", aspect_ratio="1,1", resolution_w=960, resolution_h=960)
+        self.assertIn("a red cube", txt)
 
-    def test_retry_recovers(self):
-        good = '{"temporal_caption": "cap"}'
-        client, session = make_client(["not json at all", good])
-        record = client.upsample_t2v("a cat", resolution="480", aspect_ratio="16,9", duration="7s", fps=24)
-        self.assertIn("temporal_caption", record["prompt"])
-        self.assertEqual(len(session.requests), 2)
-
-    def test_auth_header(self):
-        client, session = make_client(['{"a": 1}'], api_token="sk-test")
-        client.upsample_t2i("x", resolution="720", aspect_ratio="1,1")
-        self.assertEqual(session.requests[0]["headers"]["Authorization"], "Bearer sk-test")
-
-
-class TestHelpers(unittest.TestCase):
-    def test_duration_label(self):
-        self.assertEqual(pu.derive_duration_label(189, 24), "7s")
-        self.assertEqual(pu.derive_duration_label(121, 30), "4s")
+    def test_video_tasks_require_fps_duration(self):
         with self.assertRaises(ValueError):
-            pu.derive_duration_label(189, 0)
+            templates.build_user_text("t2v", "x", aspect_ratio="16,9", resolution_w=832, resolution_h=480)
+        with self.assertRaises(KeyError):
+            templates.build_user_text("transfer", "x", aspect_ratio="16,9", resolution_w=832, resolution_h=480)
 
-    def test_resolution_tier_704_maps_to_720(self):
-        self.assertEqual(pu._normalize_resolution_tier("704"), "720")
-        self.assertEqual(pu._normalize_resolution_tier("480"), "480")
+    def test_messages_shape(self):
+        m = templates.build_messages(
+            "i2v", "x", aspect_ratio="16,9", resolution_w=832, resolution_h=480, fps=24, duration_secs=7,
+            with_image=True,
+        )
+        self.assertEqual(m[0]["role"], "system")
+        self.assertEqual(m[1]["content"][0], {"type": "image"})
+        self.assertEqual(m[1]["content"][1]["type"], "text")
+        m = templates.build_messages(
+            "t2v", "x", aspect_ratio="16,9", resolution_w=832, resolution_h=480, fps=24, duration_secs=7,
+        )
+        self.assertIsInstance(m[1]["content"], str)
 
-    def test_image_data_url(self):
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            f.write(b"\x89PNG\r\n")
-            path = f.name
-        try:
-            url = pu.image_path_to_data_url(path)
-            self.assertTrue(url.startswith("data:image/png;base64,"))
-        finally:
-            os.unlink(path)
 
-    def test_upsample_prompt_validations(self):
+class TestCleanResponse(unittest.TestCase):
+    def test_clean_passthrough_and_strip(self):
+        clean_in = '```json\n{"a": 1}\n```'
+        out, info = templates.clean_response(clean_in)
+        self.assertEqual(out, clean_in)
+        self.assertTrue(info["was_clean"])
+        out, info = templates.clean_response('<think>hmm</think>preamble\n```json\n{"a": 1}\n```')
+        self.assertTrue(out.startswith("```json"))
+        self.assertFalse(info["was_clean"])
+
+    def test_is_upsampled_prompt(self):
+        self.assertTrue(templates.is_upsampled_prompt('{"temporal_caption": "x"}'))
+        self.assertTrue(templates.is_upsampled_prompt('```json\n{"a": 1}\n```'))
+        self.assertFalse(templates.is_upsampled_prompt("a cat cooking pizza"))
+        self.assertFalse(templates.is_upsampled_prompt("{not json"))
+        self.assertFalse(templates.is_upsampled_prompt(None))
+
+
+class TestResolveTask(unittest.TestCase):
+    def test_auto(self):
+        self.assertEqual(resolve_task("auto", has_image=True, video_length=189), "i2v")
+        self.assertEqual(resolve_task("auto", has_image=False, video_length=189), "t2v")
+        self.assertEqual(resolve_task("auto", has_image=False, video_length=1), "t2i")
+        self.assertEqual(resolve_task("t2v", has_image=True, video_length=189), "t2v")
         with self.assertRaises(ValueError):
-            pu.upsample_prompt("", endpoint_url="http://x")
+            resolve_task("bogus", has_image=False, video_length=189)
+
+
+def make_tokenizer_only_reasoner():
+    """Reasoner with no transformer — enough for tokenization/position-id tests."""
+    return Cosmos3Reasoner(None, get_tokenizer(), preprocessor_config=TINY_PREPROC)
+
+
+class TestPositionIds(unittest.TestCase):
+    def test_text_only_sequential(self):
+        r = make_tokenizer_only_reasoner()
+        ids = torch.tensor([5, 6, 7, 8])
+        pos = r._build_position_ids(ids, None)
+        self.assertEqual(pos.shape, (3, 4))
+        self.assertTrue(torch.equal(pos[0], torch.arange(4)))
+        self.assertTrue(torch.equal(pos[0], pos[1]))
+
+    def test_image_grid_positions(self):
+        r = make_reasoner()
+        img_id = r.image_token_id
+        # [3 text tokens][4 image tokens (grid 1x4x4, merge 2)][2 text tokens]
+        ids = torch.tensor([10, 11, 12] + [img_id] * 4 + [20, 21])
+        grid = torch.tensor([[1, 4, 4]])
+        pos = r._build_position_ids(ids, grid)
+        self.assertEqual(pos.shape, (3, 9))
+        # text prefix: 0..2 on all axes
+        self.assertTrue(torch.equal(pos[:, :3], torch.arange(3).view(1, -1).expand(3, -1)))
+        # image block starts at 3: t=3 flat, h=[3,3,4,4], w=[3,4,3,4]
+        self.assertTrue(torch.equal(pos[0, 3:7], torch.tensor([3, 3, 3, 3])))
+        self.assertTrue(torch.equal(pos[1, 3:7], torch.tensor([3, 3, 4, 4])))
+        self.assertTrue(torch.equal(pos[2, 3:7], torch.tensor([3, 4, 3, 4])))
+        # trailing text resumes at max+1 = 5
+        self.assertTrue(torch.equal(pos[:, 7:], torch.tensor([[5, 6]] * 3)))
+
+
+class TestImagePreprocessing(unittest.TestCase):
+    def test_smart_resize_multiples(self):
+        h, w = smart_resize(100, 60, factor=32, min_pixels=1024, max_pixels=16384)
+        self.assertEqual(h % 32, 0)
+        self.assertEqual(w % 32, 0)
+        self.assertLessEqual(h * w, 16384)
+
+    def test_preprocess_shapes(self):
+        img = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
+        pixel_values, grid = preprocess_image(img, **TINY_PREPROC)
+        t, gh, gw = grid[0].tolist()
+        self.assertEqual(t, 1)
+        self.assertEqual(pixel_values.shape, (t * gh * gw, 3 * 2 * 16 * 16))
+
+
+class TestVisionEncoder(unittest.TestCase):
+    def test_forward_shapes(self):
+        model = tiny_vision_encoder()
+        img = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
+        pixel_values, grid = preprocess_image(img, **TINY_PREPROC)
+        embeds, deepstack = model(pixel_values.float(), grid)
+        n_merged = int(grid.prod()) // 4
+        self.assertEqual(embeds.shape, (n_merged, 64))
+        self.assertEqual(len(deepstack), 2)
+        self.assertEqual(deepstack[0].shape, (n_merged, 64))
+
+
+@unittest.skipIf(Cosmos3OmniTransformer is None, f"transformer import failed: {_TRANSFORMER_IMPORT_ERROR}")
+class TestDecodeLoop(unittest.TestCase):
+    def test_kv_cache_parity(self):
+        """Incremental decode over the cache must match a full prefill recompute."""
+        r = make_reasoner()
+        ids = torch.tensor(r.tokenizer("The robot picks up the cube")["input_ids"], dtype=torch.long)
+        tfm = r.transformer
+        dtype = tfm.embed_tokens.weight.dtype
+
+        def prefill(seq_ids):
+            cache = _KVCache(len(tfm.layers))
+            pos = r._build_position_ids(seq_ids, None)
+            cos, sin = r._rotary(pos, torch.device("cpu"), dtype)
+            hidden = tfm.embed_tokens(seq_ids)
+            hidden = r._forward_pass(hidden, cos, sin, cache, is_prefill=True)
+            return cache, r._logits(hidden[-1:])
+
+        with torch.no_grad():
+            _, logits_full = prefill(ids)
+
+            cache, _ = prefill(ids[:-1])
+            pos = torch.full((3, 1), int(ids.shape[0]) - 1, dtype=torch.long)
+            cos, sin = r._rotary(pos, torch.device("cpu"), dtype)
+            hidden = tfm.embed_tokens(ids[-1:])
+            hidden = r._forward_pass(hidden, cos, sin, cache, is_prefill=False)
+            logits_step = r._logits(hidden)
+
+        self.assertTrue(
+            torch.allclose(logits_full, logits_step, atol=1e-4),
+            f"max diff {(logits_full - logits_step).abs().max().item()}",
+        )
+
+    def test_generate_deterministic_greedy(self):
+        r = make_reasoner()
+        messages = templates.build_messages(
+            "t2v", "a cat", aspect_ratio="16,9", resolution_w=832, resolution_h=480, fps=24, duration_secs=7,
+        )
+        with torch.no_grad():
+            out1 = r.generate(messages, max_new_tokens=4)
+            out2 = r.generate(messages, max_new_tokens=4)
+        self.assertIsInstance(out1, str)
+        self.assertEqual(out1, out2)
+
+    def test_generate_i2v_with_vision(self):
+        r = make_reasoner(with_vision=True)
+        img = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
+        with torch.no_grad():
+            out = r.upsample(
+                "the cube melts",
+                task="i2v",
+                image=img,
+                resolution_w=832,
+                resolution_h=480,
+                aspect_ratio="16:9",
+                fps=24,
+                duration_secs=7,
+                max_new_tokens=4,
+            )
+        self.assertIsInstance(out, str)
+        self.assertTrue(out)  # empty-output fallback returns the original prompt
+
+    def test_i2v_without_vision_encoder_raises(self):
+        r = make_reasoner(with_vision=False)
+        img = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
         with self.assertRaises(ValueError):
-            pu.upsample_prompt("a cat", endpoint_url="http://x", mode="image2video", image_path=None)
+            r.upsample(
+                "x", task="i2v", image=img, resolution_w=832, resolution_h=480,
+                aspect_ratio="16:9", fps=24, duration_secs=7, max_new_tokens=2,
+            )
+
+    def test_strip_generation_weights(self):
+        r = make_reasoner()
+        n_before = sum(p.numel() for p in r.transformer.parameters())
+        strip_generation_weights(r.transformer)
+        n_after = sum(p.numel() for p in r.transformer.parameters())
+        self.assertLess(n_after, n_before)
+        self.assertIsInstance(r.transformer.layers[0].mlp_moe_gen, torch.nn.Identity)
+        messages = templates.build_messages(
+            "t2v", "a cat", aspect_ratio="16,9", resolution_w=832, resolution_h=480, fps=24, duration_secs=7,
+        )
+        with torch.no_grad():
+            out = r.generate(messages, max_new_tokens=2)
+        self.assertIsInstance(out, str)
 
 
 if __name__ == "__main__":
