@@ -11867,7 +11867,7 @@ with gr.Blocks(
                         choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"],
                         value="sdpa",
                     )
-                    cosmos_blocks_to_swap = gr.Slider(minimum=0, maximum=35, step=1, label="Block Swap to Save VRAM", value=0)
+                    cosmos_blocks_to_swap = gr.Slider(minimum=0, maximum=63, step=1, label="Block Swap to Save VRAM (Super: 64 layers, Nano: 36, Edge: 28 — max is layers-1)", value=0)
                 with gr.Row():
                     cosmos_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     cosmos_fp8_scaled = gr.Checkbox(label="Use Scaled FP8 (DiT)", value=False, info="Runtime FP8 conversion")
