@@ -312,6 +312,13 @@ def resolve_negative_prompt(args) -> Optional[str]:
         if os.path.exists(default_path):
             negative_prompt = read_text_or_path(default_path)
             logger.info(f"using default negative prompt from {default_path}")
+        else:
+            # vendored copy of NVIDIA's recommended negative prompt (from the
+            # Cosmos3 HF repos' example assets) for checkpoints that ship none
+            vendored = os.path.join(_here, "cosmos_video", "assets", "default_negative_prompt.txt")
+            if os.path.exists(vendored):
+                negative_prompt = read_text_or_path(vendored)
+                logger.info("using vendored default Cosmos3 negative prompt")
     return negative_prompt
 
 

@@ -235,8 +235,12 @@ def test_default_negative_prompt():
         args.ckpt_dir = ckpt
         assert resolve_negative_prompt(args) is None
 
-    # no assets file -> None (pipeline falls back to empty string)
+    # no assets file -> vendored default Cosmos3 negative prompt
     args = make_args()
+    neg = resolve_negative_prompt(args)
+    assert neg is not None and "macroblocking" in neg, "vendored fallback should apply"
+    # ... unless explicitly disabled
+    args = make_args("--no_default_negative_prompt")
     assert resolve_negative_prompt(args) is None
     print("default negative prompt: OK")
 
