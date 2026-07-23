@@ -103,6 +103,10 @@ def parse_args() -> argparse.Namespace:
     # i2v / v2v
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--video_path", type=str, default=None)
+    parser.add_argument("--edit_image", type=str, default=None,
+                        help="image2image editing: the input image is packed as a clean vision item and a new "
+                             "single frame is generated per the prompt instruction (forces video_length 1; "
+                             "cannot combine with i2v/v2v/transfer/sound/action)")
     parser.add_argument("--condition_frame_indexes", type=int, nargs="*", default=None,
                         help="latent frame indexes held clean for v2v (default 0 1)")
     parser.add_argument("--condition_video_keep", type=str, default="first", choices=["first", "last"])
@@ -136,6 +140,10 @@ def parse_args() -> argparse.Namespace:
 
     # sound
     parser.add_argument("--enable_sound", action="store_true")
+    parser.add_argument("--sound_path", type=str, default=None,
+                        help="conditioning audio clip (wav/mp3/flac/...) — framework audio_image2video / ts2v: "
+                             "the audio is AVAE-encoded and held clean while the video is generated to match it "
+                             "(requires --enable_sound and an encoder-capable sound_tokenizer)")
     parser.add_argument("--audio_save_path", type=str, default=None, help="also keep the .wav here")
 
     # memory / performance
@@ -196,6 +204,8 @@ def detect_task(args) -> str:
         return "inverse_dynamics" if args.video_path else "policy"
     if any(getattr(args, f"control_{h}") for h in cfg.TRANSFER_HINTS) or args.control_path:
         return "transfer"
+    if args.edit_image:
+        return "t2i"  # image2image rides the t2i defaults; the edit item is added via call kwargs
     if args.video_path:
         return "v2v"
     if args.image_path:
@@ -610,6 +620,10 @@ def run_generation(args, pipe, task: str, device: torch.device, seed: int):
     negative_prompt = resolve_negative_prompt(args)
 
     image = load_image(args.image_path) if args.image_path else None
+    edit_image = load_image(args.edit_image) if args.edit_image else None
+    if edit_image is not None and args.video_length != 1:
+        logger.info(f"--edit_image: forcing video_length {args.video_length} -> 1 (image2image is single-frame)")
+        args.video_length = 1
     video = None
     action = None
     hints = args.active_hints
@@ -695,6 +709,23 @@ def run_generation(args, pipe, task: str, device: torch.device, seed: int):
     if args.condition_frame_indexes is not None:
         call_kwargs["condition_frame_indexes_vision"] = tuple(args.condition_frame_indexes)
     call_kwargs["condition_video_keep"] = args.condition_video_keep
+
+    if edit_image is not None:
+        call_kwargs["edit_image"] = edit_image
+
+    if args.sound_path:
+        if not args.enable_sound:
+            raise ValueError("--sound_path requires --enable_sound (audio-conditioned video needs the sound modality)")
+        audio_channels = getattr(getattr(sound_tokenizer, "encoder", None), "input_channels", 2)
+        n_audio_samples = int(args.video_length / args.fps * sound_tokenizer.config.sampling_rate)
+        call_kwargs["conditioning_sound"] = load_conditioning_audio(
+            args.sound_path,
+            sample_rate=int(sound_tokenizer.config.sampling_rate),
+            audio_channels=int(audio_channels),
+            num_samples=n_audio_samples,
+        )
+        logger.info(f"audio conditioning: {args.sound_path} -> {n_audio_samples} samples "
+                    f"@ {sound_tokenizer.config.sampling_rate} Hz, {audio_channels} ch (ts2v)")
 
     if task == "transfer":
         weights = list(args.control_weight or [])
@@ -825,6 +856,37 @@ def save_video(frames: np.ndarray, path: str, fps: int):
         import imageio
 
         imageio.mimwrite(path, list(frames), fps=fps, quality=8)
+
+
+def load_conditioning_audio(path: str, *, sample_rate: int, audio_channels: int, num_samples: int) -> torch.Tensor:
+    """Decode an audio file into a conditioning waveform aligned to the video.
+
+    Framework inference/sound.py load_conditioning_audio parity, implemented with
+    PyAV (already a dependency) instead of soundfile+scipy: decode, resample to
+    ``sample_rate``, conform to ``audio_channels``, trim/zero-pad to exactly
+    ``num_samples``. Returns float32 ``[1, C, N]``.
+    """
+    import av
+
+    layout = "stereo" if audio_channels == 2 else "mono"
+    resampler = av.AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+    chunks: list[torch.Tensor] = []
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                chunks.append(torch.from_numpy(resampled.to_ndarray().copy()))  # planar float [C, n]
+        for resampled in resampler.resample(None):  # flush
+            chunks.append(torch.from_numpy(resampled.to_ndarray().copy()))
+    if not chunks:
+        raise ValueError(f"no audio decoded from {path}")
+    waveform = torch.cat(chunks, dim=1).to(torch.float32)  # [C, N]
+    n = waveform.shape[-1]
+    if n > num_samples:
+        waveform = waveform[:, :num_samples]
+    elif n < num_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, num_samples - n))
+    return waveform.unsqueeze(0)
 
 
 def save_audio_wav(sound: torch.Tensor, path: str, sample_rate: int):

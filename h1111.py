@@ -1892,6 +1892,7 @@ def cosmos_submit_to_queue(
     negative_prompt: str,
     input_image: str,
     input_video: str,
+    edit_image: str,
     resolution: str,
     aspect_ratio: str,
     video_length: int,
@@ -1901,6 +1902,7 @@ def cosmos_submit_to_queue(
     flow_shift,
     base_seed: int,
     enable_sound: bool,
+    sound_audio: str,
     batch_size: int,
     save_path: str,
     enable_preview: bool,
@@ -1922,6 +1924,28 @@ def cosmos_submit_to_queue(
     num_outputs: int,
     cpu_noise: bool,
     distilled: bool,
+    # Task override + transfer controls
+    task_override: str,
+    control_edge: str,
+    control_blur: str,
+    control_depth: str,
+    control_seg: str,
+    control_wsm: str,
+    control_weight: str,
+    control_guidance,
+    control_guidance_interval_lo,
+    control_guidance_interval_hi,
+    edge_threshold: str,
+    blur_strength: str,
+    no_emphasize_control: bool,
+    num_frames_per_chunk,
+    num_conditional_frames,
+    num_first_chunk_conditional_frames,
+    # Action / policy
+    domain_name: str,
+    action_path: str,
+    action_chunk_size,
+    view_point: str,
     # Performance
     attn_mode: str,
     blocks_to_swap: int,
@@ -1939,9 +1963,9 @@ def cosmos_submit_to_queue(
 ) -> Tuple[str, List[str]]:
     """Submit Cosmos3 generation job(s) to the shared queue.
 
-    Drives cosmos_engine/cosmos_generate_video.py. This tab covers t2v/t2i/i2v/v2v;
-    the CLI also supports transfer (control videos) and action/policy modes — no UI
-    for those yet, a dedicated UI can come later.
+    Drives cosmos_engine/cosmos_generate_video.py. Covers t2v/t2i/i2v/v2v, transfer
+    (per-hint control videos, control-CFG, chunked long video) and the action modes
+    (forward_dynamics/inverse_dynamics/policy) on action-capable checkpoints.
     """
     queue = get_queue()
     batch_count = int(batch_size)
@@ -1971,7 +1995,22 @@ def cosmos_submit_to_queue(
         if float(guidance_interval_hi) <= float(guidance_interval_lo):
             guidance_interval_lo = guidance_interval_hi = None
 
-    if input_video:
+    # Control videos in any hint slot switch the job to transfer; an explicit
+    # task override beats all inference (matches the CLI's --task semantics).
+    control_inputs = {
+        "edge": control_edge, "blur": control_blur, "depth": control_depth,
+        "seg": control_seg, "wsm": control_wsm,
+    }
+    control_inputs = {k: str(v).strip() for k, v in control_inputs.items() if v and str(v).strip()}
+    action_tasks = ("forward_dynamics", "inverse_dynamics", "policy")
+
+    if task_override and task_override != "auto":
+        task_name = task_override
+    elif control_inputs:
+        task_name = "transfer"
+    elif edit_image:
+        task_name = "i2i"
+    elif input_video:
         task_name = "v2v"
     elif input_image:
         task_name = "i2v"
@@ -2027,6 +2066,51 @@ def cosmos_submit_to_queue(
             if cfi_values:
                 command.extend(["--condition_frame_indexes"] + cfi_values)
 
+        if task_override and task_override != "auto":
+            command.extend(["--task", str(task_override)])
+
+        if edit_image and str(edit_image).strip():
+            command.extend(["--edit_image", str(edit_image).strip()])
+
+        if control_inputs:
+            for hint, path in control_inputs.items():
+                command.extend([f"--control_{hint}", path])
+            weight_values = [v for v in str(control_weight or "").replace(",", " ").split() if v]
+            if weight_values:
+                command.extend(["--control_weight"] + weight_values)
+            control_guidance_v = opt_number(control_guidance)
+            if control_guidance_v is not None:
+                command.extend(["--control_guidance", str(control_guidance_v)])
+            ccfg_lo = opt_number(control_guidance_interval_lo)
+            ccfg_hi = opt_number(control_guidance_interval_hi)
+            if ccfg_lo is not None and ccfg_hi is not None and float(ccfg_hi) > float(ccfg_lo):
+                command.extend(["--control_guidance_interval", str(ccfg_lo), str(ccfg_hi)])
+            command.extend(["--edge_threshold", str(edge_threshold or "medium")])
+            command.extend(["--blur_strength", str(blur_strength or "medium")])
+            if no_emphasize_control:
+                command.append("--no_emphasize_control_in_prompt")
+            chunk_v = opt_number(num_frames_per_chunk)
+            if chunk_v is not None:
+                command.extend(["--num_frames_per_chunk", str(int(chunk_v))])
+                cond_v = opt_number(num_conditional_frames)
+                if cond_v is not None:
+                    command.extend(["--num_conditional_frames", str(int(cond_v))])
+                first_cond_v = opt_number(num_first_chunk_conditional_frames)
+                if first_cond_v is not None:
+                    command.extend(["--num_first_chunk_conditional_frames", str(int(first_cond_v))])
+
+        if task_name in action_tasks:
+            if domain_name and str(domain_name).strip():
+                command.extend(["--domain_name", str(domain_name).strip()])
+            if action_path and str(action_path).strip():
+                command.extend(["--action_path", str(action_path).strip()])
+            chunk_size_v = opt_number(action_chunk_size)
+            if chunk_size_v is not None:
+                command.extend(["--action_chunk_size", str(int(chunk_size_v))])
+            if view_point and str(view_point).strip():
+                command.extend(["--view_point", str(view_point).strip()])
+            command.extend(["--action_output", os.path.splitext(output_filename)[0] + "_actions.json"])
+
         if flow_shift is not None:
             command.extend(["--flow_shift", str(flow_shift)])
         if sigma_max is not None:
@@ -2039,6 +2123,11 @@ def cosmos_submit_to_queue(
         if vae_path and str(vae_path).strip():
             command.extend(["--vae", str(vae_path).strip()])
 
+        if sound_audio and str(sound_audio).strip():
+            # Conditioning audio implies the sound modality (framework ts2v / audio→video).
+            command.extend(["--sound_path", str(sound_audio).strip()])
+            if not enable_sound:
+                command.append("--enable_sound")
         if enable_sound:
             command.append("--enable_sound")
         if normalize_cfg:
@@ -2114,6 +2203,14 @@ def cosmos_submit_to_queue(
             parameters["video_path"] = input_video
             parameters["condition_video_keep"] = condition_video_keep
             parameters["condition_frame_indexes"] = condition_frame_indexes
+        if control_inputs:
+            parameters["control_inputs"] = control_inputs
+            parameters["control_weight"] = control_weight
+            parameters["control_guidance"] = control_guidance
+        if task_name in action_tasks:
+            parameters["domain_name"] = domain_name
+            parameters["action_path"] = action_path
+            parameters["view_point"] = view_point
 
         job = queue.add_job(
             command=command,
@@ -2282,6 +2379,106 @@ def cosmos_upsample_prompt_handler(
         f"before clicking Generate."
     )
     return gr.update(value=record["prompt"]), status
+
+
+def cosmos_reason_handler(
+    question: str,
+    input_image: str,
+    input_video: str,
+    max_new_tokens,
+    gpu_layers,
+    # model / performance (shared with the generation tab)
+    ckpt_dir: str,
+    dit_path: str,
+    attn_mode: str,
+    blocks_to_swap,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_fast: bool,
+    dit_dtype: str,
+):
+    """Ask the checkpoint's understanding pathway about the tab's image/video (or text-only).
+
+    Runs cosmos_engine/cosmos_reason.py as a one-shot subprocess (same loading
+    path as the prompt upsampler: gen weights stripped, gpu_layers CPU offload),
+    streaming its progress to the console. Returns (answer, status).
+    """
+    if not (question or "").strip():
+        return "", "Ask failed: question is empty."
+    if not (ckpt_dir or "").strip():
+        return "", "Ask failed: Checkpoint Dir is empty."
+
+    output_path = os.path.join(
+        tempfile.gettempdir(), f"cosmos_reason_{int(time.time())}_{random.randint(1000, 9999)}.json"
+    )
+    gpu_layers = int(gpu_layers) if gpu_layers is not None else -1
+    command = [
+        sys.executable, "-u", "cosmos_engine/cosmos_reason.py",
+        "--ckpt_dir", str(ckpt_dir),
+        "--question", str(question),
+        "--max_new_tokens", str(max(32, int(max_new_tokens))),
+        "--attn_mode", str(attn_mode),
+        "--blocks_to_swap", "0" if gpu_layers >= 0 else str(int(blocks_to_swap)),
+        "--gpu_layers", str(gpu_layers),
+        "--dit_dtype", str(dit_dtype),
+        "--output", output_path,
+    ]
+    if input_image:
+        command.extend(["--image_path", str(input_image)])
+    elif input_video:
+        command.extend(["--video_path", str(input_video)])
+    if dit_path and str(dit_path).strip():
+        command.extend(["--dit", str(dit_path).strip()])
+    if fp8:
+        command.append("--fp8")
+    if fp8_scaled:
+        command.append("--fp8_scaled")
+    if fp8_fast and gpu_layers < 0:
+        command.append("--fp8_fast")
+
+    start = time.time()
+    output_lines: list[str] = []
+
+    def _pump(pipe):
+        for raw in pipe:
+            line = raw.rstrip()
+            if line:
+                output_lines.append(line)
+                print(f"[CosmosReason] {line}", flush=True)
+
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+    except Exception as e:
+        return "", f"Ask failed to launch: {e}"
+    pump_thread = threading.Thread(target=_pump, args=(proc.stdout,), daemon=True)
+    pump_thread.start()
+    try:
+        proc.wait(timeout=3600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return "", "Ask failed: timed out after 1 hour."
+    pump_thread.join(timeout=5)
+
+    try:
+        if proc.returncode != 0:
+            tail = "\n".join(output_lines[-6:])
+            return "", f"Ask failed (exit {proc.returncode}):\n{tail}"
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                record = json.load(f)
+        except Exception as e:
+            return "", f"Ask produced no readable output: {e}"
+    finally:
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+
+    return record.get("answer", ""), f"Answered in {time.time() - start:.0f}s."
 
 
 def start_wan22_worker():
@@ -11933,6 +12130,25 @@ with gr.Blocks(
                     cosmos_upsample_btn = gr.Button("Upsample Prompt", scale=1)
                 cosmos_upsampler_status = gr.Textbox(label="Upsampler Status", interactive=False, value="")
 
+            with gr.Accordion("Describe / Ask (Understanding)", open=False):
+                gr.Markdown(
+                    "Ask the checkpoint's own understanding pathway about the Input Image (or the middle "
+                    "frame of the Input Video; both empty = text-only Q&A). Same one-shot loading as the "
+                    "upsampler — uses the GPU Layers setting above."
+                )
+                with gr.Row():
+                    cosmos_reason_question = gr.Textbox(
+                        label="Question / Instruction",
+                        value="Describe this image in detail.",
+                        scale=3,
+                    )
+                    cosmos_reason_max_new_tokens = gr.Number(
+                        label="Max New Tokens", value=1024, minimum=32, step=32, scale=1,
+                    )
+                    cosmos_reason_btn = gr.Button("Ask", scale=1)
+                cosmos_reason_answer = gr.Textbox(label="Answer", interactive=False, value="", lines=6)
+                cosmos_reason_status = gr.Textbox(label="Status", interactive=False, value="")
+
             with gr.Row():
                 cosmos_generate_btn = gr.Button("Generate", elem_classes="green-btn")
                 cosmos_stop_btn = gr.Button("Stop Generation", variant="stop")
@@ -11948,6 +12164,73 @@ with gr.Blocks(
                     gr.Markdown("### Conditioning Inputs (both blank = t2v; length 1 = t2i)")
                     cosmos_input_image = gr.Image(label="Input Image (i2v — first frame)", type="filepath")
                     cosmos_input_video = gr.Video(label="Input Video (v2v — condition frames)")
+                    cosmos_edit_image = gr.Image(
+                        label="Edit Image (image2image — edits this image per the prompt; forces length 1)",
+                        type="filepath",
+                    )
+                    cosmos_task_override = gr.Dropdown(
+                        label="Task Override",
+                        choices=["auto", "t2v", "t2i", "i2v", "v2v", "transfer",
+                                 "forward_dynamics", "inverse_dynamics", "policy"],
+                        value="auto",
+                        info="auto: inferred from the inputs (any control video → transfer)",
+                    )
+
+                    with gr.Accordion("Transfer Controls (structural control videos)", open=False):
+                        gr.Markdown(
+                            "Setting any control video switches the job to `transfer`. Weights are "
+                            "space-separated floats, one per set hint, in edge/blur/depth/seg/wsm order."
+                        )
+                        with gr.Row():
+                            cosmos_control_edge = gr.Video(label="Edge Control")
+                            cosmos_control_blur = gr.Video(label="Blur Control")
+                        with gr.Row():
+                            cosmos_control_depth = gr.Video(label="Depth Control")
+                            cosmos_control_seg = gr.Video(label="Seg Control")
+                        cosmos_control_wsm = gr.Video(label="WSM Control (world sim map)")
+                        with gr.Row():
+                            cosmos_control_weight = gr.Textbox(label="Control Weights (blank = per-hint defaults)", value="")
+                            cosmos_control_guidance = gr.Number(
+                                label="Control Guidance (blank = per-hint default; 1.0 disables)", value=None
+                            )
+                        with gr.Row():
+                            cosmos_control_guidance_interval_lo = gr.Number(label="Control CFG Interval Lo (blank = full)", value=None)
+                            cosmos_control_guidance_interval_hi = gr.Number(label="Control CFG Interval Hi", value=None)
+                        with gr.Row():
+                            cosmos_edge_threshold = gr.Dropdown(
+                                label="Edge Threshold",
+                                choices=["very_low", "low", "medium", "high", "very_high"], value="medium",
+                            )
+                            cosmos_blur_strength = gr.Dropdown(
+                                label="Blur Strength",
+                                choices=["none", "very_low", "low", "medium", "high", "very_high"], value="medium",
+                            )
+                            cosmos_no_emphasize_control = gr.Checkbox(label="No control emphasis in prompt", value=False)
+                        gr.Markdown("Chunked long-video transfer (blank = single pass):")
+                        with gr.Row():
+                            cosmos_num_frames_per_chunk = gr.Number(label="Frames Per Chunk", value=None)
+                            cosmos_num_conditional_frames = gr.Number(label="Conditional Frames", value=None)
+                            cosmos_num_first_chunk_conditional_frames = gr.Number(label="First-Chunk Conditional", value=None)
+
+                    with gr.Accordion("Action / Policy (action-capable checkpoints only)", open=False):
+                        gr.Markdown(
+                            "forward_dynamics: image + actions → video · inverse_dynamics: video → actions · "
+                            "policy: image + instruction → actions. Select the task in Task Override above. "
+                            "Predicted actions are saved next to the output as `*_actions.json`."
+                        )
+                        with gr.Row():
+                            cosmos_domain_name = gr.Dropdown(
+                                label="Embodiment Domain",
+                                choices=[""] + ["agibotworld", "av", "bridge_orig_lerobot", "camera_pose",
+                                                "droid_lerobot", "embodiment_b", "embodiment_c_gripper",
+                                                "embodiment_c_gripper_ext", "fractal", "hand_pose",
+                                                "molmoact2_yam", "pusht", "robomind-franka",
+                                                "robomind-franka-dual", "robomind-ur", "umi", "xdof_yam"],
+                                value="",
+                            )
+                            cosmos_view_point = gr.Textbox(label="View Point", value="ego_view")
+                        cosmos_action_path = gr.Textbox(label="Action Path (.json / .npy chunk [T, dim])", value="")
+                        cosmos_action_chunk_size = gr.Number(label="Action Chunk Size (blank = default 16)", value=None)
 
                     gr.Markdown("### Generation Parameters")
                     with gr.Row():
@@ -11971,6 +12254,10 @@ with gr.Blocks(
                         cosmos_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         cosmos_random_seed_btn = gr.Button("🎲")
                     cosmos_enable_sound = gr.Checkbox(label="Enable Sound (Super/Nano checkpoints only)", value=False)
+                    cosmos_sound_audio = gr.Audio(
+                        label="Conditioning Audio (audio→video: held clean, video generated to match; Super/Nano)",
+                        type="filepath",
+                    )
 
                     with gr.Accordion("Advanced", open=False):
                         with gr.Row():
@@ -16336,6 +16623,27 @@ with gr.Blocks(
         queue=True,
     )
 
+    cosmos_reason_btn.click(
+        fn=cosmos_reason_handler,
+        inputs=[
+            cosmos_reason_question,
+            cosmos_input_image,
+            cosmos_input_video,
+            cosmos_reason_max_new_tokens,
+            cosmos_upsampler_gpu_layers,
+            cosmos_ckpt_dir,
+            cosmos_dit_path,
+            cosmos_attn_mode,
+            cosmos_blocks_to_swap,
+            cosmos_fp8,
+            cosmos_fp8_scaled,
+            cosmos_fp8_fast,
+            cosmos_dit_dtype,
+        ],
+        outputs=[cosmos_reason_answer, cosmos_reason_status],
+        queue=True,
+    )
+
     cosmos_generate_btn.click(
         fn=cosmos_generate_via_queue,
         inputs=[
@@ -16343,6 +16651,7 @@ with gr.Blocks(
             cosmos_negative_prompt,
             cosmos_input_image,
             cosmos_input_video,
+            cosmos_edit_image,
             cosmos_resolution,
             cosmos_aspect_ratio,
             cosmos_video_length,
@@ -16352,6 +16661,7 @@ with gr.Blocks(
             cosmos_flow_shift,
             cosmos_seed,
             cosmos_enable_sound,
+            cosmos_sound_audio,
             cosmos_batch_size,
             cosmos_save_path,
             cosmos_enable_preview,
@@ -16373,6 +16683,28 @@ with gr.Blocks(
             cosmos_num_outputs,
             cosmos_cpu_noise,
             cosmos_distilled,
+            # Task override + transfer controls
+            cosmos_task_override,
+            cosmos_control_edge,
+            cosmos_control_blur,
+            cosmos_control_depth,
+            cosmos_control_seg,
+            cosmos_control_wsm,
+            cosmos_control_weight,
+            cosmos_control_guidance,
+            cosmos_control_guidance_interval_lo,
+            cosmos_control_guidance_interval_hi,
+            cosmos_edge_threshold,
+            cosmos_blur_strength,
+            cosmos_no_emphasize_control,
+            cosmos_num_frames_per_chunk,
+            cosmos_num_conditional_frames,
+            cosmos_num_first_chunk_conditional_frames,
+            # Action / policy
+            cosmos_domain_name,
+            cosmos_action_path,
+            cosmos_action_chunk_size,
+            cosmos_view_point,
             # Performance
             cosmos_attn_mode,
             cosmos_blocks_to_swap,
@@ -17295,6 +17627,18 @@ with gr.Blocks(
         cosmos_num_outputs,
         cosmos_cpu_noise,
         cosmos_distilled,
+        cosmos_task_override,
+        cosmos_control_weight,
+        cosmos_control_guidance,
+        cosmos_edge_threshold,
+        cosmos_blur_strength,
+        cosmos_no_emphasize_control,
+        cosmos_num_frames_per_chunk,
+        cosmos_num_conditional_frames,
+        cosmos_num_first_chunk_conditional_frames,
+        cosmos_domain_name,
+        cosmos_view_point,
+        cosmos_action_chunk_size,
     ] + cosmos_lora_weights + cosmos_lora_multipliers + [
         cosmos_upsampler_mode,
         cosmos_upsampler_max_new_tokens,
@@ -17335,6 +17679,18 @@ with gr.Blocks(
         "cosmos_num_outputs",
         "cosmos_cpu_noise",
         "cosmos_distilled",
+        "cosmos_task_override",
+        "cosmos_control_weight",
+        "cosmos_control_guidance",
+        "cosmos_edge_threshold",
+        "cosmos_blur_strength",
+        "cosmos_no_emphasize_control",
+        "cosmos_num_frames_per_chunk",
+        "cosmos_num_conditional_frames",
+        "cosmos_num_first_chunk_conditional_frames",
+        "cosmos_domain_name",
+        "cosmos_view_point",
+        "cosmos_action_chunk_size",
     ] + [f"cosmos_lora_weight_{i+1}" for i in range(4)] + \
         [f"cosmos_lora_multiplier_{i+1}" for i in range(4)] + [
         "cosmos_upsampler_mode",
