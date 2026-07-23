@@ -2154,6 +2154,7 @@ def cosmos_upsample_prompt_handler(
     fps,
     mode: str,
     max_new_tokens,
+    gpu_layers,
     # model / performance (shared with the generation tab)
     ckpt_dir: str,
     dit_path: str,
@@ -2198,6 +2199,10 @@ def cosmos_upsample_prompt_handler(
     output_path = os.path.join(
         tempfile.gettempdir(), f"cosmos_upsample_{int(time.time())}_{random.randint(1000, 9999)}.json"
     )
+    # llama.cpp-style CPU offload: with gpu_layers >= 0 the decode-hostile block
+    # swap is dropped in favor of resident CPU layers (weights stay put, only
+    # the hidden state crosses the split once per token).
+    gpu_layers = int(gpu_layers) if gpu_layers is not None else -1
     command = [
         sys.executable, "cosmos_engine/cosmos_upsample_prompt.py",
         "--ckpt_dir", str(ckpt_dir),
@@ -2209,7 +2214,8 @@ def cosmos_upsample_prompt_handler(
         "--fps", str(int(fps)),
         "--max_new_tokens", str(max(64, int(max_new_tokens))),
         "--attn_mode", str(attn_mode),
-        "--blocks_to_swap", str(int(blocks_to_swap)),
+        "--blocks_to_swap", "0" if gpu_layers >= 0 else str(int(blocks_to_swap)),
+        "--gpu_layers", str(gpu_layers),
         "--dit_dtype", str(dit_dtype),
         "--output", output_path,
     ]
@@ -2221,7 +2227,7 @@ def cosmos_upsample_prompt_handler(
         command.append("--fp8")
     if fp8_scaled:
         command.append("--fp8_scaled")
-    if fp8_fast:
+    if fp8_fast and gpu_layers < 0:  # scaled_mm is CUDA-only; CPU-resident layers use the dequant path
         command.append("--fp8_fast")
 
     start = time.time()
@@ -11898,6 +11904,11 @@ with gr.Blocks(
                     cosmos_upsampler_max_new_tokens = gr.Number(
                         label="Max New Tokens", value=2048, minimum=64, step=64, scale=1,
                     )
+                    cosmos_upsampler_gpu_layers = gr.Number(
+                        label="GPU Layers", value=-1, minimum=-1, step=1, scale=1,
+                        info="llama.cpp-style: keep only the last N layers on the GPU, run the rest on CPU "
+                             "(-1 = all on GPU). Overrides Block Swap for upsampling — much faster per token.",
+                    )
                     cosmos_upsample_btn = gr.Button("Upsample Prompt", scale=1)
                 cosmos_upsampler_status = gr.Textbox(label="Upsampler Status", interactive=False, value="")
 
@@ -16290,6 +16301,7 @@ with gr.Blocks(
             cosmos_fps,
             cosmos_upsampler_mode,
             cosmos_upsampler_max_new_tokens,
+            cosmos_upsampler_gpu_layers,
             cosmos_ckpt_dir,
             cosmos_dit_path,
             cosmos_attn_mode,
@@ -17265,6 +17277,7 @@ with gr.Blocks(
     ] + cosmos_lora_weights + cosmos_lora_multipliers + [
         cosmos_upsampler_mode,
         cosmos_upsampler_max_new_tokens,
+        cosmos_upsampler_gpu_layers,
     ]
 
     cosmos_ui_default_keys = [
@@ -17305,6 +17318,7 @@ with gr.Blocks(
         [f"cosmos_lora_multiplier_{i+1}" for i in range(4)] + [
         "cosmos_upsampler_mode",
         "cosmos_upsampler_max_new_tokens",
+        "cosmos_upsampler_gpu_layers",
     ]
 
     def save_cosmos_defaults(*values):

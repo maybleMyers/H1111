@@ -25,7 +25,13 @@ for _p in (os.path.dirname(_ENGINE), _ENGINE):
         sys.path.insert(0, _p)
 
 from cosmos_video import upsampler_templates as templates
-from cosmos_video.reasoner import Cosmos3Reasoner, _KVCache, resolve_task, strip_generation_weights
+from cosmos_video.reasoner import (
+    Cosmos3Reasoner,
+    _KVCache,
+    place_und_layers,
+    resolve_task,
+    strip_generation_weights,
+)
 from cosmos_video.vision_encoder import Qwen3VLVisionModel, preprocess_image, smart_resize
 
 # The transformer pulls in diffusers; skip the decode-loop tests (not the
@@ -297,6 +303,33 @@ class TestDecodeLoop(unittest.TestCase):
                 "x", task="i2v", image=img, resolution_w=832, resolution_h=480,
                 aspect_ratio="16:9", fps=24, duration_secs=7, max_new_tokens=2,
             )
+
+    def test_place_und_layers_split_parity(self):
+        """llama.cpp-style split placement must not change greedy output.
+
+        CPU-only, so both groups land on cpu, but the split-aware forward
+        (per-device rope cache, forced torch attention backend, _logits device
+        move) is the code that runs on a real GPU split too.
+        """
+        r = make_reasoner()
+        messages = templates.build_messages(
+            "t2v", "a cat", aspect_ratio="16,9", resolution_w=832, resolution_h=480, fps=24, duration_secs=7,
+        )
+        with torch.no_grad():
+            baseline = r.generate(messages, max_new_tokens=4)
+            n_gpu, n_cpu = place_und_layers(r.transformer, torch.device("cpu"), gpu_layers=1)
+            self.assertEqual((n_gpu, n_cpu), (1, len(r.transformer.layers) - 1))
+            split_out = r.generate(messages, max_new_tokens=4)
+            # prefill_device=None on a cpu "gpu" group: stream branch must stay off
+            r.prefill_device = torch.device("cpu")
+            stream_off = r.generate(messages, max_new_tokens=4)
+        self.assertEqual(baseline, split_out)
+        self.assertEqual(baseline, stream_off)
+
+    def test_place_und_layers_all_on_device(self):
+        r = make_reasoner()
+        n_gpu, n_cpu = place_und_layers(r.transformer, torch.device("cpu"), gpu_layers=-1)
+        self.assertEqual((n_gpu, n_cpu), (len(r.transformer.layers), 0))
 
     def test_strip_generation_weights(self):
         r = make_reasoner()

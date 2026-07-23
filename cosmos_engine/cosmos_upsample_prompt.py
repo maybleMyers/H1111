@@ -34,6 +34,7 @@ from cosmos_video.reasoner import (
     Cosmos3Reasoner,
     extract_json_object,
     is_upsampled_prompt,
+    place_und_layers,
     resolve_task,
     strip_generation_weights,
 )
@@ -69,6 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_mode", type=str, default="torch",
                         choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"])
     parser.add_argument("--blocks_to_swap", type=int, default=0)
+    parser.add_argument("--gpu_layers", type=int, default=-1,
+                        help="llama.cpp-style CPU offload (its -ngl): keep only the last N transformer layers "
+                             "on the GPU and compute the rest on the CPU where their weights live (-1 = all on "
+                             "GPU). Far faster than --blocks_to_swap for token-by-token decoding, which would "
+                             "re-stream the swapped weights over PCIe for every generated token.")
+    parser.add_argument("--no_prefill_stream", action="store_true",
+                        help="with --gpu_layers: do not stream the CPU-resident layers through the GPU for the "
+                             "one-time prompt prefill (saves a little VRAM, costs prefill speed)")
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--fp8_scaled", action="store_true")
     parser.add_argument("--fp8_fast", action="store_true")
@@ -123,13 +132,25 @@ def main():
     if not args.keep_gen_weights:
         strip_generation_weights(transformer)
         logger.info("generation-pathway weights stripped (LM-only upsampler load)")
+    if args.gpu_layers >= 0 and args.blocks_to_swap > 0:
+        raise ValueError("--gpu_layers and --blocks_to_swap are mutually exclusive; for the upsampler's "
+                         "autoregressive decode prefer --gpu_layers (block swap re-streams weights every token)")
+    prefill_device = None
     if args.blocks_to_swap > 0:
         logger.info(f"enabling block swap: {args.blocks_to_swap} blocks")
         transformer.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
         transformer.move_to_device_except_swap_blocks(device)
         transformer.prepare_block_swap_before_forward()
     else:
-        transformer.to(device)
+        n_gpu, n_cpu = place_und_layers(transformer, device, args.gpu_layers)
+        if n_cpu:
+            if args.fp8_fast:
+                raise ValueError("--fp8_fast uses torch._scaled_mm (CUDA-only) and cannot run the CPU-resident "
+                                 "layers of --gpu_layers; drop --fp8_fast (plain --fp8_scaled works on CPU)")
+            if device.type != "cpu" and not args.no_prefill_stream:
+                prefill_device = device
+            logger.info(f"llm-style CPU offload: {n_gpu} layers on {device}, {n_cpu} layers on cpu "
+                        f"(norm/lm_head on {device}; prefill {'streamed via ' + str(device) if prefill_device else 'on cpu'})")
 
     tokenizer, chat_template = load_text_tokenizer(args.ckpt_dir)
 
@@ -150,6 +171,7 @@ def main():
         chat_template=chat_template,
         vision_encoder=vision_encoder,
         preprocessor_config=load_preprocessor_config(args.ckpt_dir),
+        prefill_device=prefill_device,
     )
     logger.info(f"models loaded in {time.time() - start:.1f}s; upsampling task={task} "
                 f"{width}x{height} fps={args.fps} duration={duration_secs}s")

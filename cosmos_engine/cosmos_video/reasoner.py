@@ -89,6 +89,34 @@ def strip_generation_weights(transformer) -> None:
             setattr(transformer, name, nn.Identity())
 
 
+def place_und_layers(transformer, device: torch.device, gpu_layers: int = -1) -> tuple[int, int]:
+    """llama.cpp-style layer placement for the und-pathway LM (its ``-ngl``).
+
+    Keeps the LAST ``gpu_layers`` transformer layers resident on ``device`` and
+    leaves the earlier ones on the CPU, where their forward runs at decode time
+    — weights are never streamed over PCIe per token, only the tiny hidden
+    state crosses the split boundary once per pass. ``embed_tokens`` stays with
+    the CPU group (a lookup is cheap anywhere); ``norm``/``lm_head`` go to
+    ``device`` since they run every token and the lm_head matmul is large.
+
+    ``gpu_layers < 0`` or ``>= num_layers`` means everything on ``device``
+    (previous behavior). Returns (n_gpu_layers, n_cpu_layers).
+    """
+    n = len(transformer.layers)
+    if gpu_layers < 0 or gpu_layers >= n:
+        transformer.to(device)
+        return n, 0
+    cpu = torch.device("cpu")
+    split = n - int(gpu_layers)
+    for i, layer in enumerate(transformer.layers):
+        layer.to(cpu if i < split else device)
+    transformer.embed_tokens.to(cpu)
+    transformer.norm.to(device)
+    transformer.lm_head.to(device)
+    transformer.rotary_emb.to(device)
+    return int(gpu_layers), split
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
@@ -121,9 +149,15 @@ class Cosmos3Reasoner:
         vision_encoder=None,
         preprocessor_config: Optional[dict] = None,
         image_token_id: Optional[int] = None,
+        prefill_device: Optional[torch.device] = None,
     ):
         self.transformer = transformer
         self.tokenizer = tokenizer
+        # With place_und_layers CPU offload: stream CPU-resident layers through
+        # this device for the one-time prompt prefill (one PCIe pass beats
+        # minutes of CPU matmuls over thousands of prompt tokens). Decode then
+        # runs those layers on the CPU. None = compute where the weights live.
+        self.prefill_device = torch.device(prefill_device) if prefill_device is not None else None
         if getattr(tokenizer, "chat_template", None) is None and chat_template is not None:
             tokenizer.chat_template = chat_template
         self.vision_encoder = vision_encoder
@@ -226,23 +260,53 @@ class Cosmos3Reasoner:
         image_mask: Optional[torch.Tensor] = None,
         deepstack_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """One pass over all layers (prompt prefill or a single decode token). Returns final hidden [T, H]."""
+        """One pass over all layers (prompt prefill or a single decode token). Returns final hidden [T, H].
+
+        Layers may live on different devices (see place_und_layers): the hidden
+        state follows the layer, the KV cache lives on each layer's home
+        device, and CPU layers force the portable SDPA attention backend. With
+        ``self.prefill_device`` set, CPU-resident layers are moved there for
+        the prefill pass only and their K/V is stored back on the CPU.
+        """
         transformer = self.transformer
         blocks_to_swap = getattr(transformer, "blocks_to_swap", None)
+        rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {cos.device: (cos, sin)}
 
         for layer_idx, layer in enumerate(transformer.layers):
             if blocks_to_swap:
                 transformer.offloader.wait_for_block(layer_idx)
+
+            home = layer.input_layernorm.weight.device
+            stream = (
+                is_prefill
+                and self.prefill_device is not None
+                and home.type == "cpu"
+                and self.prefill_device.type != "cpu"
+            )
+            run_device = self.prefill_device if stream else home
+            if stream:
+                layer.to(run_device)
+            if hidden.device != run_device:
+                hidden = hidden.to(run_device)
+            if run_device not in rope:
+                rope[run_device] = (cos.to(run_device), sin.to(run_device))
+            cos_d, sin_d = rope[run_device]
 
             attn = layer.self_attn
             h_norm = layer.input_layernorm(hidden)
             q = attn.norm_q(attn.to_q(h_norm).view(-1, attn.num_attention_heads, attn.head_dim))
             k = attn.norm_k(attn.to_k(h_norm).view(-1, attn.num_key_value_heads, attn.head_dim))
             v = attn.to_v(h_norm).view(-1, attn.num_key_value_heads, attn.head_dim)
-            q = q * cos + _rotate_half(q) * sin
-            k = k * cos + _rotate_half(k) * sin
+            q = q * cos_d + _rotate_half(q) * sin_d
+            k = k * cos_d + _rotate_half(k) * sin_d
 
-            k_all, v_all = cache.append(layer_idx, k, v)
+            if stream:
+                # Prefill runs on an empty cache, so this layer's K/V is exactly k/v:
+                # attend with the on-device tensors, store the cache on the home device.
+                cache.append(layer_idx, k.to(home), v.to(home))
+                k_all, v_all = k, v
+            else:
+                k_all, v_all = cache.append(layer_idx, k, v)
             # Prefill self-attends causally; a single decode query attends the whole cache unmasked.
             out = dispatch_attention_fn(
                 q.unsqueeze(0),
@@ -250,6 +314,7 @@ class Cosmos3Reasoner:
                 v_all.unsqueeze(0),
                 is_causal=is_prefill,
                 enable_gqa=True,
+                backend="torch" if run_device.type == "cpu" else None,
             )
             out = out.squeeze(0).flatten(-2, -1)
             hidden = hidden + attn.to_out(out)
@@ -259,16 +324,20 @@ class Cosmos3Reasoner:
             # len(deepstack) layers (Qwen3VLTextModel._deepstack_process parity; prefill only).
             if is_prefill and deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
                 ds = deepstack_embeds[layer_idx].to(device=hidden.device, dtype=hidden.dtype)
+                mask = image_mask.to(hidden.device)
                 hidden = hidden.clone()
-                hidden[image_mask] = hidden[image_mask] + ds
+                hidden[mask] = hidden[mask] + ds
 
+            if stream:
+                layer.to(home)
             if blocks_to_swap:
                 transformer.offloader.submit_move_blocks_forward(transformer.layers, layer_idx)
 
         return hidden
 
     def _logits(self, hidden_last: torch.Tensor) -> torch.Tensor:
-        normed = self.transformer.norm(hidden_last)
+        norm = self.transformer.norm
+        normed = norm(hidden_last.to(norm.weight.device))
         return self.transformer.lm_head(normed).float()
 
     @staticmethod
