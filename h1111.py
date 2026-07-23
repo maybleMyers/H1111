@@ -2204,7 +2204,7 @@ def cosmos_upsample_prompt_handler(
     # the hidden state crosses the split once per token).
     gpu_layers = int(gpu_layers) if gpu_layers is not None else -1
     command = [
-        sys.executable, "cosmos_engine/cosmos_upsample_prompt.py",
+        sys.executable, "-u", "cosmos_engine/cosmos_upsample_prompt.py",
         "--ckpt_dir", str(ckpt_dir),
         "--prompt", str(prompt),
         "--task", task,
@@ -2231,17 +2231,38 @@ def cosmos_upsample_prompt_handler(
         command.append("--fp8_fast")
 
     start = time.time()
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
-    except subprocess.TimeoutExpired:
-        return gr.update(), "Upsampling failed: timed out after 1 hour."
-    except Exception as e:
-        return gr.update(), f"Upsampling failed to launch: {e}"
+    # Stream the subprocess output to the console as it happens (model-load
+    # progress, "decoded N tokens..." lines) instead of sitting silent until
+    # exit; the lines are also kept for the error tail in the status box.
+    output_lines: list[str] = []
+
+    def _pump(pipe):
+        for raw in pipe:
+            line = raw.rstrip()
+            if line:
+                output_lines.append(line)
+                print(f"[CosmosUpsample] {line}", flush=True)
 
     try:
-        if result.returncode != 0:
-            tail = "\n".join((result.stderr or result.stdout or "").strip().splitlines()[-6:])
-            return gr.update(), f"Upsampling failed (exit {result.returncode}):\n{tail}"
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+    except Exception as e:
+        return gr.update(), f"Upsampling failed to launch: {e}"
+    pump_thread = threading.Thread(target=_pump, args=(proc.stdout,), daemon=True)
+    pump_thread.start()
+    try:
+        proc.wait(timeout=3600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return gr.update(), "Upsampling failed: timed out after 1 hour."
+    pump_thread.join(timeout=5)
+
+    try:
+        if proc.returncode != 0:
+            tail = "\n".join(output_lines[-6:])
+            return gr.update(), f"Upsampling failed (exit {proc.returncode}):\n{tail}"
         try:
             with open(output_path, "r", encoding="utf-8") as f:
                 record = json.load(f)
