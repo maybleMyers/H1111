@@ -109,6 +109,11 @@ def main():
     task = resolve_task(args.task, has_image=bool(args.image_path), video_length=args.video_length)
     if task == "i2v" and not args.image_path:
         raise ValueError("task=i2v requires --image_path")
+    if args.gpu_layers >= 0 and args.blocks_to_swap > 0:
+        # blocks_to_swap is shared with the generation settings; for the upsampler's
+        # autoregressive decode the resident CPU-layer split always wins.
+        logger.info(f"--gpu_layers {args.gpu_layers} set: ignoring --blocks_to_swap {args.blocks_to_swap}")
+        args.blocks_to_swap = 0
 
     from cosmos_video.attention import set_attention_backend
 
@@ -132,9 +137,6 @@ def main():
     if not args.keep_gen_weights:
         strip_generation_weights(transformer)
         logger.info("generation-pathway weights stripped (LM-only upsampler load)")
-    if args.gpu_layers >= 0 and args.blocks_to_swap > 0:
-        raise ValueError("--gpu_layers and --blocks_to_swap are mutually exclusive; for the upsampler's "
-                         "autoregressive decode prefer --gpu_layers (block swap re-streams weights every token)")
     prefill_device = None
     if args.blocks_to_swap > 0:
         logger.info(f"enabling block swap: {args.blocks_to_swap} blocks")
