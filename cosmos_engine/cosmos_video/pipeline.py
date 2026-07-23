@@ -17,6 +17,7 @@
 import copy
 import json
 import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -1205,6 +1206,62 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
         prompt["aspect_ratio"] = aspect_ratio
         return json.dumps(prompt)
 
+    @staticmethod
+    def _parse_json_object_prompt(prompt: str) -> dict | None:
+        """Parsed dict iff ``prompt`` is a JSON-object caption (bare, or in a ```json fence); else None.
+
+        Framework inference._parse_json_object_prompt parity, extended to unfence
+        because the H1111 native upsampler places its fenced output verbatim in the
+        prompt box. JSON arrays/numbers/strings are NOT JSON-object prompts and fall
+        through to the plain-text template path.
+        """
+        text = (prompt or "").strip()
+        fence = re.match(r"^```(?:json)?\s*(\{.*\})\s*```$", text, flags=re.DOTALL)
+        if fence:
+            text = fence.group(1)
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _format_json_prompt_with_template(
+        self,
+        prompt_obj: dict,
+        *,
+        fps: float,
+        num_frames: int,
+        height: int,
+        width: int,
+        is_image: bool,
+        add_duration_template: bool,
+        add_resolution_template: bool,
+    ) -> str:
+        """Framework inference._format_json_prompt_with_template parity for JSON captions.
+
+        Overwrites the metadata keys inside the JSON with the actual generation
+        specs, in the training augmentors' schema — ``duration: "<int>s"``,
+        ``fps: float``, ``resolution: {"H", "W"}``, ``aspect_ratio: "W,H"`` — instead
+        of appending the flat metadata sentences meant for plain-text prompts.
+        The generation specs are the source of truth over whatever the caption
+        pinned. Image samples drop duration/fps entirely (augmentor parity).
+        """
+        if is_image:
+            prompt_obj.pop("duration", None)
+            prompt_obj.pop("fps", None)
+        elif add_duration_template:
+            duration_seconds = int(num_frames / fps) if fps > 0 else 0
+            prompt_obj["duration"] = f"{duration_seconds}s"
+            prompt_obj["fps"] = float(fps)
+        if add_resolution_template:
+            ratio = width / height if height > 0 else 1.0
+            prompt_obj["resolution"] = {"H": int(height), "W": int(width)}
+            prompt_obj["aspect_ratio"] = min(
+                ("1,1", "4,3", "3,4", "16,9", "9,16"),
+                key=lambda r: abs(int(r.split(",")[0]) / int(r.split(",")[1]) - ratio),
+            )
+        return json.dumps(prompt_obj)
+
     def tokenize_prompt(
         self,
         prompt: str,
@@ -1296,7 +1353,22 @@ class Cosmos3OmniPipeline(DiffusionPipeline):
             )
             uncond_text = negative_prompt
         else:
-            cond_text = _apply_templates(prompt)
+            prompt_obj = self._parse_json_object_prompt(prompt)
+            if prompt_obj is not None:
+                # Upsampled JSON caption: inject metadata into the JSON itself
+                # (framework parity) instead of appending flat sentences after it.
+                cond_text = self._format_json_prompt_with_template(
+                    prompt_obj,
+                    fps=fps,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                    is_image=is_image,
+                    add_duration_template=add_duration_template,
+                    add_resolution_template=add_resolution_template,
+                )
+            else:
+                cond_text = _apply_templates(prompt)
             uncond_text = _apply_templates(negative_prompt, is_negative=True)
 
         cond_encodings = _tokenize(cond_text)
