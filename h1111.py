@@ -1469,6 +1469,18 @@ def wan22_generate_via_queue(
     )
 
 
+def format_elapsed_time(seconds: float) -> str:
+    """47s / 4m 32s / 1h 02m — for job timing shown in the queue tabs."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
     """Poll the queue for job status updates.
 
@@ -1504,7 +1516,10 @@ def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
             completed_count += 1
             if job.output_filename and os.path.exists(job.output_filename):
                 seed = job.parameters.get('seed', 'unknown')
-                all_videos.append((job.output_filename, f"Seed: {seed}"))
+                caption = f"Seed: {seed}"
+                if job.elapsed_time:
+                    caption += f" | {format_elapsed_time(job.elapsed_time)}"
+                all_videos.append((job.output_filename, caption))
         elif job.status == JobStatus.RUNNING.value:
             running_job = job
             if job.preview_path and os.path.exists(job.preview_path):
@@ -1524,11 +1539,19 @@ def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
         progress_text = running_job.progress_text or f"Progress: {running_job.progress:.0f}%"
         status_parts.insert(0, f"Processing {completed_count + 1}/{total_jobs}")
     elif completed_count == total_jobs and total_jobs > 0:
-        status_parts.insert(0, f"All {total_jobs} generation(s) complete!")
+        total_elapsed = sum(j.elapsed_time for j in jobs if j.status == JobStatus.COMPLETED.value)
+        done_msg = f"All {total_jobs} generation(s) complete!"
+        if total_elapsed:
+            done_msg += f" (total {format_elapsed_time(total_elapsed)})"
+        status_parts.insert(0, done_msg)
         progress_text = "Done"
         timer_active = False
     elif completed_count + failed_count == total_jobs and total_jobs > 0:
-        status_parts.insert(0, f"Batch complete: {completed_count} succeeded, {failed_count} failed")
+        total_elapsed = sum(j.elapsed_time for j in jobs if j.status == JobStatus.COMPLETED.value)
+        done_msg = f"Batch complete: {completed_count} succeeded, {failed_count} failed"
+        if total_elapsed:
+            done_msg += f" (total {format_elapsed_time(total_elapsed)})"
+        status_parts.insert(0, done_msg)
         progress_text = "Done"
         timer_active = False
     elif total_jobs == 0:
@@ -12257,24 +12280,21 @@ with gr.Blocks(
                     gr.Markdown("### Generation Parameters")
                     with gr.Row():
                         cosmos_resolution = gr.Dropdown(
-                            label="Resolution (tier; used when Width/Height blank)",
+                            label="Resolution (tier — auto-calculates Width/Height)",
                             choices=["256", "480", "704", "720", "768"],
                             value="720",
                         )
                         cosmos_aspect_ratio = gr.Dropdown(
-                            label="Aspect Ratio",
+                            label="Aspect Ratio (ignored when an image/video is loaded)",
                             choices=["16:9", "9:16", "1:1", "4:3", "3:4"],
                             value="16:9",
                         )
                     with gr.Row():
-                        cosmos_width = gr.Number(
-                            label="Width (px, multiple of 16; blank = tier)",
-                            value=None, minimum=0, step=16,
-                        )
-                        cosmos_height = gr.Number(
-                            label="Height (px, multiple of 16; blank = tier)",
-                            value=None, minimum=0, step=16,
-                        )
+                        cosmos_width = gr.Number(label="Width", value=1280, minimum=16, step=16, interactive=True)
+                        cosmos_calc_height_btn = gr.Button("→")
+                        cosmos_calc_width_btn = gr.Button("←")
+                        cosmos_height = gr.Number(label="Height", value=720, minimum=16, step=16, interactive=True)
+                    cosmos_original_dims = gr.Textbox(visible=False, value="")
                     with gr.Row():
                         cosmos_video_length = gr.Number(label="Video Length (frames, 4n+1; 1 for image)", value=189, minimum=1, step=4)
                         cosmos_fps = gr.Dropdown(label="FPS", choices=[10, 16, 24, 30], value=24)
@@ -16675,29 +16695,81 @@ with gr.Blocks(
         queue=True,
     )
 
-    # Auto-fill explicit pixel dimensions from the provided media (priority:
-    # input image > edit image > video), snapped down to Cosmos's multiple of
-    # 16. Cleared inputs blank the fields so the Resolution/Aspect tier applies.
-    def update_cosmos_dimensions(input_image, edit_image, input_video):
-        def snap16(w, h):
-            return max(16, (w // 16) * 16), max(16, (h // 16) * 16)
+    # Width/Height are always auto-calculated from the selected resolution
+    # tier: with no media the official tier/aspect table is used verbatim;
+    # with an image/video (priority: input image > edit image > video) the
+    # media's aspect ratio is fitted into the tier's pixel area — each tier is
+    # ~constant area (see cosmos_video.configs.VIDEO_RES_SIZE_INFO) — snapped
+    # to the VAE's 16-px grid. The ←/→ buttons recompute one dimension from a
+    # hand-typed value using the media's aspect ratio (wan2.2-style).
+    def _cosmos_snap16(v):
+        return max(16, int(round(v / 16)) * 16)
+
+    def _cosmos_media_dims(input_image, edit_image, input_video):
+        """Raw (w, h) of the highest-priority media, or None."""
         for img_path in (input_image, edit_image):
             if img_path:
-                w, h = snap16(*Image.open(img_path).size)
-                return gr.update(value=w), gr.update(value=h)
+                return Image.open(img_path).size
         if input_video:
             info = get_video_info(input_video)
             if info:
-                w, h = snap16(info['width'], info['height'])
-                return gr.update(value=w), gr.update(value=h)
-        return gr.update(value=None), gr.update(value=None)
+                return info['width'], info['height']
+        return None
 
-    for _cosmos_media_input in (cosmos_input_image, cosmos_edit_image, cosmos_input_video):
-        _cosmos_media_input.change(
+    def update_cosmos_dimensions(resolution, aspect_ratio, input_image, edit_image, input_video):
+        cosmos_engine_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cosmos_engine")
+        if cosmos_engine_dir not in sys.path:
+            sys.path.insert(0, cosmos_engine_dir)
+        from cosmos_video import configs as cosmos_cfg
+        table = cosmos_cfg.VIDEO_RES_SIZE_INFO[str(resolution)]
+        dims = _cosmos_media_dims(input_image, edit_image, input_video)
+        if dims is None:
+            w, h = table[aspect_ratio]
+            return "", gr.update(value=int(w)), gr.update(value=int(h))
+        ar = dims[0] / dims[1]
+        # Media AR close to an official aspect (within ~3%) → exact table entry;
+        # otherwise fit the AR into the tier's pixel area on the 16-px grid.
+        closest = min(table, key=lambda k: abs(math.log(ar * int(k.split(':')[1]) / int(k.split(':')[0]))))
+        a, b = map(int, closest.split(':'))
+        if abs(math.log(ar * b / a)) < 0.03:
+            w, h = table[closest]
+        else:
+            area = table["1:1"][0] ** 2
+            w = _cosmos_snap16(math.sqrt(area * ar))
+            h = _cosmos_snap16(math.sqrt(area / ar))
+        return f"{dims[0]}x{dims[1]}", gr.update(value=int(w)), gr.update(value=int(h))
+
+    for _cosmos_dim_input in (cosmos_resolution, cosmos_aspect_ratio,
+                              cosmos_input_image, cosmos_edit_image, cosmos_input_video):
+        _cosmos_dim_input.change(
             fn=update_cosmos_dimensions,
-            inputs=[cosmos_input_image, cosmos_edit_image, cosmos_input_video],
-            outputs=[cosmos_width, cosmos_height],
+            inputs=[cosmos_resolution, cosmos_aspect_ratio,
+                    cosmos_input_image, cosmos_edit_image, cosmos_input_video],
+            outputs=[cosmos_original_dims, cosmos_width, cosmos_height],
         )
+
+    def calculate_cosmos_height(width, original_dims):
+        if not original_dims:
+            return gr.update()
+        ow, oh = map(int, original_dims.split('x'))
+        return gr.update(value=_cosmos_snap16(float(width) * oh / ow))
+
+    def calculate_cosmos_width(height, original_dims):
+        if not original_dims:
+            return gr.update()
+        ow, oh = map(int, original_dims.split('x'))
+        return gr.update(value=_cosmos_snap16(float(height) * ow / oh))
+
+    cosmos_calc_height_btn.click(
+        fn=calculate_cosmos_height,
+        inputs=[cosmos_width, cosmos_original_dims],
+        outputs=[cosmos_height],
+    )
+    cosmos_calc_width_btn.click(
+        fn=calculate_cosmos_width,
+        inputs=[cosmos_height, cosmos_original_dims],
+        outputs=[cosmos_width],
+    )
 
     cosmos_generate_btn.click(
         fn=cosmos_generate_via_queue,
