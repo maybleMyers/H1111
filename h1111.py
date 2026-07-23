@@ -1895,6 +1895,8 @@ def cosmos_submit_to_queue(
     edit_image: str,
     resolution: str,
     aspect_ratio: str,
+    width,
+    height,
     video_length: int,
     fps: int,
     infer_steps: int,
@@ -1989,6 +1991,21 @@ def cosmos_submit_to_queue(
 
     flow_shift = opt_number(flow_shift)
     sigma_max = opt_number(sigma_max)
+
+    # Frame count must be 4n+1 (VAE temporal compression 4); 1 = still image.
+    video_length = int(video_length)
+    if video_length > 1:
+        video_length = max(5, 4 * round((video_length - 1) / 4) + 1)
+
+    # Explicit pixel dimensions (both set) override the resolution/aspect tier;
+    # Cosmos needs multiples of 16 (VAE spatial compression).
+    width = opt_number(width)
+    height = opt_number(height)
+    if width is not None and height is not None:
+        width = max(16, (int(width) // 16) * 16)
+        height = max(16, (int(height) // 16) * 16)
+    else:
+        width = height = None
     guidance_interval_lo = opt_number(guidance_interval_lo)
     guidance_interval_hi = opt_number(guidance_interval_hi)
     if guidance_interval_lo is not None and guidance_interval_hi is not None:
@@ -2050,6 +2067,11 @@ def cosmos_submit_to_queue(
             "--output_type", "video",
             "--output_filename", output_filename,
         ]
+
+        # Explicit pixel size wins over the tier (the CLI still uses --resolution
+        # for the action-task resolution_tier, so both are passed).
+        if width is not None and height is not None:
+            command.extend(["--video_size", str(height), str(width)])
 
         # -1 = random: the seed is resolved here so it is always >= 0 when passed
         if current_seed >= 0:
@@ -12235,7 +12257,7 @@ with gr.Blocks(
                     gr.Markdown("### Generation Parameters")
                     with gr.Row():
                         cosmos_resolution = gr.Dropdown(
-                            label="Resolution",
+                            label="Resolution (tier; used when Width/Height blank)",
                             choices=["256", "480", "704", "720", "768"],
                             value="720",
                         )
@@ -12245,7 +12267,16 @@ with gr.Blocks(
                             value="16:9",
                         )
                     with gr.Row():
-                        cosmos_video_length = gr.Number(label="Video Length (frames, 4n+1; 1 for image)", value=189, step=4)
+                        cosmos_width = gr.Number(
+                            label="Width (px, multiple of 16; blank = tier)",
+                            value=None, minimum=0, step=16,
+                        )
+                        cosmos_height = gr.Number(
+                            label="Height (px, multiple of 16; blank = tier)",
+                            value=None, minimum=0, step=16,
+                        )
+                    with gr.Row():
+                        cosmos_video_length = gr.Number(label="Video Length (frames, 4n+1; 1 for image)", value=189, minimum=1, step=4)
                         cosmos_fps = gr.Dropdown(label="FPS", choices=[10, 16, 24, 30], value=24)
                     cosmos_infer_steps = gr.Slider(minimum=1, maximum=100, step=1, label="Sampling Steps", value=35)
                     cosmos_guidance_scale = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, label="Guidance Scale", value=6.0)
@@ -16644,6 +16675,30 @@ with gr.Blocks(
         queue=True,
     )
 
+    # Auto-fill explicit pixel dimensions from the provided media (priority:
+    # input image > edit image > video), snapped down to Cosmos's multiple of
+    # 16. Cleared inputs blank the fields so the Resolution/Aspect tier applies.
+    def update_cosmos_dimensions(input_image, edit_image, input_video):
+        def snap16(w, h):
+            return max(16, (w // 16) * 16), max(16, (h // 16) * 16)
+        for img_path in (input_image, edit_image):
+            if img_path:
+                w, h = snap16(*Image.open(img_path).size)
+                return gr.update(value=w), gr.update(value=h)
+        if input_video:
+            info = get_video_info(input_video)
+            if info:
+                w, h = snap16(info['width'], info['height'])
+                return gr.update(value=w), gr.update(value=h)
+        return gr.update(value=None), gr.update(value=None)
+
+    for _cosmos_media_input in (cosmos_input_image, cosmos_edit_image, cosmos_input_video):
+        _cosmos_media_input.change(
+            fn=update_cosmos_dimensions,
+            inputs=[cosmos_input_image, cosmos_edit_image, cosmos_input_video],
+            outputs=[cosmos_width, cosmos_height],
+        )
+
     cosmos_generate_btn.click(
         fn=cosmos_generate_via_queue,
         inputs=[
@@ -16654,6 +16709,8 @@ with gr.Blocks(
             cosmos_edit_image,
             cosmos_resolution,
             cosmos_aspect_ratio,
+            cosmos_width,
+            cosmos_height,
             cosmos_video_length,
             cosmos_fps,
             cosmos_infer_steps,
