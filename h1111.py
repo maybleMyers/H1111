@@ -60,6 +60,7 @@ STORYMEM_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "storymem_defaults.json")
 WAN22_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "wan22_defaults.json")
 BERNINI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "bernini_defaults.json")
 COSMOS_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "cosmos_defaults.json")
+MINIMAX_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "minimax_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -2274,6 +2275,305 @@ def cosmos_submit_to_queue(
 def cosmos_generate_via_queue(*args):
     """Queue-based Cosmos3 generation; returns immediately and polls via Timer."""
     batch_id, job_ids = cosmos_submit_to_queue(*args)
+    first_job_id = job_ids[0] if job_ids else ""
+    status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+    return (
+        [],
+        [],
+        status_msg,
+        "Waiting for worker to start...",
+        first_job_id,
+        batch_id,
+        gr.Timer(value=2.0, active=True),
+    )
+
+
+MINIMAX_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+MINIMAX_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+
+
+def minimax_align_num_frames(num_frames: int) -> int:
+    """Snap a frame count up to the next 17n+5 the MiniMax-H3 video VAE can encode."""
+    num_frames = max(1, int(num_frames))
+    while num_frames % 17 != 5:
+        num_frames += 1
+    return num_frames
+
+
+def minimax_order_references(files, order_text: str):
+    """Order the multi-upload reference list by the 1-based indexes in `order_text`
+    (blank = upload order). Returns the ordered path list."""
+    paths = [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in (files or [])]
+    order = [t for t in str(order_text or "").replace(",", " ").split() if t]
+    if not order:
+        return paths
+    try:
+        indexes = [int(t) - 1 for t in order]
+    except ValueError:
+        raise gr.Error(f"Reference order must be 1-based indexes like '2 1 3', got: {order_text!r}")
+    if sorted(indexes) != list(range(len(paths))):
+        raise gr.Error(
+            f"Reference order must use each of 1..{len(paths)} exactly once, got: {order_text!r}"
+        )
+    return [paths[i] for i in indexes]
+
+
+def minimax_submit_to_queue(
+    prompt: str,
+    task_override: str,
+    input_image: str,
+    last_image: str,
+    reference_files,
+    reference_order: str,
+    reference_strip_audio: bool,
+    aspect_ratio: str,
+    width,
+    height,
+    video_length,
+    infer_steps: int,
+    flow_shift,
+    audio_flow_shift,
+    base_seed: int,
+    batch_size: int,
+    save_path: str,
+    enable_preview: bool,
+    preview_steps: int,
+    # Model Paths
+    ckpt_dir: str,
+    dit_path: str,
+    vae_path: str,
+    audio_vae_path: str,
+    # Advanced
+    num_outputs: int,
+    prompt_cache: bool,
+    # Performance
+    attn_mode: str,
+    blocks_to_swap: int,
+    fp8: bool,
+    fp8_scaled: bool,
+    fp8_fast: bool,
+    fp8_exclude_adaln: bool,
+    text_encoder_gpu_layers,
+    text_encoder_stream: bool,
+    vae_tiling: bool,
+    dit_dtype: str,
+    vae_dtype: str,
+    # LoRAs
+    lora_folder: str,
+    lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
+    lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+) -> Tuple[str, List[str]]:
+    """Submit MiniMax-H3 generation job(s) to the shared queue.
+
+    Drives minimax_engine/minimax_generate_video.py. Tasks: t2va (text), fl2va (first/last
+    keyframe), ref2va (ordered image/video/audio references — separate transformer_ref
+    partition). Guidance-distilled: no negative prompt, no CFG.
+    """
+    queue = get_queue()
+    batch_count = int(batch_size)
+    batch_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    job_ids = []
+
+    os.makedirs(save_path, exist_ok=True)
+
+    def opt_number(v):
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        if float(v) == 0:
+            return None
+        return v
+
+    flow_shift = opt_number(flow_shift)
+    audio_flow_shift = opt_number(audio_flow_shift)
+
+    references = minimax_order_references(reference_files, reference_order)
+
+    if task_override and task_override != "auto":
+        task_name = task_override
+    elif references:
+        task_name = "ref2va"
+    elif input_image or last_image:
+        task_name = "fl2va"
+    else:
+        task_name = "t2va"
+
+    if task_name == "ref2va" and not references:
+        raise gr.Error("ref2va needs at least one reference file")
+    ref_kinds = []
+    for path in references:
+        ext = os.path.splitext(path)[1].lower()
+        ref_kinds.append("image" if ext in MINIMAX_IMAGE_EXTENSIONS
+                         else "audio" if ext in MINIMAX_AUDIO_EXTENSIONS else "video")
+    for kind, limit in (("image", 9), ("video", 3), ("audio", 3)):
+        if ref_kinds.count(kind) > limit:
+            raise gr.Error(f"MiniMax-H3 accepts at most {limit} {kind} references, got {ref_kinds.count(kind)}")
+    if len(ref_kinds) > 12:
+        raise gr.Error(f"MiniMax-H3 accepts at most 12 references, got {len(ref_kinds)}")
+
+    # Frame count: 17n+5 at 24 fps, 5-15 s. 0/blank on ref2va = derive from the audio reference.
+    video_length = opt_number(video_length)
+    if video_length is not None:
+        video_length = minimax_align_num_frames(video_length)
+        if not 124 <= video_length <= 345:
+            raise gr.Error(
+                f"MiniMax-H3 generates 5-15 seconds at 24 fps: video length (snapped to 17n+5) must be "
+                f"124-345 frames, got {video_length}"
+            )
+    elif task_name != "ref2va":
+        video_length = 124
+
+    # Explicit pixel dimensions (both set) override the auto canvas; multiples of 32.
+    width = opt_number(width)
+    height = opt_number(height)
+    if width is not None and height is not None:
+        width = max(32, (int(width) // 32) * 32)
+        height = max(32, (int(height) // 32) * 32)
+    else:
+        width = height = None
+
+    for i in range(batch_count):
+        current_seed = base_seed
+        if base_seed == -1:
+            current_seed = random.randint(0, 2**31 - 1)
+        elif batch_count > 1:
+            current_seed = base_seed + i
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(save_path, f"minimax_{task_name}_{timestamp}_{current_seed}.mp4")
+        run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        unique_preview_suffix = f"minimax_{run_id}"
+
+        command = [
+            sys.executable, "minimax_engine/minimax_generate_video.py",
+            "--prompt", str(prompt),
+            "--ckpt_dir", str(ckpt_dir),
+            "--task", str(task_name),
+            "--infer_steps", str(int(infer_steps)),
+            "--num_outputs", str(int(num_outputs)),
+            "--attn_mode", str(attn_mode),
+            "--blocks_to_swap", str(int(blocks_to_swap)),
+            "--dit_dtype", str(dit_dtype),
+            "--vae_dtype", str(vae_dtype),
+            "--save_path", str(save_path),
+            "--output_type", "video",
+            "--output_filename", output_filename,
+            "--video_length", str(int(video_length) if video_length is not None else 0),
+        ]
+
+        if width is not None and height is not None:
+            command.extend(["--video_size", str(height), str(width)])
+        elif aspect_ratio and task_name != "fl2va":
+            command.extend(["--aspect_ratio", str(aspect_ratio)])
+
+        if current_seed >= 0:
+            command.extend(["--seed", str(current_seed)])
+
+        if input_image:
+            command.extend(["--image_path", str(input_image)])
+        if last_image:
+            command.extend(["--last_image_path", str(last_image)])
+        for path in references:
+            command.extend(["--reference", str(path)])
+        if reference_strip_audio:
+            command.append("--reference_strip_audio")
+
+        if flow_shift is not None:
+            command.extend(["--flow_shift", str(flow_shift)])
+        if audio_flow_shift is not None:
+            command.extend(["--audio_flow_shift", str(audio_flow_shift)])
+
+        if dit_path and str(dit_path).strip():
+            command.extend(["--dit", str(dit_path).strip()])
+        if vae_path and str(vae_path).strip():
+            command.extend(["--vae", str(vae_path).strip()])
+        if audio_vae_path and str(audio_vae_path).strip():
+            command.extend(["--audio_vae", str(audio_vae_path).strip()])
+
+        if fp8:
+            command.append("--fp8")
+        if fp8_scaled:
+            command.append("--fp8_scaled")
+        if fp8_fast:
+            command.append("--fp8_fast")
+        if fp8_exclude_adaln:
+            command.append("--fp8_exclude_adaln")
+        if vae_tiling:
+            command.append("--vae_tiling")
+        te_layers = text_encoder_gpu_layers
+        if te_layers is not None and str(te_layers).strip() != "":
+            command.extend(["--text_encoder_gpu_layers", str(int(te_layers))])
+        if text_encoder_stream:
+            command.append("--text_encoder_stream")
+        if prompt_cache:
+            command.extend(["--prompt_cache", os.path.join(save_path, "minimax_prompt_cache.safetensors")])
+
+        if enable_preview:
+            command.extend(["--preview", str(max(1, int(preview_steps)))])
+            command.extend(["--preview_suffix", unique_preview_suffix])
+
+        # LoRA handling (shared lora folder listing, same as the Cosmos tab)
+        lora_weights_paths = []
+        lora_multipliers_values = []
+        lora_inputs = [
+            (lora1_str, lora1_mult),
+            (lora2_str, lora2_mult),
+            (lora3_str, lora3_mult),
+            (lora4_str, lora4_mult),
+        ]
+        if lora_folder and os.path.exists(lora_folder):
+            for name, mult in lora_inputs:
+                if name and name != "None":
+                    path = os.path.join(lora_folder, name)
+                    if os.path.exists(path):
+                        lora_weights_paths.append(path)
+                        lora_multipliers_values.append(str(mult))
+        if lora_weights_paths:
+            command.extend(["--lora_weight"] + lora_weights_paths)
+            command.extend(["--lora_multiplier"] + lora_multipliers_values)
+
+        parameters = {
+            "model_type": "MiniMax-H3",
+            "prompt": prompt,
+            "task": task_name,
+            "aspect_ratio": aspect_ratio,
+            "video_length": video_length,
+            "fps": 24,
+            "infer_steps": infer_steps,
+            "flow_shift": flow_shift,
+            "audio_flow_shift": audio_flow_shift,
+            "seed": current_seed,
+            "num_outputs": num_outputs,
+            "ckpt_dir": ckpt_dir,
+            "attn_mode": attn_mode,
+            "blocks_to_swap": blocks_to_swap,
+            "save_path": save_path,
+        }
+        if input_image:
+            parameters["image_path"] = input_image
+        if last_image:
+            parameters["last_image_path"] = last_image
+        if references:
+            parameters["references"] = references
+
+        job = queue.add_job(
+            command=command,
+            parameters=parameters,
+            output_filename=output_filename,
+            batch_id=batch_id,
+            batch_index=i,
+            batch_total=batch_count,
+        )
+        job_ids.append(job.id)
+        print(f"[Queue] MiniMax job {job.id} queued (batch {batch_id}, item {i+1}/{batch_count})")
+
+    return batch_id, job_ids
+
+
+def minimax_generate_via_queue(*args):
+    """Queue-based MiniMax-H3 generation; returns immediately and polls via Timer."""
+    batch_id, job_ids = minimax_submit_to_queue(*args)
     first_job_id = job_ids[0] if job_ids else ""
     status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
     return (
@@ -12392,6 +12692,203 @@ with gr.Blocks(
                     cosmos_load_defaults_btn = gr.Button("Load Defaults")
                     cosmos_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
+        with gr.Tab(id=21, label="MiniMax") as minimax_tab:
+            gr.Markdown(
+                "**MiniMax-H3** — joint video **and audio** generation in one denoising pass "
+                "(24 fps, 5–15 s, 768px-short-edge canvas). Guidance-distilled: no negative "
+                "prompt, no CFG. Tasks: t2va (text), fl2va (first/last keyframe), ref2va "
+                "(ordered references, uses the checkpoint's `transformer_ref/` partition)."
+            )
+            with gr.Row():
+                with gr.Column(scale=4):
+                    minimax_prompt = gr.Textbox(
+                        scale=3,
+                        label="Enter your prompt",
+                        value="A red fox trotting through a snowy pine forest, snow crunching underfoot.",
+                        lines=5,
+                    )
+                with gr.Column(scale=1):
+                    minimax_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                with gr.Column(scale=2):
+                    minimax_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                    minimax_progress_text = gr.Textbox(label="Progress", interactive=False, value="",
+                                                       elem_id="minimax_progress_text")
+
+            with gr.Row():
+                minimax_generate_btn = gr.Button("Generate", elem_classes="green-btn")
+                minimax_stop_btn = gr.Button("Stop Generation", variant="stop")
+                minimax_stop_decode_btn = gr.Button("Stop & Decode", variant="secondary")
+
+            # Queue system state components
+            minimax_job_id_state = gr.State(value="")
+            minimax_batch_id_state = gr.State(value="")
+            minimax_poll_timer = gr.Timer(value=2.0, active=False)
+
+            with gr.Row():
+                with gr.Column():
+                    minimax_task_override = gr.Dropdown(
+                        label="Task Override",
+                        choices=["auto", "t2va", "fl2va", "ref2va"],
+                        value="auto",
+                        info="auto: any reference → ref2va, any keyframe → fl2va, else t2va",
+                    )
+                    gr.Markdown("### Keyframes (fl2va)")
+                    with gr.Row():
+                        minimax_input_image = gr.Image(
+                            label="First Frame (stretched onto the canvas; sets the aspect ratio)",
+                            type="filepath",
+                        )
+                        minimax_last_image = gr.Image(
+                            label="Last Frame (cover-cropped; can be used on its own)",
+                            type="filepath",
+                        )
+
+                    with gr.Accordion("References (ref2va)", open=False):
+                        gr.Markdown(
+                            "Up to **9 images / 3 videos / 3 audio clips**, 12 total. The order is "
+                            "semantic (it labels the references and advances the shared rotary clock) — "
+                            "reorder with 1-based indexes below. A video reference conditions on its "
+                            "soundtrack too unless stripped. Leave Video Length at 0 to derive the "
+                            "duration from a single audio-bearing reference."
+                        )
+                        minimax_reference_files = gr.File(
+                            label="Reference files (kind sniffed from the extension)",
+                            file_count="multiple",
+                            type="filepath",
+                        )
+                        with gr.Row():
+                            minimax_reference_order = gr.Textbox(
+                                label="Reference order (1-based indexes, blank = upload order)", value=""
+                            )
+                            minimax_reference_strip_audio = gr.Checkbox(
+                                label="Strip soundtrack from video references", value=False
+                            )
+
+                    gr.Markdown("### Generation Parameters")
+                    with gr.Row():
+                        minimax_aspect_ratio = gr.Dropdown(
+                            label="Aspect Ratio (auto canvas: 768px short edge, ×32; ignored for fl2va)",
+                            choices=["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "2:1", "1:2"],
+                            value="16:9",
+                        )
+                    with gr.Row():
+                        minimax_width = gr.Number(label="Width (blank = auto; ×32)", value=None, step=32)
+                        minimax_height = gr.Number(label="Height (blank = auto; ×32)", value=None, step=32)
+                    minimax_video_length = gr.Number(
+                        label="Video Length (frames @ 24 fps, snapped to 17n+5; 124–345 = 5–15 s; "
+                              "0 = derive from audio reference)",
+                        value=124, minimum=0, step=1,
+                    )
+                    minimax_infer_steps = gr.Slider(
+                        minimum=2, maximum=100, step=1, label="Sampling Steps (model evals = steps − 1)",
+                        value=50,
+                    )
+                    with gr.Row():
+                        minimax_flow_shift = gr.Number(label="Flow Shift (blank = checkpoint 12.0)", value=None)
+                        minimax_audio_flow_shift = gr.Number(label="Audio Flow Shift (blank = checkpoint 3.0)",
+                                                             value=None)
+                    with gr.Row():
+                        minimax_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                        minimax_random_seed_btn = gr.Button("🎲")
+
+                    with gr.Accordion("Advanced", open=False):
+                        with gr.Row():
+                            minimax_num_outputs = gr.Number(label="Num Outputs (per job)", value=1, minimum=1, step=1)
+                            minimax_prompt_cache = gr.Checkbox(
+                                label="Prompt Cache", value=False,
+                                info="reuse cached prompt embeddings when inputs match — skips the ~30B "
+                                     "conditioner load on repeat runs",
+                            )
+
+                with gr.Column():
+                    minimax_output = gr.Gallery(
+                        label="Generated Output (Click to select)",
+                        columns=[2], rows=[2], object_fit="contain", height="auto",
+                        show_label=True, elem_id="gallery_minimax", allow_preview=True, preview=True,
+                    )
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        minimax_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        minimax_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
+                                                          label="Preview Every N Steps")
+                        minimax_preview_output = gr.Gallery(
+                            label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
+                            allow_preview=True, preview=True, show_label=True,
+                            elem_id="minimax_preview_gallery",
+                        )
+                    with gr.Accordion("LoRA", open=False):
+                        with gr.Row():
+                            minimax_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            minimax_lora_refresh_btn = gr.Button("🔄 LoRA", elem_classes="refresh-btn")
+                        minimax_lora_weights = []
+                        minimax_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Row():
+                                minimax_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}", choices=get_lora_options("lora"),
+                                    value="None", allow_custom_value=False, interactive=True, scale=2,
+                                ))
+                                minimax_lora_multipliers.append(gr.Number(
+                                    label="Multiplier", value=1.0, scale=1, interactive=True,
+                                ))
+
+            with gr.Accordion("Model Paths", open=True):
+                minimax_ckpt_dir = gr.Textbox(
+                    label="Checkpoint Dir",
+                    value="MiniMax-H3",
+                    info="path to the cloned MiniMaxAI/MiniMax-H3 HF snapshot dir",
+                )
+                with gr.Row():
+                    minimax_dit_path = gr.Textbox(label="DiT Override (blank = per-task transformer[_ref])", value="")
+                    minimax_vae_path = gr.Textbox(label="VAE Override (blank = ckpt_dir vae)", value="")
+                    minimax_audio_vae_path = gr.Textbox(label="Audio VAE Override (blank = ckpt_dir audio_vae)",
+                                                        value="")
+
+            with gr.Accordion("Performance", open=True):
+                with gr.Row():
+                    minimax_attn_mode = gr.Dropdown(
+                        label="Attention Mode",
+                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"],
+                        value="sdpa",
+                    )
+                    minimax_blocks_to_swap = gr.Slider(
+                        minimum=0, maximum=49, step=1,
+                        label="Block Swap to Save VRAM (50 transformer blocks — max 49)", value=0,
+                    )
+                with gr.Row():
+                    minimax_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
+                    minimax_fp8_scaled = gr.Checkbox(
+                        label="Use Scaled FP8 (DiT)", value=True,
+                        info="33B transformer is 61.7 GB in bf16 — fp8 (~31 GB) is required on 48 GB cards",
+                    )
+                    minimax_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="scaled_mm fp8 matmul")
+                    minimax_fp8_exclude_adaln = gr.Checkbox(
+                        label="FP8: exclude AdaLN", value=False,
+                        info="keep the AdaLN projections in bf16 (+~13 GB, higher fidelity)",
+                    )
+                    minimax_vae_tiling = gr.Checkbox(label="VAE Tiling", value=True,
+                                                     info="the release ships with spatial tiling on")
+                with gr.Row():
+                    minimax_text_encoder_gpu_layers = gr.Number(
+                        label="Text Encoder GPU Layers (-1 = all, 0 = CPU/streamed)", value=0, step=1,
+                        info="the Qwen3-VL conditioner is ~30B; it runs once per job",
+                    )
+                    minimax_text_encoder_stream = gr.Checkbox(
+                        label="Stream Text Encoder Layers", value=True,
+                        info="move CPU-resident conditioner layers through the GPU one at a time",
+                    )
+                with gr.Row():
+                    minimax_dit_dtype = gr.Dropdown(label="DiT Dtype", choices=["bfloat16", "float16"],
+                                                    value="bfloat16")
+                    minimax_vae_dtype = gr.Dropdown(
+                        label="VAE Dtype", choices=["float32"], value="float32",
+                        info="decode runs fp16-autocast over fp32 weights (checkpoint contract)",
+                    )
+                minimax_save_path = gr.Textbox(label="Save Path", value="outputs")
+                with gr.Row():
+                    minimax_save_defaults_btn = gr.Button("Save Defaults")
+                    minimax_load_defaults_btn = gr.Button("Load Defaults")
+                    minimax_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+
         # StoryMem Tab - Multi-Shot Story Video Generation with Memory Bank
         with gr.Tab(id=17, label="StoryMem") as storymem_tab:
             gr.Markdown("""
@@ -16894,6 +17391,109 @@ with gr.Blocks(
         outputs=cosmos_lora_refresh_outputs_list
     )
 
+    # ===== MiniMax Event Handlers =====
+    minimax_generate_btn.click(
+        fn=minimax_generate_via_queue,
+        inputs=[
+            minimax_prompt,
+            minimax_task_override,
+            minimax_input_image,
+            minimax_last_image,
+            minimax_reference_files,
+            minimax_reference_order,
+            minimax_reference_strip_audio,
+            minimax_aspect_ratio,
+            minimax_width,
+            minimax_height,
+            minimax_video_length,
+            minimax_infer_steps,
+            minimax_flow_shift,
+            minimax_audio_flow_shift,
+            minimax_seed,
+            minimax_batch_size,
+            minimax_save_path,
+            minimax_enable_preview,
+            minimax_preview_steps,
+            # Model Paths
+            minimax_ckpt_dir,
+            minimax_dit_path,
+            minimax_vae_path,
+            minimax_audio_vae_path,
+            # Advanced
+            minimax_num_outputs,
+            minimax_prompt_cache,
+            # Performance
+            minimax_attn_mode,
+            minimax_blocks_to_swap,
+            minimax_fp8,
+            minimax_fp8_scaled,
+            minimax_fp8_fast,
+            minimax_fp8_exclude_adaln,
+            minimax_text_encoder_gpu_layers,
+            minimax_text_encoder_stream,
+            minimax_vae_tiling,
+            minimax_dit_dtype,
+            minimax_vae_dtype,
+            # LoRAs
+            minimax_lora_folder,
+            *minimax_lora_weights,
+            *minimax_lora_multipliers,
+        ],
+        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
+                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
+        queue=True
+    )
+
+    minimax_poll_timer.tick(
+        fn=wan22_poll_active_job,
+        inputs=[minimax_job_id_state, minimax_batch_id_state],
+        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
+                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer]
+    )
+
+    minimax_stop_btn.click(
+        fn=wan22_stop_queue_generation,
+        inputs=[minimax_batch_id_state],
+        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
+                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
+        queue=False
+    )
+
+    minimax_stop_decode_btn.click(
+        fn=wan22_stop_and_decode,
+        outputs=[minimax_batch_progress],
+        queue=False
+    )
+
+    minimax_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[minimax_seed])
+
+    minimax_lora_refresh_outputs_list = []
+    for i in range(len(minimax_lora_weights)):
+        minimax_lora_refresh_outputs_list.extend([minimax_lora_weights[i], minimax_lora_multipliers[i]])
+
+    def refresh_minimax_loras(folder: str) -> List[gr.update]:
+        choices = get_lora_options(folder)
+        updates = []
+        for _ in range(4):
+            updates.extend([gr.update(choices=choices, value="None"), gr.update(value=1.0)])
+        return updates
+
+    minimax_lora_refresh_btn.click(
+        fn=refresh_minimax_loras,
+        inputs=[minimax_lora_folder],
+        outputs=minimax_lora_refresh_outputs_list
+    )
+
+    def minimax_default_reference_order(files):
+        count = len(files or [])
+        return " ".join(str(i + 1) for i in range(count))
+
+    minimax_reference_files.change(
+        fn=minimax_default_reference_order,
+        inputs=[minimax_reference_files],
+        outputs=[minimax_reference_order],
+    )
+
     # ===== StoryMem Event Handlers =====
     storymem_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[storymem_seed])
 
@@ -17892,6 +18492,134 @@ with gr.Blocks(
         fn=initial_load_cosmos_defaults,
         inputs=None,
         outputs=cosmos_ui_default_components_ORDERED_LIST
+    )
+
+    minimax_ui_default_components_ORDERED_LIST = [
+        minimax_ckpt_dir,
+        minimax_dit_path,
+        minimax_vae_path,
+        minimax_audio_vae_path,
+        minimax_attn_mode,
+        minimax_blocks_to_swap,
+        minimax_fp8,
+        minimax_fp8_scaled,
+        minimax_fp8_fast,
+        minimax_fp8_exclude_adaln,
+        minimax_text_encoder_gpu_layers,
+        minimax_text_encoder_stream,
+        minimax_vae_tiling,
+        minimax_dit_dtype,
+        minimax_vae_dtype,
+        minimax_save_path,
+        minimax_lora_folder,
+        minimax_aspect_ratio,
+        minimax_video_length,
+        minimax_infer_steps,
+        minimax_flow_shift,
+        minimax_audio_flow_shift,
+        minimax_task_override,
+        minimax_num_outputs,
+        minimax_prompt_cache,
+        minimax_enable_preview,
+        minimax_preview_steps,
+    ] + minimax_lora_weights + minimax_lora_multipliers
+
+    minimax_ui_default_keys = [
+        "minimax_ckpt_dir",
+        "minimax_dit_path",
+        "minimax_vae_path",
+        "minimax_audio_vae_path",
+        "minimax_attn_mode",
+        "minimax_blocks_to_swap",
+        "minimax_fp8",
+        "minimax_fp8_scaled",
+        "minimax_fp8_fast",
+        "minimax_fp8_exclude_adaln",
+        "minimax_text_encoder_gpu_layers",
+        "minimax_text_encoder_stream",
+        "minimax_vae_tiling",
+        "minimax_dit_dtype",
+        "minimax_vae_dtype",
+        "minimax_save_path",
+        "minimax_lora_folder",
+        "minimax_aspect_ratio",
+        "minimax_video_length",
+        "minimax_infer_steps",
+        "minimax_flow_shift",
+        "minimax_audio_flow_shift",
+        "minimax_task_override",
+        "minimax_num_outputs",
+        "minimax_prompt_cache",
+        "minimax_enable_preview",
+        "minimax_preview_steps",
+    ] + [f"minimax_lora_weight_{i+1}" for i in range(4)] + \
+        [f"minimax_lora_multiplier_{i+1}" for i in range(4)]
+
+    def save_minimax_defaults(*values):
+        os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+        settings_to_save = {}
+        for i, key in enumerate(minimax_ui_default_keys):
+            settings_to_save[key] = values[i]
+        try:
+            with open(MINIMAX_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings_to_save, f, indent=2)
+            return "MiniMax defaults saved successfully."
+        except Exception as e:
+            return f"Error saving MiniMax defaults: {e}"
+
+    def load_minimax_defaults(request: gr.Request):
+        if not os.path.exists(MINIMAX_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(minimax_ui_default_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(minimax_ui_default_keys) + [""]
+
+        try:
+            with open(MINIMAX_DEFAULTS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(minimax_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+        lora_folder = loaded_settings.get("minimax_lora_folder", "lora")
+        lora_choices = get_lora_options(lora_folder)
+
+        updates = []
+        for i, key in enumerate(minimax_ui_default_keys):
+            component = minimax_ui_default_components_ORDERED_LIST[i]
+            default_value_from_component = None
+            if hasattr(component, 'value'):
+                default_value_from_component = component.value
+
+            value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            if "lora_weight" in key:
+                if value_to_set not in lora_choices:
+                    value_to_set = "None"
+                updates.append(gr.update(choices=lora_choices, value=value_to_set))
+            else:
+                updates.append(gr.update(value=value_to_set))
+
+        return updates + ["MiniMax defaults loaded successfully."]
+
+    minimax_save_defaults_btn.click(
+        fn=save_minimax_defaults,
+        inputs=minimax_ui_default_components_ORDERED_LIST,
+        outputs=[minimax_defaults_status]
+    )
+    minimax_load_defaults_btn.click(
+        fn=load_minimax_defaults,
+        inputs=None,
+        outputs=minimax_ui_default_components_ORDERED_LIST + [minimax_defaults_status]
+    )
+
+    def initial_load_minimax_defaults():
+        results_and_status = load_minimax_defaults(None)
+        return results_and_status[:-1]
+
+    demo.load(
+        fn=initial_load_minimax_defaults,
+        inputs=None,
+        outputs=minimax_ui_default_components_ORDERED_LIST
     )
 
     # ===== HoloCine Button Handlers =====

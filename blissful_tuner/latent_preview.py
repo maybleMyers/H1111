@@ -40,7 +40,7 @@ class LatentPreviewer():
         # Add Framepack check here too if needed for original_latents/timesteps later
         # elif model_type == "framepack" and ...
 
-        if self.model_type not in ["hunyuan", "wan", "framepack", "cosmos"]:
+        if self.model_type not in ["hunyuan", "wan", "framepack", "cosmos", "minimax"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         if self.mode == "taehv":
@@ -55,8 +55,8 @@ class LatentPreviewer():
             self.fps = args.fps
         elif self.mode == "latent2rgb":
             self.decoder = self.decode_latent2rgb
-            # cosmos (Wan2.2 48ch VAE) compresses 16x spatially, others 8x
-            self.scale_factor = 16 if self.model_type == "cosmos" else 8
+            # cosmos (Wan2.2 48ch VAE) and minimax (MiniMax-H3 24ch VAE) compress 16x spatially, others 8x
+            self.scale_factor = 16 if self.model_type in ("cosmos", "minimax") else 8
             # Adjust FPS for latent2rgb preview if necessary
             # Original code had / 4, but maybe match output FPS is better?
             # Let's keep the / 4 logic for now as it was there before.
@@ -304,6 +304,13 @@ class LatentPreviewer():
                     [ 0.0504, -0.0483, -0.0356], [-0.0837,  0.0168,  0.0055]
                 ],
                 "bias": [0.0317, -0.0878, -0.1388],
+            },
+            # MiniMax-H3 24ch video VAE latents (normalized (x - mean) / std). No published
+            # latent->RGB factors yet: grayscale channel-mean placeholder until a least-squares
+            # fit from real decoded pairs lands (minimax_engine phase 5).
+            "minimax": {
+                "rgb_factors": [[1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0]] * 24,
+                "bias": [0.0, 0.0, 0.0],
             },
             # No 'framepack' key needed, will map to 'hunyuan' below
         }
