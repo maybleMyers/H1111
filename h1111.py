@@ -12852,13 +12852,14 @@ with gr.Blocks(
                     )
                     minimax_blocks_to_swap = gr.Slider(
                         minimum=0, maximum=49, step=1,
-                        label="Block Swap to Save VRAM (50 transformer blocks — max 49)", value=0,
+                        label="Block Swap to Save VRAM (50 transformer blocks — max 49)", value=25,
                     )
                 with gr.Row():
                     minimax_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     minimax_fp8_scaled = gr.Checkbox(
-                        label="Use Scaled FP8 (DiT)", value=True,
-                        info="33B transformer is 61.7 GB in bf16 — fp8 (~31 GB) is required on 48 GB cards",
+                        label="Use Scaled FP8 (DiT)", value=False,
+                        info="off = full-quality bf16 (61.7 GB, needs block swap on 48 GB cards); "
+                             "on = ~31 GB resident, lossy runtime quantization",
                     )
                     minimax_fp8_fast = gr.Checkbox(label="FP8 Fast", value=False, info="scaled_mm fp8 matmul")
                     minimax_fp8_exclude_adaln = gr.Checkbox(
