@@ -2364,6 +2364,7 @@ def minimax_submit_to_queue(
     vae_tiling: bool,
     dit_dtype: str,
     vae_dtype: str,
+    compile_enabled: bool,
     # LoRAs
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
@@ -2507,6 +2508,8 @@ def minimax_submit_to_queue(
             command.append("--fp8_exclude_adaln")
         if vae_tiling:
             command.append("--vae_tiling")
+        if compile_enabled:
+            command.append("--compile")
         te_layers = text_encoder_gpu_layers
         if te_layers is not None and str(te_layers).strip() != "":
             command.extend(["--text_encoder_gpu_layers", str(int(te_layers))])
@@ -2554,6 +2557,7 @@ def minimax_submit_to_queue(
             "ckpt_dir": ckpt_dir,
             "attn_mode": attn_mode,
             "blocks_to_swap": blocks_to_swap,
+            "compile": compile_enabled,
             "save_path": save_path,
         }
         if input_image:
@@ -12894,6 +12898,11 @@ with gr.Blocks(
                         label="VAE Dtype", choices=["float32"], value="float32",
                         info="decode runs fp16-autocast over fp32 weights (checkpoint contract)",
                     )
+                    minimax_compile = gr.Checkbox(
+                        label="Enable torch.compile",
+                        value=False,
+                        info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
+                    )
                 minimax_save_path = gr.Textbox(label="Save Path", value="outputs")
                 with gr.Row():
                     minimax_save_defaults_btn = gr.Button("Save Defaults")
@@ -17445,6 +17454,7 @@ with gr.Blocks(
             minimax_vae_tiling,
             minimax_dit_dtype,
             minimax_vae_dtype,
+            minimax_compile,
             # LoRAs
             minimax_lora_folder,
             *minimax_lora_weights,
@@ -18569,6 +18579,7 @@ with gr.Blocks(
         minimax_vae_tiling,
         minimax_dit_dtype,
         minimax_vae_dtype,
+        minimax_compile,
         minimax_save_path,
         minimax_lora_folder,
         minimax_aspect_ratio,
@@ -18599,6 +18610,7 @@ with gr.Blocks(
         "minimax_vae_tiling",
         "minimax_dit_dtype",
         "minimax_vae_dtype",
+        "minimax_compile",
         "minimax_save_path",
         "minimax_lora_folder",
         "minimax_aspect_ratio",

@@ -33,6 +33,7 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import AttentionMixin, AttentionModuleMixin, dispatch_attention_fn
+from .compile_config import maybe_compile
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class MiniMaxH3TransformerOutput(BaseOutput):
     audio_sample: torch.Tensor
 
 
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     r"""
     Rotate the leading `rotary_dim` channels of every head and pass the remaining channels through unchanged.
@@ -102,6 +104,22 @@ class MiniMaxH3RotaryPosEmbed(nn.Module):
         freqs = torch.cat((freqs_t, freqs_h, freqs_w), dim=-1)
         freqs = torch.cat((freqs, freqs), dim=-1)
         return freqs.cos(), freqs.sin()
+
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def _apply_modulated_norm(
+    norm_out: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    """Apply per-row AdaLN shift/scale: norm * (1 + scale[row]) + shift[row]."""
+    return norm_out * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
+
+
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def _apply_gate_residual(
+    residual: torch.Tensor, gate: torch.Tensor, out: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    """Apply per-row gated residual connection: residual + gate[row] * out."""
+    return residual + gate.index_select(0, indices) * out
 
 
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
@@ -156,9 +174,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         shift, scale = self.linear(nn.functional.silu(temb).to(self.linear.weight.dtype)).chunk(2, dim=-1)
         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
         hidden_states = self.norm(hidden_states)
-        return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
-            0, timestep_indices
-        )
+        return _apply_modulated_norm(hidden_states, scale, shift, timestep_indices)
 
 
 class MiniMaxH3AttnProcessor:
@@ -362,19 +378,15 @@ class MiniMaxH3TransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_msa.index_select(0, adaln_indices)
-        ) + shift_msa.index_select(0, adaln_indices)
+        norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_msa, shift_msa, adaln_indices)
         attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        hidden_states = residual + gate_msa.index_select(0, adaln_indices) * attn_output
+        hidden_states = _apply_gate_residual(residual, gate_msa, attn_output, adaln_indices)
 
         residual = hidden_states
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_mlp.index_select(0, adaln_indices)
-        ) + shift_mlp.index_select(0, adaln_indices)
+        norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_mlp, shift_mlp, adaln_indices)
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual + gate_mlp.index_select(0, adaln_indices) * ff_output
+        hidden_states = _apply_gate_residual(residual, gate_mlp, ff_output, adaln_indices)
 
         return hidden_states
 

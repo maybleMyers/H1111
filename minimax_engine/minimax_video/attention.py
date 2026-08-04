@@ -12,6 +12,8 @@ import inspect
 import torch
 import torch.nn.functional as F
 
+from .compile_config import maybe_compile
+
 _VALID_BACKENDS = ("torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers")
 
 # Module-level default backend, used when dispatch_attention_fn is called with backend=None.
@@ -43,6 +45,14 @@ def _repeat_kv(key: torch.Tensor, value: torch.Tensor, num_q_heads: int, heads_d
     return key.repeat_interleave(n_rep, dim=heads_dim), value.repeat_interleave(n_rep, dim=heads_dim)
 
 
+@maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def _sdpa_core(q, k, v, attn_mask, dropout_p, is_causal):
+    """Compiled SDPA core ([B, H, S, D] layout), used by the non-GQA paths."""
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+    )
+
+
 def _sdpa_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
     # [B, S, H, D] -> [B, H, S, D]
     q = query.transpose(1, 2)
@@ -56,13 +66,9 @@ def _sdpa_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_g
         except TypeError:
             # Older torch without enable_gqa kwarg: repeat KV heads manually.
             k, v = _repeat_kv(k, v, q.shape[1], heads_dim=1)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
-            )
+            out = _sdpa_core(q, k, v, attn_mask, dropout_p, is_causal)
     else:
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
-        )
+        out = _sdpa_core(q, k, v, attn_mask, dropout_p, is_causal)
     return out.transpose(1, 2)
 
 

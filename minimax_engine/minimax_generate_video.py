@@ -38,6 +38,14 @@ for _p in (os.path.dirname(_here), _here):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Set the global compile flag BEFORE importing minimax_video model modules: the
+# @maybe_compile decorators read it at import time (same pattern as wan2_generate_video.py).
+from minimax_video import compile_config as _compile_config
+
+if "--compile" in sys.argv:
+    _compile_config.USE_TORCH_COMPILE = True
+    print("torch.compile() enabled for optimized inference (function-level compilation)")
+
 from utils.device_utils import clean_memory_on_device
 from utils.model_utils import str_to_dtype
 from utils.safetensors_utils import load_safetensors, mem_eff_save_file
@@ -90,6 +98,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--attn_mode", type=str, default="sdpa",
                         choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"])
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile with function-level decorators (mode: max-autotune-no-cudagraphs, "
+                             "dynamic: True). Compatible with all dtypes and block swap; first run is slower while "
+                             "kernels compile.")
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="0-49 transformer blocks swapped to CPU")
     parser.add_argument("--fp8", action="store_true", help="cast transformer block weights to e4m3")
     parser.add_argument("--fp8_scaled", action="store_true", help="scaled fp8 quantization with monkey patch")
@@ -283,6 +295,20 @@ def load_transformer_stage(args, task, device):
     from minimax_video.model_loader import load_transformer
 
     minimax_attention.set_attention_backend(args.attn_mode)
+
+    if args.compile:
+        # Function-level compilation is handled via @maybe_compile decorators in minimax_video
+        # (flag set at import time from sys.argv, before the model modules were imported).
+        logger.info("torch.compile enabled via function-level decorators (mode: max-autotune-no-cudagraphs, dynamic: True)")
+        # Enable persistent disk caching for compiled kernels
+        try:
+            from torch._inductor import config as inductor_config
+
+            inductor_config.fx_graph_cache = True
+            logger.info("Inductor disk cache enabled - compiled kernels will be cached for faster subsequent runs")
+        except (ImportError, AttributeError):
+            logger.warning("Could not enable inductor cache (requires PyTorch 2.1+)")
+        torch._dynamo.config.cache_size_limit = 32
 
     lora_weights_list = None
     lora_multipliers = None
