@@ -26,6 +26,11 @@ import sys
 import time
 from datetime import datetime
 
+# Fragmentation guard: the denoise loop cycles many differently-sized multi-GB activation
+# blocks; expandable segments keep the caching allocator from stranding reserved memory.
+# Must be set before torch initializes CUDA; an explicit user setting wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 from PIL import Image
@@ -102,7 +107,13 @@ def parse_args() -> argparse.Namespace:
                         help="Enable torch.compile with function-level decorators (mode: max-autotune-no-cudagraphs, "
                              "dynamic: True). Compatible with all dtypes and block swap; first run is slower while "
                              "kernels compile.")
-    parser.add_argument("--blocks_to_swap", type=int, default=0, help="0-49 transformer blocks swapped to CPU")
+    parser.add_argument("--blocks_to_swap", type=int, default=0,
+                        help="0-49 transformer blocks kept on CPU (pinned) and streamed through the GPU")
+    parser.add_argument("--classic_block_swap", action="store_true",
+                        help="use the legacy rolling block swap instead of pinned sub-block weight streaming")
+    parser.add_argument("--act_chunk_rows", type=int, default=32768,
+                        help="process row-wise ops (AdaLN, rotary, FF, output heads) in slices of this many rows "
+                             "of the packed sequence to bound activation peaks; 0 = off")
     parser.add_argument("--fp8", action="store_true", help="cast transformer block weights to e4m3")
     parser.add_argument("--fp8_scaled", action="store_true", help="scaled fp8 quantization with monkey patch")
     parser.add_argument("--fp8_fast", action="store_true", help="use scaled_mm fp8 matmul (with --fp8_scaled)")
@@ -292,9 +303,13 @@ def encode_prompt_stage(args, task, plan, prompt, device):
 
 def load_transformer_stage(args, task, device):
     from minimax_video import attention as minimax_attention
+    from minimax_video import transformer as minimax_transformer
     from minimax_video.model_loader import load_transformer
 
     minimax_attention.set_attention_backend(args.attn_mode)
+    minimax_transformer.set_act_chunk_rows(args.act_chunk_rows)
+    if args.act_chunk_rows:
+        logger.info(f"row-chunked activations enabled: {args.act_chunk_rows} rows per slice")
 
     if args.compile:
         # Function-level compilation is handled via @maybe_compile decorators in minimax_video
@@ -343,7 +358,9 @@ def load_transformer_stage(args, task, device):
         dit_path=args.dit,
     )
     if args.blocks_to_swap and args.blocks_to_swap > 0:
-        transformer.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        transformer.enable_block_swap(
+            args.blocks_to_swap, device, supports_backward=False, streaming=not args.classic_block_swap
+        )
         transformer.move_to_device_except_swap_blocks(device)
         transformer.prepare_block_swap_before_forward()
     else:

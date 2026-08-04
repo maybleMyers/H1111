@@ -2405,6 +2405,8 @@ def minimax_submit_to_queue(
     # Performance
     attn_mode: str,
     blocks_to_swap: int,
+    classic_block_swap: bool,
+    act_chunk_rows,
     fp8: bool,
     fp8_scaled: bool,
     fp8_fast: bool,
@@ -2511,6 +2513,7 @@ def minimax_submit_to_queue(
             "--num_outputs", str(int(num_outputs)),
             "--attn_mode", str(attn_mode),
             "--blocks_to_swap", str(int(blocks_to_swap)),
+            "--act_chunk_rows", str(int(act_chunk_rows) if act_chunk_rows is not None else 0),
             "--dit_dtype", str(dit_dtype),
             "--vae_dtype", str(vae_dtype),
             "--save_path", str(save_path),
@@ -2556,6 +2559,8 @@ def minimax_submit_to_queue(
             command.append("--fp8_fast")
         if fp8_exclude_adaln:
             command.append("--fp8_exclude_adaln")
+        if classic_block_swap:
+            command.append("--classic_block_swap")
         if vae_tiling:
             command.append("--vae_tiling")
         if compile_enabled:
@@ -13026,6 +13031,17 @@ with gr.Blocks(
                         label="Block Swap to Save VRAM (50 transformer blocks — max 49)", value=25,
                     )
                 with gr.Row():
+                    minimax_classic_block_swap = gr.Checkbox(
+                        label="Classic Block Swap", value=False,
+                        info="legacy rolling swap instead of pinned sub-block weight streaming "
+                             "(streaming pins ~1.2 GB/block bf16 or ~0.6 GB/block fp8 of host RAM)",
+                    )
+                    minimax_act_chunk_rows = gr.Number(
+                        label="Activation Chunk Rows (0 = off)", value=32768, step=1, minimum=0,
+                        info="process row-wise ops (AdaLN, rotary, FF, output heads) in slices of this many "
+                             "rows to bound activation peaks on long/large runs",
+                    )
+                with gr.Row():
                     minimax_fp8 = gr.Checkbox(label="Use FP8 (DiT)", value=False)
                     minimax_fp8_scaled = gr.Checkbox(
                         label="Use Scaled FP8 (DiT)", value=False,
@@ -17602,6 +17618,8 @@ with gr.Blocks(
             # Performance
             minimax_attn_mode,
             minimax_blocks_to_swap,
+            minimax_classic_block_swap,
+            minimax_act_chunk_rows,
             minimax_fp8,
             minimax_fp8_scaled,
             minimax_fp8_fast,
@@ -18766,6 +18784,8 @@ with gr.Blocks(
         minimax_audio_vae_path,
         minimax_attn_mode,
         minimax_blocks_to_swap,
+        minimax_classic_block_swap,
+        minimax_act_chunk_rows,
         minimax_fp8,
         minimax_fp8_scaled,
         minimax_fp8_fast,
@@ -18797,6 +18817,8 @@ with gr.Blocks(
         "minimax_audio_vae_path",
         "minimax_attn_mode",
         "minimax_blocks_to_swap",
+        "minimax_classic_block_swap",
+        "minimax_act_chunk_rows",
         "minimax_fp8",
         "minimax_fp8_scaled",
         "minimax_fp8_fast",

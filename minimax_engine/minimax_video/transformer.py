@@ -61,6 +61,27 @@ class MiniMaxH3TransformerOutput(BaseOutput):
     audio_sample: torch.Tensor
 
 
+# Row-chunked activation transients. Everything in a block except the attention matmul itself is
+# independent per row of the packed sequence, so those ops can run over row slices with identical
+# math while their transients shrink from O(seq_len) to O(chunk). At 10-15 s the packed sequence
+# is ~100k rows and the eager rotary / AdaLN / SwiGLU intermediates alone exceed a 32 GB card;
+# with slicing they are bounded by the chunk size. 0 disables slicing.
+_ACT_CHUNK_ROWS = 0
+
+
+def set_act_chunk_rows(num_rows: int):
+    """Process row-wise ops (AdaLN, rotary, FF, output heads) in slices of `num_rows` rows (0 = off)."""
+    global _ACT_CHUNK_ROWS
+    _ACT_CHUNK_ROWS = max(0, int(num_rows))
+
+
+def _row_spans(seq_len: int) -> list[tuple[int, int]]:
+    chunk = _ACT_CHUNK_ROWS
+    if not chunk or seq_len <= chunk:
+        return [(0, seq_len)]
+    return [(start, min(start + chunk, seq_len)) for start in range(0, seq_len, chunk)]
+
+
 @maybe_compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     r"""
@@ -77,6 +98,17 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
     hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
     hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
     return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1).contiguous()
+
+
+def _apply_rotary_emb_rows(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Row-sliced `_apply_rotary_emb` (rotary is per-row): bounds its cat/mul intermediates to O(chunk)."""
+    spans = _row_spans(hidden_states.shape[1])
+    if len(spans) == 1:
+        return _apply_rotary_emb(hidden_states, cos, sin)
+    out = torch.empty_like(hidden_states)
+    for start, end in spans:
+        out[:, start:end] = _apply_rotary_emb(hidden_states[:, start:end], cos[start:end], sin[start:end])
+    return out
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -122,6 +154,17 @@ def _apply_gate_residual(
     return residual + gate.index_select(0, indices) * out
 
 
+def _adaln_input_dtype(linear: nn.Linear) -> torch.dtype:
+    # Under --fp8_scaled the projection weight is float8; casting the activation to it would hand
+    # F.linear two fp8 operands (the monkey patch dequantizes the weight back to the input dtype).
+    # Fall back to the bias dtype in that case — the bias is never quantized, so it carries the
+    # block stack's compute dtype. Otherwise match the weight as before.
+    dtype = linear.weight.dtype
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return linear.bias.dtype if linear.bias is not None else torch.bfloat16
+    return dtype
+
+
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
     r"""
     Projects the shared timestep embedding into the six per-(timestep, modality) modulation parameters of one
@@ -148,7 +191,7 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
         # mixed-precision checkpoint — and only its result is cast down to the bfloat16 projection. Every block reads
         # the same `temb`, so a rounding applied before the activation biases every block's modulation parameters
         # identically at every sampling step, which accumulates coherently over the denoising trajectory.
-        temb = self.linear(nn.functional.silu(temb).to(self.linear.weight.dtype))
+        temb = self.linear(nn.functional.silu(temb).to(_adaln_input_dtype(self.linear)))
         temb = temb.view(-1, 6 * self.hidden_size)
         return temb.chunk(6, dim=-1)
 
@@ -171,7 +214,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, temb: torch.Tensor, timestep_indices: torch.Tensor) -> torch.Tensor:
         # As in `MiniMaxH3AdaLayerNormModulation`: activate at `temb`'s precision, cast to the projection's dtype after.
-        shift, scale = self.linear(nn.functional.silu(temb).to(self.linear.weight.dtype)).chunk(2, dim=-1)
+        shift, scale = self.linear(nn.functional.silu(temb).to(_adaln_input_dtype(self.linear))).chunk(2, dim=-1)
         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
         hidden_states = self.norm(hidden_states)
         return _apply_modulated_norm(hidden_states, scale, shift, timestep_indices)
@@ -207,8 +250,8 @@ class MiniMaxH3AttnProcessor:
         key = attn.norm_k(key)
 
         if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
+            query = _apply_rotary_emb_rows(query, *rotary_emb)
+            key = _apply_rotary_emb_rows(key, *rotary_emb)
 
         # Without padding rows the packed sequence is a single attention document and no mask is needed (passing an
         # all-zero float mask here would hard-fail the flash / sage backends). When padding rows are present, the
@@ -376,17 +419,49 @@ class MiniMaxH3TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
-        residual = hidden_states
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_msa, shift_msa, adaln_indices)
-        attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        hidden_states = _apply_gate_residual(residual, gate_msa, attn_output, adaln_indices)
+        # RMSNorm, the AdaLN modulation/gates and the feed-forward are all row-wise, so with
+        # _ACT_CHUNK_ROWS set they run over row slices: identical values, transients bounded by
+        # the slice size instead of the full packed sequence. Only q/k/v + SDPA + to_out remain
+        # full-sequence. The single-span case keeps the original one-shot code path.
+        spans = _row_spans(hidden_states.shape[1])
 
         residual = hidden_states
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_mlp, shift_mlp, adaln_indices)
-        ff_output = self.ff(norm_hidden_states)
-        hidden_states = _apply_gate_residual(residual, gate_mlp, ff_output, adaln_indices)
+        if len(spans) == 1:
+            norm_hidden_states = self.norm1(hidden_states)
+            norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_msa, shift_msa, adaln_indices)
+        else:
+            norm_hidden_states = torch.empty_like(hidden_states)
+            for start, end in spans:
+                norm_hidden_states[:, start:end] = _apply_modulated_norm(
+                    self.norm1(hidden_states[:, start:end]), scale_msa, shift_msa, adaln_indices[start:end]
+                )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
+        del norm_hidden_states
+        if len(spans) == 1:
+            hidden_states = _apply_gate_residual(residual, gate_msa, attn_output, adaln_indices)
+        else:
+            hidden_states = torch.empty_like(residual)
+            for start, end in spans:
+                hidden_states[:, start:end] = _apply_gate_residual(
+                    residual[:, start:end], gate_msa, attn_output[:, start:end], adaln_indices[start:end]
+                )
+        del attn_output
+
+        residual = hidden_states
+        if len(spans) == 1:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = _apply_modulated_norm(norm_hidden_states, scale_mlp, shift_mlp, adaln_indices)
+            ff_output = self.ff(norm_hidden_states)
+            hidden_states = _apply_gate_residual(residual, gate_mlp, ff_output, adaln_indices)
+        else:
+            hidden_states = torch.empty_like(residual)
+            for start, end in spans:
+                norm_slice = _apply_modulated_norm(
+                    self.norm2(residual[:, start:end]), scale_mlp, shift_mlp, adaln_indices[start:end]
+                )
+                hidden_states[:, start:end] = _apply_gate_residual(
+                    residual[:, start:end], gate_mlp, self.ff(norm_slice), adaln_indices[start:end]
+                )
 
         return hidden_states
 
@@ -516,8 +591,10 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
     # H1111 block swap (mirrors cosmos_engine/cosmos_video/transformer.py).
     # -------------------------------------------------------------------------
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool = False):
-        from modules.custom_offloading_utils import ModelOffloader
+    def enable_block_swap(
+        self, blocks_to_swap: int, device: torch.device, supports_backward: bool = False, streaming: bool = True
+    ):
+        from modules.custom_offloading_utils import ChunkedStreamingOffloader, ModelOffloader
 
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.transformer_blocks)
@@ -526,14 +603,28 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
             self.blocks_to_swap <= self.num_blocks - 1
         ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
 
-        self.offloader = ModelOffloader(
-            "minimax_block",
-            self.transformer_blocks,
-            self.num_blocks,
-            self.blocks_to_swap,
-            supports_backward,
-            device,
-        )
+        if streaming and not supports_backward and device.type == "cuda":
+            # Pinned sub-block weight streaming: CPU-resident blocks are uploaded chunk-by-chunk
+            # (in the order the block's forward consumes them) through a fixed staging ring —
+            # upload-only PCIe traffic and zero steady-state allocations. The classic rolling
+            # swap remains available via streaming=False (--classic_block_swap).
+            self.offloader = ChunkedStreamingOffloader(
+                "minimax_block",
+                self.transformer_blocks,
+                self.num_blocks,
+                self.blocks_to_swap,
+                device,
+                chunk_groups=[["adaln_proj"], ["norm1", "attn"], ["norm2", "ff"]],
+            )
+        else:
+            self.offloader = ModelOffloader(
+                "minimax_block",
+                self.transformer_blocks,
+                self.num_blocks,
+                self.blocks_to_swap,
+                supports_backward,
+                device,
+            )
         print(
             f"MiniMaxH3Transformer3DModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of "
             f"{self.num_blocks} blocks. Supports backward: {supports_backward}"
@@ -652,6 +743,13 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
         if bool(is_pad.any()):
             attention_mask = is_pad[None, :] == is_pad[:, None]
 
+        if self.blocks_to_swap:
+            begin_forward = getattr(self.offloader, "begin_forward", None)
+            if begin_forward is not None:
+                # streaming offloaders recycle the previous pass's staging buffers and prime the
+                # first uploads here; a no-op for the classic rolling swap
+                begin_forward(self.transformer_blocks)
+
         for block_idx, block in enumerate(self.transformer_blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
@@ -669,9 +767,31 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
         # 5. Both heads run over every row, then the rows of each modality are selected. The heads are listed in
         # `_keep_in_fp32_modules`, so they stay float32 while the block stack runs in the requested `torch_dtype`;
         # align the activation with their parameter dtype.
-        hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(self.proj_out.weight.dtype)
-        video_output = self.proj_out(hidden_states).index_select(1, video_indices)
-        audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
+        spans = _row_spans(sequence_length)
+        if len(spans) == 1:
+            hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(self.proj_out.weight.dtype)
+            video_output = self.proj_out(hidden_states).index_select(1, video_indices)
+            audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
+        else:
+            # Row-sliced epilogue: norm_out and both heads are row-wise, so slicing gives the same
+            # values while the full-sequence float32 cast never materializes — only the two small
+            # head outputs do (out_features 96 and 32 vs hidden_size 5376).
+            head_dtype = self.proj_out.weight.dtype
+            batch_size = hidden_states.shape[0]
+            video_full = torch.empty(
+                (batch_size, sequence_length, self.proj_out.out_features), dtype=head_dtype, device=hidden_states.device
+            )
+            audio_full = torch.empty(
+                (batch_size, sequence_length, self.audio_proj_out.out_features),
+                dtype=head_dtype,
+                device=hidden_states.device,
+            )
+            for start, end in spans:
+                normed = self.norm_out(hidden_states[:, start:end], temb, timestep_indices[start:end]).to(head_dtype)
+                video_full[:, start:end] = self.proj_out(normed)
+                audio_full[:, start:end] = self.audio_proj_out(normed)
+            video_output = video_full.index_select(1, video_indices)
+            audio_output = audio_full.index_select(1, audio_indices)
 
         if not return_dict:
             return (video_output, audio_output)

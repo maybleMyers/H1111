@@ -1,3 +1,4 @@
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import time
@@ -555,3 +556,257 @@ class ModelOffloader(Offloader):
             f"now swapping {self.blocks_to_swap} of {self.num_blocks} blocks"
         )
         return n
+
+
+class ChunkedStreamingOffloader:
+    """
+    Inference-only weight streaming at sub-block granularity for a uniform block stack.
+
+    The parameters of streamed blocks stay on CPU as immutable, pinned masters. Each block is
+    split into an ordered list of chunks — groups of direct child modules in the order the
+    block's forward visits them — and chunks are uploaded ahead of use into a small ring of
+    pre-allocated GPU staging buffers (NUM_SETS buffer sets per chunk type) on a dedicated copy
+    stream. A forward pre-hook on each chunk's first module releases every earlier chunk's
+    staging buffer (weights are immutable during inference, so release is just repointing the
+    params at their CPU masters — no download), tops the prefetch pipeline up one block ahead,
+    and makes the compute stream wait on this chunk's upload event.
+
+    Compared to the classic rolling swap (ModelOffloader): PCIe traffic is upload-only and
+    proportional to blocks_to_swap, there are zero steady-state allocations (no fragmentation
+    churn), no per-swap stream creation, no thread pool and no host-side synchronize —
+    ordering is done entirely with CUDA events.
+
+    The public surface mirrors what block-swap-aware transformers already call on
+    ModelOffloader: prepare_block_devices_before_forward / begin_forward / wait_for_block /
+    submit_move_blocks_forward (the last two are no-ops here; the hooks do the work).
+    """
+
+    NUM_SETS = 2  # staging sets per chunk type: double buffering across consecutive blocks
+
+    def __init__(
+        self,
+        block_type: str,
+        blocks: list[nn.Module],
+        num_blocks: int,
+        blocks_to_swap: int,
+        device: torch.device,
+        chunk_groups: list[list[str]],
+        debug: bool = False,
+    ):
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise RuntimeError(f"[{block_type}] chunked weight streaming requires a CUDA device, got {self.device}")
+
+        self.block_type = block_type
+        self.num_blocks = num_blocks
+        self.blocks_to_swap = blocks_to_swap
+        self.num_resident = num_blocks - blocks_to_swap
+        self.chunk_groups = [list(group) for group in chunk_groups]
+        self.chunks_per_block = len(self.chunk_groups)
+        self.lookahead = self.chunks_per_block  # prefetch one full block ahead of compute
+        self.debug = debug
+
+        self.copy_stream = torch.cuda.Stream(self.device)
+        self.chunk_params = {}  # (block_idx, chunk_idx) -> list of (param, cpu master tensor)
+        self.staging = None  # [chunk_idx][set_idx] -> list of GPU tensors shaped like that chunk
+        self.set_release_evt = None  # [chunk_idx][set_idx] -> Event: last occupant's kernels enqueued
+        self.chunk_order = []  # execution order over streamed blocks: [(block_idx, chunk_idx), ...]
+        self.chunk_pos = {}  # inverse of chunk_order
+        self.upload_evt = {}  # pos -> Event: chunk upload complete on the copy stream
+        self.pos_staging = {}  # pos -> set_idx currently holding that chunk
+        self._held = deque()  # submitted-and-not-released positions, ascending
+        self._submitted = -1
+        self._current_pos = -1
+        self._hook_handles = []
+        self._prepared = False
+
+    # ----- ModelOffloader-compatible surface -----
+
+    def wait_for_block(self, block_idx: int):
+        pass  # the chunk pre-hooks wait at finer granularity
+
+    def submit_move_blocks_forward(self, blocks: list[nn.Module], block_idx: int):
+        pass  # uploads are submitted by the chunk pre-hooks
+
+    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+        if self.blocks_to_swap <= 0:
+            return
+        if self._prepared:
+            self.reset()
+            return
+
+        for block in blocks[: self.num_resident]:
+            block.to(self.device)
+            weighs_to_device(block, self.device)
+
+        gb = 1024**3
+        pinned_bytes = 0
+        pin_failed = False
+        template = None
+        for i in range(self.num_resident, self.num_blocks):
+            block = blocks[i]
+            covered = set()
+            signature = []
+            for k, group in enumerate(self.chunk_groups):
+                masters = []
+                for child_name in group:
+                    module = block.get_submodule(child_name)
+                    for param_name, param in module.named_parameters(prefix=child_name):
+                        covered.add(param_name)
+                        param.data = param.data.to("cpu")
+                        if not pin_failed and not param.data.is_pinned():
+                            try:
+                                param.data = param.data.pin_memory()
+                                pinned_bytes += param.data.nbytes
+                            except RuntimeError:
+                                # host RAM limit: keep this and all later masters pageable (correct, slower uploads)
+                                pin_failed = True
+                                print(f"[{self.block_type}] pin_memory failed; remaining masters stay pageable")
+                        masters.append((param, param.data))
+                        signature.append((param_name, tuple(param.shape), param.dtype))
+                self.chunk_params[(i, k)] = masters
+            all_names = {name for name, _ in block.named_parameters()}
+            if covered != all_names:
+                missing = sorted(all_names - covered)
+                raise RuntimeError(f"[{self.block_type}] chunk groups miss block params, e.g. {missing[:5]}")
+            if template is None:
+                template = signature
+            elif signature != template:
+                raise RuntimeError(f"[{self.block_type}] streamed blocks are not uniform; cannot stream chunk-wise")
+            # buffers (fp8 scale_weight etc.) are tiny -> live on the GPU permanently
+            for module in block.modules():
+                for buf_name, buf in module._buffers.items():
+                    if buf is not None and buf.device.type != self.device.type:
+                        module._buffers[buf_name] = buf.to(self.device)
+
+        first = self.num_resident
+        ring_bytes = 0
+        self.staging = []
+        self.set_release_evt = []
+        for k in range(self.chunks_per_block):
+            shapes = [(master.shape, master.dtype) for _, master in self.chunk_params[(first, k)]]
+            sets = []
+            for _ in range(self.NUM_SETS):
+                sets.append([torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in shapes])
+                ring_bytes += sum(int(t.nbytes) for t in sets[-1])
+            self.staging.append(sets)
+            self.set_release_evt.append([None] * self.NUM_SETS)
+
+        for i in range(self.num_resident, self.num_blocks):
+            for k in range(self.chunks_per_block):
+                self.chunk_pos[(i, k)] = len(self.chunk_order)
+                self.chunk_order.append((i, k))
+            for k, group in enumerate(self.chunk_groups):
+                lead = blocks[i].get_submodule(group[0])
+                handle = lead.register_forward_pre_hook(self._make_pre_hook(self.chunk_pos[(i, k)]))
+                self._hook_handles.append(handle)
+
+        block_bytes = sum(
+            int(master.nbytes) for k in range(self.chunks_per_block) for _, master in self.chunk_params[(first, k)]
+        )
+        synchronize_device(self.device)
+        clean_memory_on_device(self.device)
+        self._prepared = True
+        print(
+            f"[{self.block_type}] chunked weight streaming: {self.num_resident} blocks resident, "
+            f"{self.blocks_to_swap} streamed in {self.chunks_per_block} chunks/block "
+            f"({block_bytes / gb:.2f} GB/block, staging ring {ring_bytes / gb:.2f} GB, "
+            f"pinned {pinned_bytes / gb:.2f} GB)"
+        )
+
+    def begin_forward(self, blocks: list[nn.Module]):
+        """Call at the start of each forward pass: recycles the previous pass's buffers and primes the pipeline."""
+        if self.blocks_to_swap <= 0 or not self._prepared:
+            return
+        # chunks still held from the previous forward: their kernels were enqueued long ago, release now
+        while self._held:
+            self._release(self._held.popleft())
+        self._current_pos = -1
+        self._submitted = -1
+        target = min(self.lookahead, len(self.chunk_order)) - 1
+        while self._submitted < target:
+            self._submit(self._submitted + 1)
+
+    def reset(self):
+        """Drain the pipeline and point every streamed param back at its CPU master (abort recovery)."""
+        if not self._prepared:
+            return
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        while self._held:
+            self._release(self._held.popleft(), record_release=False)
+        for k in range(self.chunks_per_block):
+            self.set_release_evt[k] = [None] * self.NUM_SETS
+        self.upload_evt.clear()
+        self.pos_staging.clear()
+        self._current_pos = -1
+        self._submitted = -1
+
+    def remove_hooks(self):
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+
+    # ----- internals -----
+
+    def _make_pre_hook(self, pos: int):
+        def pre_hook(module, args):
+            self._activate(pos)
+
+        return pre_hook
+
+    def _activate(self, pos: int):
+        if pos == self._current_pos:
+            return  # repeated call from a row-chunked helper inside the same chunk
+        # everything before this chunk has its kernels enqueued: release those staging buffers
+        while self._held and self._held[0] < pos:
+            self._release(self._held.popleft())
+        target = min(pos + self.lookahead, len(self.chunk_order) - 1)
+        while self._submitted < target:
+            self._submit(self._submitted + 1)
+        evt = self.upload_evt.get(pos)
+        if evt is not None:
+            torch.cuda.current_stream().wait_event(evt)
+        self._current_pos = pos
+
+    def _set_for_pos(self, pos: int) -> int:
+        block_idx, _ = self.chunk_order[pos]
+        return (block_idx - self.num_resident) % self.NUM_SETS
+
+    def _submit(self, pos: int):
+        block_idx, k = self.chunk_order[pos]
+        set_idx = self._set_for_pos(pos)
+        release_evt = self.set_release_evt[k][set_idx]
+        self.set_release_evt[k][set_idx] = None
+        masters = self.chunk_params[(block_idx, k)]
+        bufs = self.staging[k][set_idx]
+        with torch.cuda.stream(self.copy_stream):
+            if release_evt is not None:
+                # don't overwrite the buffers while the previous occupant's kernels may still read them
+                self.copy_stream.wait_event(release_evt)
+            for (param, master), buf in zip(masters, bufs):
+                buf.copy_(master, non_blocking=True)
+                param.data = buf
+            evt = torch.cuda.Event()
+            evt.record(self.copy_stream)
+        self.upload_evt[pos] = evt
+        self.pos_staging[pos] = set_idx
+        self._held.append(pos)
+        self._submitted = pos
+        if self.debug:
+            print(f"[{self.block_type}] submit chunk {(block_idx, k)} -> staging set {set_idx}")
+
+    def _release(self, pos: int, record_release: bool = True):
+        block_idx, k = self.chunk_order[pos]
+        set_idx = self.pos_staging.pop(pos)
+        for param, master in self.chunk_params[(block_idx, k)]:
+            param.data = master
+        if record_release:
+            evt = torch.cuda.Event()
+            evt.record()  # compute stream: fires once this chunk's kernels are done with the buffers
+            self.set_release_evt[k][set_idx] = evt
+        self.upload_evt.pop(pos, None)
+        if self.debug:
+            print(f"[{self.block_type}] release chunk {(block_idx, k)} <- staging set {set_idx}")
