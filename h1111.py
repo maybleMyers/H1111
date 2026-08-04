@@ -2300,6 +2300,12 @@ def minimax_align_num_frames(num_frames: int) -> int:
     return num_frames
 
 
+# The encodable 17n+5 frame counts inside the released 5-15 s window (124..345 @ 24 fps).
+MINIMAX_VIDEO_LENGTH_CHOICES = [("0 — derive from audio reference", 0)] + [
+    (f"{n} frames ({n / 24:.2f} s)", n) for n in range(124, 346, 17)
+]
+
+
 def minimax_order_references(files, order_text: str):
     """Order the multi-upload reference list by the 1-based indexes in `order_text`
     (blank = upload order). Returns the ordered path list."""
@@ -12708,6 +12714,7 @@ with gr.Blocks(
                         lines=5,
                     )
                 with gr.Column(scale=1):
+                    minimax_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
                     minimax_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
                 with gr.Column(scale=2):
                     minimax_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
@@ -12771,13 +12778,16 @@ with gr.Blocks(
                             choices=["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "2:1", "1:2"],
                             value="16:9",
                         )
+                    minimax_original_dims = gr.Textbox(visible=False, value="")
                     with gr.Row():
                         minimax_width = gr.Number(label="Width (blank = auto; ×32)", value=None, step=32)
+                        minimax_calc_height_btn = gr.Button("→")
+                        minimax_calc_width_btn = gr.Button("←")
                         minimax_height = gr.Number(label="Height (blank = auto; ×32)", value=None, step=32)
-                    minimax_video_length = gr.Number(
-                        label="Video Length (frames @ 24 fps, snapped to 17n+5; 124–345 = 5–15 s; "
-                              "0 = derive from audio reference)",
-                        value=124, minimum=0, step=1,
+                    minimax_video_length = gr.Dropdown(
+                        label="Video Length (frames @ 24 fps; the VAE encodes 17n+5 frames, 5–15 s)",
+                        choices=MINIMAX_VIDEO_LENGTH_CHOICES,
+                        value=124,
                     )
                     minimax_infer_steps = gr.Slider(
                         minimum=2, maximum=100, step=1, label="Sampling Steps (model evals = steps − 1)",
@@ -17468,6 +17478,54 @@ with gr.Blocks(
 
     minimax_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[minimax_seed])
 
+    minimax_prompt.change(fn=count_prompt_tokens, inputs=minimax_prompt, outputs=minimax_token_counter)
+
+    # Keyframe upload snaps the canvas to the image (first frame wins — it anchors the
+    # geometry; the last frame is cover-cropped). Cleared images blank the fields back to auto.
+    def update_minimax_dimensions(input_image, last_image):
+        image = input_image or last_image
+        if image is None:
+            return "", gr.update(value=None), gr.update(value=None)
+        img = Image.open(image)
+        w, h = img.size
+        w = max(32, (w // 32) * 32)
+        h = max(32, (h // 32) * 32)
+        return f"{w}x{h}", w, h
+
+    minimax_input_image.change(
+        fn=update_minimax_dimensions,
+        inputs=[minimax_input_image, minimax_last_image],
+        outputs=[minimax_original_dims, minimax_width, minimax_height],
+    )
+    minimax_last_image.change(
+        fn=update_minimax_dimensions,
+        inputs=[minimax_input_image, minimax_last_image],
+        outputs=[minimax_original_dims, minimax_width, minimax_height],
+    )
+
+    def minimax_calc_width(height, original_dims):
+        if not original_dims or not height:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split("x"))
+        return gr.update(value=max(32, math.floor(height * orig_w / orig_h / 32) * 32))
+
+    def minimax_calc_height(width, original_dims):
+        if not original_dims or not width:
+            return gr.update()
+        orig_w, orig_h = map(int, original_dims.split("x"))
+        return gr.update(value=max(32, math.floor(width * orig_h / orig_w / 32) * 32))
+
+    minimax_calc_width_btn.click(
+        fn=minimax_calc_width,
+        inputs=[minimax_height, minimax_original_dims],
+        outputs=[minimax_width],
+    )
+    minimax_calc_height_btn.click(
+        fn=minimax_calc_height,
+        inputs=[minimax_width, minimax_original_dims],
+        outputs=[minimax_height],
+    )
+
     minimax_lora_refresh_outputs_list = []
     for i in range(len(minimax_lora_weights)):
         minimax_lora_refresh_outputs_list.extend([minimax_lora_weights[i], minimax_lora_multipliers[i]])
@@ -18592,6 +18650,16 @@ with gr.Blocks(
                 default_value_from_component = component.value
 
             value_to_set = loaded_settings.get(key, default_value_from_component)
+
+            if key == "minimax_video_length" and value_to_set is not None:
+                # Defaults saved before the dropdown may hold floats or off-grid counts.
+                try:
+                    v = int(float(value_to_set))
+                    value_to_set = 0 if v <= 0 else min(
+                        max(124, minimax_align_num_frames(v)), 345
+                    )
+                except (TypeError, ValueError):
+                    value_to_set = 124
 
             if "lora_weight" in key:
                 if value_to_set not in lora_choices:

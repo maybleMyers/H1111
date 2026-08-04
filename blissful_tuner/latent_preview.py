@@ -305,12 +305,25 @@ class LatentPreviewer():
                 ],
                 "bias": [0.0317, -0.0878, -0.1388],
             },
-            # MiniMax-H3 24ch video VAE latents (normalized (x - mean) / std). No published
-            # latent->RGB factors yet: grayscale channel-mean placeholder until a least-squares
-            # fit from real decoded pairs lands (minimax_engine phase 5).
+            # MiniMax-H3 24ch video VAE latents (normalized (x - mean) / std). Least-squares
+            # fit from real encoded pairs via minimax_engine/fit_minimax_preview_factors.py
+            # (R^2 ~ 0.96-0.97 per channel).
             "minimax": {
-                "rgb_factors": [[1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0]] * 24,
-                "bias": [0.0, 0.0, 0.0],
+                "rgb_factors": [
+                    [0.0299, -0.0373, -0.0286], [-0.0431, -0.0100, -0.0625],
+                    [0.2540, 0.1962, 0.1402], [0.0566, -0.0280, -0.1885],
+                    [0.0153, 0.0525, -0.0808], [0.0325, 0.0115, -0.0650],
+                    [-0.0090, -0.0169, -0.0244], [-0.0025, -0.0026, -0.0279],
+                    [0.0022, 0.0057, 0.0033], [0.1200, 0.0577, 0.0465],
+                    [0.0112, 0.0046, 0.0337], [-0.0175, -0.0065, 0.0239],
+                    [0.0057, 0.0069, 0.0266], [-0.0187, 0.0005, -0.0015],
+                    [-0.0227, -0.0080, 0.0055], [0.0199, 0.0103, -0.0023],
+                    [0.0013, 0.0058, 0.0029], [-0.0176, -0.0021, 0.0053],
+                    [-0.0102, 0.0044, 0.0081], [0.0258, 0.0071, 0.0100],
+                    [-0.0011, 0.0048, 0.0109], [-0.0050, -0.0141, -0.0124],
+                    [-0.0103, -0.0028, 0.0091], [-0.0023, -0.0013, -0.0038],
+                ],
+                "bias": [0.5997, 0.5676, 0.5387],
             },
             # No 'framepack' key needed, will map to 'hunyuan' below
         }
