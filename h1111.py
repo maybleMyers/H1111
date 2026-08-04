@@ -7,6 +7,8 @@ import re
 import os
 import random
 import tiktoken
+import html
+from urllib.parse import quote as url_quote
 import sys
 import ffmpeg
 import imageio_ffmpeg
@@ -2304,6 +2306,54 @@ def minimax_align_num_frames(num_frames: int) -> int:
 MINIMAX_VIDEO_LENGTH_CHOICES = [("0 — derive from audio reference", 0)] + [
     (f"{n} frames ({n / 24:.2f} s)", n) for n in range(124, 346, 17)
 ]
+
+
+def minimax_reference_kind(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return ("image" if ext in MINIMAX_IMAGE_EXTENSIONS
+            else "audio" if ext in MINIMAX_AUDIO_EXTENSIONS else "video")
+
+
+def minimax_reference_preview_html(files) -> str:
+    """Render the accumulated reference list as a card grid (index badge, kind badge,
+    inline media preview, per-card remove button wired through the hidden textbox+button)."""
+    files = files or []
+    if not files:
+        return (
+            '<div class="minimax-ref-empty">No references yet — drop images, videos or '
+            'audio into the box above.</div>'
+        )
+    counts = {"image": 0, "video": 0, "audio": 0}
+    cards = []
+    for i, path in enumerate(files):
+        kind = minimax_reference_kind(path)
+        counts[kind] += 1
+        url = "/gradio_api/file=" + url_quote(path)
+        name = html.escape(os.path.basename(path))
+        if kind == "image":
+            media = f'<img src="{url}" loading="lazy" alt="{name}">'
+        elif kind == "video":
+            media = f'<video src="{url}" controls preload="metadata"></video>'
+        else:
+            media = f'<audio src="{url}" controls preload="metadata"></audio>'
+        cards.append(
+            f'<div class="minimax-ref-card">'
+            f'<div class="minimax-ref-head">'
+            f'<span class="minimax-ref-index">{i + 1}</span>'
+            f'<span class="minimax-ref-kind minimax-ref-kind-{kind}">{kind}</span>'
+            f'<button type="button" class="minimax-ref-remove" title="Remove this reference" '
+            f'onclick="minimaxRemoveRef({i + 1})">&#10005;</button>'
+            f'</div>'
+            f'<div class="minimax-ref-media">{media}</div>'
+            f'<div class="minimax-ref-name" title="{name}">{name}</div>'
+            f'</div>'
+        )
+    summary = (
+        f'<div class="minimax-ref-summary">{counts["image"]}/9 images &middot; '
+        f'{counts["video"]}/3 videos &middot; {counts["audio"]}/3 audio &middot; '
+        f'{len(files)}/12 total</div>'
+    )
+    return summary + '<div class="minimax-ref-grid">' + "".join(cards) + "</div>"
 
 
 def minimax_order_references(files, order_text: str):
@@ -10666,8 +10716,85 @@ with gr.Blocks(
     .light-blue-btn:hover {
         background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important; /* Slightly darker on hover */
         border-color: #8AA9B5 !important;
-    }    
-    """, 
+    }
+    .minimax-hidden { display: none !important; }
+    .minimax-ref-summary {
+        font-size: 0.85em;
+        opacity: 0.8;
+        margin: 4px 0 6px 2px;
+    }
+    .minimax-ref-empty {
+        font-size: 0.85em;
+        opacity: 0.6;
+        margin: 4px 0 6px 2px;
+    }
+    .minimax-ref-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 10px;
+    }
+    .minimax-ref-card {
+        border: 1px solid var(--border-color-primary, #444);
+        border-radius: 8px;
+        padding: 6px;
+        background: var(--background-fill-secondary, rgba(128,128,128,0.05));
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+    }
+    .minimax-ref-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .minimax-ref-index {
+        font-weight: bold;
+        background: #0060df;
+        color: white;
+        border-radius: 4px;
+        padding: 0 6px;
+        font-size: 0.85em;
+    }
+    .minimax-ref-kind {
+        font-size: 0.75em;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        border-radius: 4px;
+        padding: 0 5px;
+        color: white;
+    }
+    .minimax-ref-kind-image { background: #27ae60; }
+    .minimax-ref-kind-video { background: #8e44ad; }
+    .minimax-ref-kind-audio { background: #e67e22; }
+    .minimax-ref-remove {
+        margin-left: auto;
+        border: none;
+        background: transparent;
+        color: var(--body-text-color, inherit);
+        opacity: 0.6;
+        cursor: pointer;
+        font-size: 0.95em;
+        line-height: 1;
+        padding: 2px 4px;
+    }
+    .minimax-ref-remove:hover { opacity: 1; color: #e74c3c; }
+    .minimax-ref-media img, .minimax-ref-media video {
+        width: 100%;
+        max-height: 140px;
+        object-fit: contain;
+        border-radius: 4px;
+        display: block;
+    }
+    .minimax-ref-media audio { width: 100%; }
+    .minimax-ref-name {
+        font-size: 0.75em;
+        opacity: 0.75;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    """,
 
 ) as demo:
     # Add state for tracking selected video indices in both tabs
@@ -10691,6 +10818,26 @@ with gr.Blocks(
     demo.load(None, None, None, js=r"""
         () => {
             document.title = 'H1111';
+
+            // A file dropped outside an upload zone would otherwise navigate the
+            // browser to the file, wiping out the page. Swallow stray drops at the
+            // window level; Gradio's own dropzones handle their drops first.
+            window.addEventListener('dragover', (e) => { e.preventDefault(); }, false);
+            window.addEventListener('drop', (e) => { e.preventDefault(); }, false);
+
+            // Per-card remove buttons in the MiniMax reference preview: write the
+            // 1-based index into the hidden textbox, then click the hidden button.
+            window.minimaxRemoveRef = (idx) => {
+                const box = document.querySelector('#minimax_ref_remove_idx textarea, #minimax_ref_remove_idx input');
+                if (!box) return;
+                box.value = String(idx);
+                box.dispatchEvent(new Event('input', { bubbles: true }));
+                setTimeout(() => {
+                    const btn = document.querySelector('#minimax_ref_remove_btn button, button#minimax_ref_remove_btn, #minimax_ref_remove_btn');
+                    if (btn) btn.click();
+                }, 60);
+            };
+
             let lastProgressText = '';
 
             function updateTitle(text) {
@@ -12703,12 +12850,6 @@ with gr.Blocks(
                     cosmos_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
         with gr.Tab(id=21, label="MiniMax") as minimax_tab:
-            gr.Markdown(
-                "**MiniMax-H3** — joint video **and audio** generation in one denoising pass "
-                "(24 fps, 5–15 s, 768px-short-edge canvas). Guidance-distilled: no negative "
-                "prompt, no CFG. Tasks: t2va (text), fl2va (first/last keyframe), ref2va "
-                "(ordered references, uses the checkpoint's `transformer_ref/` partition)."
-            )
             with gr.Row():
                 with gr.Column(scale=4):
                     minimax_prompt = gr.Textbox(
@@ -12756,17 +12897,22 @@ with gr.Blocks(
 
                     with gr.Accordion("References (ref2va)", open=False):
                         gr.Markdown(
-                            "Up to **9 images / 3 videos / 3 audio clips**, 12 total. The order is "
-                            "semantic (it labels the references and advances the shared rotary clock) — "
-                            "reorder with 1-based indexes below. A video reference conditions on its "
-                            "soundtrack too unless stripped. Leave Video Length at 0 to derive the "
-                            "duration from a single audio-bearing reference."
+                            "Up to **9 images / 3 videos / 3 audio clips**, 12 total. New drops are "
+                            "**added** to the set. The order is semantic (it labels the references and "
+                            "advances the shared rotary clock) — reorder with 1-based indexes below. "
+                            "A video reference conditions on its soundtrack too unless stripped. Leave "
+                            "Video Length at 0 to derive the duration from a single audio-bearing "
+                            "reference."
                         )
+                        minimax_reference_state = gr.State(value=[])
                         minimax_reference_files = gr.File(
-                            label="Reference files (kind sniffed from the extension)",
+                            label="Drop images / videos / audio here (or click to browse)",
                             file_count="multiple",
                             type="filepath",
+                            height=110,
+                            elem_id="minimax_ref_dropzone",
                         )
+                        minimax_reference_preview = gr.HTML(value=minimax_reference_preview_html([]))
                         with gr.Row():
                             minimax_reference_order = gr.Textbox(
                                 label="Reference order (1-based indexes, blank = upload order)", value=""
@@ -12774,6 +12920,17 @@ with gr.Blocks(
                             minimax_reference_strip_audio = gr.Checkbox(
                                 label="Strip soundtrack from video references", value=False
                             )
+                            minimax_reference_clear_btn = gr.Button("Clear all references", size="sm")
+                        # Hidden plumbing for the per-card ✕ buttons in the HTML preview
+                        # (kept visible=True so they exist in the DOM; hidden via CSS).
+                        minimax_reference_remove_idx = gr.Textbox(
+                            value="", elem_id="minimax_ref_remove_idx",
+                            elem_classes=["minimax-hidden"],
+                        )
+                        minimax_reference_remove_btn = gr.Button(
+                            "remove", elem_id="minimax_ref_remove_btn",
+                            elem_classes=["minimax-hidden"],
+                        )
 
                     gr.Markdown("### Generation Parameters")
                     with gr.Row():
@@ -17419,7 +17576,7 @@ with gr.Blocks(
             minimax_task_override,
             minimax_input_image,
             minimax_last_image,
-            minimax_reference_files,
+            minimax_reference_state,
             minimax_reference_order,
             minimax_reference_strip_audio,
             minimax_aspect_ratio,
@@ -17557,10 +17714,49 @@ with gr.Blocks(
         count = len(files or [])
         return " ".join(str(i + 1) for i in range(count))
 
-    minimax_reference_files.change(
-        fn=minimax_default_reference_order,
-        inputs=[minimax_reference_files],
-        outputs=[minimax_reference_order],
+    def minimax_add_references(state_files, uploaded):
+        """Append newly dropped files to the accumulated set, then clear the dropzone
+        so it stays an always-available drop target."""
+        files = list(state_files or [])
+        for f in (uploaded or []):
+            path = f if isinstance(f, str) else getattr(f, "name", str(f))
+            if path and path not in files:
+                files.append(path)
+        return (files, None, minimax_default_reference_order(files),
+                minimax_reference_preview_html(files))
+
+    minimax_reference_files.upload(
+        fn=minimax_add_references,
+        inputs=[minimax_reference_state, minimax_reference_files],
+        outputs=[minimax_reference_state, minimax_reference_files,
+                 minimax_reference_order, minimax_reference_preview],
+    )
+
+    def minimax_remove_reference(state_files, idx_text):
+        files = list(state_files or [])
+        try:
+            idx = int(str(idx_text).strip())
+        except ValueError:
+            return files, minimax_default_reference_order(files), minimax_reference_preview_html(files)
+        if 1 <= idx <= len(files):
+            files.pop(idx - 1)
+        return (files, minimax_default_reference_order(files),
+                minimax_reference_preview_html(files))
+
+    minimax_reference_remove_btn.click(
+        fn=minimax_remove_reference,
+        inputs=[minimax_reference_state, minimax_reference_remove_idx],
+        outputs=[minimax_reference_state, minimax_reference_order, minimax_reference_preview],
+    )
+
+    def minimax_clear_references():
+        return [], None, "", minimax_reference_preview_html([])
+
+    minimax_reference_clear_btn.click(
+        fn=minimax_clear_references,
+        inputs=None,
+        outputs=[minimax_reference_state, minimax_reference_files,
+                 minimax_reference_order, minimax_reference_preview],
     )
 
     # ===== StoryMem Event Handlers =====
