@@ -19,6 +19,43 @@ from blissful_tuner.utils import BlissfulLogger
 
 logger = BlissfulLogger(__name__, "#8e00ed")
 
+# Upstream repo hosting the TAE preview checkpoints (taehv.pth, taew2_1.pth, taeh3.safetensors, ...)
+_TAEHV_RAW_BASE = "https://raw.githubusercontent.com/madebyollin/taehv/main"
+
+
+def ensure_taehv_checkpoint(path: str) -> str:
+    """Return `path`, downloading it from madebyollin/taehv first when it does not exist.
+
+    Only `tae*.safetensors` names (that repo's safetensors/ folder) are attempted — never
+    pickle checkpoints; anything else raises the same FileNotFoundError the previewer always
+    raised. The download goes to a temp file and is renamed into place, so an interrupted
+    fetch never leaves a truncated checkpoint behind.
+    """
+    if os.path.exists(path):
+        return path
+    name = os.path.basename(path)
+    if not (name.startswith("tae") and name.endswith(".safetensors")):
+        raise FileNotFoundError(f"{path} was not found!")
+    url = f"{_TAEHV_RAW_BASE}/safetensors/{name}"
+    logger.info(f"{path} not found — downloading {name} from {url}")
+    import urllib.request
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = path + ".download"
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise FileNotFoundError(f"{path} was not found and auto-download from {url} failed: {e}") from e
+    logger.info(f"Saved {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return path
+
 
 class LatentPreviewer():
     @torch.inference_mode()
@@ -45,8 +82,7 @@ class LatentPreviewer():
 
         if self.mode == "taehv":
             ####logger.info(f"Loading TAEHV: {args.preview_vae}...")
-            if not os.path.exists(args.preview_vae):
-                raise FileNotFoundError(f"{args.preview_vae} was not found!")
+            ensure_taehv_checkpoint(args.preview_vae)
             # Model variant (taehv/taew2_1/taeh3/...) is detected from the checkpoint filename
             self.taehv = TAEHV(checkpoint_path=args.preview_vae).to("cpu", self.dtype)  # Offload for VRAM and match datatype
             self.decoder = self.decode_taehv

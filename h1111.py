@@ -13355,8 +13355,9 @@ with gr.Blocks(
                                                           label="Preview Every N Steps")
                         minimax_preview_vae = gr.Textbox(
                             label="Preview TAE Checkpoint (optional)", value="",
-                            info="blank = fast latent2rgb preview; path to taeh3.pth (madebyollin/taehv) "
-                                 "for full-resolution TAE previews",
+                            info="blank = fast latent2rgb preview; a path like weights/taeh3.safetensors enables "
+                                 "full-resolution TAE previews — known madebyollin/taehv checkpoints are "
+                                 "downloaded automatically if the file is missing",
                         )
                         minimax_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,

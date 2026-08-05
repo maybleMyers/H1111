@@ -156,7 +156,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_suffix", type=str, default=None)
     parser.add_argument(
         "--preview_vae", type=str, default=None,
-        help="path to a TAEHV checkpoint (taeh3.pth) for full-resolution TAE previews; default = fast latent2rgb",
+        help="path to a TAEHV checkpoint (e.g. weights/taeh3.safetensors) for full-resolution TAE previews; "
+             "known madebyollin/taehv checkpoints are downloaded automatically when missing. "
+             "default = fast latent2rgb",
     )
     parser.add_argument("--fps", type=int, default=24, help=argparse.SUPPRESS)  # fixed by the model; kept for tooling
 

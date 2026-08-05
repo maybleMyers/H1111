@@ -149,6 +149,7 @@ def test_command_builder_flags_exist_in_cli():
     import re
 
     emitted = set(re.findall(r'"(--[a-z_]+)"', submit_src))
-    declared = set(re.findall(r'add_argument\("(--[a-z_]+)"', cli_src))
+    # \s* tolerates multi-line add_argument( calls, where the flag sits on the next line
+    declared = set(re.findall(r'add_argument\(\s*"(--[a-z_]+)"', cli_src))
     missing = emitted - declared
     assert not missing, f"submit handler emits flags the CLI does not declare: {sorted(missing)}"
