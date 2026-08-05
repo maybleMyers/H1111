@@ -85,6 +85,95 @@ def _is_fp32_key(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in FP32_KEY_PREFIXES)
 
 
+def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] = None) -> dict:
+    """Convert an ai-toolkit MiniMax-H3 LoRA (PEFT `lora_A`/`lora_B` keys over the original
+    fused module names) into `lora_down`/`lora_up` pairs on this port's diffusers-layout keys,
+    so the generic merge in `load_safetensors_with_lora_and_fp8` can consume it.
+
+    ai-toolkit vendors the reference model, whose in-memory layout is what
+    `_convert_minimax_h3_upstream.py` consumes: `qkv_proj` rows are `[q_all; k_all; v_all]`
+    and `fc1` rows are `[gate; up]`, while the port splits QKV into `to_q`/`to_k`/`to_v` and
+    stores SwiGLU as `[up; gate]`. Splitting/reordering the `lora_B` rows applies the identical
+    transform to the low-rank delta (`delta_W = B @ A`; a row permutation of `delta_W` is the
+    same row permutation of `B`). The PEFT format carries no alpha keys and ai-toolkit's
+    runtime scale is alpha/rank == 1.0, which matches the merge's `alpha = dim` fallback.
+
+    `expected_shapes` (model key -> weight shape) drops converted pairs that cannot apply to
+    this checkpoint. Concretely: LoRAs trained on the ComfyUI pruned variant carry
+    `adaln_proj.linear` deltas over its 8-dim `adaln_t_table` temb, which do not exist in the
+    full checkpoint's 2688-dim AdaLN input space and would otherwise crash the merge.
+    """
+    if not any(key.endswith((".lora_A.weight", ".lora_B.weight")) for key in lora_sd):
+        return lora_sd
+
+    converted = {}
+    for key, value in lora_sd.items():
+        if not key.endswith((".lora_A.weight", ".lora_B.weight")):
+            converted[key] = value
+            continue
+        is_up = key.endswith(".lora_B.weight")
+        suffix = ".lora_up.weight" if is_up else ".lora_down.weight"
+        base = key[: -len(".lora_A.weight")]
+        for prefix in ("diffusion_model.", "transformer."):
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+                break
+        if base.startswith("token_refiner.blocks."):
+            base = "token_refiner.refiner_blocks." + base[len("token_refiner.blocks."):]
+        elif base.startswith("blocks."):
+            base = "transformer_blocks." + base[len("blocks."):]
+
+        if base.endswith(".attn.qkv_proj"):
+            stem = base[: -len("qkv_proj")]
+            if is_up:
+                for name, part in zip(("to_q", "to_k", "to_v"), value.chunk(3, dim=0)):
+                    converted[stem + name + suffix] = part.contiguous()
+            else:
+                for name in ("to_q", "to_k", "to_v"):
+                    converted[stem + name + suffix] = value
+        elif base.endswith(".attn.out_proj"):
+            converted[base[: -len("out_proj")] + "to_out.0" + suffix] = value
+        elif base.endswith(".mlp.fc1"):
+            new_base = base[: -len("mlp.fc1")] + "ff.net.0.proj"
+            if is_up:
+                gate, up = value.chunk(2, dim=0)
+                converted[new_base + suffix] = torch.cat([up, gate], dim=0).contiguous()
+            else:
+                converted[new_base + suffix] = value
+        elif base.endswith(".mlp.fc2"):
+            converted[base[: -len("mlp.fc2")] + "ff.net.2" + suffix] = value
+        else:
+            # 1:1 modules: adaln_proj.linear and anything already in diffusers naming.
+            converted[base + suffix] = value
+
+    if expected_shapes is not None:
+        dropped = []
+        for down_key in [k for k in converted if k.endswith(".lora_down.weight")]:
+            base = down_key[: -len(".lora_down.weight")]
+            up_key = base + ".lora_up.weight"
+            down, up = converted[down_key], converted.get(up_key)
+            weight_shape = expected_shapes.get(base + ".weight")
+            if (
+                up is None
+                or weight_shape is None
+                or len(weight_shape) != 2
+                or down.shape[-1] != weight_shape[1]
+                or up.shape[0] != weight_shape[0]
+            ):
+                converted.pop(down_key, None)
+                converted.pop(up_key, None)
+                dropped.append(base)
+        if dropped:
+            logger.warning(
+                f"Dropped {len(dropped)} LoRA modules whose shapes do not match this "
+                f"checkpoint (e.g. {dropped[0]}). LoRAs trained on the ComfyUI pruned "
+                f"checkpoint carry adaln_proj deltas over its 8-dim adaln_t_table input, "
+                f"which the full checkpoint's 2688-dim AdaLN cannot consume; those modules "
+                f"are skipped."
+            )
+    return converted
+
+
 def load_transformer(
     ckpt_dir: str,
     device: torch.device,
@@ -117,6 +206,12 @@ def load_transformer(
 
     exclude_keys = FP8_EXCLUDE_KEYS + (["adaln_proj"] if fp8_exclude_adaln else [])
     model = _from_config(MiniMaxH3Transformer3DModel, config_path, dit_dtype)
+
+    if lora_weights_list:
+        expected_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+        lora_weights_list = [
+            convert_peft_lora_to_native(sd, expected_shapes) for sd in lora_weights_list
+        ]
 
     if fp8_scaled:
         from modules.fp8_optimization_utils import (

@@ -5,7 +5,7 @@ annotated-types==0.7.0
 anyio==4.8.0
 ascii-magic==2.3.0
 av==12.1.0
-bitsandbytes==0.45.0
+bitsandbytes==0.50.0
 certifi==2025.1.31
 charset-normalizer==3.4.1
 click==8.1.8
@@ -83,6 +83,7 @@ toml==0.10.2
 tomlkit==0.13.2
 torch==2.8.0
 torchvision==0.23.0
+torchaudio==2.8.0
 torchsde
 tqdm==4.67.1
 transformers==4.46.2
