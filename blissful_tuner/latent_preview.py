@@ -10,11 +10,11 @@ Created on Mon Mar 10 16:47:29 2025
 @author: blyss
 """
 import os
+import numpy as np
 import torch
 import av
 from PIL import Image
 from .taehv import TAEHV
-from .utils import load_torch_file
 from blissful_tuner.utils import BlissfulLogger
 
 logger = BlissfulLogger(__name__, "#8e00ed")
@@ -45,11 +45,10 @@ class LatentPreviewer():
 
         if self.mode == "taehv":
             ####logger.info(f"Loading TAEHV: {args.preview_vae}...")
-            if os.path.exists(args.preview_vae):
-                tae_sd = load_torch_file(args.preview_vae, safe_load=True, device=args.device)
-            else:
+            if not os.path.exists(args.preview_vae):
                 raise FileNotFoundError(f"{args.preview_vae} was not found!")
-            self.taehv = TAEHV(tae_sd).to("cpu", self.dtype)  # Offload for VRAM and match datatype
+            # Model variant (taehv/taew2_1/taeh3/...) is detected from the checkpoint filename
+            self.taehv = TAEHV(checkpoint_path=args.preview_vae).to("cpu", self.dtype)  # Offload for VRAM and match datatype
             self.decoder = self.decode_taehv
             self.scale_factor = None
             self.fps = args.fps

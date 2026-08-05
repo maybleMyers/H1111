@@ -17,6 +17,7 @@
 # (C) transformer -> denoise, (D) VAEs -> decode + save.
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -153,6 +154,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_metadata", action="store_true")
     parser.add_argument("--preview", type=int, default=None, metavar="N", help="write latent preview every N steps")
     parser.add_argument("--preview_suffix", type=str, default=None)
+    parser.add_argument(
+        "--preview_vae", type=str, default=None,
+        help="path to a TAEHV checkpoint (taeh3.pth) for full-resolution TAE previews; default = fast latent2rgb",
+    )
     parser.add_argument("--fps", type=int, default=24, help=argparse.SUPPRESS)  # fixed by the model; kept for tooling
 
     args = parser.parse_args()
@@ -302,6 +307,11 @@ def encode_prompt_stage(args, task, plan, prompt, device):
             )
 
     del conditioner
+    # The int8/fp8 monkey patches store a bound forward on each patched module, creating
+    # module <-> method reference cycles that plain refcounting cannot free: without a
+    # collect here, every GPU-resident conditioner layer survives the del and the
+    # transformer stage starts ~20 GB short.
+    gc.collect()
     clean_memory_on_device(device)
     return embeds, tags
 
@@ -394,10 +404,14 @@ def make_step_callback(args, pipe, plan, layout, progress_bar, previewer_holder)
                 sigma = 1.0 - t
                 x0_rows = latents[num_condition_rows:] + sigma * noise_pred[0, num_condition_rows:].float()
                 x0 = pipe.unpack_video_latents(x0_rows, plan)  # denormalized (1, C, T, H, W)
-                # The preview factors run on *normalized* latents; re-normalize.
-                mean = torch.tensor(pipe.vae.config.latents_mean, device=x0.device).view(1, -1, 1, 1, 1)
-                std = torch.tensor(pipe.vae.config.latents_std, device=x0.device).view(1, -1, 1, 1, 1)
-                normalized = ((x0 - mean) / std)[0]  # [C, T, H, W]
+                if args.preview_vae:
+                    # TAEHV (taeh3) mimics the real video VAE and decodes raw latents.
+                    preview_latents = x0[0]  # [C, T, H, W]
+                else:
+                    # The latent2rgb factors were fit on *normalized* latents; re-normalize.
+                    mean = torch.tensor(pipe.vae.config.latents_mean, device=x0.device).view(1, -1, 1, 1, 1)
+                    std = torch.tensor(pipe.vae.config.latents_std, device=x0.device).view(1, -1, 1, 1, 1)
+                    preview_latents = ((x0 - mean) / std)[0]  # [C, T, H, W]
                 if previewer_holder.get("previewer") is None:
                     from blissful_tuner.latent_preview import LatentPreviewer
 
@@ -405,7 +419,7 @@ def make_step_callback(args, pipe, plan, layout, progress_bar, previewer_holder)
                         args, None, None, latents.device, torch.float32, model_type="minimax"
                     )
                 previewer_holder["previewer"].preview(
-                    normalized.float(), step, preview_suffix=args.preview_suffix
+                    preview_latents.float(), step, preview_suffix=args.preview_suffix
                 )
             except Exception as e:  # previews must never kill a run
                 logger.warning(f"preview failed at step {step}: {e}")
@@ -675,6 +689,7 @@ def run_one(args, task, device, seed):
 
     del transformer
     pipe.transformer = None
+    gc.collect()  # int8/fp8-patched modules sit in reference cycles; free them before the VAEs return
     clean_memory_on_device(device)
 
     # Stage D: VAEs back -> decode + save.

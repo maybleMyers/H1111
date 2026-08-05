@@ -156,7 +156,46 @@ def collect_quant_markers(sd: dict) -> dict[str, dict]:
 # ---------------------------------------------------------------------------- runtime patch
 
 
-def _int8_mm_2d(x2d: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, group_size: int) -> Optional[torch.Tensor]:
+# Row-chunk budget for the int8 GEMM's int32 accumulator. The full accumulator would be
+# [seq_len, out_features] int32 — ~11 GB for the 28672-wide fc1 on a 100k-row packed
+# sequence — and the float32 scaling epilogue would transiently double that. Chunking caps
+# both while the (much smaller) int8/output tensors stay whole.
+_INT8_MM_ACC_BYTES = 256 * 1024 * 1024
+
+
+def _int8_mm_chunked(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    weight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """`(xq @ weight_t) * (xs * weight_scale)` in row chunks: the int32 accumulator and its
+    float32 scaling exist only chunk-at-a-time; results land directly in `out_dtype`."""
+    m = xq.shape[0]
+    n = weight_t.shape[1]
+    ws = weight_scale.reshape(1, -1).to(torch.float32)
+    out = torch.empty(m, n, dtype=out_dtype, device=xq.device)
+    chunk = max(32, _INT8_MM_ACC_BYTES // (n * 4))
+    start = 0
+    while start < m:
+        stop = min(start + chunk, m)
+        if 0 < m - stop <= 16:  # torch._int_mm needs > 16 rows; fold a tiny tail in
+            stop = m
+        acc = torch._int_mm(xq[start:stop], weight_t)
+        out[start:stop] = (acc.to(torch.float32) * (xs[start:stop].to(torch.float32) * ws)).to(out_dtype)
+        del acc
+        start = stop
+    return out
+
+
+def _int8_mm_2d(
+    x2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
     """True int8 GEMM: rotate + row-quantize the activation, `torch._int_mm`, scale back by
     `x_scale * weight_scale`. Returns None when the shape constraints of the cuBLAS IMMA
     path are not met (caller falls back to the dequant path)."""
@@ -167,17 +206,16 @@ def _int8_mm_2d(x2d: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Ten
     if group_size:
         x2d = rotate_activation(x2d, group_size)
     xq, xs = quantize_int8_rowwise(x2d)
-    acc = torch._int_mm(xq, weight.t().contiguous())  # int32 [m, n]
-    out = acc.to(torch.float32) * (xs.to(torch.float32) * weight_scale.reshape(1, -1).to(torch.float32))
-    return out
+    del x2d
+    return _int8_mm_chunked(xq, xs, weight.t().contiguous(), weight_scale, out_dtype)
 
 
 def int8_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     group_size = self.int8_convrot_groupsize
     if self.int8_use_int_mm:
-        out = _int8_mm_2d(x.reshape(-1, x.shape[-1]), self.weight, self.weight_scale, group_size)
+        out = _int8_mm_2d(x.reshape(-1, x.shape[-1]), self.weight, self.weight_scale, group_size, x.dtype)
         if out is not None:
-            out = out.to(x.dtype).reshape(*x.shape[:-1], self.weight.shape[0])
+            out = out.reshape(*x.shape[:-1], self.weight.shape[0])
             if self.bias is not None:
                 out = out + self.bias.to(out.dtype)
             return out

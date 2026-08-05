@@ -2395,6 +2395,7 @@ def minimax_submit_to_queue(
     save_path: str,
     enable_preview: bool,
     preview_steps: int,
+    preview_vae: str,
     # Model Paths
     ckpt_dir: str,
     dit_path: str,
@@ -2583,6 +2584,8 @@ def minimax_submit_to_queue(
         if enable_preview:
             command.extend(["--preview", str(max(1, int(preview_steps)))])
             command.extend(["--preview_suffix", unique_preview_suffix])
+            if preview_vae and str(preview_vae).strip():
+                command.extend(["--preview_vae", str(preview_vae).strip()])
 
         # LoRA handling (shared lora folder listing, same as the Cosmos tab)
         lora_weights_paths = []
@@ -13350,6 +13353,11 @@ with gr.Blocks(
                         minimax_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
                         minimax_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
                                                           label="Preview Every N Steps")
+                        minimax_preview_vae = gr.Textbox(
+                            label="Preview TAE Checkpoint (optional)", value="",
+                            info="blank = fast latent2rgb preview; path to taeh3.pth (madebyollin/taehv) "
+                                 "for full-resolution TAE previews",
+                        )
                         minimax_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
                             allow_preview=True, preview=True, show_label=True,
@@ -18257,6 +18265,7 @@ with gr.Blocks(
             minimax_save_path,
             minimax_enable_preview,
             minimax_preview_steps,
+            minimax_preview_vae,
             # Model Paths
             minimax_ckpt_dir,
             minimax_dit_path,
@@ -19462,6 +19471,7 @@ with gr.Blocks(
         minimax_prompt_cache,
         minimax_enable_preview,
         minimax_preview_steps,
+        minimax_preview_vae,
     ] + minimax_lora_weights + minimax_lora_multipliers
 
     minimax_ui_default_keys = [
@@ -19497,6 +19507,7 @@ with gr.Blocks(
         "minimax_prompt_cache",
         "minimax_enable_preview",
         "minimax_preview_steps",
+        "minimax_preview_vae",
     ] + [f"minimax_lora_weight_{i+1}" for i in range(4)] + \
         [f"minimax_lora_multiplier_{i+1}" for i in range(4)]
 
