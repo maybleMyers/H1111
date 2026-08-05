@@ -63,6 +63,7 @@ WAN22_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "wan22_defaults.json")
 BERNINI_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "bernini_defaults.json")
 COSMOS_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "cosmos_defaults.json")
 MINIMAX_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "minimax_defaults.json")
+INTERP_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "interp_defaults.json")
 
 # Helper functions for model detection (moved to global scope)
 def get_wan_of_dit_models(dit_folder: str, filter_name: str = "") -> List[str]:
@@ -10674,6 +10675,363 @@ def handle_extend_generation(base_video_path: str, new_videos: list, save_path: 
         print(f"Error extending video: {str(e)}")
         return current_gallery, f"Failed to extend video: {str(e)}"
 
+# =============================================================================
+# Frame Interpolation / Upscaling (GIMM-VFI / BiM-VFI / ESRGAN / SwinIR / BasicVSR++)
+# Checkpoints auto-download from HuggingFace into weights/ on first use.
+# =============================================================================
+INTERP_WEIGHTS_REPO = "maybleMyers/interpolate"
+WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
+GIMM_VFI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GIMM-VFI")
+
+GIMM_MODELS = {
+    "GIMM-VFI-R (RAFT)": {
+        "type": "gimm",
+        "checkpoint": "gimmvfi_r_arb.pt",
+        "aux": ["raft-things.pth"],
+    },
+    "GIMM-VFI-R-P (RAFT+Perceptual)": {
+        "type": "gimm",
+        "checkpoint": "gimmvfi_r_arb_lpips.pt",
+        "aux": ["raft-things.pth"],
+    },
+    "GIMM-VFI-F (FlowFormer)": {
+        "type": "gimm",
+        "checkpoint": "gimmvfi_f_arb.pt",
+        "aux": ["flowformer_sintel.pth"],
+    },
+    "GIMM-VFI-F-P (FlowFormer+Perceptual)": {
+        "type": "gimm",
+        "checkpoint": "gimmvfi_f_arb_lpips.pt",
+        "aux": ["flowformer_sintel.pth"],
+    },
+    "BiM-VFI (Bidirectional Motion)": {
+        "type": "bim",
+        "checkpoint": "bim_vfi.pth",
+    },
+}
+
+# Upscaler model configurations
+UPSCALER_MODELS = {
+    "Real-ESRGAN x2": {
+        "type": "esrgan",
+        "scale": 2,
+        "checkpoint": "RealESRGAN_x2plus.pth",
+    },
+    "Real-ESRGAN x4": {
+        "type": "esrgan",
+        "scale": 4,
+        "checkpoint": "RealESRGAN_x4plus.pth",
+    },
+    "SwinIR x4": {
+        "type": "swinir",
+        "scale": 4,
+        "checkpoint": "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+    },
+    "BasicVSR++ x4 (Temporal)": {
+        "type": "basicvsr",
+        "scale": 4,
+        "checkpoint": "basicvsr_plusplus_reds4.pth",
+    },
+}
+
+
+def ensure_interp_weight(filename: str) -> str:
+    """Return the path to a checkpoint in weights/, downloading it from HuggingFace on first use."""
+    dest = os.path.join(WEIGHTS_DIR, filename)
+    if os.path.exists(dest):
+        return dest
+    from huggingface_hub import hf_hub_download
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    print(f"Downloading {filename} from {INTERP_WEIGHTS_REPO} to {WEIGHTS_DIR}...")
+    hf_hub_download(repo_id=INTERP_WEIGHTS_REPO, filename=filename, local_dir=WEIGHTS_DIR)
+    return dest
+
+
+def link_gimm_aux_weight(weight_path: str):
+    """GIMM-VFI resolves RAFT/FlowFormer weights via 'pretrained_ckpt/...' relative to its own
+    directory, so link the downloaded file there (falling back to a copy if symlinks fail)."""
+    ckpt_dir = os.path.join(GIMM_VFI_DIR, "pretrained_ckpt")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    dest = os.path.join(ckpt_dir, os.path.basename(weight_path))
+    if os.path.exists(dest):
+        return
+    try:
+        os.symlink(os.path.abspath(weight_path), dest)
+    except OSError:
+        shutil.copy2(weight_path, dest)
+
+
+def interpolate_video(
+    input_video: str,
+    model_variant: str,
+    checkpoint_path: str,
+    config_path: str,
+    interp_factor: int,
+    ds_scale: float,
+    output_fps_override: float,
+    raft_iters: int,
+    pyr_level: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified dispatcher for video frame interpolation.
+    Runs interpolation in a subprocess for complete VRAM cleanup.
+    """
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    model_info = GIMM_MODELS.get(model_variant, {})
+    model_type = model_info.get("type", "gimm")
+
+    # Resolve checkpoint: user override, else auto-download into weights/ on first use
+    if not checkpoint_path:
+        try:
+            yield None, f"Checking weights for {model_variant}...", 0.02
+            checkpoint_path = ensure_interp_weight(model_info["checkpoint"])
+            for aux_name in model_info.get("aux", []):
+                link_gimm_aux_weight(ensure_interp_weight(aux_name))
+        except Exception as e:
+            yield None, f"Error downloading weights: {e}", 0.0
+            return
+
+    # Create output path
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = f"interpolated_{model_type}_{int(time.time())}.mp4"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Build subprocess command
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    interp_script = os.path.join(script_dir, "interpolate_video.py")
+
+    command = [
+        sys.executable, interp_script,
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--variant", model_variant,
+        "--factor", str(int(interp_factor)),
+        "--pyr-level", str(int(pyr_level)),
+        "--ds-scale", str(float(ds_scale)),
+        "--output-fps", str(float(output_fps_override)),
+        "--seed", str(int(seed)),
+    ]
+
+    if checkpoint_path:
+        command.extend(["--checkpoint", checkpoint_path])
+    if config_path:
+        command.extend(["--config", config_path])
+
+    print("\n" + "=" * 80)
+    print("LAUNCHING INTERPOLATION SUBPROCESS:")
+    print(" ".join(command))
+    print("=" * 80 + "\n")
+
+    yield None, "Starting interpolation subprocess...", 0.05
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Interpolation failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
+def upscale_video(
+    input_video: str,
+    model_variant: str,
+    model_path_override: str,
+    tile_size: int,
+    half_precision: bool,
+    motion_blur: bool,
+    blur_strength: float,
+    blur_samples: int,
+    crf: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified video upscaling dispatcher.
+    Launches upscale_video.py as subprocess for VRAM cleanup.
+    """
+    # Validate input
+    if not input_video or not os.path.exists(input_video):
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    # Get model config
+    model_config = UPSCALER_MODELS.get(model_variant)
+    if not model_config:
+        yield None, f"Error: Unknown model variant: {model_variant}", 0.0
+        return
+
+    model_type = model_config["type"]
+    scale = model_config["scale"]
+
+    # Determine model path: user override, else auto-download into weights/ on first use
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if model_path_override and model_path_override.strip():
+        model_path = model_path_override.strip()
+        if not os.path.exists(model_path):
+            yield None, f"Error: Model not found at {model_path}", 0.0
+            return
+    else:
+        try:
+            yield None, f"Checking weights for {model_variant}...", 0.03
+            model_path = ensure_interp_weight(model_config["checkpoint"])
+        except Exception as e:
+            yield None, f"Error downloading {model_variant}: {e}", 0.0
+            return
+
+    # Create output path
+    output_dir = os.path.join("outputs", "upscaled")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = int(time.time())
+    input_name = os.path.splitext(os.path.basename(input_video))[0]
+    output_path = os.path.join(output_dir, f"{input_name}_upscaled_{scale}x_{timestamp}.mp4")
+
+    yield None, f"Starting {model_variant} upscaling...", 0.05
+
+    # Build command
+    cmd = [
+        sys.executable, os.path.join(script_dir, "upscale_video.py"),
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--model-path", model_path,
+        "--scale", str(scale),
+        "--tile-size", str(tile_size),
+        "--crf", str(crf),
+        "--seed", str(seed),
+    ]
+
+    if half_precision:
+        cmd.append("--half")
+
+    if motion_blur:
+        cmd.extend([
+            "--motion-blur",
+            "--blur-strength", str(blur_strength),
+            "--blur-samples", str(blur_samples),
+        ])
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Upscaling failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
 # UI setup
 with gr.Blocks(
     theme=themes.Default(
@@ -14383,6 +14741,159 @@ with gr.Blocks(
                             )
                             wan_of_save_path = gr.Textbox(label="Save Path", value="outputs/wan_one_frame")
 
+                #Convert lora tab        
+                with gr.Tab("Convert LoRA") as convert_lora_tab:
+                    def suggest_output_name(file_obj) -> str:
+                        """Generate suggested output name from input file"""
+                        if not file_obj:
+                            return ""
+                        # Get input filename without extension and add MUSUBI
+                        base_name = os.path.splitext(os.path.basename(file_obj.name))[0]
+                        return f"{base_name}_MUSUBI"
+
+                    def convert_lora(input_file, output_name: str, target_format: str) -> str:
+                        """Convert LoRA file to specified format"""
+                        try:
+                            if input_file is None:
+                                return "Error: No input file selected"
+
+                            # Ensure output directory exists
+                            os.makedirs("lora", exist_ok=True)
+
+                            # Construct output path
+                            output_path = os.path.join("lora", f"{output_name}.safetensors")
+
+                            # Determine which script to use based on target_format
+                            if target_format == "Hunyuan to FramePack":
+                                script_name = "convert_hunyuan_to_framepack.py"
+                                cmd = [
+                                    sys.executable,
+                                    script_name,
+                                    "--input", input_file.name,
+                                    "--output", output_path
+                                ]
+                                print(f"Using '{script_name}' to convert {input_file.name} to {output_path} for FramePack.")
+                            else:
+                                script_name = "convert_lora.py"
+                                if target_format == "peft to default":
+                                    target_arg = "peft"
+                                else:
+                                    target_arg = target_format.lower()
+                                cmd = [
+                                    sys.executable,
+                                    script_name,
+                                    "--input", input_file.name,
+                                    "--output", output_path,
+                                    "--target", target_arg
+                                ]
+
+                            print(f"Running conversion command: {' '.join(cmd)}")
+
+                            # Check if the selected script file exists
+                            if not os.path.exists(script_name):
+                                 return f"Error: Conversion script '{script_name}' not found. Please ensure it's in the same directory as h1111.py."
+
+                            # Execute conversion
+                            result = subprocess.run(
+                                cmd,
+                                capture_output=True,
+                                text=True,
+                                check=True
+                            )
+
+                            console_output = result.stdout if result.stdout else ""
+                            if result.stderr:
+                                console_output += f"\n--- Script STDERR ---\n{result.stderr}"
+                            if not console_output.strip():
+                                console_output = "Conversion script completed with no output."
+                                if os.path.exists(output_path):
+                                    console_output += f"\n[UI Info] Output file confirmed by h1111.py at: {output_path}"
+                                else:
+                                    console_output += f"\n[UI Warning] Output file NOT found by h1111.py at expected location: {output_path}"               
+                            return console_output.strip()
+                        except subprocess.CalledProcessError as e:
+                            error_message = f"Conversion Script Error (Exit Code: {e.returncode}):\n"
+                            if e.stdout and e.stdout.strip():
+                                error_message += f"--- Script STDOUT ---\n{e.stdout.strip()}\n"
+                            if e.stderr and e.stderr.strip():
+                                error_message += f"--- Script STDERR ---\n{e.stderr.strip()}\n"
+                            if not (e.stdout and e.stdout.strip()) and not (e.stderr and e.stderr.strip()):
+                                error_message += "Script produced no output on STDOUT or STDERR."
+                    
+                            print(f"Subprocess error details logged to console. UI will show combined script output.") # Log for server console
+                            return error_message.strip()
+
+
+                    with gr.Row():
+                        input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
+                        output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
+                        format_radio = gr.Radio(
+                            choices=["default", "other", "peft to default", "Hunyuan to FramePack"],
+                            value="default",
+                            label="Target Format",
+                            info="'default': diffusers to H1111/MUSUBI, 'other': to diffusion pipe, 'peft to default': PEFT/StoryMem to H1111/MUSUBI, 'Hunyuan to FramePack': FramePack compatibility"
+                        )
+
+                    with gr.Row():
+                        convert_btn = gr.Button("Convert LoRA", variant="primary")
+                        status_output = gr.Textbox(label="Status", interactive=False)
+
+                    # Automatically update output name when file is selected
+                    input_file.change(
+                        fn=suggest_output_name,
+                        inputs=[input_file],
+                        outputs=[output_name]
+                    )
+
+                    # Handle conversion
+                    convert_btn.click(
+                        fn=convert_lora,
+                        inputs=[input_file, output_name, format_radio],
+                        outputs=status_output
+                    )
+                with gr.Tab("Model Merging") as model_merge_tab:
+                    with gr.Row():
+                        with gr.Column():
+                            # Model selection
+                            dit_model = gr.Dropdown(
+                                label="Base DiT Model",
+                                choices=["mp_rank_00_model_states.pt"],
+                                value="mp_rank_00_model_states.pt",
+                                allow_custom_value=True,
+                                interactive=True
+                            )
+                            merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
+                    with gr.Row():
+                        with gr.Column():
+                            # Output model name
+                            output_model = gr.Textbox(label="Output Model Name", value="merged_model.safetensors")
+                            exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
+                            merge_btn = gr.Button("Merge Models", variant="primary")
+                            merge_status = gr.Textbox(label="Status", interactive=False)
+                    with gr.Row():
+                        # LoRA selection section (similar to Text2Video)
+                        merge_lora_weights = []
+                        merge_lora_multipliers = []
+                        for i in range(4):
+                            with gr.Column():
+                                merge_lora_weights.append(gr.Dropdown(
+                                    label=f"LoRA {i+1}",
+                                    choices=get_lora_options(),
+                                    value="None",
+                                    allow_custom_value=True,
+                                    interactive=True
+                                ))
+                                merge_lora_multipliers.append(gr.Slider(
+                                    label=f"Multiplier",
+                                    minimum=0.0,
+                                    maximum=2.0,
+                                    step=0.05,
+                                    value=1.0
+                                ))
+                        with gr.Row():
+                            merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+
         with gr.Tab(id=6, label="WanX-v2v", visible=False) as wanx_v2v_tab:
             with gr.Row():
                 with gr.Column(scale=4):
@@ -14548,159 +15059,281 @@ with gr.Blocks(
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
 
-        #Convert lora tab        
-        with gr.Tab("Convert LoRA") as convert_lora_tab:
-            def suggest_output_name(file_obj) -> str:
-                """Generate suggested output name from input file"""
-                if not file_obj:
-                    return ""
-                # Get input filename without extension and add MUSUBI
-                base_name = os.path.splitext(os.path.basename(file_obj.name))[0]
-                return f"{base_name}_MUSUBI"
 
-            def convert_lora(input_file, output_name: str, target_format: str) -> str:
-                """Convert LoRA file to specified format"""
-                try:
-                    if input_file is None:
-                        return "Error: No input file selected"
 
-                    # Ensure output directory exists
-                    os.makedirs("lora", exist_ok=True)
-
-                    # Construct output path
-                    output_path = os.path.join("lora", f"{output_name}.safetensors")
-
-                    # Determine which script to use based on target_format
-                    if target_format == "Hunyuan to FramePack":
-                        script_name = "convert_hunyuan_to_framepack.py"
-                        cmd = [
-                            sys.executable,
-                            script_name,
-                            "--input", input_file.name,
-                            "--output", output_path
-                        ]
-                        print(f"Using '{script_name}' to convert {input_file.name} to {output_path} for FramePack.")
-                    else:
-                        script_name = "convert_lora.py"
-                        if target_format == "peft to default":
-                            target_arg = "peft"
-                        else:
-                            target_arg = target_format.lower()
-                        cmd = [
-                            sys.executable,
-                            script_name,
-                            "--input", input_file.name,
-                            "--output", output_path,
-                            "--target", target_arg
-                        ]
-
-                    print(f"Running conversion command: {' '.join(cmd)}")
-
-                    # Check if the selected script file exists
-                    if not os.path.exists(script_name):
-                         return f"Error: Conversion script '{script_name}' not found. Please ensure it's in the same directory as h1111.py."
-
-                    # Execute conversion
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-
-                    console_output = result.stdout if result.stdout else ""
-                    if result.stderr:
-                        console_output += f"\n--- Script STDERR ---\n{result.stderr}"
-                    if not console_output.strip():
-                        console_output = "Conversion script completed with no output."
-                        if os.path.exists(output_path):
-                            console_output += f"\n[UI Info] Output file confirmed by h1111.py at: {output_path}"
-                        else:
-                            console_output += f"\n[UI Warning] Output file NOT found by h1111.py at expected location: {output_path}"               
-                    return console_output.strip()
-                except subprocess.CalledProcessError as e:
-                    error_message = f"Conversion Script Error (Exit Code: {e.returncode}):\n"
-                    if e.stdout and e.stdout.strip():
-                        error_message += f"--- Script STDOUT ---\n{e.stdout.strip()}\n"
-                    if e.stderr and e.stderr.strip():
-                        error_message += f"--- Script STDERR ---\n{e.stderr.strip()}\n"
-                    if not (e.stdout and e.stdout.strip()) and not (e.stderr and e.stderr.strip()):
-                        error_message += "Script produced no output on STDOUT or STDERR."
-                    
-                    print(f"Subprocess error details logged to console. UI will show combined script output.") # Log for server console
-                    return error_message.strip()
-
+        with gr.Tab("Frame Interpolation") as frame_interp_tab:
+            gr.Markdown("### Increase Video FPS using GIMM-VFI\nState-of-the-art frame interpolation for smooth slow motion and higher frame rates.")
 
             with gr.Row():
-                input_file = gr.File(label="Input LoRA File", file_types=[".safetensors"])
-                output_name = gr.Textbox(label="Output Name", placeholder="Output filename (without extension)")
-                format_radio = gr.Radio(
-                    choices=["default", "other", "peft to default", "Hunyuan to FramePack"],
-                    value="default",
-                    label="Target Format",
-                    info="'default': diffusers to H1111/MUSUBI, 'other': to diffusion pipe, 'peft to default': PEFT/StoryMem to H1111/MUSUBI, 'Hunyuan to FramePack': FramePack compatibility"
-                )
+                # Input Column
+                with gr.Column(scale=1):
+                    interp_input_video = gr.Video(label="Input Video", sources=["upload"])
 
-            with gr.Row():
-                convert_btn = gr.Button("Convert LoRA", variant="primary")
-                status_output = gr.Textbox(label="Status", interactive=False)
+                    # Model Settings
+                    with gr.Accordion("Model Settings", open=True):
+                        interp_model_variant = gr.Dropdown(
+                            label="Model Variant",
+                            choices=list(GIMM_MODELS.keys()),
+                            value="GIMM-VFI-R-P (RAFT+Perceptual)",
+                            info="R=RAFT (faster), F=FlowFormer (better quality), P=Perceptual loss (recommended)"
+                        )
+                        interp_checkpoint_path = gr.Textbox(
+                            label="Checkpoint Path (optional)",
+                            placeholder="Leave empty to use default for selected variant",
+                            info="Override the default checkpoint path"
+                        )
+                        interp_config_path = gr.Textbox(
+                            label="Config Path (optional)",
+                            placeholder="Leave empty to use default for selected variant",
+                            info="Override the default config path"
+                        )
 
-            # Automatically update output name when file is selected
-            input_file.change(
-                fn=suggest_output_name,
-                inputs=[input_file],
-                outputs=[output_name]
-            )
-
-            # Handle conversion
-            convert_btn.click(
-                fn=convert_lora,
-                inputs=[input_file, output_name, format_radio],
-                outputs=status_output
-            )
-        with gr.Tab("Model Merging") as model_merge_tab:
-            with gr.Row():
-                with gr.Column():
-                    # Model selection
-                    dit_model = gr.Dropdown(
-                        label="Base DiT Model",
-                        choices=["mp_rank_00_model_states.pt"],
-                        value="mp_rank_00_model_states.pt",
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    merge_refresh_btn = gr.Button("🔄", elem_classes="refresh-btn")
-            with gr.Row():
-                with gr.Column():
-                    # Output model name
-                    output_model = gr.Textbox(label="Output Model Name", value="merged_model.safetensors")
-                    exclude_single_blocks = gr.Checkbox(label="Exclude Single Blocks", value=False)
-                    merge_btn = gr.Button("Merge Models", variant="primary")
-                    merge_status = gr.Textbox(label="Status", interactive=False)
-            with gr.Row():
-                # LoRA selection section (similar to Text2Video)
-                merge_lora_weights = []
-                merge_lora_multipliers = []
-                for i in range(4):
-                    with gr.Column():
-                        merge_lora_weights.append(gr.Dropdown(
-                            label=f"LoRA {i+1}",
-                            choices=get_lora_options(),
-                            value="None",
-                            allow_custom_value=True,
-                            interactive=True
-                        ))
-                        merge_lora_multipliers.append(gr.Slider(
-                            label=f"Multiplier",
-                            minimum=0.0,
-                            maximum=2.0,
+                    # Interpolation Settings
+                    with gr.Accordion("Interpolation Settings", open=True):
+                        interp_factor = gr.Slider(
+                            label="Interpolation Factor",
+                            minimum=2,
+                            maximum=16,
+                            value=2,
+                            step=1,
+                            info="2=2x FPS (1 new frame), 4=4x FPS (3 new frames), 8=8x FPS (7 new frames)"
+                        )
+                        interp_ds_scale = gr.Slider(
+                            label="DS Scale (for high-res)",
+                            minimum=0.25,
+                            maximum=1.0,
+                            value=1.0,
                             step=0.05,
-                            value=1.0
-                        ))
-                with gr.Row():
-                    merge_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                    dit_folder = gr.Textbox(label="DiT Model Folder", value="hunyuan")
+                            info="Downscale factor: 1.0=SD/HD, 0.5=2K (~8GB VRAM), 0.25=4K (~11GB VRAM)"
+                        )
+                        interp_output_fps = gr.Number(
+                            label="Output FPS Override",
+                            value=0,
+                            minimum=0,
+                            info="0 = auto (input FPS × factor). Set manually for custom output FPS."
+                        )
 
+                    # Advanced Settings
+                    with gr.Accordion("Advanced", open=False):
+                        interp_raft_iters = gr.Slider(
+                            label="RAFT Iterations (GIMM-VFI only)",
+                            minimum=12,
+                            maximum=32,
+                            value=20,
+                            step=1,
+                            info="More iterations = better quality, slower (GIMM-VFI only)"
+                        )
+                        interp_pyr_level = gr.Slider(
+                            label="Pyramid Level (BiM-VFI only)",
+                            minimum=0,
+                            maximum=8,
+                            value=0,
+                            step=1,
+                            info="0=auto (based on resolution), 5=<1080p, 6=1080p, 7=4K+"
+                        )
+                        interp_seed = gr.Number(
+                            label="Seed",
+                            value=0,
+                            info="Random seed for reproducibility"
+                        )
+
+                    # Upscaling Settings
+                    with gr.Accordion("Upscaling", open=False):
+                        upscale_enable = gr.Checkbox(
+                            label="Enable Upscaling",
+                            value=False,
+                            info="Apply spatial upscaling (standalone or after interpolation)"
+                        )
+                        upscale_model = gr.Dropdown(
+                            label="Upscaler Model",
+                            choices=list(UPSCALER_MODELS.keys()),
+                            value="Real-ESRGAN x2",
+                            info="ESRGAN/SwinIR: frame-by-frame, BasicVSR++: temporal-aware"
+                        )
+                        upscale_tile_size = gr.Slider(
+                            label="Tile Size",
+                            minimum=0,
+                            maximum=1024,
+                            value=512,
+                            step=64,
+                            info="0=no tiling (more VRAM), 512=balanced, lower=less VRAM"
+                        )
+                        upscale_half = gr.Checkbox(
+                            label="Half Precision (FP16)",
+                            value=True,
+                            info="Faster, less VRAM, slight quality loss"
+                        )
+                        upscale_model_path = gr.Textbox(
+                            label="Custom Model Path (optional)",
+                            placeholder="Leave empty for default model",
+                            info="Override the default checkpoint path"
+                        )
+                        upscale_crf = gr.Slider(
+                            label="Output CRF",
+                            minimum=10,
+                            maximum=30,
+                            value=18,
+                            step=1,
+                            info="Video quality: lower=better quality, larger file (18=good default)"
+                        )
+
+                    # Motion Blur Settings (for masking deformation artifacts)
+                    with gr.Accordion("Motion Blur (Artifact Masking)", open=False):
+                        motion_blur_enable = gr.Checkbox(
+                            label="Enable Motion Blur",
+                            value=False,
+                            info="Add blur along motion vectors to mask deformation artifacts"
+                        )
+                        motion_blur_strength = gr.Slider(
+                            label="Blur Strength",
+                            minimum=0.1,
+                            maximum=2.0,
+                            value=1.0,
+                            step=0.1,
+                            info="Higher = more blur along motion direction"
+                        )
+                        motion_blur_samples = gr.Slider(
+                            label="Blur Samples",
+                            minimum=3,
+                            maximum=15,
+                            value=7,
+                            step=2,
+                            info="More samples = smoother blur (use odd numbers)"
+                        )
+
+                    # Action Buttons
+                    with gr.Row():
+                        interp_generate_btn = gr.Button("🎬 Interpolate", variant="primary", elem_classes="green-btn")
+                        upscale_btn = gr.Button("🔍 Upscale", variant="secondary")
+                    with gr.Row():
+                        interp_save_defaults_btn = gr.Button("💾 Save Defaults")
+                        interp_load_defaults_btn = gr.Button("📂 Load Defaults")
+
+                # Output Column
+                with gr.Column(scale=1):
+                    interp_output_video = gr.Video(label="Interpolated Video")
+                    interp_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+                    interp_progress = gr.Slider(
+                        label="Progress",
+                        minimum=0,
+                        maximum=1,
+                        value=0,
+                        interactive=False,
+                        visible=True
+                    )
+
+                    gr.Markdown("""
+                    **Notes:**
+                    - Checkpoints download automatically from [maybleMyers/interpolate](https://huggingface.co/maybleMyers/interpolate) into `weights/` on first use
+                    - **GIMM-VFI**: R=RAFT (faster), F=FlowFormer (better quality), P=Perceptual loss
+                    - **BiM-VFI**: Bidirectional motion field interpolation
+                    - For 2K/4K video with GIMM-VFI, reduce DS Scale to fit in VRAM
+                    - BiM-VFI auto-detects pyramid level based on resolution (or set manually)
+
+                    **Upscaling:**
+                    - **Real-ESRGAN / SwinIR**: frame-by-frame, **BasicVSR++**: temporal-aware
+                    - Motion blur uses RAFT flow to mask deformation artifacts
+                    """)
+
+            # Frame Interpolation event handlers
+            interp_generate_btn.click(
+                fn=interpolate_video,
+                inputs=[
+                    interp_input_video,
+                    interp_model_variant,
+                    interp_checkpoint_path,
+                    interp_config_path,
+                    interp_factor,
+                    interp_ds_scale,
+                    interp_output_fps,
+                    interp_raft_iters,
+                    interp_pyr_level,
+                    interp_seed,
+                ],
+                outputs=[interp_output_video, interp_status, interp_progress]
+            )
+
+            # Upscaling event handler
+            upscale_btn.click(
+                fn=upscale_video,
+                inputs=[
+                    interp_input_video,  # Use same input video
+                    upscale_model,
+                    upscale_model_path,
+                    upscale_tile_size,
+                    upscale_half,
+                    motion_blur_enable,
+                    motion_blur_strength,
+                    motion_blur_samples,
+                    upscale_crf,
+                    interp_seed,  # Reuse same seed
+                ],
+                outputs=[interp_output_video, interp_status, interp_progress]
+            )
+
+            # Save/Load defaults
+            interp_ui_default_components = [
+                interp_model_variant, interp_checkpoint_path, interp_config_path,
+                interp_factor, interp_ds_scale, interp_output_fps,
+                interp_raft_iters, interp_pyr_level, interp_seed,
+                upscale_enable, upscale_model, upscale_tile_size, upscale_half,
+                upscale_model_path, upscale_crf,
+                motion_blur_enable, motion_blur_strength, motion_blur_samples,
+            ]
+            interp_ui_default_keys = [
+                "interp_model_variant", "interp_checkpoint_path", "interp_config_path",
+                "interp_factor", "interp_ds_scale", "interp_output_fps",
+                "interp_raft_iters", "interp_pyr_level", "interp_seed",
+                "upscale_enable", "upscale_model", "upscale_tile_size", "upscale_half",
+                "upscale_model_path", "upscale_crf",
+                "motion_blur_enable", "motion_blur_strength", "motion_blur_samples",
+            ]
+
+            def save_interp_defaults(*values):
+                os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+                settings_to_save = dict(zip(interp_ui_default_keys, values))
+                try:
+                    with open(INTERP_DEFAULTS_FILE, 'w') as f:
+                        json.dump(settings_to_save, f, indent=2)
+                    return "Interpolation defaults saved successfully."
+                except Exception as e:
+                    return f"Error saving interpolation defaults: {e}"
+
+            def load_interp_defaults(request: gr.Request = None):
+                if not os.path.exists(INTERP_DEFAULTS_FILE):
+                    if request:  # Button click with no saved file
+                        return [gr.update()] * len(interp_ui_default_keys) + ["No defaults file found."]
+                    return [gr.update()] * len(interp_ui_default_keys) + [""]
+                try:
+                    with open(INTERP_DEFAULTS_FILE, 'r') as f:
+                        loaded_settings = json.load(f)
+                except Exception as e:
+                    return [gr.update()] * len(interp_ui_default_keys) + [f"Error loading defaults: {e}"]
+                updates = []
+                for i, key in enumerate(interp_ui_default_keys):
+                    component = interp_ui_default_components[i]
+                    default_value = getattr(component, 'value', None)
+                    updates.append(gr.update(value=loaded_settings.get(key, default_value)))
+                return updates + ["Interpolation defaults loaded successfully."]
+
+            interp_save_defaults_btn.click(
+                fn=save_interp_defaults,
+                inputs=interp_ui_default_components,
+                outputs=[interp_status]
+            )
+            interp_load_defaults_btn.click(
+                fn=load_interp_defaults,
+                inputs=None,
+                outputs=interp_ui_default_components + [interp_status]
+            )
+
+            def initial_load_interp_defaults():
+                return load_interp_defaults(None)[:-1]
+            demo.load(
+                fn=initial_load_interp_defaults,
+                inputs=None,
+                outputs=interp_ui_default_components
+            )
 
     #Event handlers etc
     
