@@ -81,6 +81,8 @@ class MiniMaxH3Conditioner:
         dtype: torch.dtype = torch.bfloat16,
         gpu_layers: int = -1,
         stream_device: torch.device | str | None = None,
+        text_encoder_path: str | None = None,
+        int8_use_int_mm: bool = False,
     ):
         """
         Args:
@@ -91,6 +93,13 @@ class MiniMaxH3Conditioner:
                 (-1 = all, 0 = none). The rest stay on CPU.
             stream_device: when set, CPU-resident layers are streamed there one at a
                 time during the forward.
+            text_encoder_path: optional single-file weight override (e.g. an int8
+                convrot export). Text-model weights (and the vision tower, when the
+                file carries `visual.*` keys — the "ultra_p" export does) come from this
+                file; config/tokenizer/processor still come from the snapshot. int8
+                tensors keep their `weight_scale` and get the int8 monkey patch.
+            int8_use_int_mm: run quantized Linears through torch._int_mm instead of
+                dequantize-per-forward.
         """
         self.device = torch.device(device)
         self.dtype = dtype
@@ -131,7 +140,9 @@ class MiniMaxH3Conditioner:
             self.text_model = Qwen3VLTruncatedTextModel(text_config, MINIMAX_H3_TEXT_ENCODER_LAYER)
             self.vision_tower = build_vision_tower(vision_config)
 
-        self._load_weights(encoder_dir, gpu_layers)
+        self._load_weights(
+            encoder_dir, gpu_layers, text_encoder_path=text_encoder_path, int8_use_int_mm=int8_use_int_mm
+        )
 
     # ------------------------------------------------------------------ loading
 
@@ -146,20 +157,81 @@ class MiniMaxH3Conditioner:
             raise FileNotFoundError(f"no safetensors weights found under {encoder_dir}")
         return shards
 
-    def _load_weights(self, encoder_dir: str, gpu_layers: int) -> None:
+    def _load_weights(
+        self,
+        encoder_dir: str,
+        gpu_layers: int,
+        text_encoder_path: str | None = None,
+        int8_use_int_mm: bool = False,
+    ) -> None:
         import safetensors.torch
+
+        from .int8_quant import QUANT_MARKER_SUFFIX, WEIGHT_SCALE_SUFFIX, apply_int8_monkey_patch, collect_quant_markers
+
+        def keep_dtype(value: torch.Tensor, key: str) -> torch.Tensor:
+            # int8 weights and their float32 scales must survive the cast untouched
+            if value.dtype == torch.int8 or key.endswith(WEIGHT_SCALE_SUFFIX) or key.endswith(QUANT_MARKER_SUFFIX):
+                return value
+            return value.to(self.dtype)
 
         num_read = MINIMAX_H3_TEXT_ENCODER_LAYER
         text_sd, vision_sd = {}, {}
-        for shard in self._shard_files(encoder_dir):
-            raw = safetensors.torch.load_file(shard, device="cpu")
-            text_part, vision_part = _strip_known_prefixes(raw)
-            for key, value in text_part.items():
-                if _wanted_text_key(key, num_read):
-                    text_sd[key] = value.to(self.dtype)
-            for key, value in vision_part.items():
-                vision_sd[key] = value.to(self.dtype)
-            del raw
+        if text_encoder_path:
+            # single-file override (int8 convrot export): text weights always, vision
+            # tower too when the file ships it; otherwise the snapshot still provides vision
+            from utils.safetensors_utils import MemoryEfficientSafeOpen
+
+            with MemoryEfficientSafeOpen(text_encoder_path) as f:
+                for key in f.keys():
+                    value = f.get_tensor(key)
+                    text_part, vision_part = _strip_known_prefixes({key: value})
+                    for k, v in text_part.items():
+                        # quant markers and weight_scales share their layer's prefix, so the
+                        # same filter keeps exactly the wanted layers' quant tensors
+                        if _wanted_text_key(k, num_read):
+                            text_sd[k] = keep_dtype(v, k)
+                    for k, v in vision_part.items():
+                        vision_sd[k] = keep_dtype(v, k)
+            if not vision_sd:
+                for shard in self._shard_files(encoder_dir):
+                    raw = safetensors.torch.load_file(shard, device="cpu")
+                    _, vision_part = _strip_known_prefixes(raw)
+                    for key, value in vision_part.items():
+                        vision_sd[key] = value.to(self.dtype)
+                    del raw
+        else:
+            for shard in self._shard_files(encoder_dir):
+                raw = safetensors.torch.load_file(shard, device="cpu")
+                text_part, vision_part = _strip_known_prefixes(raw)
+                for key, value in text_part.items():
+                    if _wanted_text_key(key, num_read):
+                        text_sd[key] = value.to(self.dtype)
+                for key, value in vision_part.items():
+                    vision_sd[key] = value.to(self.dtype)
+                del raw
+
+        # int8 layers announce themselves via their per-layer quant markers: register the
+        # scale buffers and bind the int8 forwards before the state dict lands
+        text_markers = collect_quant_markers(text_sd)
+        if text_markers:
+            self.text_model.requires_grad_(False)  # int8 tensors cannot carry grads under assign=True
+            apply_int8_monkey_patch(
+                self.text_model,
+                text_markers,
+                use_int_mm=int8_use_int_mm,
+                embedding_output_dtype=self.dtype,
+                state_dict=text_sd,
+            )
+        vision_markers = collect_quant_markers(vision_sd)
+        if vision_markers:
+            self.vision_tower.requires_grad_(False)
+            apply_int8_monkey_patch(
+                self.vision_tower,
+                vision_markers,
+                use_int_mm=int8_use_int_mm,
+                embedding_output_dtype=self.dtype,
+                state_dict=vision_sd,
+            )
 
         missing, unexpected = self.text_model.load_state_dict(text_sd, strict=False, assign=True)
         # `rotary_emb.inv_freq` is computed, and everything past layer 50 was skipped on purpose.

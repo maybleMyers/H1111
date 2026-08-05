@@ -2400,6 +2400,7 @@ def minimax_submit_to_queue(
     dit_path: str,
     vae_path: str,
     audio_vae_path: str,
+    text_encoder_path: str,
     # Advanced
     num_outputs: int,
     prompt_cache: bool,
@@ -2412,6 +2413,7 @@ def minimax_submit_to_queue(
     fp8_scaled: bool,
     fp8_fast: bool,
     fp8_exclude_adaln: bool,
+    int8_fast: bool,
     text_encoder_gpu_layers,
     text_encoder_stream: bool,
     vae_tiling: bool,
@@ -2551,6 +2553,8 @@ def minimax_submit_to_queue(
             command.extend(["--vae", str(vae_path).strip()])
         if audio_vae_path and str(audio_vae_path).strip():
             command.extend(["--audio_vae", str(audio_vae_path).strip()])
+        if text_encoder_path and str(text_encoder_path).strip():
+            command.extend(["--text_encoder", str(text_encoder_path).strip()])
 
         if fp8:
             command.append("--fp8")
@@ -2560,6 +2564,8 @@ def minimax_submit_to_queue(
             command.append("--fp8_fast")
         if fp8_exclude_adaln:
             command.append("--fp8_exclude_adaln")
+        if int8_fast:
+            command.append("--int8_fast")
         if classic_block_swap:
             command.append("--classic_block_swap")
         if vae_tiling:
@@ -13372,10 +13378,16 @@ with gr.Blocks(
                     info="path to the cloned MiniMaxAI/MiniMax-H3 HF snapshot dir",
                 )
                 with gr.Row():
-                    minimax_dit_path = gr.Textbox(label="DiT Override (blank = per-task transformer[_ref])", value="")
+                    minimax_dit_path = gr.Textbox(label="DiT Override (blank = per-task transformer[_ref])", value="",
+                                                  info="dir, merged file, or an int8 convrot export (auto-detected)")
                     minimax_vae_path = gr.Textbox(label="VAE Override (blank = ckpt_dir vae)", value="")
                     minimax_audio_vae_path = gr.Textbox(label="Audio VAE Override (blank = ckpt_dir audio_vae)",
                                                         value="")
+                minimax_text_encoder_path = gr.Textbox(
+                    label="Text Encoder Override (blank = ckpt_dir text_encoder)", value="",
+                    info="single-file override, e.g. an int8 convrot export; the 'ultra_p' file also carries "
+                         "the vision tower",
+                )
 
             with gr.Accordion("Performance", open=True):
                 with gr.Row():
@@ -13410,6 +13422,11 @@ with gr.Blocks(
                     minimax_fp8_exclude_adaln = gr.Checkbox(
                         label="FP8: exclude AdaLN", value=False,
                         info="keep the AdaLN projections in bf16 (+~13 GB, higher fidelity)",
+                    )
+                    minimax_int8_fast = gr.Checkbox(
+                        label="INT8 Fast", value=False,
+                        info="int8 convrot checkpoints only: torch._int_mm with dynamic activation "
+                             "quantization instead of dequantize-per-forward",
                     )
                     minimax_vae_tiling = gr.Checkbox(label="VAE Tiling", value=True,
                                                      info="the release ships with spatial tiling on")
@@ -18245,6 +18262,7 @@ with gr.Blocks(
             minimax_dit_path,
             minimax_vae_path,
             minimax_audio_vae_path,
+            minimax_text_encoder_path,
             # Advanced
             minimax_num_outputs,
             minimax_prompt_cache,
@@ -18257,6 +18275,7 @@ with gr.Blocks(
             minimax_fp8_scaled,
             minimax_fp8_fast,
             minimax_fp8_exclude_adaln,
+            minimax_int8_fast,
             minimax_text_encoder_gpu_layers,
             minimax_text_encoder_stream,
             minimax_vae_tiling,
@@ -19415,6 +19434,7 @@ with gr.Blocks(
         minimax_dit_path,
         minimax_vae_path,
         minimax_audio_vae_path,
+        minimax_text_encoder_path,
         minimax_attn_mode,
         minimax_blocks_to_swap,
         minimax_classic_block_swap,
@@ -19423,6 +19443,7 @@ with gr.Blocks(
         minimax_fp8_scaled,
         minimax_fp8_fast,
         minimax_fp8_exclude_adaln,
+        minimax_int8_fast,
         minimax_text_encoder_gpu_layers,
         minimax_text_encoder_stream,
         minimax_vae_tiling,
@@ -19448,6 +19469,7 @@ with gr.Blocks(
         "minimax_dit_path",
         "minimax_vae_path",
         "minimax_audio_vae_path",
+        "minimax_text_encoder_path",
         "minimax_attn_mode",
         "minimax_blocks_to_swap",
         "minimax_classic_block_swap",
@@ -19456,6 +19478,7 @@ with gr.Blocks(
         "minimax_fp8_scaled",
         "minimax_fp8_fast",
         "minimax_fp8_exclude_adaln",
+        "minimax_int8_fast",
         "minimax_text_encoder_gpu_layers",
         "minimax_text_encoder_stream",
         "minimax_vae_tiling",

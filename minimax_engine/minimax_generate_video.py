@@ -119,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp8_fast", action="store_true", help="use scaled_mm fp8 matmul (with --fp8_scaled)")
     parser.add_argument("--fp8_exclude_adaln", action="store_true",
                         help="keep the AdaLN projections out of fp8 (+~13 GB resident, higher fidelity)")
+    parser.add_argument("--int8_fast", action="store_true",
+                        help="run int8 convrot Linears through torch._int_mm (dynamic per-row activation "
+                             "quantization) instead of dequantize-per-forward")
+    parser.add_argument("--text_encoder", type=str, default=None,
+                        help="single-file text encoder override (e.g. an int8 convrot export; the "
+                             "'ultra_p' export also carries the vision tower)")
     parser.add_argument("--text_encoder_gpu_layers", type=int, default=-1,
                         help="conditioner decoder layers kept on the GPU (-1 = all, 0 = none/streamed)")
     parser.add_argument("--text_encoder_stream", action="store_true",
@@ -232,6 +238,8 @@ def _prompt_cache_key(args, task, plan, prompt) -> str:
         "last_image": args.last_image_path,
         "references": args.reference,
         "strip_audio": bool(args.reference_strip_audio),
+        # different encoder weights produce different embeddings for the same prompt
+        "text_encoder": args.text_encoder,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -267,6 +275,8 @@ def encode_prompt_stage(args, task, plan, prompt, device):
         dtype=str_to_dtype(args.text_encoder_dtype),
         gpu_layers=args.text_encoder_gpu_layers,
         stream_device=device if args.text_encoder_stream else None,
+        text_encoder_path=args.text_encoder,
+        int8_use_int_mm=args.int8_fast,
     )
     logger.info(f"conditioner loaded in {time.time() - start:.1f}s")
 
@@ -356,6 +366,7 @@ def load_transformer_stage(args, task, device):
         lora_weights_list=lora_weights_list,
         lora_multipliers=lora_multipliers,
         dit_path=args.dit,
+        int8_use_int_mm=args.int8_fast,
     )
     if args.blocks_to_swap and args.blocks_to_swap > 0:
         transformer.enable_block_swap(

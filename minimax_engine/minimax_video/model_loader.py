@@ -99,7 +99,7 @@ def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] =
     runtime scale is alpha/rank == 1.0, which matches the merge's `alpha = dim` fallback.
 
     `expected_shapes` (model key -> weight shape) drops converted pairs that cannot apply to
-    this checkpoint. Concretely: LoRAs trained on the ComfyUI pruned variant carry
+    this checkpoint. Concretely: LoRAs trained on the pruned single-file variant carry
     `adaln_proj.linear` deltas over its 8-dim `adaln_t_table` temb, which do not exist in the
     full checkpoint's 2688-dim AdaLN input space and would otherwise crash the merge.
     """
@@ -166,7 +166,7 @@ def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] =
         if dropped:
             logger.warning(
                 f"Dropped {len(dropped)} LoRA modules whose shapes do not match this "
-                f"checkpoint (e.g. {dropped[0]}). LoRAs trained on the ComfyUI pruned "
+                f"checkpoint (e.g. {dropped[0]}). LoRAs trained on the pruned single-file "
                 f"checkpoint carry adaln_proj deltas over its 8-dim adaln_t_table input, "
                 f"which the full checkpoint's 2688-dim AdaLN cannot consume; those modules "
                 f"are skipped."
@@ -186,11 +186,18 @@ def load_transformer(
     lora_weights_list: Optional[List[dict]] = None,
     lora_multipliers: Optional[List[float]] = None,
     dit_path: Optional[str] = None,
+    int8_use_int_mm: bool = False,
 ):
     """Build MiniMaxH3Transformer3DModel and load the task's partition: transformer/ for
     t2va/fl2va, transformer_ref/ for ref2va (or an explicit dir / merged file via dit_path).
     LoRA merges during the streaming load; fp8_scaled quantizes on the fly and monkey-patches
-    the Linears. The float32 modules of the mixed-precision checkpoint stay float32."""
+    the Linears. The float32 modules of the mixed-precision checkpoint stay float32.
+
+    A single-file `dit_path` in the int8 convrot / adaln-curve pruned export layout
+    (detected from the file header) takes the int8 load path instead: keys convert to this
+    port's diffusers layout, int8 weights stay int8 with their per-row scales, and the
+    quantized Linears are monkey-patched (`int8_use_int_mm` picks torch._int_mm over
+    dequantize-per-forward)."""
     from .transformer import MiniMaxH3Transformer3DModel
 
     subfolder = "transformer_ref" if task == "ref2va" else "transformer"
@@ -203,6 +210,21 @@ def load_transformer(
     else:
         config_path = os.path.join(_component_dir(ckpt_dir, subfolder), "config.json")
         files = [tdir]
+
+    from .int8_quant import is_int8_checkpoint
+
+    if dit_path and not os.path.isdir(dit_path) and is_int8_checkpoint(dit_path):
+        if fp8 or fp8_scaled:
+            logger.warning("int8 checkpoint detected: the weights are already quantized, fp8 flags are ignored")
+        return _load_int8_transformer(
+            config_path=config_path,
+            checkpoint_path=dit_path,
+            device=device,
+            dit_dtype=dit_dtype,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            int8_use_int_mm=int8_use_int_mm,
+        )
 
     exclude_keys = FP8_EXCLUDE_KEYS + (["adaln_proj"] if fp8_exclude_adaln else [])
     model = _from_config(MiniMaxH3Transformer3DModel, config_path, dit_dtype)
@@ -276,6 +298,141 @@ def load_transformer(
         info = model.load_state_dict(sd, strict=True, assign=True)
         logger.info(f"transformer load ({subfolder}): {info}")
 
+    model.eval().requires_grad_(False)
+    return model
+
+
+def _merge_loras_into_int8_sd(
+    sd: dict,
+    quant_map: dict,
+    lora_weights_list: List[dict],
+    lora_multipliers: Optional[List[float]],
+    calc_device: torch.device,
+) -> None:
+    """Merge converted-native LoRAs (`lora_down`/`lora_up` pairs, `scale = alpha/dim` with the
+    `alpha = dim` fallback, matching utils/lora_utils) into the converted int8 state dict.
+    Quantized layers dequantize + un-rotate to the original basis at float32, take the delta,
+    and re-quantize in the same rotated basis — the only added error is the final int8
+    rounding. Unquantized layers merge in place at float32."""
+    from .int8_quant import marker_groupsize, merge_lora_deltas_into_int8
+
+    if lora_multipliers is None:
+        lora_multipliers = [1.0] * len(lora_weights_list)
+
+    consumed = [set() for _ in lora_weights_list]
+    merged_layers = 0
+    for key in [k for k in sd if k.endswith(".weight")]:
+        base = key[: -len(".weight")]
+        deltas = []
+        for i, (lora_sd, multiplier) in enumerate(zip(lora_weights_list, lora_multipliers)):
+            down = lora_sd.get(base + ".lora_down.weight")
+            up = lora_sd.get(base + ".lora_up.weight")
+            if down is None or up is None:
+                continue
+            dim = down.shape[0]
+            alpha = lora_sd.get(base + ".alpha", dim)
+            alpha = float(alpha.item()) if isinstance(alpha, torch.Tensor) else float(alpha)
+            delta = (
+                up.to(device=calc_device, dtype=torch.float32)
+                @ down.to(device=calc_device, dtype=torch.float32)
+            ) * (multiplier * alpha / dim)
+            deltas.append(delta)
+            consumed[i].update({base + ".lora_down.weight", base + ".lora_up.weight", base + ".alpha"})
+        if not deltas:
+            continue
+        if base in quant_map:
+            sd[key], sd[base + ".weight_scale"] = merge_lora_deltas_into_int8(
+                sd[key], sd[base + ".weight_scale"], marker_groupsize(quant_map[base]), deltas, calc_device
+            )
+        else:
+            weight = sd[key].to(device=calc_device, dtype=torch.float32)
+            for delta in deltas:
+                weight += delta
+            sd[key] = weight.to(device=sd[key].device, dtype=sd[key].dtype)
+        merged_layers += 1
+
+    for i, lora_sd in enumerate(lora_weights_list):
+        leftover = [k for k in lora_sd if k.endswith((".lora_down.weight", ".lora_up.weight")) and k not in consumed[i]]
+        if leftover:
+            logger.warning(
+                f"LoRA #{i}: {len(leftover)} tensors did not match any model weight (e.g. {leftover[0]})"
+            )
+    logger.info(f"int8 load: LoRA merged into {merged_layers} layers")
+
+
+def _load_int8_transformer(
+    config_path: str,
+    checkpoint_path: str,
+    device: torch.device,
+    dit_dtype: torch.dtype,
+    lora_weights_list: Optional[List[dict]],
+    lora_multipliers: Optional[List[float]],
+    int8_use_int_mm: bool,
+):
+    """Load a single-file MiniMax-H3 export: int8 convrot weights and/or the adaln-curve
+    pruned form. Keys convert to the port's diffusers layout via pure renames and row
+    permutations (exact for int8 rows + per-row scales), the curve table and the tiny
+    curve-form AdaLN projections stay float32 (matching the export's own runtime), and
+    quantized Linears are monkey-patched to dequantize per forward (or run torch._int_mm)."""
+    from utils.safetensors_utils import MemoryEfficientSafeOpen
+
+    from .int8_quant import (
+        apply_int8_monkey_patch,
+        convert_int8_dit_state_dict,
+        read_safetensors_header,
+    )
+    from .transformer import MiniMaxH3Transformer3DModel
+
+    config = _read_json(config_path)
+    config.pop("_class_name", None)
+    config.pop("_diffusers_version", None)
+    header = read_safetensors_header(checkpoint_path)
+    curve = "adaln_t_table" in header
+    if curve:
+        # the curve table's shape decides the AdaLN geometry; everything else follows config.json
+        grid, curve_dim = header["adaln_t_table"]["shape"]
+        config["adaln_curve_grid"] = grid
+        config["time_embed_dim"] = curve_dim
+    with init_empty_weights():
+        model = MiniMaxH3Transformer3DModel.from_config(config)
+    # int8 tensors cannot carry grads; must be flipped before load_state_dict(assign=True)
+    model.requires_grad_(False)
+
+    def stream_tensors():
+        with MemoryEfficientSafeOpen(checkpoint_path) as f:
+            for key in f.keys():
+                yield key, f.get_tensor(key)
+
+    sd, quant_map = convert_int8_dit_state_dict(stream_tensors())
+
+    # dtype policy: int8 weights and their float32 scales stay untouched; the mixed-precision
+    # float32 islands (patch projections, output heads) stay float32; the curve table and the
+    # curve-form AdaLN projections (stored float16, 8-dim input) are promoted to float32 to
+    # match the export runtime's compute; everything else takes the block-stack dtype.
+    for key in list(sd.keys()):
+        value = sd[key]
+        if value.dtype == torch.int8 or key.endswith(".weight_scale"):
+            continue
+        if _is_fp32_key(key) or key == "adaln_t_table":
+            target = torch.float32
+        elif curve and (".adaln_proj.linear." in key or key.startswith("norm_out.linear.")):
+            target = torch.float32
+        else:
+            target = dit_dtype
+        if value.dtype != target:
+            sd[key] = value.to(target)
+
+    if lora_weights_list:
+        expected_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+        lora_weights_list = [convert_peft_lora_to_native(l, expected_shapes) for l in lora_weights_list]
+        _merge_loras_into_int8_sd(sd, quant_map, lora_weights_list, lora_multipliers, device)
+
+    apply_int8_monkey_patch(model, quant_map, use_int_mm=int8_use_int_mm, state_dict=sd)
+    info = model.load_state_dict(sd, strict=True, assign=True)
+    logger.info(
+        f"int8 transformer load ({os.path.basename(checkpoint_path)}, "
+        f"{len(quant_map)} quantized layers, curve_adaln={curve}): {info}"
+    )
     model.eval().requires_grad_(False)
     return model
 
